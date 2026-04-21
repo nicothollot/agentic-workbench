@@ -51,5 +51,7 @@ The current portable format stores repository understanding and UI state only.
 ## Packaging / Distribution Safety
 
 - The repository uses pure JS/TS dependencies for the main application logic.
-- Windows packaging is performed via `electron-builder --win nsis`.
+- Local personal use without packaging runs from compiled repo assets with `npm run build:app` and `npm start`.
+- Windows one-file packaging is performed via Electron Builder's `portable` target.
+- Windows packaging produces a local `.exe` without requesting extra files or secrets.
 - In restricted WSL environments, packaging may fail before downloading Windows Electron artifacts from GitHub; this is an environment constraint, not a fallback to unsafe behavior.

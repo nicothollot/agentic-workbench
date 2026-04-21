@@ -977,6 +977,82 @@ p {
   gap: 14px;
 }
 
+.workflow-at-glance {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+  gap: 16px;
+  padding: 18px 20px;
+  border-radius: 22px;
+  border: 1px solid rgba(31, 54, 92, 0.16);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(246, 238, 227, 0.94));
+}
+
+.workflow-at-glance__main,
+.workflow-at-glance__fact {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.workflow-at-glance__main h3,
+.workflow-at-glance__main p,
+.workflow-at-glance__brief li,
+.workflow-at-glance__fact strong,
+.workflow-at-glance__fact em,
+.workflow-at-glance__next {
+  overflow-wrap: anywhere;
+}
+
+.workflow-at-glance__main h3 {
+  font-size: 1.2rem;
+}
+
+.workflow-at-glance__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.workflow-at-glance__brief {
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-at-glance__brief > div {
+  display: grid;
+  gap: 4px;
+}
+
+.workflow-at-glance__steps {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 1.2rem;
+  color: var(--accent-strong);
+}
+
+.workflow-at-glance__fact {
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(25, 40, 68, 0.08);
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.workflow-at-glance__fact span,
+.workflow-at-glance__fact em,
+.workflow-at-glance__next {
+  color: var(--muted);
+}
+
+.workflow-at-glance__fact em {
+  font-style: normal;
+}
+
+.workflow-at-glance__next {
+  grid-column: 1 / -1;
+  padding-top: 2px;
+}
+
 .workflow-autopilot-card,
 .workflow-goal-progress {
   display: grid;
@@ -1005,18 +1081,49 @@ p {
 .goal-checklist-preview {
   display: grid;
   gap: 6px;
+  max-height: 320px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.goal-checklist-preview__header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  color: var(--accent-strong);
+  background: linear-gradient(180deg, rgba(249, 244, 238, 0.98), rgba(249, 244, 238, 0.92));
+}
+
+.goal-checklist-preview__header span {
+  color: var(--muted);
 }
 
 .goal-checklist-preview__item {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 8px;
-  align-items: center;
+  align-items: start;
+  padding: 10px 0;
+  border-top: 1px solid rgba(25, 40, 68, 0.08);
   color: var(--accent-strong);
 }
 
-.goal-checklist-preview__item span:last-child {
+.goal-checklist-preview__copy {
+  display: grid;
+  gap: 4px;
   min-width: 0;
+}
+
+.goal-checklist-preview__copy span {
+  color: var(--muted);
+}
+
+.goal-checklist-preview__copy strong,
+.goal-checklist-preview__copy span {
   overflow-wrap: anywhere;
 }
 
@@ -1070,6 +1177,12 @@ p {
 .workflow-agent-list {
   display: grid;
   gap: 12px;
+}
+
+.workflow-agent-list-card--bounded .workflow-agent-list {
+  max-height: 380px;
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .workflow-step-rail {
@@ -1345,8 +1458,25 @@ p {
 .workflow-secondary__details summary {
   cursor: pointer;
   list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 16px 18px;
   font-weight: 600;
+  color: var(--accent-strong);
+}
+
+.workflow-secondary__details summary::after {
+  content: "+";
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(31, 54, 92, 0.08);
   color: var(--accent-strong);
 }
 
@@ -1356,6 +1486,10 @@ p {
 
 .workflow-secondary__details[open] summary {
   border-bottom: 1px solid rgba(25, 40, 68, 0.08);
+}
+
+.workflow-secondary__details[open] summary::after {
+  content: "-";
 }
 
 .workflow-secondary__content {
@@ -1934,6 +2068,7 @@ code {
   .workflow-cycle-board__status,
   .workflow-cycle-board__grid,
   .workflow-feed-card__grid,
+  .workflow-at-glance,
   .workflow-grid,
   .overview-grid,
   .agent-lanes,
@@ -2029,6 +2164,8 @@ code {
   .workflow-cycle-board__status,
   .workflow-cycle-board__grid,
   .workflow-feed-card__grid,
+  .workflow-at-glance,
+  .workflow-at-glance__facts,
   .workflow-grid,
   .workflow-cycle-grid,
   .workflow-goal-panel__grid,

@@ -91,29 +91,14 @@ type SpawnProcess = typeof import("node:child_process").spawn;
 type ExecFileProcess = typeof import("node:child_process").execFile;
 
 type PackageAppScript = {
+  buildArtifactCopyFallbackPath: (destinationPath: string, attempt?: number, now?: Date) => string;
   buildTargetArgs: (
     target: string,
-    outputDir: string,
-    options?: {
-      windowsSigningConfig?: {
-        cliArgs: string[];
-      };
-    }
+    outputDir: string
   ) => string[];
-  createWindowsSigningConfig: (
-    requestedMode?: string,
-    env?: NodeJS.ProcessEnv,
-    platform?: NodeJS.Platform
-  ) => {
-    enabled: boolean;
-    cliArgs: string[];
-    env: NodeJS.ProcessEnv;
-    mode: string;
-    reason: string;
-  };
-  parsePackageArgs: (argv: string[]) => { compile: boolean; targets: string[]; windowsSigningMode: string };
+  createBuilderEnv: (env?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+  parsePackageArgs: (argv: string[]) => { compile: boolean; targets: string[] };
   resolveDownloadsDir: (env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform) => string;
-  resolveWindowsSigningMode: (requestedMode?: string, env?: NodeJS.ProcessEnv) => string;
   windowsPathToWslPath: (inputPath: string) => string;
 };
 
@@ -242,12 +227,14 @@ describe("packaging script", () => {
     expect(packageAppScript.windowsPathToWslPath("C:\\Users\\nicot\\Downloads")).toBe("/mnt/c/Users/nicot/Downloads");
     expect(packageAppScript.parsePackageArgs(["--win", "--no-compile"])).toEqual({
       compile: false,
-      targets: ["win"],
-      windowsSigningMode: "auto"
+      targets: ["win"]
     });
     expect(packageAppScript.parsePackageArgs(["--all"]).targets.sort()).toEqual(["mac", "win"]);
-    expect(packageAppScript.parsePackageArgs(["--win", "--signed"]).windowsSigningMode).toBe("required");
-    expect(packageAppScript.parsePackageArgs(["--win", "--unsigned"]).windowsSigningMode).toBe("disabled");
+    expect(packageAppScript.buildArtifactCopyFallbackPath(
+      "/mnt/c/Users/nicot/Downloads/Codex Agent Workbench-0.1.0-windows-x64.exe",
+      2,
+      new Date("2026-04-21T10:11:12.000Z")
+    )).toBe("/mnt/c/Users/nicot/Downloads/Codex Agent Workbench-0.1.0-windows-x64-20260421101112-2.exe");
   });
 
   it("resolves explicit and native Windows Downloads destinations", async () => {
@@ -257,63 +244,35 @@ describe("packaging script", () => {
     expect(packageAppScript.resolveDownloadsDir({ USERPROFILE: "C:\\Users\\TestUser" }, "win32")).toBe("C:\\Users\\TestUser\\Downloads");
   });
 
-  it("enables Windows signing only when requested or configured", async () => {
+  it("builds the Windows portable executable without extra packaging credentials", async () => {
     const packageAppScript = await loadPackageAppScript();
-    const certDir = await createTempDir("codesign-cert");
-    const certPath = path.join(certDir, "codex-agent-workbench.pfx");
-    await writeFile(certPath, "fake certificate payload for config tests", "utf8");
-
-    expect(packageAppScript.resolveWindowsSigningMode("auto", { AWB_SIGN_WINDOWS: "1" })).toBe("required");
-    expect(packageAppScript.resolveWindowsSigningMode("auto", { AWB_SIGN_WINDOWS: "off" })).toBe("disabled");
-
-    const unsignedConfig = packageAppScript.createWindowsSigningConfig("auto", {}, "linux");
-    expect(unsignedConfig.enabled).toBe(false);
-    expect(unsignedConfig.cliArgs).toContain("--config.win.signAndEditExecutable=false");
-
-    const signedConfig = packageAppScript.createWindowsSigningConfig(
-      "auto",
-      {
-        WIN_CSC_LINK: certPath,
-        WIN_CSC_KEY_PASSWORD: "secret"
-      },
-      "linux"
-    );
-    expect(signedConfig.enabled).toBe(true);
-    expect(signedConfig.cliArgs).toContain("--config.win.signAndEditExecutable=true");
-    expect(signedConfig.cliArgs).toContain("--config.win.forceCodeSigning=true");
-    expect(signedConfig.env.WIN_CSC_LINK).toBe(certPath);
-    expect(signedConfig.env.WIN_CSC_KEY_PASSWORD).toBe("secret");
-  });
-
-  it("fails signed Windows packaging early when the certificate file is missing", async () => {
-    const packageAppScript = await loadPackageAppScript();
-
-    expect(() => packageAppScript.createWindowsSigningConfig(
-      "required",
-      {
-        WSL_DISTRO_NAME: "Ubuntu",
-        AWB_WIN_CSC_LINK: "C:\\Users\\nicot\\certs\\missing.pfx"
-      },
-      "linux"
-    )).toThrow("/mnt/c/Users/nicot/certs/missing.pfx");
-  });
-
-  it("passes Windows signing flags into the electron-builder invocation", async () => {
-    const packageAppScript = await loadPackageAppScript();
-    const args = packageAppScript.buildTargetArgs("win", "/tmp/out", {
-      windowsSigningConfig: {
-        cliArgs: [
-          "--config.win.signAndEditExecutable=true",
-          "--config.win.forceCodeSigning=true"
-        ]
-      }
-    });
+    const args = packageAppScript.buildTargetArgs("win", "/tmp/out");
+    const packageJson = JSON.parse(await readFile(path.resolve("package.json"), "utf8"));
 
     expect(args).toContain("--win");
     expect(args).toContain("portable");
-    expect(args).toContain("--config.win.signAndEditExecutable=true");
-    expect(args).toContain("--config.win.forceCodeSigning=true");
-    expect(args).not.toContain("--config.win.signAndEditExecutable=false");
+    expect(args).toContain("--config.win.signAndEditExecutable=false");
+    expect(packageJson.build.win.signExts).toEqual(["!.exe"]);
+  });
+
+  it("drops inherited Windows package credential environment before running the builder", async () => {
+    const packageAppScript = await loadPackageAppScript();
+    const env = packageAppScript.createBuilderEnv({
+      AWB_SIGN_WINDOWS: "1",
+      AWB_WIN_CSC_LINK: "/tmp/local.pfx",
+      CSC_LINK: "/tmp/generic.pfx",
+      PATH: "/usr/bin",
+      WIN_CSC_LINK: "/tmp/windows.pfx",
+      npm_config_loglevel: "verbose"
+    });
+
+    expect(env.AWB_SIGN_WINDOWS).toBeUndefined();
+    expect(env.AWB_WIN_CSC_LINK).toBeUndefined();
+    expect(env.CSC_LINK).toBeUndefined();
+    expect(env.WIN_CSC_LINK).toBeUndefined();
+    expect(env.npm_config_loglevel).toBeUndefined();
+    expect(env.CSC_IDENTITY_AUTO_DISCOVERY).toBe("false");
+    expect(env.PATH).toBe("/usr/bin");
   });
 });
 
@@ -1115,7 +1074,7 @@ describe("workflow state", () => {
     expect(stepProgress.recommendation.requiresUserInput).toBe(true);
   });
 
-  it("does not keep prompting recovery for an already superseded disconnected agent", () => {
+  it("does not keep prompting recovery for an already handled or superseded disconnected agent", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {
       ...emptyUltimateGoal("user"),

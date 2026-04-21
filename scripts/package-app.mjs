@@ -12,38 +12,21 @@ const stageDir = path.join(rootDir, ".electron-builder", "app");
 const packageOutputRoot = path.join(rootDir, ".electron-builder", "out");
 
 const appTargets = new Set(["win", "mac"]);
-const windowsSigningModes = new Set(["auto", "required", "disabled"]);
-
-const hasValue = (value) => typeof value === "string" && value.trim().length > 0;
-
-const normalizeSigningModeEnvValue = (value) => {
-  if (!hasValue(value)) {
-    return undefined;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on", "required", "force", "signed"].includes(normalized)) {
-    return "required";
-  }
-  if (["0", "false", "no", "off", "disabled", "unsigned"].includes(normalized)) {
-    return "disabled";
-  }
-  if (normalized === "auto") {
-    return "auto";
-  }
-
-  throw new Error(`Invalid AWB_SIGN_WINDOWS value: ${value}`);
-};
-
-const getFirstEnvValue = (env, keys) => {
-  for (const key of keys) {
-    if (hasValue(env[key])) {
-      return env[key].trim();
-    }
-  }
-
-  return undefined;
-};
+const windowsLocalExecutableArgs = ["--config.win.signAndEditExecutable=false"];
+const packagingCredentialEnvKeys = [
+  "AWB_SIGN_WINDOWS",
+  "AWB_WIN_CSC_KEY_PASSWORD",
+  "AWB_WIN_CSC_LINK",
+  "AWB_WIN_PUBLISHER_NAME",
+  "CSC_KEY_PASSWORD",
+  "CSC_LINK",
+  "CSC_NAME",
+  "WIN_CSC_KEY_PASSWORD",
+  "WIN_CSC_LINK"
+];
+const expectedBuilderInfoFilters = [
+  /file signing skipped via signExts configuration/
+];
 
 export const isWslEnvironment = (env = process.env, platform = process.platform) => {
   if (platform !== "linux") {
@@ -181,7 +164,6 @@ export const resolveDefaultPackageTargets = (env = process.env, platform = proce
 export const parsePackageArgs = (argv) => {
   const targets = new Set();
   let compile = true;
-  let windowsSigningMode = "auto";
 
   for (const arg of argv) {
     if (arg === "--win" || arg === "--windows") {
@@ -201,22 +183,13 @@ export const parsePackageArgs = (argv) => {
       compile = false;
       continue;
     }
-    if (arg === "--signed" || arg === "--sign") {
-      windowsSigningMode = "required";
-      continue;
-    }
-    if (arg === "--unsigned" || arg === "--no-sign") {
-      windowsSigningMode = "disabled";
-      continue;
-    }
 
     throw new Error(`Unknown package argument: ${arg}`);
   }
 
   return {
     compile,
-    targets: targets.size > 0 ? [...targets] : resolveDefaultPackageTargets(),
-    windowsSigningMode
+    targets: targets.size > 0 ? [...targets] : resolveDefaultPackageTargets()
   };
 };
 
@@ -232,178 +205,49 @@ const assertTargetsCanBuildOnHost = (targets) => {
   }
 };
 
-export const resolveWindowsSigningMode = (requestedMode = "auto", env = process.env) => {
-  if (!windowsSigningModes.has(requestedMode)) {
-    throw new Error(`Unsupported Windows signing mode: ${requestedMode}`);
-  }
-  if (requestedMode !== "auto") {
-    return requestedMode;
-  }
-
-  return normalizeSigningModeEnvValue(env.AWB_SIGN_WINDOWS) ?? "auto";
-};
-
-const normalizeCodeSigningFileReference = (input, env = process.env, platform = process.platform) => {
-  const trimmed = input.trim();
-  if (isWslEnvironment(env, platform) && /^[a-zA-Z]:[\\/]/.test(trimmed)) {
-    return windowsPathToWslPath(trimmed);
-  }
-
-  return trimmed;
-};
-
-const isLocalCertificateReference = (input) => {
-  const trimmed = input.trim();
-  if (trimmed.startsWith("https://") || trimmed.startsWith("data:")) {
-    return false;
-  }
-  if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && (trimmed.length > 2048 || trimmed.endsWith("="))) {
-    return false;
-  }
-
-  return true;
-};
-
-const hasWindowsSpecificSigningMaterial = (env) =>
-  [
-    "WIN_CSC_LINK",
-    "AWB_WIN_CSC_LINK",
-    "AWB_WIN_CERTIFICATE_FILE",
-    "AWB_WIN_CERTIFICATE_SUBJECT_NAME",
-    "AWB_WIN_CERT_SUBJECT",
-    "AWB_WIN_CERTIFICATE_SHA1",
-    "AWB_WIN_CERT_SHA1"
-  ].some((key) => hasValue(env[key]));
-
-const hasGenericSigningMaterial = (env) => hasValue(env.CSC_LINK);
-
-const buildWindowsSigningConfigArgs = (env, platform) => {
-  const args = [
-    "--config.win.signAndEditExecutable=true",
-    "--config.win.forceCodeSigning=true"
-  ];
-
-  const certificateFile = getFirstEnvValue(env, [
-    "AWB_WIN_CERTIFICATE_FILE"
-  ]);
-  if (certificateFile) {
-    args.push(
-      "--config.win.signtoolOptions.certificateFile",
-      normalizeCodeSigningFileReference(certificateFile, env, platform)
-    );
-  }
-
-  const certificateSubjectName = getFirstEnvValue(env, [
-    "AWB_WIN_CERTIFICATE_SUBJECT_NAME",
-    "AWB_WIN_CERT_SUBJECT"
-  ]);
-  if (certificateSubjectName) {
-    args.push("--config.win.signtoolOptions.certificateSubjectName", certificateSubjectName);
-  }
-
-  const certificateSha1 = getFirstEnvValue(env, [
-    "AWB_WIN_CERTIFICATE_SHA1",
-    "AWB_WIN_CERT_SHA1"
-  ]);
-  if (certificateSha1) {
-    args.push("--config.win.signtoolOptions.certificateSha1", certificateSha1);
-  }
-
-  const publisherName = getFirstEnvValue(env, ["AWB_WIN_PUBLISHER_NAME"]);
-  if (publisherName) {
-    args.push("--config.win.signtoolOptions.publisherName", publisherName);
-  }
-
-  return args;
-};
-
-export const createWindowsSigningConfig = (
-  requestedMode = "auto",
-  env = process.env,
-  platform = process.platform
-) => {
-  const mode = resolveWindowsSigningMode(requestedMode, env);
-  const hasWindowsMaterial = hasWindowsSpecificSigningMaterial(env);
-  const hasAnySupportedMaterial = hasWindowsMaterial || hasGenericSigningMaterial(env);
-
-  if (mode === "disabled") {
-    return {
-      enabled: false,
-      cliArgs: ["--config.win.signAndEditExecutable=false"],
-      env: {},
-      mode,
-      reason: "Windows code signing was disabled."
-    };
-  }
-
-  if (mode === "auto" && !hasWindowsMaterial) {
-    return {
-      enabled: false,
-      cliArgs: ["--config.win.signAndEditExecutable=false"],
-      env: {},
-      mode,
-      reason: "No Windows-specific code signing material was provided."
-    };
-  }
-
-  if (mode === "required" && !hasAnySupportedMaterial) {
-    throw new Error(
-      [
-        "Windows code signing was requested, but no signing certificate was configured.",
-        "Set WIN_CSC_LINK or AWB_WIN_CSC_LINK to a trusted code-signing certificate file, base64 payload, or HTTPS URL.",
-        "Set WIN_CSC_KEY_PASSWORD or AWB_WIN_CSC_KEY_PASSWORD if the certificate requires a password."
-      ].join(" ")
-    );
-  }
-
-  const signingEnv = {};
-  const cscLink = getFirstEnvValue(env, ["WIN_CSC_LINK", "AWB_WIN_CSC_LINK", "CSC_LINK"]);
-  if (cscLink) {
-    const normalizedCscLink = normalizeCodeSigningFileReference(cscLink, env, platform);
-    if (isLocalCertificateReference(normalizedCscLink) && !existsSync(normalizedCscLink)) {
-      throw new Error(
-        [
-          `Windows code signing certificate not found: ${normalizedCscLink}`,
-          "Create or copy the trusted .pfx/.p12 certificate to that path, or update WIN_CSC_LINK/AWB_WIN_CSC_LINK.",
-          "If you intended to use a base64 certificate payload or HTTPS URL, set WIN_CSC_LINK to that value directly."
-        ].join(" ")
-      );
-    }
-    signingEnv.WIN_CSC_LINK = normalizedCscLink;
-  }
-
-  const cscPassword = getFirstEnvValue(env, [
-    "WIN_CSC_KEY_PASSWORD",
-    "AWB_WIN_CSC_KEY_PASSWORD",
-    "AWB_WIN_CERTIFICATE_PASSWORD",
-    "CSC_KEY_PASSWORD"
-  ]);
-  if (cscPassword !== undefined) {
-    signingEnv.WIN_CSC_KEY_PASSWORD = cscPassword;
-  }
+const createFilteredWriter = (destination, filters) => {
+  let buffered = "";
 
   return {
-    enabled: true,
-    cliArgs: buildWindowsSigningConfigArgs(env, platform),
-    env: signingEnv,
-    mode,
-    reason: mode === "required"
-      ? "Windows code signing was requested."
-      : "Windows-specific code signing material was provided."
+    flush() {
+      if (buffered.length > 0 && !filters.some((filter) => filter.test(buffered))) {
+        destination.write(buffered);
+      }
+      buffered = "";
+    },
+    write(chunk) {
+      buffered += chunk.toString();
+      const lines = buffered.split(/\r?\n/);
+      buffered = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!filters.some((filter) => filter.test(line))) {
+          destination.write(`${line}\n`);
+        }
+      }
+    }
   };
 };
 
-const run = (command, args, env = process.env) =>
+const run = (command, args, env = process.env, options = {}) =>
   new Promise((resolve, reject) => {
+    const outputFilters = options.outputFilters ?? [];
     const child = spawn(command, args, {
       cwd: rootDir,
       env,
-      stdio: "inherit",
+      stdio: outputFilters.length > 0 ? ["inherit", "pipe", "pipe"] : "inherit",
       shell: process.platform === "win32"
     });
+    const stdoutWriter = outputFilters.length > 0 ? createFilteredWriter(process.stdout, outputFilters) : undefined;
+    const stderrWriter = outputFilters.length > 0 ? createFilteredWriter(process.stderr, outputFilters) : undefined;
+
+    child.stdout?.on("data", (chunk) => stdoutWriter?.write(chunk));
+    child.stderr?.on("data", (chunk) => stderrWriter?.write(chunk));
 
     child.on("error", reject);
     child.on("exit", (code) => {
+      stdoutWriter?.flush();
+      stderrWriter?.flush();
       if (code === 0) {
         resolve();
         return;
@@ -413,17 +257,17 @@ const run = (command, args, env = process.env) =>
     });
   });
 
-const createBuilderEnv = (env = process.env, windowsSigningConfig = undefined) => {
+export const createBuilderEnv = (env = process.env) => {
   const builderEnv = Object.fromEntries(
     Object.entries(env).filter(([key]) => !key.startsWith("npm_"))
   );
 
   builderEnv.NO_UPDATE_NOTIFIER = "true";
   builderEnv.npm_config_update_notifier = "false";
-  builderEnv.CSC_IDENTITY_AUTO_DISCOVERY = "false";
-  if (windowsSigningConfig?.enabled) {
-    Object.assign(builderEnv, windowsSigningConfig.env);
+  for (const key of packagingCredentialEnvKeys) {
+    delete builderEnv[key];
   }
+  builderEnv.CSC_IDENTITY_AUTO_DISCOVERY = "false";
 
   return builderEnv;
 };
@@ -453,7 +297,7 @@ const stageApp = async () => {
   await writeFile(path.join(stageDir, "package.json"), `${JSON.stringify(packagedManifest, null, 2)}\n`);
 };
 
-export const buildTargetArgs = (target, outputDir, options = {}) => {
+export const buildTargetArgs = (target, outputDir) => {
   const commonArgs = [
     path.join(rootDir, "node_modules", "electron-builder", "cli.js"),
     "--publish",
@@ -465,13 +309,12 @@ export const buildTargetArgs = (target, outputDir, options = {}) => {
   ];
 
   if (target === "win") {
-    const windowsSigningConfig = options.windowsSigningConfig ?? createWindowsSigningConfig("auto");
     return [
       ...commonArgs,
       "--win",
       "portable",
       "--x64",
-      ...windowsSigningConfig.cliArgs
+      ...windowsLocalExecutableArgs
     ];
   }
 
@@ -509,30 +352,63 @@ const collectDistributableArtifacts = async (outputDir, target) => {
   return artifacts;
 };
 
+export const buildArtifactCopyFallbackPath = (destinationPath, attempt = 1, now = new Date()) => {
+  const extension = path.extname(destinationPath);
+  const baseName = path.basename(destinationPath, extension);
+  const timestamp = now.toISOString().replace(/\D/g, "").slice(0, 14);
+  const attemptSuffix = attempt > 1 ? `-${attempt}` : "";
+  return path.join(path.dirname(destinationPath), `${baseName}-${timestamp}${attemptSuffix}${extension}`);
+};
+
+const isLockedDestinationError = (error) =>
+  error && typeof error === "object" && ["EACCES", "EPERM"].includes(error.code);
+
+const copyArtifactToDownloads = async (artifactPath, downloadsDir) => {
+  const destinationPath = path.join(downloadsDir, path.basename(artifactPath));
+
+  try {
+    await cp(artifactPath, destinationPath, { force: true });
+    return destinationPath;
+  } catch (error) {
+    if (!isLockedDestinationError(error)) {
+      throw error;
+    }
+
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
+      const fallbackPath = buildArtifactCopyFallbackPath(destinationPath, attempt);
+      try {
+        await cp(artifactPath, fallbackPath, { errorOnExist: true, force: false });
+        console.warn(`Could not replace ${destinationPath}; copied artifact to ${fallbackPath} instead.`);
+        return fallbackPath;
+      } catch (fallbackError) {
+        if (fallbackError && typeof fallbackError === "object" && fallbackError.code === "EEXIST") {
+          continue;
+        }
+        throw fallbackError;
+      }
+    }
+
+    throw new Error(`Could not copy ${artifactPath} to ${downloadsDir}: fallback artifact names already exist.`);
+  }
+};
+
 const copyArtifactsToDownloads = async (artifacts, downloadsDir) => {
   await mkdir(downloadsDir, { recursive: true });
 
   const copiedArtifacts = [];
   for (const artifactPath of artifacts) {
-    const destinationPath = path.join(downloadsDir, path.basename(artifactPath));
-    await cp(artifactPath, destinationPath, { force: true });
-    copiedArtifacts.push(destinationPath);
+    copiedArtifacts.push(await copyArtifactToDownloads(artifactPath, downloadsDir));
   }
 
   return copiedArtifacts;
 };
 
 export const packageApp = async (argv = process.argv.slice(2)) => {
-  const { compile, targets, windowsSigningMode } = parsePackageArgs(argv);
+  const { compile, targets } = parsePackageArgs(argv);
   assertTargetsCanBuildOnHost(targets);
 
   const downloadsDir = resolveDownloadsDir();
-  const windowsSigningConfig = createWindowsSigningConfig(windowsSigningMode);
-  const builderEnv = createBuilderEnv(process.env, windowsSigningConfig);
-
-  if (targets.includes("win")) {
-    console.log(`Windows code signing: ${windowsSigningConfig.enabled ? "enabled" : "disabled"} (${windowsSigningConfig.reason})`);
-  }
+  const builderEnv = createBuilderEnv(process.env);
 
   if (compile) {
     await run("npm", ["run", "build:app"]);
@@ -545,7 +421,9 @@ export const packageApp = async (argv = process.argv.slice(2)) => {
   for (const target of targets) {
     const outputDir = path.join(packageOutputRoot, target);
     await mkdir(outputDir, { recursive: true });
-    await run(process.execPath, buildTargetArgs(target, outputDir, { windowsSigningConfig }), builderEnv);
+    await run(process.execPath, buildTargetArgs(target, outputDir), builderEnv, {
+      outputFilters: target === "win" ? expectedBuilderInfoFilters : []
+    });
 
     const artifacts = await collectDistributableArtifacts(outputDir, target);
     if (artifacts.length === 0) {

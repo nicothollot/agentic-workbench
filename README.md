@@ -69,6 +69,13 @@ Run in mock mode:
 npm run mock
 ```
 
+Run the compiled local workspace without generating a new Windows executable:
+
+```bash
+npm run build:app
+npm start
+```
+
 ## Build And Test
 
 ```bash
@@ -83,27 +90,18 @@ Distributable packaging:
 ```bash
 npm run build
 npm run package:win
-npm run package:win:signed
 npm run package:mac
 ```
 
-`npm run build` now creates the native one-file distributable for the current build host:
+`npm run build` creates the native one-file distributable for the current build host:
 
 - WSL/Linux and native Windows emit a Windows portable `.exe`.
 - macOS emits a `.dmg`.
 
+Windows executable packaging is available for local use. `npm run package:win` and `npm run dist:win` produce the local portable `.exe` without requesting extra files or secrets.
+
 The final `.exe` or `.dmg` is copied into the detected Downloads folder. Under WSL, the script prefers the Windows profile Downloads folder, so this machine resolves to `/mnt/c/Users/nicot/Downloads`.
 Use `AWB_PACKAGE_OUTPUT_DIR=/path/to/output npm run build` to override the destination.
-
-For Smart App Control-friendly Windows builds, sign with a trusted RSA code-signing certificate:
-
-```bash
-export WIN_CSC_LINK="/mnt/c/Users/<you>/certs/codex-agent-workbench.pfx"
-export WIN_CSC_KEY_PASSWORD="<certificate password>"
-npm run package:win:signed
-```
-
-Unsigned local builds are still supported by `npm run package:win`.
 
 Detailed packaging and test instructions:
 

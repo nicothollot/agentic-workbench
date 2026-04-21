@@ -10,6 +10,7 @@
     "clean": "node scripts/clean.mjs",
     "dev": "node scripts/dev.mjs",
     "mock": "cross-env AWB_MOCK_MODE=1 node scripts/dev.mjs",
+    "start": "electron .",
     "generate:icons": "node scripts/generate-icons.mjs",
     "build": "node scripts/package-app.mjs",
     "build:app": "npm run clean && npm run generate:icons && npm run build:renderer && npm run build:electron",
@@ -20,11 +21,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "package:win": "node scripts/package-app.mjs --win",
-    "package:win:signed": "node scripts/package-app.mjs --win --signed",
     "package:mac": "node scripts/package-app.mjs --mac",
     "package:all": "node scripts/package-app.mjs --all",
-    "dist:win": "npm run package:win",
-    "dist:win:signed": "npm run package:win:signed",
+    "dist:win": "node scripts/package-app.mjs --win",
     "generate:app-server": "node scripts/generate-app-server.mjs"
   },
   "dependencies": {
@@ -88,6 +87,9 @@
     "win": {
       "icon": "build-resources/generated/icon.ico",
       "signAndEditExecutable": false,
+      "signExts": [
+        "!.exe"
+      ],
       "target": [
         {
           "target": "portable",

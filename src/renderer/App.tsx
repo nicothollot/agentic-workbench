@@ -61,6 +61,52 @@ type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
 const interfaceIconUrl = new URL("../../assets/branding/interface_icon.png", import.meta.url).href;
 const WORKFLOW_AGENT_STALE_MS = 10 * 60 * 1000;
 
+const buildUltimateGoalFormatGuide = (projectName: string): string => [
+  "Ultimate Goal authoring format for Codex Agent Workbench",
+  "",
+  "Use this prompt with ChatGPT or another LLM when you want it to draft an Ultimate Goal that this workbench can turn into a reliable checklist and workflow cycle.",
+  "",
+  "Prompt to give the LLM:",
+  "",
+  `You are drafting an Ultimate Goal for the project named "${projectName}". The result will be imported into Codex Agent Workbench, which will infer a goal checklist and then run repeated recommendation, scoped planning, coding, integrity validation, and merge cycles against the repository.`,
+  "",
+  "Write the goal so each success criterion can become an observable checklist item. Be concrete about user-visible behavior, acceptance conditions, quality expectations, constraints, and what is out of scope. Avoid secrets, credentials, machine-specific paths, or private environment details.",
+  "",
+  "Return plain text only. Do not wrap the result in Markdown fences. Use exactly these section headings:",
+  "",
+  "Project Charter: [one sentence describing the durable end state]",
+  "",
+  "Detailed Intent:",
+  "[2-5 sentences explaining what the project should accomplish, why it matters, and how the agent should prioritize tradeoffs]",
+  "",
+  "Success Criteria:",
+  "- [observable outcome the workflow can validate]",
+  "- [observable outcome the workflow can validate]",
+  "- [observable outcome the workflow can validate]",
+  "",
+  "Constraints:",
+  "- [technical, security, platform, compatibility, or process rule the agents must preserve]",
+  "- [technical, security, platform, compatibility, or process rule the agents must preserve]",
+  "",
+  "Non-goals:",
+  "- [explicitly out-of-scope work so the workflow does not chase it]",
+  "- [explicitly out-of-scope work so the workflow does not chase it]",
+  "",
+  "Quality Bar:",
+  "[the standard for done: tests, UX polish, performance, reliability, accessibility, packaging expectations, or review expectations]",
+  "",
+  "Target Audience:",
+  "[who will use or evaluate the finished project]",
+  "",
+  "Checklist inference guidance:",
+  "- Make every success criterion testable or inspectable.",
+  "- Include enough detail for a scoped coding agent to choose the next bounded task without asking for basic intent.",
+  "- Put hard rules in Constraints, not in Success Criteria.",
+  "- Put excluded work in Non-goals, especially packaging, deployment, account setup, or optional polish that should not happen automatically.",
+  "- Mention required validation commands or manual review expectations in Quality Bar when they matter.",
+  ""
+].join("\n");
+
 const validationClass = (status: ValidationStatus): string =>
   ({
     exact: "badge-exact",
@@ -333,6 +379,15 @@ const goalCheckStatusLabel = (status: ProjectWorkflowState["goalChecklist"][numb
       return "Unknown";
   }
 };
+
+const goalCheckSourceLabel = (source: ProjectWorkflowState["goalChecklist"][number]["source"]): string =>
+  ({
+    success_criterion: "Success criterion",
+    quality_bar: "Quality bar",
+    constraint: "Constraint",
+    agent: "Agent",
+    deterministic: "Deterministic"
+  })[source];
 
 const toLineList = (value: string): string[] =>
   value
@@ -910,14 +965,15 @@ const UltimateGoalProgressCard = ({
     return null;
   }
 
-  const requiredChecks = (checklist ?? []).filter((check) => check.required && check.status !== "not_applicable");
+  const allChecks = [...(checklist ?? [])].sort((left, right) => {
+    const order = { unmet: 0, unknown: 1, met: 2, not_applicable: 3 } as const;
+    if (left.required !== right.required) {
+      return left.required ? -1 : 1;
+    }
+    return order[left.status] - order[right.status] || left.title.localeCompare(right.title);
+  });
+  const requiredChecks = allChecks.filter((check) => check.required && check.status !== "not_applicable");
   const metChecks = requiredChecks.filter((check) => check.status === "met");
-  const visibleChecks = requiredChecks.length > 0
-    ? [...requiredChecks].sort((left, right) => {
-      const order = { unmet: 0, unknown: 1, met: 2, not_applicable: 3 } as const;
-      return order[left.status] - order[right.status] || left.title.localeCompare(right.title);
-    }).slice(0, 8)
-    : [];
 
   return (
     <section className="workflow-goal-progress">
@@ -956,14 +1012,24 @@ const UltimateGoalProgressCard = ({
           </span>
         </div>
       ) : null}
-      {visibleChecks.length > 0 ? (
+      {allChecks.length > 0 ? (
         <div className="goal-checklist-preview">
-          {visibleChecks.map((check) => (
+          <div className="goal-checklist-preview__header">
+            <strong>Full goal checklist</strong>
+            <span>{allChecks.length} item{allChecks.length === 1 ? "" : "s"}</span>
+          </div>
+          {allChecks.map((check) => (
             <div key={check.id} className="goal-checklist-preview__item">
               <span className={`badge goal-check-badge goal-check-badge--${check.status}`}>
                 {goalCheckStatusLabel(check.status)}
               </span>
-              <span>{check.title}</span>
+              <div className="goal-checklist-preview__copy">
+                <strong>{check.title}</strong>
+                <span>
+                  {check.required ? "Required" : "Optional"} · {goalCheckSourceLabel(check.source)}
+                  {check.evidence ? ` · ${check.evidence}` : check.description ? ` · ${check.description}` : ""}
+                </span>
+              </div>
             </div>
           ))}
         </div>
@@ -1000,6 +1066,85 @@ const WorkflowStepRail = ({
       </div>
     ))}
   </div>
+);
+
+const WorkflowAtAGlance = ({
+  goalTitle,
+  currentActivity,
+  recommendationTitle,
+  executionPlan,
+  intendedSteps,
+  stageLabel,
+  activeStepTitle,
+  agentName,
+  agentStatus,
+  checklistSummary,
+  nextGuidance
+}: {
+  goalTitle: string;
+  currentActivity: string;
+  recommendationTitle: string;
+  executionPlan: string;
+  intendedSteps: string[];
+  stageLabel: string;
+  activeStepTitle?: string;
+  agentName?: string;
+  agentStatus?: AgentState["status"];
+  checklistSummary: string;
+  nextGuidance?: string;
+}) => (
+  <article className="workflow-at-glance">
+    <div className="workflow-at-glance__main">
+      <span className="workflow-option__label">Workflow look</span>
+      <h3>{goalTitle}</h3>
+      <div className="workflow-at-glance__brief">
+        <div>
+          <span className="workflow-option__label">Now</span>
+          <p>{currentActivity}</p>
+        </div>
+        <div>
+          <span className="workflow-option__label">Recommendation</span>
+          <p>{recommendationTitle}</p>
+        </div>
+        <div>
+          <span className="workflow-option__label">Plan</span>
+          <p>{executionPlan}</p>
+        </div>
+        <div>
+          <span className="workflow-option__label">Intended steps</span>
+          {intendedSteps.length ? (
+            <ol className="workflow-at-glance__steps">
+              {intendedSteps.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          ) : (
+            <p>Steps will appear when the workflow has a recommendation or scoped goal.</p>
+          )}
+        </div>
+      </div>
+    </div>
+    <div className="workflow-at-glance__facts">
+      <div className="workflow-at-glance__fact">
+        <span>Stage</span>
+        <strong>{stageLabel}</strong>
+      </div>
+      <div className="workflow-at-glance__fact">
+        <span>Agent</span>
+        <strong>{agentName ?? "Waiting for next run"}</strong>
+        {agentStatus ? <em>{agentStatus}</em> : null}
+      </div>
+      <div className="workflow-at-glance__fact">
+        <span>Step</span>
+        <strong>{activeStepTitle ?? "No active step yet"}</strong>
+      </div>
+      <div className="workflow-at-glance__fact">
+        <span>Checklist</span>
+        <strong>{checklistSummary}</strong>
+      </div>
+    </div>
+    {nextGuidance ? <p className="workflow-at-glance__next">{nextGuidance}</p> : null}
+  </article>
 );
 
 interface TranscriptEntryView {
@@ -1757,6 +1902,72 @@ export const App = () => {
     () => workflow ? buildWorkflowGoalView(workflow) : null,
     [workflow]
   );
+  const currentWorkflowAgent = useMemo(() => {
+    if (!workflow) {
+      return undefined;
+    }
+
+    const isCurrentCycleAgent = (agent: AgentState): boolean =>
+      agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber;
+
+    return workflowAgents.find((agent) => isCurrentCycleAgent(agent) && isWorkflowAgentActive(agent))
+      ?? workflowAgents.find(isCurrentCycleAgent)
+      ?? workflowAgents[0];
+  }, [workflow, workflowAgents]);
+  const workflowChecklistSummary = useMemo(() => {
+    const checks = workflow?.goalChecklist ?? [];
+    if (checks.length === 0) {
+      return "No checks yet";
+    }
+
+    const requiredChecks = checks.filter((check) => check.required && check.status !== "not_applicable");
+    const metChecks = requiredChecks.filter((check) => check.status === "met");
+    return `${metChecks.length}/${requiredChecks.length} required met (${checks.length} total)`;
+  }, [workflow]);
+  const workflowGlanceGoal = workflowGoalView?.currentGoal ?? workflow?.ultimateGoal.summary ?? "Set the Ultimate Goal";
+  const workflowGlanceActivity = currentWorkflowAgent
+    ? agentPreviewText(currentWorkflowAgent, workflow)
+    : activeWorkflowStep?.currentActivity ?? workflowGoalView?.currentFocus ?? (
+      workflow ? workflowStatusSummary(workflow, autopilotEnabled, workflowObjective) : "Workflow state unavailable."
+    );
+  const workflowGlanceRecommendation = workflow?.approvedRecommendation?.title
+    ?? (workflow?.recommendations[0]?.title ? `Awaiting choice: ${workflow.recommendations[0].title}` : "No recommendation selected yet");
+  const workflowGlancePlan = workflow?.scopedGoal?.executionBrief
+    ?? workflowGoalView?.executionPlan
+    ?? workflow?.approvedRecommendation?.summary
+    ?? "Waiting for a scoped execution plan.";
+  const workflowGlanceSteps = useMemo(() => {
+    if (!workflow) {
+      return [];
+    }
+
+    if (workflow.scopedGoal) {
+      return [
+        workflow.scopedGoal.summary,
+        ...workflow.scopedGoal.acceptanceCriteria.slice(0, 3).map((criterion) => `Meet: ${criterion}`),
+        ...workflow.scopedGoal.testStrategy.slice(0, 2).map((strategy) => `Validate: ${strategy}`)
+      ].filter((step) => step.trim().length > 0);
+    }
+
+    if (workflow.approvedRecommendation) {
+      return [
+        "Turn the chosen recommendation into a scoped goal.",
+        "Run the coding agent against that scoped goal.",
+        "Run integrity checks against the scoped goal and Ultimate Goal.",
+        "Merge or finalize the validated result."
+      ];
+    }
+
+    if (workflow.recommendations.length > 0) {
+      return [
+        "Choose one recommendation.",
+        "Create a scoped implementation goal.",
+        "Run coding, validation, and integration for that goal."
+      ];
+    }
+
+    return [];
+  }, [workflow]);
   const workflowRepairCounter = useMemo(
     () => workflow ? getWorkflowRepairCounterView(workflow) : null,
     [workflow]
@@ -2122,6 +2333,25 @@ export const App = () => {
       anchor.click();
       window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
       showInfoNotice(`Downloaded repair report as ${fileName}.`);
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const downloadUltimateGoalFormat = () => {
+    const projectName = activeProject?.record.identity.projectName ?? "project";
+
+    try {
+      setNotice(undefined);
+      const fileName = `${sanitizeReportName(projectName)}-ultimate-goal-format.txt`;
+      const blob = new Blob([buildUltimateGoalFormatGuide(projectName)], { type: "text/plain;charset=utf-8" });
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = fileName;
+      anchor.click();
+      window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
+      showInfoNotice(`Downloaded Ultimate Goal authoring format as ${fileName}.`);
     } catch (error) {
       handleError(error);
     }
@@ -3210,13 +3440,27 @@ export const App = () => {
               </div>
             </header>
 
+            <WorkflowAtAGlance
+              goalTitle={workflowGlanceGoal}
+              currentActivity={workflowGlanceActivity}
+              recommendationTitle={workflowGlanceRecommendation}
+              executionPlan={workflowGlancePlan}
+              intendedSteps={workflowGlanceSteps}
+              stageLabel={workflow ? workflowStageLabel(workflow.workflowStage) : "Workflow unavailable"}
+              activeStepTitle={activeWorkflowStep?.title}
+              agentName={currentWorkflowAgent?.name}
+              agentStatus={currentWorkflowAgent?.status}
+              checklistSummary={workflowChecklistSummary}
+              nextGuidance={workflowNextGuidance}
+            />
+
             <div className="workflow-minimal-layout">
               <div className="workflow-minimal-layout__main">
                 <article className={`workflow-primary-action ${workflowAction?.kind === "resolve_blocker" ? "workflow-primary-action--blocked" : ""}`}>
-                    <div>
-                      <div className="eyebrow">What needs your attention</div>
-                      <h3>{workflowAction?.title ?? "Nothing right now; the system is working"}</h3>
-                      <p>{workflowAction?.description ?? "No action is needed. The workflow is progressing automatically."}</p>
+                  <div>
+                    <div className="eyebrow">What needs your attention</div>
+                    <h3>{workflowAction?.title ?? "Nothing right now; the system is working"}</h3>
+                    <p>{workflowAction?.description ?? "No action is needed. The workflow is progressing automatically."}</p>
                     {workflowNextGuidance ? <p className="workflow-primary-action__next">{workflowNextGuidance}</p> : null}
                   </div>
                   {workflowAction?.kind === "confirm_goal" ? (
@@ -3243,7 +3487,13 @@ export const App = () => {
                 </article>
 
                 {workflowGoalView ? (
-                  <article className="overview-card workflow-cycle-board">
+                  <details className="workflow-secondary__details workflow-secondary__details--current" open>
+                    <summary>
+                      <span>Current goal, plan, and checklist</span>
+                      <span className="badge">Cycle {activeProject.record.workflow.workflowCycle.cycleNumber}</span>
+                    </summary>
+                    <div className="workflow-secondary__content">
+                      <section className="workflow-cycle-board">
                     <SectionTitle
                       eyebrow="Current cycle"
                       title={workflowGoalView.currentGoal}
@@ -3339,7 +3589,9 @@ export const App = () => {
                         </div>
                       </div>
                     ) : null}
-                  </article>
+                      </section>
+                    </div>
+                  </details>
                 ) : null}
 
                 {workflowProminence.manualHandoff && workflow?.manualHandoff ? (
@@ -3405,7 +3657,12 @@ export const App = () => {
                 ) : null}
 
                 {(workflowProminence.recommendations || activeProject.record.workflow.recommendations.length > 0 || activeProject.record.workflow.approvedRecommendation) ? (
-                  <article className={`overview-card workflow-panel ${workflowProminence.recommendations ? "workflow-panel--prominent" : "workflow-panel--secondary"}`}>
+                  <details className={`workflow-secondary__details ${workflowProminence.recommendations ? "workflow-panel--prominent" : "workflow-panel--secondary"}`} open={workflowProminence.recommendations}>
+                    <summary>
+                      <span>Recommendations</span>
+                      <span className="badge">{activeProject.record.workflow.recommendations.length}</span>
+                    </summary>
+                    <div className="workflow-secondary__content workflow-panel">
                     <SectionTitle
                       eyebrow="Recommendations"
                       title="Pick the next bounded task"
@@ -3459,10 +3716,16 @@ export const App = () => {
                         </div>
                       )}
                     </div>
-                  </article>
+                    </div>
+                  </details>
                 ) : null}
 
-                <article className="overview-card workflow-panel workflow-agent-list-card">
+                <details className="workflow-secondary__details">
+                  <summary>
+                    <span>Manual agent</span>
+                    <span className="badge">{manualAgents.length}</span>
+                  </summary>
+                  <div className="workflow-secondary__content workflow-panel workflow-agent-list-card">
                   <SectionTitle
                     eyebrow="Manual Agent"
                     title="Ask about the repo or request a one-off change"
@@ -3501,7 +3764,8 @@ export const App = () => {
                       <div className="empty-copy">No manual agents have started yet.</div>
                     )}
                   </div>
-                </article>
+                  </div>
+                </details>
 
                 {pendingUserInputRequests.length > 0 ? (
                   <article className="overview-card workflow-panel workflow-user-input-panel workflow-panel--prominent">
@@ -3668,7 +3932,12 @@ export const App = () => {
                   </article>
                 ) : null}
 
-                <article className="overview-card workflow-feed-card">
+                <details className="workflow-secondary__details">
+                  <summary>
+                    <span>Approvals and recent activity</span>
+                    <span className="badge">{pendingApprovals.length} approvals</span>
+                  </summary>
+                  <div className="workflow-secondary__content workflow-feed-card">
                   <SectionTitle eyebrow="Execution feed" title="Approvals and recent activity" meta={<span className="badge">{pendingApprovals.length} approvals</span>} />
                   <div className="workflow-feed-card__grid">
                     <div className="panel support-panel workflow-feed-card__panel">
@@ -3705,7 +3974,8 @@ export const App = () => {
                       </div>
                     </div>
                   </div>
-                </article>
+                  </div>
+                </details>
 
                 <details className="workflow-secondary__details" open={!activeProject.record.workflow.ultimateGoal.confirmedAt || Boolean(activeProject.record.workflow.ultimateGoalDraft)}>
                   <summary>Ultimate Goal details</summary>
@@ -3796,6 +4066,9 @@ export const App = () => {
                     </button>
                     <button className="secondary-button" onClick={() => void importUltimateGoalText()}>
                       Import Goal from .txt
+                    </button>
+                    <button className="secondary-button" onClick={downloadUltimateGoalFormat}>
+                      Download Ultimate Goal format
                     </button>
                     <button className="secondary-button" onClick={() => void detectUltimateGoal()}>
                       Detect Ultimate Goal
@@ -3920,8 +4193,8 @@ export const App = () => {
               </div>
 
               <aside className="workflow-minimal-layout__side">
-                <article className="overview-card workflow-agent-list-card">
-                  <SectionTitle eyebrow="Workflow agents" title="Runs in this cycle" meta={<span className="badge">{workflowAgents.length}</span>} />
+                <article className="overview-card workflow-agent-list-card workflow-agent-list-card--bounded">
+                  <SectionTitle eyebrow="Agent call history" title="Workflow runs" meta={<span className="badge">{workflowAgents.length}</span>} />
                   <p className="agent-card__subtle">
                     Each workflow agent is constrained to the active project folder. Select a run to inspect its full explanation.
                   </p>
@@ -3940,7 +4213,7 @@ export const App = () => {
                   </div>
                 </article>
 
-                <article className="overview-card workflow-agent-list-card">
+                <article className="overview-card workflow-agent-list-card workflow-agent-list-card--bounded">
                   <SectionTitle eyebrow="Manual agents" title="Independent runs" meta={<span className="badge">{manualAgents.length}</span>} />
                   <p className="agent-card__subtle">
                     These runs stay outside the cycle and are useful for repo questions or one-off changes.
