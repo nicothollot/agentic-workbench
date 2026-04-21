@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build and package output
+dist/
+dist-electron/
+release/
+.electron-builder/
+build-resources/generated/
+
+# Test and tool output
+coverage/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+final_trade_interface-review-log-*.json
+repair_debug.md
+
+# Local agent/runtime state
+.codex
+.codex/
+.agent-workbench/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+certs/
+
+# OS and Windows metadata
+.DS_Store
+Thumbs.db
+*.Zone.Identifier
+*:Zone.Identifier

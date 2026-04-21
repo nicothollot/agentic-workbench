@@ -1,0 +1,214 @@
+import { nanoid } from "nanoid";
+import { APP_VERSION, DEFAULT_CODEX_BINARY, DEFAULT_DISTRO_NAME, DEFAULT_WORKTREE_BASE_DIR, PORTABLE_INTERFACE_VERSION } from "./constants";
+import type {
+  AgentCategory,
+  AgentFreshnessMarker,
+  AgentState,
+  AppSettings,
+  LayoutConfig,
+  LocalProjectRecord,
+  LocalProjectState,
+  PortableProjectInterface,
+  ProjectIdentity,
+  ProjectWorkflowState,
+  UltimateGoal,
+  ValidationSnapshot,
+  WorkflowBudgets,
+  WorkflowCycle,
+  WorkflowAppealState,
+  WorkflowMemory,
+  WorkflowStepId,
+  WorkflowStepProgress
+} from "./types";
+import { nowIso } from "./utils";
+
+export const defaultSettings = (): AppSettings => ({
+  executionMode: process.platform === "win32" ? "wsl" : "local",
+  distroName: DEFAULT_DISTRO_NAME,
+  codexBinaryPath: DEFAULT_CODEX_BINARY,
+  worktreeBaseDir: DEFAULT_WORKTREE_BASE_DIR,
+  warnOnMntMount: true,
+  mockMode: false,
+  maxRepairCycles: 3,
+  interfaceCreationReasoningEffort: "medium",
+  autoApproveCommands: false,
+  autoApproveGitCommits: false,
+  autoApproveGitPushes: false
+});
+
+export const defaultLayout = (): LayoutConfig => ({
+  leftPanelWidth: 300,
+  rightPanelWidth: 360,
+  bottomPanelHeight: 240,
+  activeCenterTab: "overview"
+});
+
+export const defaultLocalState = (): LocalProjectState => ({
+  treeFilter: "",
+  autopilotEnabled: false,
+  workflowObjective: "deliver",
+  workflowPauseRequested: false,
+  lastOpenedAt: nowIso()
+});
+
+export const emptyUltimateGoal = (source: UltimateGoal["source"] = "user"): UltimateGoal => ({
+  summary: "",
+  detailedIntent: "",
+  successCriteria: [],
+  constraints: [],
+  nonGoals: [],
+  targetAudience: "",
+  qualityBar: "",
+  source
+});
+
+export const defaultWorkflowCycle = (): WorkflowCycle => ({
+  cycleNumber: 1,
+  acceptanceCriteria: [],
+  status: "idle"
+});
+
+export const defaultWorkflowBudgets = (): WorkflowBudgets => ({
+  maxRepairLoops: 3,
+  maxRecommendationOptions: 5,
+  maxCycleSummaries: 12,
+  maxAcceptedDecisions: 24,
+  maxOpenIssues: 24,
+  maxAgentRestartsPerCategory: 3,
+  maxCodingIterationsPerCycle: 4,
+  maxIntegrityRunsPerCycle: 3
+});
+
+export const defaultWorkflowRepairState = () => ({
+  attemptCount: 0,
+  maxAttempts: defaultWorkflowBudgets().maxRepairLoops,
+  status: "idle" as const
+});
+
+export const defaultWorkflowAppealState = (): WorkflowAppealState => ({
+  status: "not_started"
+});
+
+const defaultAgentFreshnessMarker = (): AgentFreshnessMarker => ({
+  restartCount: 0,
+  freshnessToken: 0
+});
+
+export const defaultWorkflowMemory = (): WorkflowMemory => {
+  const categories: AgentCategory[] = ["bootstrap", "goal", "coding", "integrity", "merge", "recommendation", "manual"];
+  return {
+    canonicalSummary: "",
+    canonicalFacts: [],
+    perCycleSummaries: [],
+    lastAcceptedDecisions: [],
+    knownOpenIssues: [],
+    agentFreshness: Object.fromEntries(categories.map((category) => [category, defaultAgentFreshnessMarker()])) as Record<
+      AgentCategory,
+      AgentFreshnessMarker
+    >
+  };
+};
+
+export const workflowStepOrder: WorkflowStepId[] = [
+  "ultimate_goal",
+  "recommendation",
+  "goal_plan",
+  "coding",
+  "integrity",
+  "merge"
+];
+
+export const defaultWorkflowStepProgress = (stepId: WorkflowStepId): WorkflowStepProgress => ({
+  stepId,
+  status: stepId === "ultimate_goal" ? "waiting" : "not_started",
+  requiresUserInput: stepId === "ultimate_goal",
+  runCount: 0,
+  attemptCount: 0
+});
+
+export const defaultWorkflowStepProgressState = (): Record<WorkflowStepId, WorkflowStepProgress> =>
+  Object.fromEntries(
+    workflowStepOrder.map((stepId) => [stepId, defaultWorkflowStepProgress(stepId)])
+  ) as Record<WorkflowStepId, WorkflowStepProgress>;
+
+export const defaultProjectWorkflowState = (): ProjectWorkflowState => ({
+  ultimateGoal: emptyUltimateGoal(),
+  goalChecklist: [],
+  workflowCycle: defaultWorkflowCycle(),
+  workflowStage: "charter_needed",
+  repairLoopCount: 0,
+  appeal: defaultWorkflowAppealState(),
+  repair: defaultWorkflowRepairState(),
+  workflowBudgets: defaultWorkflowBudgets(),
+  workflowStopReason: "charter_missing",
+  humanInterventions: [],
+  recommendations: [],
+  stepProgress: defaultWorkflowStepProgressState(),
+  memory: defaultWorkflowMemory(),
+  activityLog: []
+});
+
+export const emptyValidationSnapshot = (projectKind: ValidationSnapshot["projectKind"]): ValidationSnapshot => ({
+  interfaceSchemaVersion: PORTABLE_INTERFACE_VERSION,
+  appMinVersion: APP_VERSION,
+  projectKind
+});
+
+export const createAgentSkeleton = (category: AgentState["category"], name: string, taskPrompt: string, model: string): AgentState => ({
+  id: nanoid(),
+  category,
+  name,
+  taskPrompt,
+  model,
+  workflowCycleNumber: undefined,
+  createdAt: nowIso(),
+  status: "idle",
+  changedFiles: [],
+  approvals: [],
+  commandLog: [],
+  events: []
+});
+
+export const createLocalProjectRecord = (
+  id: string,
+  displayPath: string,
+  wslPath: string,
+  projectRoot: string,
+  hostPath: string,
+  identity: ProjectIdentity,
+  validation: ValidationSnapshot,
+  distroName?: string
+): LocalProjectRecord => ({
+  id,
+  displayPath,
+  wslPath,
+  projectRoot,
+  hostPath,
+  distroName,
+  identity,
+  validation,
+  layout: defaultLayout(),
+  localState: defaultLocalState(),
+  workflow: defaultProjectWorkflowState(),
+  dependencies: [],
+  summaryCache: [],
+  agents: [],
+  userInputRequests: []
+});
+
+export const createPortableInterface = (record: LocalProjectRecord): PortableProjectInterface => ({
+  schemaVersion: PORTABLE_INTERFACE_VERSION,
+  appMinVersion: APP_VERSION,
+  exportedAt: nowIso(),
+  checksum: "",
+  identity: record.identity,
+  validation: record.validation,
+  layout: record.layout,
+  localStateDefaults: record.localState,
+  workflow: record.workflow,
+  overview: record.overview,
+  stats: record.stats,
+  dependencies: record.dependencies,
+  summaryCache: record.summaryCache,
+  agents: record.agents
+});

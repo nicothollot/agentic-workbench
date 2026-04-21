@@ -1,0 +1,119 @@
+{
+  "name": "codex-agent-workbench",
+  "version": "0.1.0",
+  "description": "Local-first Electron workbench for orchestrating Codex agents against a repository.",
+  "main": "dist-electron/main/index.cjs",
+  "type": "module",
+  "author": "Codex",
+  "license": "MIT",
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "dev": "node scripts/dev.mjs",
+    "mock": "cross-env AWB_MOCK_MODE=1 node scripts/dev.mjs",
+    "generate:icons": "node scripts/generate-icons.mjs",
+    "build": "node scripts/package-app.mjs",
+    "build:app": "npm run clean && npm run generate:icons && npm run build:renderer && npm run build:electron",
+    "build:renderer": "vite build",
+    "build:electron": "vite build -c vite.main.config.ts && vite build -c vite.preload.config.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package:win": "node scripts/package-app.mjs --win",
+    "package:win:signed": "node scripts/package-app.mjs --win --signed",
+    "package:mac": "node scripts/package-app.mjs --mac",
+    "package:all": "node scripts/package-app.mjs --all",
+    "dist:win": "npm run package:win",
+    "dist:win:signed": "npm run package:win:signed",
+    "generate:app-server": "node scripts/generate-app-server.mjs"
+  },
+  "dependencies": {
+    "@radix-ui/react-scroll-area": "^1.2.3",
+    "@radix-ui/react-separator": "^1.1.2",
+    "clsx": "^2.1.1",
+    "electron-log": "^5.3.4",
+    "fast-xml-parser": "^5.2.5",
+    "ignore": "^7.0.5",
+    "nanoid": "^5.1.5",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "smol-toml": "^1.4.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "@testing-library/jest-dom": "^6.8.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.0",
+    "cross-env": "^10.0.0",
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12",
+    "eslint": "^9.33.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.20",
+    "globals": "^16.3.0",
+    "jsdom": "^26.1.0",
+    "png2icons": "^2.0.1",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.39.0",
+    "vite": "^7.1.3",
+    "vitest": "^3.2.4"
+  },
+  "build": {
+    "appId": "com.codex.agentworkbench",
+    "productName": "Codex Agent Workbench",
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "beforeBuild": "./scripts/electron-builder-before-build.mjs",
+    "asar": true,
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "assets/branding/interface_icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/branding/app.ico",
+        "to": "app.ico"
+      }
+    ],
+    "directories": {
+      "buildResources": "build-resources",
+      "output": "release"
+    },
+    "win": {
+      "icon": "build-resources/generated/icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-windows-${arch}.${ext}"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build-resources/generated/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-macos-${arch}.${ext}"
+    }
+  }
+}

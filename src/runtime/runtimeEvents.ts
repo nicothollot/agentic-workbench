@@ -1,0 +1,314 @@
+import { nanoid } from "nanoid";
+import type { AgentState, ApprovalDecision, ApprovalRequestRecord, RuntimeEventRecord } from "@shared/types";
+import { nowIso } from "@shared/utils";
+
+export type WorkbenchTransportEvent =
+  | { kind: "thread-status"; threadId: string; status: string }
+  | { kind: "turn-started"; threadId: string; turnId: string }
+  | { kind: "turn-completed"; threadId: string; turnId: string; status: string }
+  | { kind: "item-started"; threadId: string; itemId: string; itemType: string; title: string; detail?: string; command?: string; cwd?: string }
+  | { kind: "item-completed"; threadId: string; itemId: string; itemType: string; status?: string; title: string; detail?: string; exitCode?: number | null; raw?: unknown }
+  | { kind: "agent-message-delta"; threadId: string; itemId: string; delta: string }
+  | { kind: "plan-delta"; threadId: string; itemId: string; delta: string }
+  | { kind: "reasoning-delta"; threadId: string; itemId: string; delta: string }
+  | { kind: "terminal-input"; threadId: string; itemId: string; input: string }
+  | { kind: "command-output"; threadId: string; itemId: string; delta: string }
+  | { kind: "file-change"; threadId: string; itemId: string; delta: string }
+  | { kind: "approval-request"; approval: ApprovalRequestRecord }
+  | { kind: "approval-resolved"; approvalId: string; decision: ApprovalDecision }
+  | { kind: "raw"; title: string; detail?: string; raw?: unknown };
+
+const getStepIdForAgent = (agent: AgentState): RuntimeEventRecord["stepId"] => {
+  switch (agent.category) {
+    case "recommendation":
+      return "recommendation";
+    case "coding":
+      return "coding";
+    case "integrity":
+      return "integrity";
+    case "merge":
+      return "merge";
+    case "goal":
+      return agent.name === "Ultimate Goal Agent" || agent.currentPhase?.toLowerCase().includes("ultimate goal")
+        ? "ultimate_goal"
+        : "goal_plan";
+    default:
+      return undefined;
+  }
+};
+
+const MAX_EVENT_DETAIL_LENGTH = 8_000;
+
+const capDetail = (value: string, maxLength = MAX_EVENT_DETAIL_LENGTH): string =>
+  value.length <= maxLength ? value : value.slice(-maxLength);
+
+const pushEvent = (
+  agent: AgentState,
+  type: RuntimeEventRecord["type"],
+  title: string,
+  detail?: string,
+  raw?: unknown,
+  options?: Pick<RuntimeEventRecord, "status" | "itemId">
+): void => {
+  const timestamp = nowIso();
+  agent.events.unshift({
+    id: nanoid(),
+    agentId: agent.id,
+    timestamp,
+    type,
+    status: options?.status,
+    stepId: getStepIdForAgent(agent),
+    agentCategory: agent.category,
+    itemId: options?.itemId,
+    title,
+    detail,
+    raw
+  });
+  agent.lastActivityAt = timestamp;
+  if (agent.events.length > 250) {
+    agent.events.length = 250;
+  }
+};
+
+const findStreamingEventIndex = (
+  agent: AgentState,
+  type: RuntimeEventRecord["type"],
+  itemId?: string
+): number => agent.events.findIndex((entry) => entry.type === type && entry.itemId === itemId && entry.status === "running");
+
+const upsertStreamingEvent = (
+  agent: AgentState,
+  type: RuntimeEventRecord["type"],
+  title: string,
+  delta: string,
+  options?: Pick<RuntimeEventRecord, "itemId"> & { status?: RuntimeEventRecord["status"]; maxLength?: number }
+): void => {
+  const timestamp = nowIso();
+  const index = findStreamingEventIndex(agent, type, options?.itemId);
+  if (index >= 0) {
+    const [existing] = agent.events.splice(index, 1);
+    existing.timestamp = timestamp;
+    existing.title = title;
+    existing.detail = capDetail(`${existing.detail ?? ""}${delta}`, options?.maxLength);
+    existing.status = options?.status ?? existing.status ?? "running";
+    existing.stepId = getStepIdForAgent(agent);
+    existing.agentCategory = agent.category;
+    agent.events.unshift(existing);
+    agent.lastActivityAt = timestamp;
+    return;
+  }
+
+  pushEvent(agent, type, title, capDetail(delta, options?.maxLength), undefined, {
+    status: options?.status ?? "running",
+    itemId: options?.itemId
+  });
+};
+
+const finalizeStreamingEvent = (
+  agent: AgentState,
+  type: RuntimeEventRecord["type"],
+  title: string,
+  detail: string | undefined,
+  options?: Pick<RuntimeEventRecord, "itemId" | "status"> & { raw?: unknown; maxLength?: number }
+): boolean => {
+  const timestamp = nowIso();
+  const index = findStreamingEventIndex(agent, type, options?.itemId);
+  if (index === -1) {
+    return false;
+  }
+
+  const [existing] = agent.events.splice(index, 1);
+  existing.timestamp = timestamp;
+  existing.title = title;
+  existing.detail = detail ? capDetail(detail, options?.maxLength) : existing.detail;
+  existing.status = options?.status ?? "completed";
+  existing.raw = options?.raw ?? existing.raw;
+  existing.stepId = getStepIdForAgent(agent);
+  existing.agentCategory = agent.category;
+  agent.events.unshift(existing);
+  agent.lastActivityAt = timestamp;
+  return true;
+};
+
+export const reduceAgentRuntimeEvent = (agent: AgentState, event: WorkbenchTransportEvent): AgentState => {
+  switch (event.kind) {
+    case "thread-status":
+      agent.status = event.status === "running" ? "running" : event.status === "completed" ? "completed" : agent.status;
+      agent.currentPhase = `Thread ${event.status}`;
+      if (event.status === "completed" || event.status === "failed") {
+        agent.completedAt ??= nowIso();
+      }
+      pushEvent(agent, "thread", "Thread status changed", event.status, event, {
+        status: event.status === "completed" ? "completed" : event.status === "failed" ? "failed" : "running"
+      });
+      return agent;
+    case "turn-started":
+      agent.status = "running";
+      agent.startedAt ??= nowIso();
+      agent.currentPhase = "Turn running";
+      pushEvent(agent, "turn", "Turn started", event.turnId, event, { status: "running" });
+      return agent;
+    case "turn-completed":
+      agent.status = event.status === "failed" ? "failed" : "completed";
+      agent.currentPhase = `Turn ${event.status}`;
+      agent.completedAt ??= nowIso();
+      pushEvent(agent, "turn", "Turn completed", event.status, event, {
+        status: event.status === "failed" ? "failed" : "completed"
+      });
+      return agent;
+    case "item-started":
+      agent.status = "running";
+      agent.startedAt ??= nowIso();
+      agent.currentSubtask = event.detail ?? event.command ?? event.title;
+      if (event.command) {
+        agent.commandLog.unshift({
+          itemId: event.itemId,
+          command: event.command,
+          cwd: event.cwd,
+          output: "",
+          status: "running",
+          startedAt: nowIso()
+        });
+      }
+      pushEvent(agent, "item", event.title, event.detail ?? event.command, event, {
+        status: "running",
+        itemId: event.itemId
+      });
+      return agent;
+    case "item-completed": {
+      if (event.itemType === "commandExecution") {
+        const command = agent.commandLog.find((entry) => entry.itemId === event.itemId);
+        if (command) {
+          command.status = event.status ?? command.status;
+          command.completedAt = nowIso();
+          command.exitCode = event.exitCode;
+        }
+      }
+      agent.currentSubtask = undefined;
+      if (event.itemType === "agentMessage") {
+        if (finalizeStreamingEvent(agent, "message", "Agent message", event.detail, {
+          status: event.status === "failed" ? "failed" : "completed",
+          itemId: event.itemId,
+          raw: event.raw,
+          maxLength: 8_000
+        })) {
+          return agent;
+        }
+        pushEvent(agent, "message", "Agent message", capDetail(event.detail ?? "", 8_000), event.raw, {
+          status: event.status === "failed" ? "failed" : "completed",
+          itemId: event.itemId
+        });
+        return agent;
+      }
+      if (event.itemType === "plan") {
+        if (finalizeStreamingEvent(agent, "item", "Plan update", event.detail, {
+          status: event.status === "failed" ? "failed" : "completed",
+          itemId: event.itemId,
+          raw: event.raw,
+          maxLength: 4_000
+        })) {
+          return agent;
+        }
+      }
+      if (event.itemType === "reasoning") {
+        if (finalizeStreamingEvent(agent, "item", "Reasoning update", event.detail, {
+          status: event.status === "failed" ? "failed" : "completed",
+          itemId: event.itemId,
+          raw: event.raw,
+          maxLength: 4_000
+        })) {
+          return agent;
+        }
+      }
+      if (event.itemType === "fileChange") {
+        finalizeStreamingEvent(agent, "file-change", "File change event", undefined, {
+          status: event.status === "failed" ? "failed" : "completed",
+          itemId: event.itemId
+        });
+      }
+      if (event.itemType === "commandExecution") {
+        finalizeStreamingEvent(agent, "command", "Command output", undefined, {
+          status: event.status === "failed" ? "failed" : "completed",
+          itemId: event.itemId
+        });
+      }
+      pushEvent(agent, event.itemType === "commandExecution" ? "command" : "item", event.title, event.detail, event.raw, {
+        status: event.status === "failed" ? "failed" : "completed",
+        itemId: event.itemId
+      });
+      return agent;
+    }
+    case "agent-message-delta":
+      agent.lastMessageSnippet = capDetail(`${agent.lastMessageSnippet ?? ""}${event.delta}`, 240);
+      upsertStreamingEvent(agent, "message", "Agent message", event.delta, {
+        status: "running",
+        itemId: event.itemId,
+        maxLength: 8_000
+      });
+      return agent;
+    case "plan-delta":
+      agent.currentSubtask = event.delta.slice(0, 240);
+      upsertStreamingEvent(agent, "item", "Plan update", event.delta, {
+        status: "running",
+        itemId: event.itemId,
+        maxLength: 4_000
+      });
+      return agent;
+    case "reasoning-delta":
+      upsertStreamingEvent(agent, "item", "Reasoning update", event.delta, {
+        status: "running",
+        itemId: event.itemId,
+        maxLength: 4_000
+      });
+      return agent;
+    case "terminal-input":
+      pushEvent(agent, "command", "Terminal input sent", event.input, event, {
+        status: "running",
+        itemId: event.itemId
+      });
+      return agent;
+    case "command-output": {
+      const lastCommand = agent.commandLog.find((entry) => entry.itemId === event.itemId) ?? agent.commandLog[0];
+      if (lastCommand) {
+        lastCommand.output = `${lastCommand.output}${event.delta}`.slice(-12_000);
+      }
+      upsertStreamingEvent(agent, "command", "Command output", event.delta, {
+        status: "running",
+        itemId: event.itemId,
+        maxLength: 12_000
+      });
+      return agent;
+    }
+    case "file-change":
+      upsertStreamingEvent(agent, "file-change", "File change event", event.delta, {
+        status: "running",
+        itemId: event.itemId,
+        maxLength: 6_000
+      });
+      return agent;
+    case "approval-request":
+      agent.approvals.unshift(event.approval);
+      agent.status = "waiting_approval";
+      pushEvent(agent, "approval", "Approval requested", event.approval.summary, event.approval, {
+        status: "waiting",
+        itemId: event.approval.itemId
+      });
+      return agent;
+    case "approval-resolved": {
+      const approval = agent.approvals.find((entry) => entry.id === event.approvalId);
+      if (approval) {
+        approval.status = event.decision === "decline" || event.decision === "cancel" ? "rejected" : "approved";
+      }
+      agent.status = "running";
+      pushEvent(agent, "approval", "Approval resolved", event.decision, event, {
+        status: event.decision === "decline" || event.decision === "cancel" ? "failed" : "completed"
+      });
+      return agent;
+    }
+    case "raw":
+      pushEvent(agent, "raw", event.title, event.detail, event.raw, {
+        status: "info"
+      });
+      return agent;
+  }
+};
