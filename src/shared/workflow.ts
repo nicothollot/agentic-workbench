@@ -451,11 +451,81 @@ const recommendationPriorityScore = (priority: WorkflowRecommendationOption["pri
     low: 2
   })[priority];
 
+const normalizeRecommendationMatchText = (value: string): string =>
+  value.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+
+const recommendationText = (recommendation: WorkflowRecommendationOption): string =>
+  [
+    recommendation.title,
+    recommendation.summary,
+    recommendation.rationale,
+    recommendation.expectedImpact
+  ].map(normalizeRecommendationMatchText).join(" ");
+
+const openRequiredGoalChecks = (
+  workflow?: Pick<ProjectWorkflowState, "goalChecklist">
+): ProjectWorkflowState["goalChecklist"] =>
+  workflow?.goalChecklist.filter((check) =>
+    check.required &&
+    check.status !== "met" &&
+    check.status !== "not_applicable"
+  ) ?? [];
+
+const goalCheckSourceScore = (source: ProjectWorkflowState["goalChecklist"][number]["source"]): number =>
+  ({
+    success_criterion: 80,
+    quality_bar: 70,
+    constraint: 58,
+    deterministic: 48,
+    agent: 42
+  })[source] ?? 0;
+
+const goalCheckStatusScore = (status: ProjectWorkflowState["goalChecklist"][number]["status"]): number =>
+  status === "unmet" ? 16 : status === "unknown" ? 10 : 0;
+
+const checklistAlignmentScore = (
+  recommendation: WorkflowRecommendationOption,
+  workflow?: Pick<ProjectWorkflowState, "goalChecklist">
+): number => {
+  const text = recommendationText(recommendation);
+  const title = recommendation.title.trim();
+  const openChecks = openRequiredGoalChecks(workflow);
+  let score = 0;
+
+  if (/^satisfy goal check:/i.test(title)) {
+    score += 100;
+  }
+  if (/\b(?:goal checklist|required check|checklist item)\b/i.test(`${recommendation.summary} ${recommendation.rationale}`)) {
+    score += 34;
+  }
+  if (/\bUltimate Goal percentage\b/i.test(recommendation.expectedImpact)) {
+    score += 28;
+  }
+
+  for (const check of openChecks) {
+    const candidates = [check.title, check.description]
+      .map(normalizeRecommendationMatchText)
+      .filter((entry) => entry.length >= 8);
+    if (candidates.some((candidate) => text.includes(candidate) || candidate.includes(text))) {
+      score += goalCheckSourceScore(check.source) + goalCheckStatusScore(check.status);
+      break;
+    }
+  }
+
+  if (openChecks.length > 0 && /\b(?:stabilize recent work|operator feedback|package\/startup|startup-readiness|test-harness)\b/i.test(title)) {
+    score -= 70;
+  }
+
+  return score;
+};
+
 export const pickAutopilotRecommendation = (
-  recommendations: WorkflowRecommendationOption[]
+  recommendations: WorkflowRecommendationOption[],
+  workflow?: Pick<ProjectWorkflowState, "goalChecklist">
 ): WorkflowRecommendationOption | undefined =>
   [...recommendations]
     .sort((left, right) =>
+      checklistAlignmentScore(right, workflow) - checklistAlignmentScore(left, workflow) ||
       right.confidence - left.confidence ||
       recommendationPriorityScore(left.priority) - recommendationPriorityScore(right.priority) ||
       left.rank - right.rank ||

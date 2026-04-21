@@ -126,6 +126,36 @@ const isRequiredForCompletion = (check: GoalAttainmentCheck): boolean =>
 
 const isMetForCompletion = (check: GoalAttainmentCheck): boolean => check.status === "met";
 
+const goalCheckSourceImpactScore: Record<GoalCheckSource, number> = {
+  success_criterion: 100,
+  quality_bar: 86,
+  constraint: 72,
+  deterministic: 64,
+  agent: 58
+};
+
+const goalCheckStatusImpactScore: Record<GoalCheckStatus, number> = {
+  unmet: 18,
+  unknown: 10,
+  not_applicable: -80,
+  met: -120
+};
+
+const goalCheckCompletionImpactScore = (check: GoalAttainmentCheck): number =>
+  goalCheckSourceImpactScore[check.source] +
+  goalCheckStatusImpactScore[check.status] +
+  (check.required ? 12 : 0);
+
+const rankGoalChecksByCompletionImpact = (checks: GoalAttainmentCheck[]): GoalAttainmentCheck[] =>
+  checks
+    .map((check, index) => ({ check, index, score: goalCheckCompletionImpactScore(check) }))
+    .sort((left, right) =>
+      right.score - left.score ||
+      left.index - right.index ||
+      left.check.title.localeCompare(right.check.title)
+    )
+    .map((entry) => entry.check);
+
 export interface GoalCheckUpdateInput {
   action?: "add" | "update" | "remove";
   id?: string;
@@ -540,9 +570,10 @@ const toAreaLabel = (relativePath?: string): string => {
 
 const rankRelevantPaths = (
   context: WorkflowRecommendationContext,
-  preferredPaths: string[]
+  preferredPaths: string[],
+  extraKeywords: string[] = []
 ): string[] => {
-  const keywords = topGoalKeywords(context);
+  const keywords = unique([...extraKeywords, ...topGoalKeywords(context)]).slice(0, 16);
   const entryPoints = new Set(context.scan.stats.entryPoints);
   const preferred = new Set(preferredPaths);
 
@@ -596,7 +627,7 @@ export const estimateUltimateGoalProgress = (
   const acceptedDecisions = context.workflow.memory.lastAcceptedDecisions.length;
   const openIssues = context.workflow.memory.knownOpenIssues.filter((issue) => issue.status === "open");
   const pendingInterventions = context.workflow.humanInterventions.filter((intervention) => intervention.status === "pending");
-  const unmetPreview = checklistProgress.unmet.slice(0, 4).map((check) => check.title);
+  const unmetPreview = rankGoalChecksByCompletionImpact(checklistProgress.unmet).slice(0, 4).map((check) => check.title);
   const rationale = [
     checklistProgress.required.length > 0
       ? `${checklistProgress.met.length} of ${checklistProgress.required.length} required goal checks are met.`
@@ -676,11 +707,11 @@ export const assessUltimateGoalCompletion = (
   };
 };
 
-const firstUnmetRequiredGoalCheck = (context: WorkflowRecommendationContext): GoalAttainmentCheck | undefined => {
+const rankedUnmetRequiredGoalChecks = (context: WorkflowRecommendationContext): GoalAttainmentCheck[] => {
   const checklist = buildGoalChecklistForAssessment(context);
-  return checklist
-    .filter((check) => isRequiredForCompletion(check) && !isMetForCompletion(check))
-    .sort((left, right) => statusRank[left.status] - statusRank[right.status] || left.title.localeCompare(right.title))[0];
+  return rankGoalChecksByCompletionImpact(
+    checklist.filter((check) => isRequiredForCompletion(check) && !isMetForCompletion(check))
+  );
 };
 
 const goalCheckRecommendationSummary = (check: GoalAttainmentCheck): string => {
@@ -806,13 +837,13 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
   const latestCycleSummary = context.workflow.memory.perCycleSummaries[0];
   const lastDecision = context.workflow.memory.lastAcceptedDecisions[0];
   const customFocus = normalizeCustomFocus(context.customFocus);
-  const unmetGoalCheck = firstUnmetRequiredGoalCheck(context);
+  const unmetGoalChecks = rankedUnmetRequiredGoalChecks(context);
   const drafts: RecommendationDraft[] = [];
 
   if (customFocus) {
     pushDraft(drafts, {
       key: `custom:implement:${customFocus}`,
-      score: 110,
+      score: 132,
       title: `Implement a bounded slice of ${customFocus}`,
       summary: "Turn the operator's custom direction into one concrete repo change that can complete in a single cycle.",
       rationale: "The operator explicitly asked for this direction, so the recommendation set should stay anchored to it instead of drifting into unrelated repo work.",
@@ -825,7 +856,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     });
     pushDraft(drafts, {
       key: `custom:validate:${customFocus}`,
-      score: 106,
+      score: 128,
       title: `Validate the repo impact of ${customFocus}`,
       summary: "Pair the custom direction with a tightly scoped verification step so the resulting change is easy to review.",
       rationale: "Closely related recommendations should help the user compare implementation versus validation-oriented variants of the same idea.",
@@ -838,7 +869,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     });
     pushDraft(drafts, {
       key: `custom:refine:${customFocus}`,
-      score: 102,
+      score: 124,
       title: `Tighten the edges around ${customFocus}`,
       summary: "Generate a near-neighbor follow-up task that stays strongly related to the custom direction while remaining cycle-sized.",
       rationale: "The operator asked for related options, so the recommendation set should include a refinement path rather than only one literal restatement.",
@@ -855,7 +886,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     const intervention = pendingInterventions[0];
     pushDraft(drafts, {
       key: `intervention:${intervention.id}`,
-      score: 100,
+      score: 150,
       title: `Unblock ${intervention.title}`,
       summary: intervention.description,
       rationale: "The workflow cannot continue safely until the required human step is resolved.",
@@ -872,7 +903,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     const issue = openIssues[0];
     pushDraft(drafts, {
       key: `issue:${issue.id}`,
-      score: 94,
+      score: 140,
       title: `Resolve ${issue.title}`,
       summary: issue.detail,
       rationale: "This issue is still open in workflow memory, so fixing it would burn down explicit project debt instead of starting a fresh thread.",
@@ -885,32 +916,42 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     });
   }
 
-  if (unmetGoalCheck) {
+  for (const [index, unmetGoalCheck] of unmetGoalChecks.slice(0, 3).entries()) {
+    const checkRelevantPaths = rankRelevantPaths(
+      context,
+      [...unmetGoalCheck.relatedPaths, ...recentChangedFiles],
+      tokenize(`${unmetGoalCheck.title} ${unmetGoalCheck.description}`)
+    );
     pushDraft(drafts, {
       key: `goal-check:${unmetGoalCheck.id}`,
-      score: 92,
+      score: 118 - index * 4,
       title: `Satisfy goal check: ${truncate(unmetGoalCheck.title, 72)}`,
       summary: goalCheckRecommendationSummary(unmetGoalCheck),
       rationale: goalCheckRecommendationRationale(unmetGoalCheck),
       expectedImpact: "This moves the Ultimate Goal percentage by converting an explicit required check into evidenced completion.",
       priority: "high",
-      confidence: unmetGoalCheck.status === "unmet" ? 0.92 : 0.84,
+      confidence: unmetGoalCheck.status === "unmet" ? 0.96 : 0.93,
       estimatedScope: "small",
       riskLevel: unmetGoalCheck.status === "unmet" ? "medium" : "low",
-      relatedPaths: unmetGoalCheck.relatedPaths.length > 0 ? unmetGoalCheck.relatedPaths.slice(0, 4) : relevantPaths.slice(0, 4)
+      relatedPaths: checkRelevantPaths.slice(0, 4)
     });
   }
 
   if (recentChangedFiles.length > 0) {
+    const explicitChecklistWorkAvailable = unmetGoalChecks.length > 0 && pendingInterventions.length === 0 && openIssues.length === 0;
     pushDraft(drafts, {
       key: `changes:${recentChangedFiles.slice(0, 3).join(",")}`,
-      score: 88,
+      score: explicitChecklistWorkAvailable ? 58 : 88,
       title: `Stabilize recent work in ${focusArea}`,
       summary: `Review the latest agent changes and close the loop around ${recentChangedFiles.slice(0, 3).join(", ")}.`,
-      rationale: "The repository already has fresh changes, so the highest-leverage next step is usually to validate and tighten what is already in motion.",
-      expectedImpact: "This converts partial progress into durable progress instead of letting recent work sprawl across multiple cycles.",
-      priority: "high",
-      confidence: 0.9,
+      rationale: explicitChecklistWorkAvailable
+        ? "Recent changes are worth validating, but explicit unmet required goal checks should stay ahead of generic stabilization while there is no open blocker."
+        : "The repository already has fresh changes, so the highest-leverage next step is usually to validate and tighten what is already in motion.",
+      expectedImpact: explicitChecklistWorkAvailable
+        ? "This is a fallback safety task; it should not displace checklist-completion work that can move the Ultimate Goal percentage."
+        : "This converts partial progress into durable progress instead of letting recent work sprawl across multiple cycles.",
+      priority: explicitChecklistWorkAvailable ? "low" : "high",
+      confidence: explicitChecklistWorkAvailable ? 0.68 : 0.9,
       estimatedScope: "small",
       riskLevel: "medium",
       relatedPaths: recentChangedFiles.slice(0, 4)

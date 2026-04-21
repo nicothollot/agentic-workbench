@@ -3507,7 +3507,7 @@ export const App = () => {
                           <strong>{autopilotEnabled ? "On" : "Off"}</strong>
                         </div>
                         <p className="agent-card__subtle">
-                          When autopilot is on, the workflow approves the highest-confidence recommendation automatically. Turning it off only changes the next recommendation decision point and does not interrupt work already in progress.
+                          When autopilot is on, the workflow approves the highest-impact checklist-aligned recommendation automatically. Turning it off only changes the next recommendation decision point and does not interrupt work already in progress.
                         </p>
                         <div className="candidate-card__title-row">
                           <span className="workflow-option__label">Objective</span>

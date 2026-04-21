@@ -351,8 +351,8 @@ export const workflowStatusSummary = (
   if (workflow.workflowStage === "recommendation_pending" && workflow.recommendations.length > 0) {
     return autopilotEnabled
       ? workflowObjective === "optimize"
-        ? "Optimize mode is choosing the highest-confidence improvement"
-        : "Autopilot is choosing the highest-confidence next step"
+        ? "Optimize mode is choosing the highest-impact improvement"
+        : "Autopilot is choosing the highest-impact next step"
       : workflowObjective === "optimize"
         ? "Review and choose the next improvement"
         : "Review and choose the next recommended step";
@@ -445,7 +445,7 @@ export const workflowActionGuide = (
         return {
           kind: "none",
           title: "Autopilot is choosing the final appeal pass",
-          description: "The base goal appears complete, so the workflow will approve the highest-confidence polish recommendation automatically."
+          description: "The base goal appears complete, so the workflow will approve the highest-impact polish recommendation automatically."
         };
       }
       return {
@@ -479,8 +479,8 @@ export const workflowActionGuide = (
         kind: "none",
         title: workflowObjective === "optimize" ? "Optimize mode is choosing the next improvement" : "Autopilot is choosing the next step",
         description: workflowObjective === "optimize"
-          ? "Autopilot is on, so optimize mode will approve the highest-confidence improvement automatically."
-          : "Autopilot is on, so the workflow will approve the highest-confidence recommendation automatically."
+          ? "Autopilot is on, so optimize mode will approve the highest-impact improvement automatically."
+          : "Autopilot is on, so the workflow will approve the highest-impact checklist-aligned recommendation automatically."
       };
     }
     return {

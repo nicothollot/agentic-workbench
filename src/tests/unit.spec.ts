@@ -1311,7 +1311,7 @@ describe("workflow state", () => {
     expect(getNextWorkflowAutomationAction(workflow, [], "folder", false, false, "deliver")).toBeNull();
   });
 
-  it("picks the highest-confidence recommendation for autopilot", () => {
+  it("falls back to the highest-confidence recommendation when no option targets the checklist", () => {
     const recommendations = [
       makeRecommendation({
         id: "rec-1",
@@ -1337,6 +1337,44 @@ describe("workflow state", () => {
     ];
 
     expect(pickAutopilotRecommendation(recommendations)?.id).toBe("rec-2");
+  });
+
+  it("prefers checklist-completion recommendations over higher-confidence generic stabilization", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(
+      {
+        ...emptyUltimateGoal("user"),
+        summary: "Build a market research dashboard.",
+        successCriteria: ["App includes drawdown visualization and recovery analysis"]
+      },
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+
+    const recommendations = [
+      makeRecommendation({
+        id: "rec-1",
+        rank: 1,
+        title: "Satisfy goal check: App includes drawdown visualization and recovery analysis",
+        summary: "Gather implementation and validation evidence for this required check.",
+        rationale: "The goal checklist blocks completion here.",
+        expectedImpact: "This moves the Ultimate Goal percentage by converting an explicit required check into evidenced completion.",
+        confidence: 0.84,
+        priority: "high"
+      }),
+      makeRecommendation({
+        id: "rec-2",
+        rank: 2,
+        title: "Stabilize recent work in package.json",
+        summary: "Review the latest package script changes and close the loop.",
+        rationale: "The repository already has fresh changes.",
+        expectedImpact: "This converts partial progress into durable progress.",
+        confidence: 0.97,
+        priority: "high"
+      })
+    ];
+
+    expect(pickAutopilotRecommendation(recommendations, workflow)?.id).toBe("rec-1");
   });
 });
 
@@ -2377,6 +2415,78 @@ describe("workflow recommendations", () => {
     expect(recommendations.every((entry) => entry.rationale.length > 10 && entry.expectedImpact.length > 10)).toBe(true);
     expect(recommendations.every((entry) => entry.relatedPaths.length <= 4 && entry.estimatedScope !== "large")).toBe(true);
     expect(recommendations.some((entry) => entry.relatedPaths.includes("src/renderer/App.tsx"))).toBe(true);
+  });
+
+  it("ranks unmet required goal checks ahead of generic recent-change stabilization", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a desktop market analytics dashboard.",
+      detailedIntent: "The app should include direct drawdown and rolling-metric research workflows.",
+      successCriteria: [
+        "App includes drawdown visualization and recovery analysis",
+        "App includes rolling metrics such as rolling volatility and rolling Sharpe"
+      ],
+      constraints: ["Keep the app usable without premium data credentials."],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+
+    const stats: ProjectStats = {
+      projectRoot: "/repo",
+      kind: "git",
+      totalFiles: 5,
+      totalFolders: 4,
+      totalSizeBytes: 12_288,
+      includedFiles: 5,
+      includedFolders: 4,
+      includedSizeBytes: 12_288,
+      excludedFiles: 0,
+      excludedFolders: 0,
+      excludedSizeBytes: 0,
+      excludedPaths: [],
+      fileTypeBreakdown: { TypeScript: 4, JSON: 1 },
+      languageBreakdown: { TypeScript: 4, JSON: 1 },
+      entryPoints: ["src/renderer/App.tsx"],
+      manifestFiles: ["package.json"],
+      testsPresent: true,
+      primaryManagers: ["npm"],
+      explanation: "Small Electron analytics repo"
+    };
+
+    const recommendations = buildWorkflowRecommendations({
+      workflow,
+      agents: [
+        {
+          ...createAgentSkeleton("coding", "Coding Pass 1", "Stabilize package scripts.", "gpt-5.4"),
+          changedFiles: ["package.json"]
+        }
+      ],
+      scan: {
+        kind: "git",
+        files: [
+          { absolutePath: "/repo/src/renderer/App.tsx", relativePath: "src/renderer/App.tsx", size: 4_096, language: "TypeScript" },
+          { absolutePath: "/repo/src/analytics/drawdown.ts", relativePath: "src/analytics/drawdown.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/src/analytics/rollingMetrics.ts", relativePath: "src/analytics/rollingMetrics.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/src/tests/analytics.spec.ts", relativePath: "src/tests/analytics.spec.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/package.json", relativePath: "package.json", size: 1_024, language: "JSON" }
+        ],
+        stats,
+        dependencies: []
+      },
+      overview: undefined,
+      objective: "deliver",
+      maxOptions: 5
+    });
+
+    expect(recommendations[0]?.title).toContain("Satisfy goal check: App includes drawdown");
+    expect(recommendations.slice(0, 2).every((entry) => entry.title.startsWith("Satisfy goal check:"))).toBe(true);
+    const stabilizeIndex = recommendations.findIndex((entry) => entry.title.startsWith("Stabilize recent work"));
+    expect(stabilizeIndex === -1 || stabilizeIndex > 1).toBe(true);
   });
 
   it("biases deterministic recommendations toward a custom focus", () => {

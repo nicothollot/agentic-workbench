@@ -814,6 +814,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .some((value) => value === target || value.includes(target) || target.includes(value));
   }
 
+  private scopedGoalTargetsGoalCheck(workflow: ProjectWorkflowState, check: GoalAttainmentCheck): boolean {
+    const scopedGoal = workflow.scopedGoal;
+    if (!scopedGoal) {
+      return false;
+    }
+
+    const scopedGoalText = [
+      scopedGoal.summary,
+      scopedGoal.executionBrief,
+      ...scopedGoal.acceptanceCriteria
+    ]
+      .map((value) => this.normalizeGoalCheckMatchText(value))
+      .join(" ");
+    if (!scopedGoalText) {
+      return false;
+    }
+
+    return [check.title, check.description]
+      .map((value) => this.normalizeGoalCheckMatchText(value))
+      .filter((value) => value.length >= 12)
+      .some((value) => scopedGoalText.includes(value));
+  }
+
   private findCompletedCycleTargetGoalCheck(project: LoadedProject, timestamp: string): GoalAttainmentCheck | undefined {
     const workflow = this.ensureWorkflowState(project.record);
     const approvedRecommendation = workflow.approvedRecommendation;
@@ -837,7 +860,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const explicitTarget = approvedRecommendation.title.match(/^Satisfy goal check:\s*(.+)$/i)?.[1]?.trim();
     if (explicitTarget) {
       const explicitMatch = candidates.find((check) => this.goalCheckMatchesTargetText(check, explicitTarget));
-      if (explicitMatch) {
+      if (explicitMatch && this.scopedGoalTargetsGoalCheck(workflow, explicitMatch)) {
         return explicitMatch;
       }
     }
@@ -864,7 +887,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         .filter((value) => value.length >= 12)
         .some((value) => haystack.includes(value))
     );
-    return matches.length === 1 ? matches[0] : undefined;
+    const scopedGoalMatches = matches.filter((check) => this.scopedGoalTargetsGoalCheck(workflow, check));
+    return scopedGoalMatches.length === 1 ? scopedGoalMatches[0] : undefined;
   }
 
   private markCompletedCycleGoalCheckEvidence(project: LoadedProject, timestamp: string): void {
@@ -1031,7 +1055,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             await this.runRecommendation(projectId, true);
             break;
           case "approve_recommendation": {
-            const recommendation = pickAutopilotRecommendation(workflow.recommendations);
+            const recommendation = pickAutopilotRecommendation(workflow.recommendations, workflow);
             if (!recommendation) {
               break;
             }
@@ -2959,7 +2983,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return {
       type: "object",
       additionalProperties: false,
-      required: ["summary", "ultimateGoalProgress", "ultimateGoalCompletion", "recommendations"],
+      required: ["summary", "ultimateGoalProgress", "ultimateGoalCompletion", "recommendations", "goalCheckUpdates"],
       properties: {
         summary: { type: "string" },
         ultimateGoalProgress: {
@@ -3024,15 +3048,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["title", "status", "evidence"],
+            required: [
+              "action",
+              "id",
+              "title",
+              "description",
+              "required",
+              "status",
+              "confidence",
+              "evidence",
+              "relatedPaths"
+            ],
             properties: {
-              action: { type: "string", enum: ["add", "update", "remove"] },
-              id: { type: "string" },
+              action: { type: ["string", "null"], enum: ["add", "update", "remove", null] },
+              id: { type: ["string", "null"] },
               title: { type: "string" },
-              description: { type: "string" },
-              required: { type: "boolean" },
+              description: { type: ["string", "null"] },
+              required: { type: ["boolean", "null"] },
               status: { type: "string", enum: ["unknown", "unmet", "met", "not_applicable"] },
-              confidence: { type: "number", minimum: 0, maximum: 1 },
+              confidence: { type: ["number", "null"], minimum: 0, maximum: 1 },
               evidence: { type: "string" },
               relatedPaths: {
                 type: "array",
@@ -3124,11 +3158,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : "Return 0 to 5 recommendations.",
       "Every recommendation must be a small, concrete, single-cycle task. Break work down. Do not propose a large rewrite, a broad audit, or multiple unrelated actions in one recommendation.",
       "Prefer recommendations that are easy for a coding agent to execute and for an integrity agent to verify in one cycle.",
+      "When any required Goal checklist item is unmet or unknown, rank direct work on those checklist items ahead of generic stabilization, package-script cleanup, operator-feedback tweaks, or recently changed file follow-up unless there is an explicit open blocker.",
+      "For checklist work, recommend the option that can most directly move one required check from unmet/unknown to met with repository evidence. Avoid claiming a feature check is satisfied through unrelated harness or package-only work.",
       "Default to small scope. Only use medium scope when the task is still clearly doable by one coding agent in one pass.",
       "Do not recommend end-to-end milestones, phase-wide deliverables, or umbrella workflows.",
       "Maintain the Goal checklist. You may add a required check, mark a check unmet/unknown if evidence shows it is not actually done, or mark a check met only when repository evidence or validation output supports it.",
       "Do not mark the Ultimate Goal satisfied unless every required Goal checklist item is met and no open blockers remain. Accepted decisions, completed cycles, and passing tests for a small slice are not enough by themselves.",
-      "Return goalCheckUpdates for every checklist status you add or change. Each met check must include concrete evidence.",
+      "Return goalCheckUpdates as an array every time, even when it is empty. Return one update for every checklist status you add or change. Each met check must include concrete evidence.",
       "Estimate completion from required Goal checklist items only: percentComplete is met required checks divided by total required checks.",
       workflowObjective === "optimize"
         ? "If the Ultimate Goal already looks satisfied, say so in the goal-completion assessment and still recommend the next bounded improvement instead of stopping."
@@ -3301,6 +3337,46 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
+  private recommendationDeduplicationKey(recommendation: ProjectWorkflowState["recommendations"][number]): string {
+    const explicitGoalCheckTarget = recommendation.title.match(/^Satisfy goal check:\s*(.+)$/i)?.[1]?.trim();
+    return explicitGoalCheckTarget
+      ? `goal:${this.normalizeGoalCheckMatchText(explicitGoalCheckTarget)}`
+      : `title:${this.normalizeGoalCheckMatchText(recommendation.title)}`;
+  }
+
+  private ensureChecklistRecommendationsLead(
+    context: WorkflowRecommendationContext,
+    recommendations: ProjectWorkflowState["recommendations"],
+    deterministicRecommendations: ProjectWorkflowState["recommendations"]
+  ): ProjectWorkflowState["recommendations"] {
+    if (context.customFocus?.trim()) {
+      return recommendations.map((recommendation, index) => ({ ...recommendation, rank: index + 1 }));
+    }
+
+    const checklistRecommendations = deterministicRecommendations.filter((recommendation) =>
+      /^Satisfy goal check:/i.test(recommendation.title)
+    );
+    if (checklistRecommendations.length === 0) {
+      return recommendations.map((recommendation, index) => ({ ...recommendation, rank: index + 1 }));
+    }
+
+    const seen = new Set<string>();
+    return [...checklistRecommendations, ...recommendations]
+      .filter((recommendation) => {
+        const key = this.recommendationDeduplicationKey(recommendation);
+        if (seen.has(key)) {
+          return false;
+        }
+        seen.add(key);
+        return true;
+      })
+      .slice(0, Math.max(1, Math.min(context.maxOptions, 5)))
+      .map((recommendation, index) => ({
+        ...recommendation,
+        rank: index + 1
+      }));
+  }
+
   private async applyRecommendationSet(
     project: LoadedProject,
     agent: AgentState | undefined,
@@ -3309,7 +3385,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     progressEstimate: Omit<UltimateGoalProgressEstimate, "updatedAt">,
     proposedGoalCompletion: Omit<NonNullable<ProjectWorkflowState["ultimateGoalCompletion"]>, "updatedAt">,
     automate = false,
-    goalCheckUpdates: GoalCheckUpdateInput[] = []
+    goalCheckUpdates: GoalCheckUpdateInput[] = [],
+    customFocus?: string
   ): Promise<void> {
     const workflow = this.ensureWorkflowState(project.record);
     const generatedAt = nowIso();
@@ -3322,7 +3399,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ownerAgentId: agent?.id
       }
     );
-    const recommendationContext = this.buildWorkflowRecommendationContext(project);
+    const recommendationContext = this.buildWorkflowRecommendationContext(project, customFocus);
     const progressSource = goalCheckUpdates.length > 0 ||
       progressEstimate.source === "recommendation" ||
       proposedGoalCompletion.source === "recommendation"
@@ -3336,15 +3413,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ...assessUltimateGoalCompletion(recommendationContext, checklistProgressEstimate),
       source: progressSource
     };
-    const effectiveRecommendations = recommendations.length > 0 || checklistGoalCompletion.state === "goal_satisfied"
+    const deterministicRecommendations = buildWorkflowRecommendations(recommendationContext)
+      .map((entry) => sanitizeRecommendationForCycle(entry))
+      .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
+      .map((entry, index) => ({
+        ...entry,
+        rank: index + 1
+      }));
+    const candidateRecommendations = recommendations.length > 0 || checklistGoalCompletion.state === "goal_satisfied"
       ? recommendations
-      : buildWorkflowRecommendations(recommendationContext)
-        .map((entry) => sanitizeRecommendationForCycle(entry))
-        .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
-        .map((entry, index) => ({
-          ...entry,
-          rank: index + 1
-        }));
+      : deterministicRecommendations;
+    const effectiveRecommendations = checklistGoalCompletion.state === "goal_satisfied"
+      ? candidateRecommendations
+      : this.ensureChecklistRecommendationsLead(recommendationContext, candidateRecommendations, deterministicRecommendations);
     const appealPassQueued = this.shouldQueueAppealPass(recommendationContext, checklistGoalCompletion) && effectiveRecommendations.length > 0;
     const normalizedProgressEstimate = checklistGoalCompletion.state === "goal_satisfied"
       ? {
@@ -3494,7 +3575,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       recommendations,
       progressEstimate,
       goalCompletion,
-      automate
+      automate,
+      [],
+      customFocus
     );
   }
 
@@ -3554,7 +3637,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       progressEstimate,
       goalCompletion,
       automate,
-      parsed.goalCheckUpdates
+      parsed.goalCheckUpdates,
+      this.extractCustomRecommendationFocus(agent)
     );
     return true;
   }
@@ -3864,7 +3948,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       currentActivity: decisionSource === "autopilot" ? "Autopilot approved the next step" : "Recommendation approved",
       latestProgressNote: recommendation.title,
       message: decisionSource === "autopilot"
-        ? "Autopilot chose the highest-confidence recommendation and is preparing the scoped execution plan."
+        ? "Autopilot chose the highest-impact checklist-aligned recommendation and is preparing the scoped execution plan."
         : "Preparing the scoped execution plan."
     }, { status: "completed" });
     this.resetWorkflowStepProgress(workflow, "goal_plan", {

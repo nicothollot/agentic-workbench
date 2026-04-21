@@ -221,17 +221,18 @@ const createCustomMockRecommendationPayload = (
     ]
   });
 
-const createMockScopedGoalPayload = (): string =>
-  JSON.stringify({
-    summary: "Implement a bounded workflow-cycle cleanup pass",
+const createMockScopedGoalPayload = (approvedRecommendation?: string): string => {
+  const recommendation = approvedRecommendation?.trim() || "the approved recommendation";
+  return JSON.stringify({
+    summary: `Implement ${recommendation}`,
     executionBrief: [
-      "Update the workflow orchestration so the current cycle stays sequential and explicit.",
+      `Implement the approved recommendation: ${recommendation}.`,
       "Make the selected recommendation flow into a scoped plan that the coding agent can execute in one pass.",
       "Keep all behavior inside the active project folder and preserve typed IPC and renderer sandboxing.",
       "When the implementation is complete, run the deterministic checks that already exist for this repository and summarize what changed."
     ].join("\n\n"),
     acceptanceCriteria: [
-      "The workflow waits for the user to choose one recommendation before planning begins.",
+      `The completed work satisfies: ${recommendation}.`,
       "The goal-planning step produces one bounded implementation brief for the coding agent.",
       "The workflow state remains explicit enough for integrity and merge to follow."
     ],
@@ -245,6 +246,7 @@ const createMockScopedGoalPayload = (): string =>
       "Verify the scoped goal still advances the confirmed ultimate goal."
     ]
   });
+};
 
 const isUltimateGoalSchema = (value: unknown): boolean => {
   if (!value || typeof value !== "object") {
@@ -279,6 +281,15 @@ const extractCustomRecommendationFocus = (input: TurnStartParams["input"]): stri
     .map((entry) => entry.text)
     .join("\n");
   const match = combinedText.match(/Custom recommendation focus from the operator:\s*(.+)/);
+  return match?.[1]?.trim();
+};
+
+const extractApprovedRecommendationTitle = (input: TurnStartParams["input"]): string | undefined => {
+  const combinedText = input
+    .filter((entry): entry is Extract<TurnStartParams["input"][number], { type: "text" }> => entry.type === "text")
+    .map((entry) => entry.text)
+    .join("\n");
+  const match = combinedText.match(/Approved recommendation:\s*(.+)/);
   return match?.[1]?.trim();
 };
 
@@ -524,7 +535,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
             ? createCustomMockRecommendationPayload(thread?.cwd ?? "/tmp", customRecommendationFocus, workflowObjective)
             : createMockRecommendationPayload(thread?.cwd ?? "/tmp", workflowObjective)
           : isScopedGoalSchema(params.outputSchema)
-            ? createMockScopedGoalPayload()
+            ? createMockScopedGoalPayload(extractApprovedRecommendationTitle(params.input))
             : createMockInterfacePayload(thread?.cwd ?? "/tmp")
       : "Mock agent is processing the task.";
     thread?.turns.push({

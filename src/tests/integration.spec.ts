@@ -1444,7 +1444,7 @@ describe("integration flows", () => {
     expect(appealWorkflow.recommendations[0]?.title.toLowerCase()).toContain("polish");
   });
 
-  it("autopilot picks the highest-confidence recommendation and only stops at the next recommendation boundary when turned off", async () => {
+  it("autopilot picks a checklist-aligned recommendation and only stops at the next recommendation boundary when turned off", async () => {
     const root = await createSampleFolder("autopilot-boundary", {
       lint: "node -e \"setTimeout(() => process.exit(0), 120)\"",
       typecheck: "node -e \"setTimeout(() => process.exit(0), 120)\"",
@@ -1463,7 +1463,7 @@ describe("integration flows", () => {
       selected.record.id,
       {
         summary: "Let the workflow run unattended until the next recommendation decision.",
-        detailedIntent: "Autopilot should pick the most confident next step, but turning it off should only affect the next recommendation boundary.",
+        detailedIntent: "Autopilot should pick the most checklist-aligned next step, but turning it off should only affect the next recommendation boundary.",
         successCriteria: ["Autopilot picks a recommendation automatically.", "Turning it off does not interrupt the active cycle."],
         constraints: ["Keep the behavior persisted in project state."],
         nonGoals: ["Do not cancel work that is already running."],
@@ -1479,9 +1479,16 @@ describe("integration flows", () => {
       return workflow?.approvedRecommendation && workflow.recommendations.length > 0 ? workflow : null;
     }, 6_000);
 
-    expect(autopilotApproved.approvedRecommendation?.confidence).toBe(
-      Math.max(...autopilotApproved.recommendations.map((entry) => entry.confidence))
+    const checklistRecommendations = autopilotApproved.recommendations.filter((entry) =>
+      entry.title.startsWith("Satisfy goal check:")
     );
+    if (checklistRecommendations.length > 0) {
+      expect(autopilotApproved.approvedRecommendation?.recommendationId).toBe(checklistRecommendations[0]?.id);
+    } else {
+      expect(autopilotApproved.approvedRecommendation?.confidence).toBe(
+        Math.max(...autopilotApproved.recommendations.map((entry) => entry.confidence))
+      );
+    }
 
     await service.updateUiState(selected.record.id, { autopilotEnabled: false });
 
