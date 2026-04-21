@@ -1095,7 +1095,11 @@ describe("integration flows", () => {
     activeAgent.status = "running";
     activeAgent.startedAt = new Date().toISOString();
     activeAgent.threadId = "missing-thread";
+    const activeAgentWithoutThread = createAgentSkeleton("recommendation", "Interrupted Recommendation Without Thread", "Generate recommendations.", "gpt-5.4-mini");
+    activeAgentWithoutThread.status = "running";
+    activeAgentWithoutThread.startedAt = new Date().toISOString();
     record?.agents.unshift(activeAgent);
+    record?.agents.unshift(activeAgentWithoutThread);
     await serviceA.updateUiState(selected.record.id, { treeFilter: "resume-marker" });
     await serviceA.exportInterface(selected.record.id);
 
@@ -1105,6 +1109,8 @@ describe("integration flows", () => {
     expect(localCandidate).toBeTruthy();
     const reopened = await serviceB.selectPendingInterface("local", localCandidate?.path);
     expect(reopened.record.agents.find((agent) => agent.id === activeAgent.id)?.status).toBe("disconnected");
+    expect(reopened.record.agents.find((agent) => agent.id === activeAgentWithoutThread.id)?.status).toBe("disconnected");
+    expect(reopened.record.workflow.stepProgress.recommendation.status).toBe("waiting");
   });
 
   it("detects and persists an ultimate goal draft", async () => {
@@ -1573,6 +1579,114 @@ describe("integration flows", () => {
     expect(getProjectRecord(serviceB, selected.record.id)?.localState.workflowPauseRequested).toBe(false);
     expect(resumedWorkflow.activityLog.some((event) => event.title === "Workflow automation resumed")).toBe(true);
   }, 14_000);
+
+  it("rechecks stale satisfied goal evidence and regenerates checklist recommendations after continue", async () => {
+    const root = await createSampleFolder("resume-stale-satisfied-goal", {
+      lint: "echo lint",
+      typecheck: "echo typecheck",
+      test: "echo test",
+      build: "echo build"
+    });
+    const appData = await createTempDir("appdata-resume-stale-satisfied-goal");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: true });
+
+    const targetCriterion = "Recommendations appear without an extra click.";
+    await service.updateUltimateGoal(
+      selected.record.id,
+      {
+        summary: "Move the workflow toward minimal-input automation.",
+        detailedIntent: "Generate recommendations automatically once the charter is confirmed.",
+        successCriteria: [targetCriterion],
+        constraints: [],
+        nonGoals: ["Do not bypass approvals."],
+        targetAudience: "Operators of the workflow tab.",
+        qualityBar: "",
+        source: "user"
+      },
+      true
+    );
+
+    const record = getProjectRecord(service, selected.record.id);
+    expect(record).toBeTruthy();
+    if (!record) {
+      throw new Error("Expected project record.");
+    }
+
+    const staleTimestamp = "2026-04-20T00:00:00.000Z";
+    const staleEvidence = "Cycle 30 completed after deterministic validation and integration. Scoped goal: Smallest viable slice: stabilize package/startup-readiness work.";
+    record.workflow.goalChecklist = applyGoalChecklistUpdates(
+      buildGoalChecklistFromUltimateGoal(record.workflow.ultimateGoal, record.workflow.goalChecklist, staleTimestamp),
+      [{
+        title: targetCriterion,
+        status: "met",
+        confidence: 0.95,
+        evidence: staleEvidence,
+        relatedPaths: ["package.json"]
+      }],
+      { timestamp: staleTimestamp }
+    );
+    record.workflow.workflowCycle.status = "completed";
+    record.workflow.workflowStage = "cycle_complete";
+    record.workflow.workflowStopReason = "ultimate_goal_satisfied";
+    record.workflow.recommendations = [];
+    record.workflow.recommendationsGeneratedAt = undefined;
+    record.workflow.approvedRecommendation = undefined;
+    record.workflow.scopedGoal = undefined;
+    record.workflow.appeal = {
+      status: "not_applicable",
+      reason: "The stale saved state treated the goal as complete.",
+      completedAt: staleTimestamp
+    };
+    record.workflow.ultimateGoalProgress = {
+      percentComplete: 100,
+      rationale: "Stale saved state treated all checks as complete.",
+      source: "deterministic",
+      updatedAt: staleTimestamp
+    };
+    record.workflow.ultimateGoalCompletion = {
+      state: "goal_satisfied",
+      rationale: "Stale saved state treated all checks as complete.",
+      source: "deterministic",
+      updatedAt: staleTimestamp
+    };
+    record.workflow.stepProgress.recommendation = {
+      ...record.workflow.stepProgress.recommendation,
+      status: "completed",
+      requiresUserInput: false,
+      completedAt: staleTimestamp,
+      updatedAt: staleTimestamp,
+      currentActivity: "No next cycle required"
+    };
+    await service.updateUiState(selected.record.id, { treeFilter: "stale-satisfied-goal" });
+    await service.dispose();
+
+    const serviceB = await createService(appData);
+    await serviceB.openProject(selected.record.id);
+
+    const reopened = getProjectRecord(serviceB, selected.record.id);
+    const reopenedTargetCheck = reopened?.workflow.goalChecklist.find((check) => check.title === targetCriterion);
+    expect(reopened?.localState.workflowPauseRequested).toBe(true);
+    expect(reopenedTargetCheck?.status).toBe("unknown");
+    expect(reopened?.workflow.ultimateGoalCompletion?.state).toBe("needs_more_work");
+
+    await serviceB.updateUiState(selected.record.id, { workflowPauseRequested: false });
+
+    const resumedWorkflow = await waitFor(() => {
+      const workflow = getProjectRecord(serviceB, selected.record.id)?.workflow;
+      return workflow?.recommendations.some((recommendation) => recommendation.title.includes(targetCriterion))
+        ? workflow
+        : null;
+    }, 6_000);
+
+    expect(resumedWorkflow.recommendations[0]?.title).toBe(`Satisfy goal check: ${targetCriterion}`);
+    expect(resumedWorkflow.ultimateGoalCompletion?.state).toBe("needs_more_work");
+    expect(resumedWorkflow.activityLog.some((event) => event.title === "Goal checklist evidence refreshed")).toBe(true);
+  }, 10_000);
 
   it("recovers an interrupted coding run from the saved scoped goal", async () => {
     const root = await createSampleFolder("recover-interrupted-coding");

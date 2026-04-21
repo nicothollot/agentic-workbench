@@ -144,6 +144,44 @@ const writeEnabledAgentCategories = new Set<AgentCategory>(["coding", "manual"])
 const isWriteEnabledAgentCategory = (category: AgentCategory): boolean => writeEnabledAgentCategories.has(category);
 const activeAgentStatuses = new Set<AgentState["status"]>(["starting", "running", "waiting_approval"]);
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
+const userDerivedGoalCheckSources = new Set<GoalAttainmentCheck["source"]>(["success_criterion", "quality_bar", "constraint"]);
+const weakGoalEvidenceStopwords = new Set([
+  "accepted",
+  "after",
+  "agent",
+  "agents",
+  "check",
+  "checklist",
+  "complete",
+  "completed",
+  "completion",
+  "cycle",
+  "deterministic",
+  "evidence",
+  "goal",
+  "integration",
+  "latest",
+  "package",
+  "passed",
+  "readiness",
+  "required",
+  "satisfy",
+  "scoped",
+  "slice",
+  "smallest",
+  "stabilize",
+  "startup",
+  "test",
+  "tests",
+  "validation",
+  "viable",
+  "work",
+  "workflow"
+]);
+const genericGoalCompletionEvidencePatterns = [
+  /\bCycle\s+\d+\s+completed after deterministic validation and integration\b/i,
+  /\bcompleted after deterministic validation and integration\b/i
+];
 
 export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }> {
   private settings: AppSettings = defaultSettings();
@@ -802,6 +840,71 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
   }
 
+  private normalizeGoalEvidenceToken(token: string): string {
+    if (token.length > 5 && token.endsWith("ing")) {
+      return token.slice(0, -3);
+    }
+    if (token.length > 4 && token.endsWith("ed")) {
+      return token.slice(0, -2);
+    }
+    if (token.length > 4 && token.endsWith("es")) {
+      return token.slice(0, -2);
+    }
+    if (token.length > 3 && token.endsWith("s")) {
+      return token.slice(0, -1);
+    }
+    return token;
+  }
+
+  private tokenizeGoalEvidence(value: string): string[] {
+    return [...new Set(
+      (value.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+        .map((token) => this.normalizeGoalEvidenceToken(token))
+        .filter((token) => token.length >= 4 && !weakGoalEvidenceStopwords.has(token))
+    )];
+  }
+
+  private isGenericGoalCompletionEvidence(evidence?: string): boolean {
+    return Boolean(evidence && genericGoalCompletionEvidencePatterns.some((pattern) => pattern.test(evidence)));
+  }
+
+  private goalCheckEvidenceDirectlyMentionsCheck(
+    check: Pick<GoalAttainmentCheck, "title" | "description">,
+    evidence?: string,
+    relatedPaths: string[] = []
+  ): boolean {
+    const checkTokens = this.tokenizeGoalEvidence(`${check.title} ${check.description}`);
+    if (checkTokens.length === 0) {
+      return Boolean(evidence?.trim());
+    }
+
+    const evidenceTokens = new Set(this.tokenizeGoalEvidence([evidence ?? "", ...relatedPaths].join(" ")));
+    const overlapCount = checkTokens.filter((token) => evidenceTokens.has(token)).length;
+    return checkTokens.length <= 2 ? overlapCount >= 1 : overlapCount >= 2;
+  }
+
+  private shouldDowngradeGenericMetGoalCheckEvidence(
+    check: Pick<GoalAttainmentCheck, "title" | "description" | "source">,
+    evidence?: string,
+    relatedPaths: string[] = []
+  ): boolean {
+    return check.source !== "deterministic" &&
+      this.isGenericGoalCompletionEvidence(evidence) &&
+      !this.goalCheckEvidenceDirectlyMentionsCheck(check, evidence, relatedPaths);
+  }
+
+  private findGoalCheckForUpdate(project: LoadedProject, id: string | undefined, title: string): GoalAttainmentCheck | undefined {
+    const workflow = this.ensureWorkflowState(project.record);
+    const normalizedTitle = this.normalizeGoalCheckMatchText(title);
+    return buildGoalChecklistForAssessment({
+      workflow,
+      agents: project.record.agents
+    }).find((check) =>
+      (id && check.id === id) ||
+      this.normalizeGoalCheckMatchText(check.title) === normalizedTitle
+    );
+  }
+
   private goalCheckMatchesTargetText(check: GoalAttainmentCheck, targetText: string): boolean {
     const target = this.normalizeGoalCheckMatchText(targetText);
     if (target.length < 8) {
@@ -944,6 +1047,183 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       source: "deterministic",
       updatedAt: timestamp
     };
+  }
+
+  private refreshUltimateGoalAssessmentIfChanged(project: LoadedProject, timestamp = nowIso()): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previousChecklist = JSON.stringify(workflow.goalChecklist);
+    workflow.goalChecklist = buildGoalChecklistForAssessment({
+      workflow,
+      agents: project.record.agents
+    }, timestamp);
+    let changed = JSON.stringify(workflow.goalChecklist) !== previousChecklist;
+    const context = this.buildWorkflowRecommendationContext(project);
+    const progressEstimate = estimateUltimateGoalProgress(context);
+    const currentProgress = workflow.ultimateGoalProgress;
+    if (
+      !currentProgress ||
+      currentProgress.source !== "deterministic" ||
+      currentProgress.percentComplete !== progressEstimate.percentComplete ||
+      currentProgress.rationale !== progressEstimate.rationale
+    ) {
+      workflow.ultimateGoalProgress = {
+        ...progressEstimate,
+        source: "deterministic",
+        updatedAt: timestamp
+      };
+      changed = true;
+    }
+
+    const completionAssessment = assessUltimateGoalCompletion(context, progressEstimate);
+    const currentCompletion = workflow.ultimateGoalCompletion;
+    if (
+      !currentCompletion ||
+      currentCompletion.source !== "deterministic" ||
+      currentCompletion.state !== completionAssessment.state ||
+      currentCompletion.rationale !== completionAssessment.rationale
+    ) {
+      workflow.ultimateGoalCompletion = {
+        ...completionAssessment,
+        source: "deterministic",
+        updatedAt: timestamp
+      };
+      changed = true;
+    }
+
+    return changed;
+  }
+
+  private reconcileStaleGoalChecklistEvidence(project: LoadedProject, timestamp = nowIso()): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    let changed = false;
+    workflow.goalChecklist = workflow.goalChecklist.map((check) => {
+      if (
+        !check.required ||
+        check.status !== "met" ||
+        !userDerivedGoalCheckSources.has(check.source) ||
+        !this.shouldDowngradeGenericMetGoalCheckEvidence(check, check.evidence, check.relatedPaths)
+      ) {
+        return check;
+      }
+
+      changed = true;
+      return {
+        ...check,
+        status: "unknown" as const,
+        confidence: Math.min(check.confidence ?? 0.5, 0.55),
+        evidence: "Previous generic completion evidence did not directly support this checklist item after resume reconciliation.",
+        updatedAt: timestamp
+      };
+    });
+
+    if (changed) {
+      this.recordWorkflowActivity(workflow, {
+        source: "system",
+        status: "waiting",
+        title: "Goal checklist evidence refreshed",
+        detail: "Generic completion evidence was rechecked against the saved Ultimate Goal so unfinished checklist items can receive recommendations.",
+        stepId: "recommendation"
+      });
+    }
+
+    return changed;
+  }
+
+  private hasActiveWorkflowAgentForStep(project: LoadedProject, stepId: WorkflowStepId): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    return project.record.agents.some((agent) =>
+      agent.category !== "manual" &&
+      isAgentActive(agent) &&
+      this.getWorkflowStepIdForAgent(agent) === stepId &&
+      (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+    );
+  }
+
+  private requeueStaleRunningWorkflowSteps(project: LoadedProject): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    let changed = false;
+    const requeue = (
+      stepId: WorkflowStepId,
+      patch: Partial<ProjectWorkflowState["stepProgress"][WorkflowStepId]>
+    ): void => {
+      if (workflow.stepProgress[stepId].status !== "running" || this.hasActiveWorkflowAgentForStep(project, stepId)) {
+        return;
+      }
+      this.resetWorkflowStepProgress(workflow, stepId, {
+        status: "waiting",
+        requiresUserInput: false,
+        warning: undefined,
+        ...patch
+      });
+      changed = true;
+    };
+
+    requeue("ultimate_goal", {
+      requiresUserInput: true,
+      currentActivity: workflow.ultimateGoalDraft ? "Draft ready for review" : "Queued to redetect the Ultimate Goal",
+      message: workflow.ultimateGoalDraft
+        ? "Review and confirm the saved Ultimate Goal draft."
+        : "Ultimate Goal detection can restart from the saved project state."
+    });
+    requeue("recommendation", {
+      requiresUserInput: workflow.recommendations.length > 0 && !workflow.approvedRecommendation,
+      currentActivity: workflow.recommendations.length > 0 && !workflow.approvedRecommendation
+        ? "Waiting for a recommendation choice"
+        : "Queued to regenerate recommendations",
+      latestProgressNote: workflow.recommendations[0]?.title,
+      message: workflow.recommendations.length > 0 && !workflow.approvedRecommendation
+        ? "Saved recommendations are still available. Choose one to continue."
+        : "Recommendation generation will restart from the saved project state."
+    });
+    if (workflow.approvedRecommendation && !workflow.scopedGoal) {
+      requeue("goal_plan", {
+        currentActivity: "Queued to recreate the scoped plan",
+        latestProgressNote: workflow.approvedRecommendation.title,
+        message: "The approved recommendation was saved; goal planning will restart from that decision."
+      });
+    }
+    if (workflow.scopedGoal) {
+      requeue("coding", {
+        currentActivity: workflow.repair.status === "repairing" ? "Queued to restart the repair pass" : "Queued to restart coding",
+        latestProgressNote: workflow.scopedGoal.summary,
+        message: "The scoped goal was saved; coding will restart from that plan."
+      });
+      requeue("integrity", {
+        currentActivity: workflow.repair.status === "retrying_validation"
+          ? "Queued to retry validation after repair"
+          : "Queued to retry validation",
+        message: "Validation will restart from the saved workflow state."
+      });
+    }
+    requeue("merge", {
+      currentActivity: "Queued to retry integration",
+      message: "Merge will restart from the saved validation result."
+    });
+
+    return changed;
+  }
+
+  private reconcileWorkflowResumeState(project: LoadedProject): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    const timestamp = nowIso();
+    let changed = this.reconcileStaleGoalChecklistEvidence(project, timestamp);
+    if (
+      hasConfirmedUltimateGoal(workflow.ultimateGoal) &&
+      (
+        changed ||
+        !workflow.ultimateGoalProgress ||
+        !workflow.ultimateGoalCompletion ||
+        workflow.workflowCycle.status === "completed" ||
+        workflow.workflowCycle.status === "merged"
+      )
+    ) {
+      changed = this.refreshUltimateGoalAssessmentIfChanged(project, timestamp) || changed;
+    }
+    changed = this.requeueStaleRunningWorkflowSteps(project) || changed;
+    if (changed) {
+      this.refreshWorkflowMemory(workflow);
+    }
+    return changed;
   }
 
   private finalizeWorkflowCycle(project: LoadedProject): void {
@@ -2122,6 +2402,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       project.record.agents.unshift(bootstrapAgent);
     }
 
+    this.reconcileWorkflowResumeState(project);
     this.syncWorkflowState(project);
     this.projects.set(projectId, project);
     await this.cleanupCompletedManagedWorktrees(project);
@@ -2503,6 +2784,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (loadedRepairMaxAttempts !== undefined) {
       this.resumeRepairIfLimitExpanded(project, loadedRepairMaxAttempts);
     }
+    this.reconcileWorkflowResumeState(project);
     this.syncWorkflowState(project);
     this.projects.set(projectId, project);
     if (source === "local") {
@@ -2756,6 +3038,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
     const nextPauseRequested = project.record.localState.workflowPauseRequested;
     if (partial.workflowPauseRequested !== undefined && previousPauseRequested !== nextPauseRequested) {
+      if (!nextPauseRequested) {
+        this.reconcileWorkflowResumeState(project);
+      }
       const workflow = this.ensureWorkflowState(project.record);
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
@@ -3269,19 +3554,36 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
       const action = record.action;
       const normalizedAction = action === "add" || action === "update" || action === "remove" ? action : undefined;
+      const id = typeof record.id === "string" && record.id.trim() ? record.id.trim() : undefined;
+      let normalizedStatus: NonNullable<GoalCheckUpdateInput["status"]> = status;
+      let evidence = typeof record.evidence === "string" ? record.evidence.trim() : "";
+      const relatedPaths = this.sanitizeRelatedPaths(project, record.relatedPaths);
+      const existingCheck = this.findGoalCheckForUpdate(project, id, title);
+      const checkForEvidence = existingCheck ?? {
+        title,
+        description: typeof record.description === "string" ? record.description.trim() : "",
+        source: "agent" as const
+      };
+      if (
+        normalizedStatus === "met" &&
+        this.shouldDowngradeGenericMetGoalCheckEvidence(checkForEvidence, evidence, relatedPaths)
+      ) {
+        normalizedStatus = "unknown";
+        evidence = "Generic completion evidence did not directly support this checklist item, so it remains unknown after resume-safe validation.";
+      }
       return [
         {
           action: normalizedAction,
-          id: typeof record.id === "string" && record.id.trim() ? record.id.trim() : undefined,
+          id,
           title,
           description: typeof record.description === "string" ? record.description.trim() : undefined,
           required: typeof record.required === "boolean" ? record.required : undefined,
-          status,
+          status: normalizedStatus,
           confidence: typeof record.confidence === "number" && Number.isFinite(record.confidence)
             ? Math.max(0, Math.min(1, record.confidence))
             : undefined,
-          evidence: typeof record.evidence === "string" ? record.evidence.trim() : "",
-          relatedPaths: this.sanitizeRelatedPaths(project, record.relatedPaths)
+          evidence,
+          relatedPaths
         }
       ];
     }).slice(0, 30);
@@ -4444,6 +4746,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     project.record.localState.workflowPauseRequested = false;
     this.resetWorkflowAfterInterruptedAgents(project, interruptedAgents, { markRecoveryHandled: true });
+    this.reconcileWorkflowResumeState(project);
 
     if (!this.transport || this.codexAvailability.source === "unavailable") {
       await this.initializeTransport();
@@ -6059,16 +6362,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private async resumeSavedAgents(project: LoadedProject): Promise<void> {
-    if (!this.transport) {
-      return;
-    }
-
     const interruptedAgents: AgentState[] = [];
     for (const agent of project.record.agents) {
-      if (!agent.threadId) {
-        continue;
-      }
-
       if (agent.category !== "manual" && isAgentActive(agent)) {
         this.markAgentDisconnected(
           project,
@@ -6079,7 +6374,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         continue;
       }
 
+      if (!agent.threadId) {
+        continue;
+      }
+
       if (agent.status === "completed" || agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected") {
+        continue;
+      }
+
+      if (!this.transport) {
+        this.markAgentDisconnected(project, agent, "Codex app-server is unavailable, so the saved thread could not be resumed in this session.");
+        interruptedAgents.push(agent);
         continue;
       }
 
@@ -6094,8 +6399,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
     }
 
+    let changed = false;
     if (interruptedAgents.length > 0) {
       this.resetWorkflowAfterInterruptedAgents(project, interruptedAgents, { markRecoveryHandled: true });
+      changed = true;
+    }
+    changed = this.reconcileWorkflowResumeState(project) || changed;
+    if (changed) {
       await this.saveProject(project);
     }
   }
