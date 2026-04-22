@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { AppService } from "@runtime/appService";
+import { MockCodexTransport } from "@runtime/mockCodexTransport";
 import { WorkbenchStorage } from "@runtime/storage";
 import {
   applyGoalChecklistUpdates,
@@ -116,6 +117,23 @@ const waitFor = async <T>(getValue: () => T | null | undefined | false, timeoutM
 
 const getProjectRecord = (service: AppService, projectId: string) =>
   service.getState().projects.find((entry) => entry.record.id === projectId)?.record;
+
+const isScopedGoalOutputSchema = (value: unknown): boolean => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const properties = (value as { properties?: Record<string, unknown> }).properties;
+  return Boolean(properties?.executionBrief && properties?.acceptanceCriteria && properties?.testStrategy);
+};
+
+class FailingScopedGoalTransport extends MockCodexTransport {
+  async startTurn(params: Parameters<MockCodexTransport["startTurn"]>[0]): ReturnType<MockCodexTransport["startTurn"]> {
+    if (isScopedGoalOutputSchema(params.outputSchema)) {
+      throw new Error("Array buffer allocation failed");
+    }
+    return await super.startTurn(params);
+  }
+}
 
 describe("integration flows", () => {
   it("does not report an existing interface on a true first open", async () => {
@@ -1579,6 +1597,115 @@ describe("integration flows", () => {
     expect(getProjectRecord(serviceB, selected.record.id)?.localState.workflowPauseRequested).toBe(false);
     expect(resumedWorkflow.activityLog.some((event) => event.title === "Workflow automation resumed")).toBe(true);
   }, 14_000);
+
+  it("resumes goal planning from an approved recommendation waiting for scoping", async () => {
+    const root = await createSampleFolder("pause-at-goal-plan", {
+      lint: "node -e \"setTimeout(() => process.exit(0), 80)\"",
+      typecheck: "node -e \"setTimeout(() => process.exit(0), 80)\"",
+      test: "node -e \"setTimeout(() => process.exit(0), 80)\"",
+      build: "node -e \"setTimeout(() => process.exit(0), 80)\""
+    });
+    const appData = await createTempDir("appdata-pause-at-goal-plan");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    await service.updateUltimateGoal(
+      selected.record.id,
+      {
+        summary: "Resume cleanly from an approved recommendation.",
+        detailedIntent: "Continuing a paused workflow should start the goal agent when the chosen recommendation has not been scoped yet.",
+        successCriteria: ["The goal-plan step starts after continue."],
+        constraints: ["Keep the saved recommendation decision intact."],
+        nonGoals: ["Do not regenerate recommendations just to resume."],
+        targetAudience: "Operators continuing a paused workflow cycle.",
+        qualityBar: "The next step begins without an extra developer-control click.",
+        source: "user"
+      },
+      true
+    );
+
+    const recommendationId = await waitFor(() => getProjectRecord(service, selected.record.id)?.workflow.recommendations[0]?.id);
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: true });
+    await service.approveRecommendation(selected.record.id, recommendationId);
+
+    const pausedAtGoalPlan = await waitFor(() => {
+      const record = getProjectRecord(service, selected.record.id);
+      return record?.localState.workflowPauseRequested &&
+        record.workflow.approvedRecommendation &&
+        !record.workflow.scopedGoal &&
+        record.workflow.workflowStage === "recommendation_approved" &&
+        record.workflow.stepProgress.goal_plan.status === "waiting"
+        ? record
+        : null;
+    });
+    expect(pausedAtGoalPlan.workflow.stepProgress.goal_plan.currentActivity).toBe("Queued for scoping");
+
+    await service.dispose();
+
+    const serviceB = await createService(appData);
+    await serviceB.openProject(selected.record.id);
+    expect(getProjectRecord(serviceB, selected.record.id)?.workflow.scopedGoal).toBeUndefined();
+
+    await serviceB.updateUiState(selected.record.id, { workflowPauseRequested: false });
+
+    const resumedWorkflow = await waitFor(() => {
+      const workflow = getProjectRecord(serviceB, selected.record.id)?.workflow;
+      return workflow?.scopedGoal ? workflow : null;
+    }, 8_000);
+
+    expect(resumedWorkflow.approvedRecommendation?.recommendationId).toBe(recommendationId);
+    expect(resumedWorkflow.stepProgress.goal_plan.status).toBe("completed");
+    expect(resumedWorkflow.activityLog.some((event) => event.title === "Workflow automation resumed")).toBe(true);
+  }, 12_000);
+
+  it("falls back to a deterministic scoped goal when goal-agent launch runs out of buffer", async () => {
+    const root = await createSampleFolder("goal-plan-launch-allocation-fallback", {
+      lint: "echo lint",
+      typecheck: "echo typecheck",
+      test: "echo test",
+      build: "echo build"
+    });
+    const appData = await createTempDir("appdata-goal-plan-launch-allocation-fallback");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    await service.updateUltimateGoal(
+      selected.record.id,
+      {
+        summary: "Keep workflow continuation resilient.",
+        detailedIntent: "A transient app-server allocation failure while starting the goal agent should not strand the cycle after a recommendation is approved.",
+        successCriteria: ["A fallback scoped goal is created after continue."],
+        constraints: ["Preserve the approved recommendation decision."],
+        nonGoals: ["Do not require a manual retry for goal planning."],
+        targetAudience: "Operators running repeated workflow cycles.",
+        qualityBar: "The cycle advances to a scoped goal with visible fallback evidence.",
+        source: "user"
+      },
+      true
+    );
+
+    const recommendationId = await waitFor(() => getProjectRecord(service, selected.record.id)?.workflow.recommendations[0]?.id);
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: true });
+    await service.approveRecommendation(selected.record.id, recommendationId);
+
+    (service as unknown as { transport: MockCodexTransport }).transport = new FailingScopedGoalTransport();
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: false });
+
+    const resumedWorkflow = await waitFor(() => {
+      const workflow = getProjectRecord(service, selected.record.id)?.workflow;
+      return workflow?.scopedGoal ? workflow : null;
+    }, 8_000);
+
+    expect(resumedWorkflow.approvedRecommendation?.recommendationId).toBe(recommendationId);
+    expect(resumedWorkflow.scopedGoal?.sourceRecommendationId).toBe(recommendationId);
+    expect(resumedWorkflow.activityLog.some((event) => event.title === "Goal agent launch failed; using fallback scoped plan")).toBe(true);
+    expect(service.getState().diagnostics.some((entry) => entry.includes("Array buffer allocation failed"))).toBe(true);
+  }, 12_000);
 
   it("rechecks stale satisfied goal evidence and regenerates checklist recommendations after continue", async () => {
     const root = await createSampleFolder("resume-stale-satisfied-goal", {

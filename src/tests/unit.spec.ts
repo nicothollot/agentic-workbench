@@ -3565,4 +3565,30 @@ describe("event reducer", () => {
     expect(agent.approvals).toHaveLength(1);
     expect(agent.status).toBe("waiting_approval");
   });
+
+  it("caps bulky raw event payloads before they enter persisted agent state", () => {
+    const agent: AgentState = createAgentSkeleton("coding", "Agent", "Prompt", "gpt-5.4");
+    reduceAgentRuntimeEvent(agent, {
+      kind: "item-completed",
+      threadId: "thread-1",
+      itemId: "item-1",
+      itemType: "agentMessage",
+      title: "Agent message",
+      detail: "d".repeat(20_000),
+      raw: {
+        type: "agentMessage",
+        text: "x".repeat(20_000),
+        nested: {
+          output: "y".repeat(20_000)
+        }
+      }
+    });
+
+    const event = agent.events[0];
+    const raw = event?.raw as { text?: string; nested?: { output?: string } } | undefined;
+    expect(event?.detail?.length).toBeLessThanOrEqual(8_000);
+    expect(raw?.text?.length).toBeLessThan(2_100);
+    expect(raw?.nested?.output?.length).toBeLessThan(2_100);
+    expect(JSON.stringify(event).length).toBeLessThan(13_000);
+  });
 });

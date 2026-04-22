@@ -100,7 +100,7 @@ import {
   resolveExecutionPathWithinProjectRoot
 } from "./projectBoundary";
 import { hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult } from "./repoScanner";
-import { reduceAgentRuntimeEvent } from "./runtimeEvents";
+import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
 import { WorkbenchStorage } from "./storage";
 import { readUltimateGoalTextImport } from "./ultimateGoalImport";
 import { buildProjectShellHandoffPrompt, openProjectShellWindow } from "./projectShell";
@@ -1296,10 +1296,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
 
-    const timer = setTimeout(() => {
+    setTimeout(() => {
       void this.runWorkflowAutomation(projectId);
     }, 0);
-    timer.unref?.();
   }
 
   private async runWorkflowAutomation(projectId: string): Promise<void> {
@@ -2802,6 +2801,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private async saveProject(project: LoadedProject): Promise<void> {
+    this.compactProjectRuntimeHistory(project);
     this.syncWorkflowState(project);
     project.record.summaryCache = project.summaryCache.list();
     await this.storage.saveProject(project.record);
@@ -2809,6 +2809,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (!registry.includes(project.record.id)) {
       registry.push(project.record.id);
       await this.storage.saveRegistry(registry);
+    }
+  }
+
+  private compactProjectRuntimeHistory(project: LoadedProject): void {
+    for (const agent of project.record.agents) {
+      agent.events = agent.events.slice(0, 250).map(compactRuntimeEventRecord);
+      agent.commandLog = agent.commandLog.map((entry) => ({
+        ...entry,
+        command: entry.command.length > 8_000
+          ? `${entry.command.slice(0, 8_000).trimEnd()}...[truncated ${entry.command.length - 8_000} chars]`
+          : entry.command,
+        output: entry.output.length > 12_000 ? entry.output.slice(-12_000) : entry.output
+      }));
     }
   }
 
@@ -3030,10 +3043,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   async updateUiState(projectId: string, partial: Partial<LocalProjectRecord["localState"]>): Promise<void> {
     const project = this.findProject(projectId);
+    const localStatePatch = {
+      ...partial
+    } as Partial<LocalProjectRecord["localState"]> & { projectId?: string };
+    delete localStatePatch.projectId;
     const previousPauseRequested = project.record.localState.workflowPauseRequested;
     project.record.localState = {
       ...project.record.localState,
-      ...partial,
+      ...localStatePatch,
       lastOpenedAt: nowIso()
     };
     const nextPauseRequested = project.record.localState.workflowPauseRequested;
@@ -4186,6 +4203,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.applyFallbackScopedGoal(project, approvedRecommendation, agent, automate);
   }
 
+  private isRecoverableAgentLaunchError(error: unknown): boolean {
+    const detail = error instanceof Error ? error.message : String(error);
+    return /array buffer allocation failed|codex app-server|transport|model|invalid[_ ]json[_ ]schema|invalid schema|response_format|request failed|systemerror|unavailable/i.test(detail);
+  }
+
   async approveRecommendation(
     projectId: string,
     recommendationId: string,
@@ -4314,18 +4336,53 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return project.record.workflow.scopedGoal;
     }
 
-    await this.createAgent(
-      projectId,
-      "goal",
-      "Goal Agent",
-      this.buildScopedGoalPrompt(project, approvedRecommendation),
-      this.getDefaultAgentModel(),
-      {
-        sandbox: "read-only",
-        outputSchema: this.buildScopedGoalOutputSchema(),
-        initialPhase: "Drafting scoped goal plan"
+    try {
+      await this.createAgent(
+        projectId,
+        "goal",
+        "Goal Agent",
+        this.buildScopedGoalPrompt(project, approvedRecommendation),
+        this.getDefaultAgentModel(),
+        {
+          sandbox: "read-only",
+          outputSchema: this.buildScopedGoalOutputSchema(),
+          initialPhase: "Drafting scoped goal plan"
+        }
+      );
+    } catch (error) {
+      if (!this.isRecoverableAgentLaunchError(error)) {
+        throw error;
       }
-    );
+      const detail = error instanceof Error ? error.message : String(error);
+      const failedAgent = project.record.agents.find((entry) =>
+        entry.category === "goal" &&
+        entry.name === "Goal Agent" &&
+        entry.status !== "completed" &&
+        (entry.workflowCycleNumber === undefined || entry.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+      );
+      if (failedAgent) {
+        failedAgent.status = "failed";
+        failedAgent.completedAt = nowIso();
+        failedAgent.currentPhase = "Goal agent launch failed";
+        failedAgent.lastMessageSnippet = detail.slice(0, 240);
+        reduceAgentRuntimeEvent(failedAgent, {
+          kind: "raw",
+          title: "Goal agent launch failed",
+          detail
+        });
+      }
+      this.diagnostics.unshift(`Goal planning used the deterministic fallback after the goal agent could not start. ${detail}`);
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "failed",
+        title: "Goal agent launch failed; using fallback scoped plan",
+        detail,
+        stepId: "goal_plan",
+        agentId: failedAgent?.id,
+        agentCategory: failedAgent ? "goal" : undefined
+      });
+      await this.applyFallbackScopedGoal(project, approvedRecommendation, failedAgent, automate);
+    }
     return project.record.workflow.scopedGoal;
   }
 

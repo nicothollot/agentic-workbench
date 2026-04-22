@@ -38,9 +38,67 @@ const getStepIdForAgent = (agent: AgentState): RuntimeEventRecord["stepId"] => {
 };
 
 const MAX_EVENT_DETAIL_LENGTH = 8_000;
+const MAX_EVENT_RAW_STRING_LENGTH = 2_000;
+const MAX_EVENT_RAW_ARRAY_LENGTH = 20;
+const MAX_EVENT_RAW_OBJECT_KEYS = 40;
+const MAX_EVENT_RAW_DEPTH = 4;
 
 const capDetail = (value: string, maxLength = MAX_EVENT_DETAIL_LENGTH): string =>
   value.length <= maxLength ? value : value.slice(-maxLength);
+
+const compactRawValue = (value: unknown, depth = 0): unknown => {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.length <= MAX_EVENT_RAW_STRING_LENGTH
+      ? value
+      : `${value.slice(0, MAX_EVENT_RAW_STRING_LENGTH).trimEnd()}...[truncated ${value.length - MAX_EVENT_RAW_STRING_LENGTH} chars]`;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "symbol") {
+    return value.description ? `Symbol(${value.description})` : "Symbol";
+  }
+  if (typeof value === "function") {
+    return `[function ${value.name || "anonymous"}]`;
+  }
+  if (typeof value !== "object") {
+    return "[unserializable raw payload]";
+  }
+  if (depth >= MAX_EVENT_RAW_DEPTH) {
+    return "[truncated nested raw payload]";
+  }
+  if (Array.isArray(value)) {
+    const compacted = value.slice(0, MAX_EVENT_RAW_ARRAY_LENGTH).map((entry) => compactRawValue(entry, depth + 1));
+    if (value.length > MAX_EVENT_RAW_ARRAY_LENGTH) {
+      compacted.push(`[truncated ${value.length - MAX_EVENT_RAW_ARRAY_LENGTH} array item(s)]`);
+    }
+    return compacted;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  const compacted: Record<string, unknown> = {};
+  for (const [key, entry] of entries.slice(0, MAX_EVENT_RAW_OBJECT_KEYS)) {
+    compacted[key] = compactRawValue(entry, depth + 1);
+  }
+  if (entries.length > MAX_EVENT_RAW_OBJECT_KEYS) {
+    compacted.__truncatedKeys = entries.length - MAX_EVENT_RAW_OBJECT_KEYS;
+  }
+  return compacted;
+};
+
+const compactRawPayload = (raw: unknown): unknown => raw === undefined ? undefined : compactRawValue(raw);
+
+export const compactRuntimeEventRecord = (event: RuntimeEventRecord): RuntimeEventRecord => ({
+  ...event,
+  detail: event.detail ? capDetail(event.detail) : event.detail,
+  raw: compactRawPayload(event.raw)
+});
 
 const pushEvent = (
   agent: AgentState,
@@ -61,8 +119,8 @@ const pushEvent = (
     agentCategory: agent.category,
     itemId: options?.itemId,
     title,
-    detail,
-    raw
+    detail: detail ? capDetail(detail) : detail,
+    raw: compactRawPayload(raw)
   });
   agent.lastActivityAt = timestamp;
   if (agent.events.length > 250) {
@@ -122,7 +180,7 @@ const finalizeStreamingEvent = (
   existing.title = title;
   existing.detail = detail ? capDetail(detail, options?.maxLength) : existing.detail;
   existing.status = options?.status ?? "completed";
-  existing.raw = options?.raw ?? existing.raw;
+  existing.raw = options?.raw === undefined ? existing.raw : compactRawPayload(options.raw);
   existing.stepId = getStepIdForAgent(agent);
   existing.agentCategory = agent.category;
   agent.events.unshift(existing);
