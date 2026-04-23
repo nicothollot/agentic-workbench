@@ -110,6 +110,7 @@ import {
   buildAppealRecommendations,
   buildGoalChecklistForAssessment,
   buildGoalChecklistFromUltimateGoal,
+  buildOutcomeStrategyBrief,
   buildWorkflowRecommendations,
   estimateUltimateGoalProgress,
   isVisualProject,
@@ -1453,6 +1454,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Inspect this repository and draft a persistent project charter.",
       "Focus on the long-lived ultimate goal rather than the next implementation step.",
       "Be explicit about success criteria, constraints, and non-goals.",
+      "Write success criteria as observable end-state outcomes that later agents can satisfy one bounded cycle at a time.",
+      "Use the quality bar to describe what makes the final project excellent, not just technically complete.",
+      "Use non-goals to prevent the autonomous cycle from chasing tempting but unnecessary work.",
       "",
       `Project: ${project.record.identity.projectName}`,
       `Overview: ${project.record.overview?.summary ?? project.scan.stats.explanation}`,
@@ -3490,6 +3494,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .map((check) =>
         `- [${check.status}] ${check.title}${check.evidence ? ` -- ${check.evidence}` : ""}`
       );
+    const outcomeStrategyBrief = buildOutcomeStrategyBrief(recommendationContext);
 
     return [
       workflowObjective === "optimize"
@@ -3526,6 +3531,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       customFocus
         ? "Stay tightly anchored to the custom recommendation focus from the operator. Reword it into bounded alternatives and closely related next steps instead of drifting into unrelated repo work."
         : "",
+      "Use the deterministic outcome strategy below as the decision frame. It is guidance, not a license to ignore concrete repository evidence.",
+      outcomeStrategyBrief,
       "",
       `Project: ${project.record.identity.projectName}`,
       `Project kind: ${project.scan.kind}`,
@@ -4080,6 +4087,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .map((check) =>
         `- [${check.status}] ${check.title}${check.evidence ? ` -- ${check.evidence}` : ""}`
       );
+    const outcomeStrategyBrief = buildOutcomeStrategyBrief(this.buildWorkflowRecommendationContext(project), {
+      maxOpenChecks: 4,
+      maxFocusPaths: 4
+    });
 
     return [
       "Turn the approved recommendation into a scoped goal for the next coding pass.",
@@ -4090,6 +4101,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Keep acceptanceCriteria to at most 4 bullets and testStrategy to at most 3 focused checks.",
       "Use the Goal checklist as the completion source of truth. Prefer a scoped plan that turns one unmet or unknown required check into a met check with evidence.",
       "Keep constraints aligned with the Ultimate Goal and the repository boundaries.",
+      "Use the outcome strategy below to keep the scoped plan pointed at the best finished project outcome.",
+      outcomeStrategyBrief,
       "",
       `Project: ${project.record.identity.projectName}`,
       `Ultimate Goal: ${workflow.ultimateGoal.summary}`,
@@ -5115,6 +5128,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private buildWorkflowCodingPrompt(project: LoadedProject, repair = false): string {
     const workflow = this.ensureWorkflowState(project.record);
     const repairStrategy = repair ? buildRepairStrategyContext(workflow, project.record.agents) : undefined;
+    const outcomeStrategyBrief = buildOutcomeStrategyBrief(this.buildWorkflowRecommendationContext(project), {
+      maxOpenChecks: 4,
+      maxFocusPaths: 4
+    });
     const activeGoalChecks = buildGoalChecklistForAssessment({
       workflow,
       agents: project.record.agents
@@ -5150,6 +5167,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ? `Integrity will verify with:\n- ${workflow.scopedGoal.testStrategy.join("\n- ")}`
         : "",
       workflow.ultimateGoal.summary ? `Ultimate Goal: ${workflow.ultimateGoal.summary}` : "",
+      outcomeStrategyBrief,
       activeGoalChecks.length ? `Relevant unmet Goal checks:\n${activeGoalChecks.join("\n")}` : "",
       repairContext.join("\n"),
       "Stay inside the active project folder, run only the most relevant checks for this slice, and summarize what changed."

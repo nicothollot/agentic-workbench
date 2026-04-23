@@ -76,7 +76,8 @@ export const createScopedGoalFromRecommendation = (
   const scopedAcceptanceCriteria = [
     recommendation.summary,
     `Deliver the change in a way that advances the ultimate goal: ${ultimateGoal.summary || "project charter alignment required"}.`,
-    ...inheritedCriteria.map((criterion) => `Maintain or improve: ${criterion}`)
+    ...inheritedCriteria.map((criterion) => `Maintain or improve: ${criterion}`),
+    ultimateGoal.qualityBar ? `Satisfy the quality bar for this slice: ${ultimateGoal.qualityBar}` : ""
   ].filter((entry) => entry.trim().length > 0);
 
   return {
@@ -93,7 +94,10 @@ export const createScopedGoalFromRecommendation = (
       .filter((entry) => entry.length > 0)
       .join("\n\n"),
     acceptanceCriteria: scopedAcceptanceCriteria,
-    constraints: inheritedConstraints,
+    constraints: [
+      ...inheritedConstraints,
+      ...ultimateGoal.nonGoals.slice(0, 2).map((nonGoal) => `Do not spend this cycle on non-goal: ${nonGoal}`)
+    ],
     testStrategy: [
       "Run the relevant deterministic verification commands before considering the task complete.",
       "Verify the implementation satisfies the scoped goal and still aligns with the ultimate goal."

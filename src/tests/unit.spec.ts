@@ -76,6 +76,7 @@ import {
   buildAppealRecommendations,
   buildGoalChecklistForAssessment,
   buildGoalChecklistFromUltimateGoal,
+  buildOutcomeStrategyBrief,
   buildWorkflowRecommendations,
   estimateUltimateGoalProgress,
   isVisualProject
@@ -1033,13 +1034,17 @@ describe("workflow state", () => {
         detailedIntent: "Evolve the dashboard toward explicit workflow state.",
         successCriteria: ["Workflow state is persisted."],
         constraints: ["Keep typed IPC intact."],
+        nonGoals: ["Do not rebuild the transport layer."],
+        qualityBar: "Test-backed changes with clear workflow evidence.",
         confirmedAt: "2026-04-07T00:00:00.000Z"
       }
     );
 
     expect(scopedGoal.summary).toBe("Model workflow approvals explicitly");
     expect(scopedGoal.acceptanceCriteria.some((entry) => entry.includes("Persist approvals"))).toBe(true);
+    expect(scopedGoal.acceptanceCriteria.some((entry) => entry.includes("quality bar"))).toBe(true);
     expect(scopedGoal.constraints).toContain("Keep typed IPC intact.");
+    expect(scopedGoal.constraints).toContain("Do not spend this cycle on non-goal: Do not rebuild the transport layer.");
   });
 
   it("normalizes workflow step progress defaults and clears stale blocked states", () => {
@@ -2586,6 +2591,74 @@ describe("workflow recommendations", () => {
     expect(recommendations.length).toBeGreaterThan(0);
     expect(recommendations[0]?.title).toContain("Satisfy goal check:");
     expect(recommendations[0]?.title).not.toContain("operator feedback");
+  });
+
+  it("builds an outcome strategy brief from the Ultimate Goal and open checklist", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a desktop market analytics dashboard.",
+      detailedIntent: "The finished app should make drawdown and rolling-risk analysis obvious to a portfolio operator.",
+      successCriteria: [
+        "App includes drawdown visualization and recovery analysis",
+        "App includes rolling metrics such as rolling volatility and rolling Sharpe"
+      ],
+      constraints: ["Keep offline mode usable without premium credentials."],
+      nonGoals: ["Do not add brokerage trading or account-linking flows."],
+      qualityBar: "The result should be test-backed, readable, and polished enough for a portfolio review.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+
+    const brief = buildOutcomeStrategyBrief({
+      workflow,
+      agents: [],
+      scan: {
+        kind: "git",
+        files: [
+          { absolutePath: "/repo/src/renderer/App.tsx", relativePath: "src/renderer/App.tsx", size: 4_096, language: "TypeScript" },
+          { absolutePath: "/repo/src/analytics/drawdown.ts", relativePath: "src/analytics/drawdown.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/src/analytics/rollingMetrics.ts", relativePath: "src/analytics/rollingMetrics.ts", size: 2_048, language: "TypeScript" }
+        ],
+        stats: {
+          projectRoot: "/repo",
+          kind: "git",
+          totalFiles: 3,
+          totalFolders: 3,
+          totalSizeBytes: 8_192,
+          includedFiles: 3,
+          includedFolders: 3,
+          includedSizeBytes: 8_192,
+          excludedFiles: 0,
+          excludedFolders: 0,
+          excludedSizeBytes: 0,
+          excludedPaths: [],
+          fileTypeBreakdown: { TypeScript: 3 },
+          languageBreakdown: { TypeScript: 3 },
+          entryPoints: ["src/renderer/App.tsx"],
+          manifestFiles: ["package.json"],
+          testsPresent: true,
+          primaryManagers: ["npm"],
+          explanation: "Small analytics app"
+        },
+        dependencies: []
+      },
+      overview: undefined,
+      objective: "deliver",
+      maxOptions: 5
+    });
+
+    expect(brief).toContain("Outcome strategy:");
+    expect(brief).toContain("Primary next move: Satisfy the highest-impact open goal check");
+    expect(brief).toContain("App includes drawdown visualization");
+    expect(brief).toContain("Quality bar:");
+    expect(brief).toContain("Keep offline mode usable");
+    expect(brief).toContain("Avoid non-goals:");
+    expect(brief).toContain("src/analytics/drawdown.ts");
   });
 
   it("biases deterministic recommendations toward a custom focus", () => {

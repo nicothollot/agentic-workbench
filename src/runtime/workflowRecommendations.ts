@@ -607,6 +607,85 @@ const rankRelevantPaths = (
     .map((entry) => entry.path);
 };
 
+export interface OutcomeStrategyBriefOptions {
+  maxOpenChecks?: number;
+  maxBlockers?: number;
+  maxConstraints?: number;
+  maxNonGoals?: number;
+  maxFocusPaths?: number;
+}
+
+const formatOutcomeBriefList = (values: string[], maxItems: number, emptyLabel: string): string =>
+  values.length
+    ? values.slice(0, maxItems).map((entry) => truncate(normalizeSpace(entry), 150)).join("; ")
+    : emptyLabel;
+
+const goalCheckBriefLine = (check: GoalAttainmentCheck): string =>
+  `${check.title}${check.evidence ? ` (${truncate(normalizeSpace(check.evidence), 96)})` : ""}`;
+
+export const buildOutcomeStrategyBrief = (
+  context: WorkflowRecommendationContext,
+  options: OutcomeStrategyBriefOptions = {}
+): string => {
+  const maxOpenChecks = options.maxOpenChecks ?? 5;
+  const maxBlockers = options.maxBlockers ?? 4;
+  const maxConstraints = options.maxConstraints ?? 4;
+  const maxNonGoals = options.maxNonGoals ?? 3;
+  const maxFocusPaths = options.maxFocusPaths ?? 5;
+  const checklist = buildGoalChecklistForAssessment(context);
+  const checklistProgress = summarizeChecklistProgress(checklist);
+  const openChecks = rankGoalChecksByCompletionImpact(checklistProgress.unmet).slice(0, maxOpenChecks);
+  const openIssues = context.workflow.memory.knownOpenIssues
+    .filter((issue) => issue.status === "open")
+    .map((issue) => `${issue.title}: ${issue.detail}`);
+  const pendingInterventions = context.workflow.humanInterventions
+    .filter((intervention) => intervention.status === "pending")
+    .map((intervention) => `${intervention.title}: ${intervention.description}`);
+  const blockers = [...pendingInterventions, ...openIssues];
+  const recentChangedFiles = collectRecentChangedFiles(context.agents);
+  const focusPaths = rankRelevantPaths(
+    context,
+    recentChangedFiles,
+    openChecks.flatMap((check) => tokenize(`${check.title} ${check.description}`))
+  ).slice(0, maxFocusPaths);
+  const primaryMove = pendingInterventions.length > 0
+    ? "Resolve the pending human intervention before asking agents to guess."
+    : openIssues.length > 0
+      ? "Resolve the highest-severity open workflow issue before starting unrelated improvements."
+      : openChecks.length > 0
+        ? "Satisfy the highest-impact open goal check with direct repository evidence."
+        : context.objective === "optimize"
+          ? "The base goal is complete; choose the next bounded improvement with the best quality payoff."
+          : "No required goal check is currently open; stop new deliver-mode cycles unless a final appeal pass is queued.";
+
+  return [
+    "Outcome strategy:",
+    `- Ultimate target: ${context.workflow.ultimateGoal.summary || "No confirmed summary is available."}`,
+    `- Completion source of truth: ${checklistProgress.met.length}/${checklistProgress.required.length} required goal checks met (${checklistProgress.percentComplete}%).`,
+    `- Primary next move: ${primaryMove}`,
+    openChecks.length
+      ? `- Highest-impact open checks: ${formatOutcomeBriefList(openChecks.map(goalCheckBriefLine), maxOpenChecks, "none")}.`
+      : "- Highest-impact open checks: none.",
+    blockers.length
+      ? `- Current blockers: ${formatOutcomeBriefList(blockers, maxBlockers, "none")}.`
+      : "- Current blockers: none.",
+    context.workflow.ultimateGoal.qualityBar.trim()
+      ? `- Quality bar: ${truncate(normalizeSpace(context.workflow.ultimateGoal.qualityBar), 220)}`
+      : "",
+    context.workflow.ultimateGoal.constraints.length
+      ? `- Preserve constraints: ${formatOutcomeBriefList(context.workflow.ultimateGoal.constraints, maxConstraints, "none")}.`
+      : "",
+    context.workflow.ultimateGoal.nonGoals.length
+      ? `- Avoid non-goals: ${formatOutcomeBriefList(context.workflow.ultimateGoal.nonGoals, maxNonGoals, "none")}.`
+      : "",
+    focusPaths.length
+      ? `- Likely focus paths: ${focusPaths.join(", ")}.`
+      : ""
+  ]
+    .filter((line) => line.trim().length > 0)
+    .join("\n");
+};
+
 const pushDraft = (drafts: RecommendationDraft[], next: RecommendationDraft): void => {
   if (!next.title.trim() || drafts.some((draft) => draft.key === next.key || draft.title === next.title)) {
     return;

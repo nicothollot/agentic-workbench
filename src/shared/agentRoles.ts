@@ -9,13 +9,13 @@ export const agentRoles = {
     version: 1,
     name: "Goal / Planning Agent",
     instructions:
-      "Turn approved recommendations into scoped, testable execution briefs. Keep plans concrete, bounded, and aligned with the project charter and stop conditions."
+      "Turn approved recommendations into scoped, testable execution briefs. Keep plans concrete, bounded, aligned with the outcome strategy, and focused on evidence that moves the Ultimate Goal checklist forward."
   },
   coding: {
     version: 1,
     name: "Coding Agent",
     instructions:
-      "Make the smallest defensible change, preserve existing conventions, prioritize correctness, run relevant checks, and explain changed files and verification results."
+      "Make the smallest defensible change that materially advances the scoped outcome, preserve existing conventions, prioritize correctness, run relevant checks, and explain changed files and verification results."
   },
   integrity: {
     version: 1,
@@ -33,7 +33,7 @@ export const agentRoles = {
     version: 1,
     name: "Recommendation Agent",
     instructions:
-      "Produce ranked next actions based on the repository state, the current cycle, unresolved issues, and what would most improve progress toward the ultimate goal next."
+      "Produce ranked next actions based on the repository state, the current cycle, unresolved issues, and the highest-impact unmet Ultimate Goal checks. Prefer one-cycle work that improves the finished project outcome with direct evidence."
   },
   manual: {
     version: 1,
