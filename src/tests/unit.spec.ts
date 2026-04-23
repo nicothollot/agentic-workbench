@@ -2103,6 +2103,33 @@ describe("workflow guardrails", () => {
     }))).toBeUndefined();
   });
 
+  it("normalizes long checklist recommendation titles before applying breadth limits", () => {
+    const recommendation = sanitizeRecommendationForCycle(makeRecommendation({
+      title: "Satisfy goal check: App shows key performance statistics including returns, volatility, Sharpe ratio, maximum drawdown, beta, correlation, rolling context, benchmark comparison, and risk regime cues",
+      summary: "Gather direct implementation and validation evidence for this required check.",
+      rationale: "The goal checklist blocks completion until this required analytics check has direct repository evidence.",
+      expectedImpact: "This moves an explicit required check toward evidenced completion.",
+      estimatedScope: "small",
+      relatedPaths: [
+        "src/renderer/index.html",
+        "src/shared/performanceStats.ts",
+        "tests/performanceStats.test.ts"
+      ]
+    }));
+
+    expect(recommendation).toMatchObject({
+      summary: "Gather direct implementation and validation evidence for this required check.",
+      estimatedScope: "small",
+      relatedPaths: [
+        "src/renderer/index.html",
+        "src/shared/performanceStats.ts",
+        "tests/performanceStats.test.ts"
+      ]
+    });
+    expect(recommendation?.title.startsWith("Satisfy goal check:")).toBe(true);
+    expect(recommendation?.title.length).toBeLessThanOrEqual(96);
+  });
+
   it("tightens scoped goals to one coding-agent pass", () => {
     const scopedGoal = sanitizeScopedGoalForSingleAgent({
       id: "goal-1",
@@ -2487,6 +2514,78 @@ describe("workflow recommendations", () => {
     expect(recommendations.slice(0, 2).every((entry) => entry.title.startsWith("Satisfy goal check:"))).toBe(true);
     const stabilizeIndex = recommendations.findIndex((entry) => entry.title.startsWith("Stabilize recent work"));
     expect(stabilizeIndex === -1 || stabilizeIndex > 1).toBe(true);
+  });
+
+  it("keeps long unknown checklist items ahead of generic fallback recommendations", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a desktop market analytics dashboard.",
+      detailedIntent: "The app should include computed statistics, rolling analytics, and technical overlays.",
+      successCriteria: [
+        "App shows key performance statistics such as returns, volatility, Sharpe ratio, max drawdown, beta, and correlation",
+        "App includes rolling metrics such as rolling volatility, rolling Sharpe, and rolling correlation",
+        "User can toggle technical overlays such as moving averages and volume-based indicators"
+      ],
+      constraints: ["Keep the app usable without premium data credentials."],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+
+    const stats: ProjectStats = {
+      projectRoot: "/repo",
+      kind: "git",
+      totalFiles: 5,
+      totalFolders: 4,
+      totalSizeBytes: 12_288,
+      includedFiles: 5,
+      includedFolders: 4,
+      includedSizeBytes: 12_288,
+      excludedFiles: 0,
+      excludedFolders: 0,
+      excludedSizeBytes: 0,
+      excludedPaths: [],
+      fileTypeBreakdown: { TypeScript: 4, JSON: 1 },
+      languageBreakdown: { TypeScript: 4, JSON: 1 },
+      entryPoints: ["package.json", "src/main/app.ts"],
+      manifestFiles: ["package.json"],
+      testsPresent: true,
+      primaryManagers: ["npm"],
+      explanation: "Small Electron analytics repo"
+    };
+
+    const recommendations = buildWorkflowRecommendations({
+      workflow,
+      agents: [
+        {
+          ...createAgentSkeleton("coding", "Coding Pass 1", "Stabilize package scripts.", "gpt-5.4"),
+          changedFiles: ["package.json"]
+        }
+      ],
+      scan: {
+        kind: "git",
+        files: [
+          { absolutePath: "/repo/src/main/app.ts", relativePath: "src/main/app.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/src/renderer/index.html", relativePath: "src/renderer/index.html", size: 4_096, language: "HTML" },
+          { absolutePath: "/repo/src/shared/performanceStats.ts", relativePath: "src/shared/performanceStats.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/tests/startupWorkspaceReadiness.test.ts", relativePath: "tests/startupWorkspaceReadiness.test.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/package.json", relativePath: "package.json", size: 1_024, language: "JSON" }
+        ],
+        stats,
+        dependencies: []
+      },
+      overview: undefined,
+      objective: "deliver",
+      maxOptions: 5
+    });
+
+    expect(recommendations.length).toBeGreaterThan(0);
+    expect(recommendations[0]?.title).toContain("Satisfy goal check:");
+    expect(recommendations[0]?.title).not.toContain("operator feedback");
   });
 
   it("biases deterministic recommendations toward a custom focus", () => {

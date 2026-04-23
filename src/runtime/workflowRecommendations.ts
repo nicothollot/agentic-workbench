@@ -715,10 +715,9 @@ const rankedUnmetRequiredGoalChecks = (context: WorkflowRecommendationContext): 
 };
 
 const goalCheckRecommendationSummary = (check: GoalAttainmentCheck): string => {
-  const basis = check.description || check.title;
   return check.status === "unknown"
-    ? `Gather implementation and validation evidence for this required check: ${basis}`
-    : `Fix the unmet required check and update the goal checklist with evidence: ${basis}`;
+    ? "Gather direct implementation and validation evidence for this required check."
+    : "Fix this required check and update the goal checklist with direct evidence.";
 };
 
 const goalCheckRecommendationRationale = (check: GoalAttainmentCheck): string => {

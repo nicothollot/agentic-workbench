@@ -180,10 +180,6 @@ export const isBoundedRecommendation = (
 export const sanitizeRecommendationForCycle = (
   recommendation: WorkflowRecommendationOption
 ): WorkflowRecommendationOption | undefined => {
-  if (!isBoundedRecommendation(recommendation)) {
-    return undefined;
-  }
-
   const normalized: WorkflowRecommendationOption = {
     ...recommendation,
     title: normalizeWhitespace(truncate(recommendation.title, 96)),

@@ -1461,19 +1461,69 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     ].join("\n");
   }
 
-  private extractJsonObject(rawText: string): Record<string, unknown> | undefined {
+  private extractJsonObjects(rawText: string): Array<Record<string, unknown>> {
     const candidate = rawText.trim();
-    const objectStart = candidate.indexOf("{");
-    const objectEnd = candidate.lastIndexOf("}");
-    if (objectStart === -1 || objectEnd === -1 || objectEnd <= objectStart) {
-      return undefined;
+    const parsedObjects: Array<Record<string, unknown>> = [];
+    let objectStart = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = 0; index < candidate.length; index += 1) {
+      const char = candidate[index];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        escaped = inString;
+        continue;
+      }
+
+      if (char === "\"") {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString && (char === "\n" || char === "\r")) {
+        objectStart = -1;
+        depth = 0;
+        inString = false;
+        escaped = false;
+        continue;
+      }
+
+      if (inString) {
+        continue;
+      }
+
+      if (char === "{") {
+        if (depth === 0) {
+          objectStart = index;
+        }
+        depth += 1;
+        continue;
+      }
+
+      if (char === "}" && depth > 0) {
+        depth -= 1;
+        if (depth === 0 && objectStart >= 0) {
+          try {
+            const parsed = JSON.parse(candidate.slice(objectStart, index + 1)) as unknown;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              parsedObjects.push(parsed as Record<string, unknown>);
+            }
+          } catch {
+            // Keep scanning; app-server messages can contain partial or diagnostic JSON fragments.
+          }
+          objectStart = -1;
+        }
+      }
     }
 
-    try {
-      return JSON.parse(candidate.slice(objectStart, objectEnd + 1)) as Record<string, unknown>;
-    } catch {
-      return undefined;
-    }
+    return parsedObjects;
   }
 
   private buildRestrictedSandboxPolicy(
@@ -1698,21 +1748,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private parseUltimateGoalDetectionOutput(rawText: string): UltimateGoal | undefined {
-    const parsed = this.extractJsonObject(rawText);
-    if (!parsed) {
-      return undefined;
+    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+      try {
+        return ultimateGoalSchema.parse({
+          ...parsed,
+          source: "detected",
+          confirmedAt: undefined,
+          lastUpdatedAt: nowIso()
+        });
+      } catch {
+        // Try the next complete object in the message.
+      }
     }
 
-    try {
-      return ultimateGoalSchema.parse({
-        ...parsed,
-        source: "detected",
-        confirmedAt: undefined,
-        lastUpdatedAt: nowIso()
-      });
-    } catch {
-      return undefined;
-    }
+    return undefined;
   }
 
   private async applyUltimateGoalDetectionOutput(project: LoadedProject, agent: AgentState, rawText: string): Promise<boolean> {
@@ -3616,44 +3665,50 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     goalCheckUpdates: GoalCheckUpdateInput[];
     recommendations: ProjectWorkflowState["recommendations"];
   } | undefined {
-    const parsed = this.extractJsonObject(rawText);
-    if (!parsed || typeof parsed.summary !== "string" || !Array.isArray(parsed.recommendations)) {
-      return undefined;
-    }
-
-    try {
-      const recommendations = parsed.recommendations
-        .slice(0, 5)
-        .map((entry, index) => workflowRecommendationOptionSchema.parse({
-          ...(entry as Record<string, unknown>),
-          id: nanoid(),
-          rank: index + 1,
-          estimatedScope: (entry as { estimatedScope?: unknown }).estimatedScope ?? "small",
-          relatedPaths: this.sanitizeRelatedPaths(project, (entry as { relatedPaths?: unknown }).relatedPaths)
-        }))
-        .map((entry) => sanitizeRecommendationForCycle(entry))
-        .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
-        .map((entry, index) => ({
-          ...entry,
-          rank: index + 1
-        }));
-      const ultimateGoalCompletion = this.parseRecommendationCompletionAssessment(
-        (parsed as { ultimateGoalCompletion?: unknown }).ultimateGoalCompletion
-      );
-      if (recommendations.length === 0 && ultimateGoalCompletion?.state !== "goal_satisfied") {
-        return undefined;
+    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+      if (typeof parsed.summary !== "string" || !Array.isArray(parsed.recommendations)) {
+        continue;
       }
 
-      return {
-        summary: parsed.summary.trim(),
-        ultimateGoalProgress: this.parseRecommendationProgress((parsed as { ultimateGoalProgress?: unknown }).ultimateGoalProgress),
-        ultimateGoalCompletion,
-        goalCheckUpdates: this.parseGoalCheckUpdates(project, (parsed as { goalCheckUpdates?: unknown }).goalCheckUpdates),
-        recommendations
-      };
-    } catch {
-      return undefined;
+      try {
+        const ultimateGoalProgress = this.parseRecommendationProgress((parsed as { ultimateGoalProgress?: unknown }).ultimateGoalProgress);
+        const ultimateGoalCompletion = this.parseRecommendationCompletionAssessment(
+          (parsed as { ultimateGoalCompletion?: unknown }).ultimateGoalCompletion
+        );
+        const goalCheckUpdatesPayload = (parsed as { goalCheckUpdates?: unknown }).goalCheckUpdates;
+        if (!ultimateGoalProgress || !ultimateGoalCompletion) {
+          continue;
+        }
+        const recommendations = parsed.recommendations
+          .slice(0, 5)
+          .map((entry, index) => workflowRecommendationOptionSchema.parse({
+            ...(entry as Record<string, unknown>),
+            id: nanoid(),
+            rank: index + 1,
+            estimatedScope: (entry as { estimatedScope?: unknown }).estimatedScope ?? "small",
+            relatedPaths: this.sanitizeRelatedPaths(project, (entry as { relatedPaths?: unknown }).relatedPaths)
+          }))
+          .map((entry) => sanitizeRecommendationForCycle(entry))
+          .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
+          .map((entry, index) => ({
+            ...entry,
+            rank: index + 1
+          }));
+        const goalCheckUpdates = this.parseGoalCheckUpdates(project, goalCheckUpdatesPayload);
+
+        return {
+          summary: parsed.summary.trim(),
+          ultimateGoalProgress,
+          ultimateGoalCompletion,
+          goalCheckUpdates,
+          recommendations
+        };
+      } catch {
+        // Try the next complete object in the message.
+      }
     }
+
+    return undefined;
   }
 
   private recommendationDeduplicationKey(recommendation: ProjectWorkflowState["recommendations"][number]): string {
@@ -4057,21 +4112,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     approvedRecommendation: ApprovedRecommendation,
     rawText: string
   ): ScopedGoal | undefined {
-    const parsed = this.extractJsonObject(rawText);
-    if (!parsed) {
-      return undefined;
+    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+      try {
+        return sanitizeScopedGoalForSingleAgent(scopedGoalSchema.parse({
+          ...parsed,
+          id: nanoid(),
+          sourceRecommendationId: approvedRecommendation.recommendationId,
+          createdAt: nowIso()
+        }));
+      } catch {
+        // Try the next complete object in the message.
+      }
     }
 
-    try {
-      return sanitizeScopedGoalForSingleAgent(scopedGoalSchema.parse({
-        ...parsed,
-        id: nanoid(),
-        sourceRecommendationId: approvedRecommendation.recommendationId,
-        createdAt: nowIso()
-      }));
-    } catch {
-      return undefined;
-    }
+    return undefined;
   }
 
   private async applyScopedGoalState(
@@ -4303,7 +4357,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return approvedRecommendation;
   }
 
-  async createScopedGoal(projectId: string, automate = false) {
+  async createScopedGoal(projectId: string, automate = true) {
     const project = this.findProject(projectId);
     const workflow = this.ensureWorkflowState(project.record);
     const approvedRecommendation = workflow.approvedRecommendation;

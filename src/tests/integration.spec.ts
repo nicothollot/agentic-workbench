@@ -1183,9 +1183,14 @@ describe("integration flows", () => {
       const candidate = service.getState().projects.find((entry) => entry.record.id === selected.record.id);
       return candidate?.record.workflow.scopedGoal ? candidate : null;
     });
+    const codingStarted = await waitFor(() => {
+      const candidate = service.getState().projects.find((entry) => entry.record.id === selected.record.id);
+      return candidate?.record.workflow.stepProgress.coding.runCount ? candidate : null;
+    });
     expect(project?.record.workflow.approvedRecommendation?.recommendationId).toBe(recommendationId);
     expect(project?.record.workflow.scopedGoal?.summary.length).toBeGreaterThan(5);
-    expect(project?.record.workflow.workflowStage).toBe("goal_ready");
+    expect(codingStarted.record.workflow.stepProgress.coding.runCount).toBeGreaterThan(0);
+    expect(codingStarted.record.agents.some((agent) => agent.category === "coding")).toBe(true);
   });
 
   it("blocks the workflow on a pending human intervention and clears the block when resolved", async () => {
@@ -1385,6 +1390,130 @@ describe("integration flows", () => {
     expect(workflow.ultimateGoalProgress?.percentComplete).toBeGreaterThan(0);
     expect(workflow.ultimateGoalProgress?.source).toBe("recommendation");
     expect(workflow.ultimateGoalProgress?.rationale.length).toBeGreaterThan(10);
+  });
+
+  it("parses recommendation output from noisy concatenated JSON messages", async () => {
+    const root = await createSampleRepo("noisy-recommendation-output");
+    const appData = await createTempDir("appdata-noisy-recommendation-output");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+
+    const validPayload = {
+      summary: "The repository needs one bounded architecture slice next.",
+      ultimateGoalProgress: {
+        percentComplete: 48,
+        rationale: "The workflow has evidence for some checks, but data-boundary work is still open."
+      },
+      ultimateGoalCompletion: {
+        state: "needs_more_work",
+        rationale: "Required checks remain open."
+      },
+      recommendations: [
+        {
+          title: "Add a local market-data adapter",
+          summary: "Move deterministic candle fixtures behind a small shared adapter.",
+          rationale: "A data-ingestion boundary makes the next analytics slices easier to verify.",
+          expectedImpact: "This creates direct evidence for separating ingestion from analytics and rendering.",
+          priority: "medium",
+          confidence: 0.78,
+          estimatedScope: "small",
+          riskLevel: "low",
+          relatedPaths: ["src/index.ts", "not-in-project.ts"]
+        }
+      ],
+      goalCheckUpdates: [
+        {
+          action: "update",
+          id: null,
+          title: "Constraint preserved: data ingestion is separated from rendering",
+          description: null,
+          required: true,
+          status: "met",
+          confidence: 0.86,
+          evidence: "src/index.ts is used as deterministic repository evidence in this regression test.",
+          relatedPaths: ["src/index.ts"]
+        }
+      ]
+    };
+    const noisyOutput = [
+      "Partial draft object that should be ignored:",
+      "{\"summary\":\"partial\",\"recommendations\":[],\"ultimateGoalCompletion\":{\"state\":\"needs_more_work\",\"rationale\":\"Not enough data yet.\"}}",
+      JSON.stringify(validPayload),
+      "Trailing diagnostic object that should also be ignored:",
+      "{\"note\":\"ignored\"}"
+    ].join("\n");
+
+    const parsed = (service as any).parseRecommendationOutput(project, noisyOutput);
+
+    expect(parsed?.summary).toBe(validPayload.summary);
+    expect(parsed?.ultimateGoalProgress?.percentComplete).toBe(48);
+    expect(parsed?.recommendations).toHaveLength(1);
+    expect(parsed?.recommendations[0]?.title).toBe("Add a local market-data adapter");
+    expect(parsed?.recommendations[0]?.relatedPaths).toEqual(["src/index.ts"]);
+    expect(parsed?.goalCheckUpdates[0]?.title).toContain("data ingestion");
+  });
+
+  it("retains checklist updates when model recommendations are filtered as too broad", async () => {
+    const root = await createSampleRepo("filtered-recommendation-updates");
+    const appData = await createTempDir("appdata-filtered-recommendation-updates");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+
+    const payload = {
+      summary: "The goal is not satisfied; direct charting evidence is still missing.",
+      ultimateGoalProgress: {
+        percentComplete: 42,
+        rationale: "Required checklist items still need implementation evidence."
+      },
+      ultimateGoalCompletion: {
+        state: "needs_more_work",
+        rationale: "The checklist still has required unmet items."
+      },
+      recommendations: [
+        {
+          title: "Rebuild every analytics, charting, persistence, validation, and provider workflow in one pass",
+          summary: "Touch renderer state, preload wiring, runtime orchestration, data ingestion, analytics computation, chart rendering, validation output, packaging, documentation, and all tests together.",
+          rationale: "This option is intentionally too broad and should be filtered by the cycle guardrail.",
+          expectedImpact: "The parser should keep the checklist updates and let deterministic fallback recommendations take over.",
+          priority: "high",
+          confidence: 0.8,
+          estimatedScope: "large",
+          riskLevel: "high",
+          relatedPaths: [
+            "src/index.ts",
+            "package.json",
+            "README.md",
+            "src/runtime/appService.ts",
+            "src/renderer/App.tsx",
+            "src/preload/index.ts"
+          ]
+        }
+      ],
+      goalCheckUpdates: [
+        {
+          action: "update",
+          id: null,
+          title: "App displays price history with responsive interactive charts across multiple timeframes",
+          description: null,
+          required: true,
+          status: "unmet",
+          confidence: 0.91,
+          evidence: "src/index.ts is the only inspected project file in this regression fixture, so chart evidence is still absent.",
+          relatedPaths: ["src/index.ts"]
+        }
+      ]
+    };
+
+    const parsed = (service as any).parseRecommendationOutput(project, JSON.stringify(payload));
+
+    expect(parsed?.summary).toBe(payload.summary);
+    expect(parsed?.recommendations).toHaveLength(0);
+    expect(parsed?.goalCheckUpdates).toHaveLength(1);
+    expect(parsed?.goalCheckUpdates[0]?.status).toBe("unmet");
   });
 
   it("queues a final appeal recommendation set after a satisfied visual deliver goal", async () => {
@@ -1930,6 +2059,7 @@ describe("integration flows", () => {
     }];
     record.workflow.recommendationsGeneratedAt = new Date().toISOString();
 
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: true });
     await service.approveRecommendation(selected.record.id, "target-rec");
     await service.createScopedGoal(selected.record.id);
     const scopedRecord = await waitFor(() => {
