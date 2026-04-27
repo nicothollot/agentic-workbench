@@ -15,7 +15,7 @@ export const agentRoles = {
     version: 1,
     name: "Coding Agent",
     instructions:
-      "Make the smallest defensible change that materially advances the scoped outcome, preserve existing conventions, prioritize correctness, run relevant checks, and explain changed files and verification results."
+      "Make the largest coherent, reviewable change that materially advances the scoped outcome, preserve existing conventions, prioritize correctness, run relevant checks, and explain changed files and verification results."
   },
   integrity: {
     version: 1,
@@ -33,7 +33,7 @@ export const agentRoles = {
     version: 1,
     name: "Recommendation Agent",
     instructions:
-      "Produce ranked next actions based on the repository state, the current cycle, unresolved issues, and the highest-impact unmet Ultimate Goal checks. Prefer one-cycle work that improves the finished project outcome with direct evidence."
+      "Produce ranked next actions based on the repository state, the current cycle, unresolved issues, and the highest-impact unmet Ultimate Goal checks. Perform checklist governance first: add only necessary required checks, remove redundant or no-longer-applicable checks with evidence, and prefer coherent one-cycle batches that improve the finished project outcome with direct evidence."
   },
   manual: {
     version: 1,

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   agentCategorySchema,
+  agentReasoningModeSchema,
   appSettingsSchema,
   gitHubStatusSchema,
   humanInterventionKindSchema,
@@ -11,6 +12,35 @@ import {
   ultimateGoalSchema,
   validationStatusSchema
 } from "./schemas";
+
+export const credentialEntrySaveRequestSchema = z.object({
+  projectId: z.string().min(1),
+  entryId: z.string().min(1).optional(),
+  providerName: z.string().min(1),
+  keyLabel: z.string().min(1),
+  apiKey: z.string().min(1),
+  secretKey: z.string().optional(),
+  notes: z.string().optional(),
+  status: z.enum(["active", "needs_attention", "disabled"]).default("active"),
+  linkedRequestIds: z.array(z.string().min(1)).default([])
+});
+
+export const credentialEntryDeleteRequestSchema = z.object({
+  projectId: z.string().min(1),
+  entryId: z.string().min(1)
+});
+
+export const credentialRequestUpdateSchema = z.object({
+  projectId: z.string().min(1),
+  requestId: z.string().min(1),
+  status: z.enum(["pending", "fulfilled", "dismissed"]),
+  notes: z.string().optional()
+});
+
+export const credentialRequestSubmitToAgentSchema = z.object({
+  projectId: z.string().min(1),
+  requestId: z.string().min(1)
+});
 
 export const projectLoadRequestSchema = z.object({
   inputPath: z.string().min(1),
@@ -33,7 +63,9 @@ export const createAgentRequestSchema = z.object({
   category: agentCategorySchema,
   name: z.string().min(1),
   prompt: z.string().min(1),
-  model: z.string().min(1)
+  model: z.string().min(1),
+  reasoningMode: agentReasoningModeSchema.optional(),
+  reasoningEffort: interfaceReasoningEffortSchema.optional()
 });
 
 export const approvalDecisionRequestSchema = z.object({
@@ -76,7 +108,7 @@ export const layoutUpdateRequestSchema = z.object({
   leftPanelWidth: z.number().int().positive().optional(),
   rightPanelWidth: z.number().int().positive().optional(),
   bottomPanelHeight: z.number().int().positive().optional(),
-  activeCenterTab: z.enum(["overview", "file", "diff", "reports"]).optional()
+  activeCenterTab: z.enum(["overview", "workflow", "logs", "agents", "credentials", "file", "diff", "reports"]).optional()
 });
 
 export const uiStateUpdateRequestSchema = z.object({
@@ -215,6 +247,10 @@ export type IpcChannel =
   | "project:updateLayout"
   | "project:updateUiState"
   | "project:openProjectShell"
+  | "credentials:saveEntry"
+  | "credentials:deleteEntry"
+  | "credentials:updateRequest"
+  | "credentials:submitRequestToAgent"
   | "workflow:updateUltimateGoal"
   | "workflow:detectUltimateGoal"
   | "workflow:importUltimateGoalText"

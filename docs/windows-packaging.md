@@ -3,16 +3,15 @@
 For personal use on the same machine, run the app from the repo instead of creating a new Windows executable:
 
 ```bash
-npm run build:app
+npm run build
 npm start
 ```
 
-`npm run build:app` compiles the local Electron assets. `npm start` launches those assets through the locally installed Electron runtime.
+`npm run build` compiles the local Electron assets. `npm start` launches those assets through the locally installed Electron runtime.
 
 The project also has packaging commands for producing shareable desktop artifacts from the current source tree:
 
 ```bash
-npm run build
 npm run package:win
 npm run package:mac
 ```
@@ -27,8 +26,8 @@ What the commands do:
 
 Default target selection:
 
-- `npm run build` selects the native one-file package for the current build host.
-- WSL/Linux and native Windows build a Windows portable `.exe`.
+- `npm run build` only compiles the local app assets and does not package a one-file artifact.
+- WSL/Linux and native Windows packaging commands build a Windows portable `.exe`.
 - `npm run package:win` requests the Windows portable `.exe`.
 - `npm run package:mac` requests the macOS `.dmg` and must be run on macOS.
 
@@ -54,7 +53,7 @@ Internal staging output is written under `.electron-builder/` and can be deleted
 Smart App Control can block newly built or unfamiliar `.exe` files. It does not infer that a file is for personal use from product names, repository names, or documentation. If you do not need a one-file Windows executable, use the local workflow:
 
 ```bash
-npm run build:app
+npm run build
 npm start
 ```
 
@@ -70,7 +69,7 @@ The packaging script does not request extra files or secrets for Windows builds.
 
 Windows:
 
-- For personal use from the repo without packaging, run `npm run build:app` and then `npm start`.
+- For personal use from the repo without packaging, run `npm run build` and then `npm start`.
 - Send or run the generated `.exe`.
 - This is a native Windows Electron build. It does not depend on the Linux Electron runtime at launch.
 

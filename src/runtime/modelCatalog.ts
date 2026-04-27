@@ -5,6 +5,29 @@ import type { DiscoveredModel } from "@shared/types";
 const lowerText = (model: Model): string =>
   `${model.model} ${model.displayName} ${model.description}`.toLowerCase();
 
+const gptVersionRank = (model: Model): number | undefined => {
+  const match = lowerText(model).match(/\bgpt-(\d+)(?:\.(\d+))?\b/);
+  if (!match) {
+    return undefined;
+  }
+
+  const major = Number.parseInt(match[1] ?? "", 10);
+  const minor = Number.parseInt(match[2] ?? "0", 10);
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) {
+    return undefined;
+  }
+
+  return major * 100 + minor;
+};
+
+const latestGptVersionRank = (models: Model[]): number | undefined => {
+  const ranks = models.map(gptVersionRank).filter((rank): rank is number => rank !== undefined);
+  return ranks.length ? Math.max(...ranks) : undefined;
+};
+
+const shouldShowModel = (model: Model, latestGptRank: number | undefined): boolean =>
+  !model.hidden || (latestGptRank !== undefined && gptVersionRank(model) === latestGptRank);
+
 const deriveLabels = (model: Model): string[] => {
   const labels = new Set<string>();
   const text = lowerText(model);
@@ -23,6 +46,9 @@ const deriveLabels = (model: Model): string[] => {
   }
   if (model.isDefault) {
     labels.add("default");
+  }
+  if (model.hidden) {
+    labels.add("CLI listed");
   }
 
   return [...labels];
@@ -45,6 +71,10 @@ const interfaceCreationScore = (model: Model): number => {
   if (model.isDefault) {
     score += 8;
   }
+  const versionRank = gptVersionRank(model);
+  if (versionRank !== undefined) {
+    score += versionRank * 100;
+  }
   if (model.supportedReasoningEfforts.some((option) => option.reasoningEffort === "xhigh")) {
     score -= 4;
   }
@@ -53,7 +83,14 @@ const interfaceCreationScore = (model: Model): number => {
 };
 
 export const buildDiscoveredModels = (models: Model[]): DiscoveredModel[] => {
-  const visible = models.filter((model) => !model.hidden);
+  const latestGptRank = latestGptVersionRank(models);
+  const visible = models
+    .filter((model) => shouldShowModel(model, latestGptRank))
+    .sort((left, right) =>
+      interfaceCreationScore(right) - interfaceCreationScore(left)
+      || left.displayName.localeCompare(right.displayName)
+      || left.model.localeCompare(right.model)
+    );
   const recommendedModel = [...visible].sort((left, right) => interfaceCreationScore(right) - interfaceCreationScore(left))[0]?.model;
 
   return visible.map((model) => {

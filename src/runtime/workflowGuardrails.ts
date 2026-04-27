@@ -203,29 +203,30 @@ const normalizeScopedList = (values: string[], limit: number): string[] =>
 export const sanitizeScopedGoalForSingleAgent = (scopedGoal: ScopedGoal): ScopedGoal => {
   const summary = normalizeWhitespace(truncate(scopedGoal.summary, 110));
   const executionBrief = normalizeWhitespace(scopedGoal.executionBrief)
-    ? `${normalizeWhitespace(scopedGoal.executionBrief)}\n\nKeep the work scoped to one coding agent pass. If the recommendation still feels broad, implement the smallest viable slice that advances it cleanly. Do not start unrelated follow-up work.`
-    : "Implement the smallest viable slice of the approved recommendation in one coding agent pass. Do not start unrelated follow-up work.";
+    ? `${normalizeWhitespace(scopedGoal.executionBrief)}\n\nKeep the work scoped to one coherent coding pass. Prefer the largest reviewable batch of related implementation, tests, and evidence that fits the approved recommendation. If the recommendation still feels broad, narrow it to the strongest cohesive batch rather than a tiny evidence-only slice. Do not start unrelated follow-up work.`
+    : "Implement the largest coherent, reviewable batch of the approved recommendation in one coding agent pass. Do not start unrelated follow-up work.";
   const constraints = normalizeScopedList(
     [
       ...scopedGoal.constraints,
-      "Keep this work scoped to one coding agent pass.",
-      "Do not expand the task into a broader multi-phase workflow."
+      "Keep this work scoped to one coherent coding agent pass.",
+      "Batch related checks only when they share implementation paths, tests, or evidence.",
+      "Do not expand the task into an unrelated multi-phase workflow."
     ],
-    4
+    5
   );
   const testStrategy = normalizeScopedList(
     [
       ...scopedGoal.testStrategy,
-      "Run only the smallest relevant deterministic checks for this slice before declaring success."
+      "Run focused deterministic checks for the changed batch, then broader validation if the batch touches shared behavior."
     ],
-    3
+    4
   );
 
   return {
     ...scopedGoal,
     summary,
     executionBrief,
-    acceptanceCriteria: normalizeScopedList(scopedGoal.acceptanceCriteria, 4),
+    acceptanceCriteria: normalizeScopedList(scopedGoal.acceptanceCriteria, 6),
     constraints,
     testStrategy
   };

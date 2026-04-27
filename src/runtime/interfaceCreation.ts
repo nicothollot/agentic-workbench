@@ -265,6 +265,7 @@ export const buildInterfaceCreationTurn = async (input: {
   identity: ProjectIdentity;
   validation: ValidationSnapshot;
   scan: RepoScanResult;
+  considerPaidServices?: boolean;
 }): Promise<{ prompt: string; outputSchema: JsonValue }> => {
   const config = INTERFACE_CREATION_CONFIG;
   const importantFiles = selectImportantFiles(input.scan, config.promptFileLimit);
@@ -354,6 +355,11 @@ export const buildInterfaceCreationTurn = async (input: {
       "Keep the output practical and concise. Prefer 1-3 sentence summaries.",
       "Explain what the project appears to do, how it is organized, what matters first, and the major subsystems.",
       "Include path summaries for the most important files or directories only.",
+      "If the interface appears to require live external data, describe the provider boundary clearly: offline demo/mock mode, live provider adapter mode when local credentials are configured, and explicit empty/loading/error states when credentials are missing.",
+      "For trading, market-data, brokerage, or finance-oriented interfaces, do not assume a single provider. Call out likely provider abstractions and credential needs without placing secrets or machine-specific account data in the portable interface.",
+      input.considerPaidServices
+        ? "Paid external services may be considered only if they are clearly labeled and a free/demo/mock mode remains available."
+        : "Do not make paid API services, subscriptions, billing setup, or credit-card-backed keys part of the required interface path. Prefer no-key, open-data, demo, or free-tier provider options. Free/no-card API keys are acceptable when entered locally through API Keys; do not treat them as secrets that belong in portable interface data.",
       "Return exactly one JSON object that matches the output schema.",
       "Do not wrap the JSON in markdown fences and do not add any commentary before or after it.",
       "Every overview string field must be present and non-empty. Use concise factual text rather than placeholders.",

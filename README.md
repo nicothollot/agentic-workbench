@@ -93,15 +93,17 @@ npm run package:win
 npm run package:mac
 ```
 
-`npm run build` creates the native one-file distributable for the current build host:
+`npm run build` compiles the local Electron app assets only. It does not create or copy a one-file desktop executable.
 
-- WSL/Linux and native Windows emit a Windows portable `.exe`.
-- macOS emits a `.dmg`.
+Use the packaging commands only when you deliberately need a shareable desktop artifact:
+
+- WSL/Linux and native Windows packaging emits a Windows portable `.exe`.
+- macOS packaging emits a `.dmg`.
 
 Windows executable packaging is available for local use. `npm run package:win` and `npm run dist:win` produce the local portable `.exe` without requesting extra files or secrets.
 
-The final `.exe` or `.dmg` is copied into the detected Downloads folder. Under WSL, the script prefers the Windows profile Downloads folder, so this machine resolves to `/mnt/c/Users/nicot/Downloads`.
-Use `AWB_PACKAGE_OUTPUT_DIR=/path/to/output npm run build` to override the destination.
+When a packaging command is used, the final `.exe` or `.dmg` is copied into the detected Downloads folder. Under WSL, the script prefers the Windows profile Downloads folder, so this machine resolves to `/mnt/c/Users/nicot/Downloads`.
+Use `AWB_PACKAGE_OUTPUT_DIR=/path/to/output npm run package:win` to override the destination.
 
 Detailed packaging and test instructions:
 

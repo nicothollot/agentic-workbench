@@ -6,9 +6,14 @@ import type { ServerNotification, ServerRequest } from "@generated/app-server";
 import type { JsonValue } from "@generated/app-server/serde_json/JsonValue";
 import type { SandboxPolicy, ToolRequestUserInputQuestion } from "@generated/app-server/v2";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, USER_INPUT_REQUESTS_PATH } from "@shared/constants";
-import { createAgentSkeleton, createLocalProjectRecord, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
+import { createAgentSkeleton, createLocalProjectRecord, defaultProjectCredentialsState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
 import { agentRoles } from "@shared/agentRoles";
-import { resolveInterfaceCreationReasoningEffort } from "@shared/modelConfig";
+import {
+  DEFAULT_AGENT_REASONING_EFFORTS,
+  DEFAULT_AGENT_REASONING_MODE,
+  resolveAgentReasoningEffort,
+  resolveInterfaceCreationReasoningEffort
+} from "@shared/modelConfig";
 import { executionPathToHostPath, resolveProjectPath } from "@shared/pathUtils";
 import {
   appSettingsSchema,
@@ -21,17 +26,23 @@ import {
 import { SummaryCache } from "@shared/summaryCache";
 import type {
   AgentCategory,
+  AgentReasoningMode,
   AgentState,
   ApprovedRecommendation,
   AppSettings,
   ApprovalDecision,
   ApprovalRequestRecord,
   CodexAvailability,
+  CredentialEntryMetadata,
+  CredentialEntryStatus,
+  CredentialRequestRecord,
+  CredentialRequestStatus,
   DiscoveredModel,
   GitHubStatus,
   GoalAttainmentCheck,
   HumanInterventionRecord,
   InterfaceCandidate,
+  InterfaceReasoningEffort,
   LoadedProjectView,
   LocalProjectRecord,
   OpenProjectShellResult,
@@ -77,6 +88,7 @@ import {
 } from "./git";
 import { shouldAutoApproveApproval } from "./approvalPolicy";
 import { CodexAppServerTransport, type CodexTransport } from "./codexTransport";
+import { updateCodexCliIfAvailable } from "./codexUpdate";
 import { RuntimeCommandExecutor, resolveExecutionMode } from "./execution";
 import { ensureGitHubRepositoryForCreation, getGitHubStatus, isGitHubRemote } from "./github";
 import { sha256 } from "./hashUtils";
@@ -101,9 +113,16 @@ import {
 } from "./projectBoundary";
 import { hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult } from "./repoScanner";
 import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
-import { WorkbenchStorage } from "./storage";
+import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
 import { readUltimateGoalTextImport } from "./ultimateGoalImport";
 import { buildProjectShellHandoffPrompt, openProjectShellWindow } from "./projectShell";
+import {
+  createAgentContextDescriptor,
+  createWorkflowContextDescriptor,
+  formatRelevantContextForPrompt,
+  pruneWorkflowContextDescriptors,
+  selectRelevantWorkflowContext
+} from "./contextSelector";
 import {
   assessUltimateGoalCompletion,
   applyGoalChecklistUpdates,
@@ -145,6 +164,36 @@ const writeEnabledAgentCategories = new Set<AgentCategory>(["coding", "manual"])
 const isWriteEnabledAgentCategory = (category: AgentCategory): boolean => writeEnabledAgentCategories.has(category);
 const activeAgentStatuses = new Set<AgentState["status"]>(["starting", "running", "waiting_approval"]);
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
+const MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH = 1_200;
+const MAX_PROMPT_DETAIL_LENGTH = 280;
+const STATE_EMIT_THROTTLE_MS = 100;
+const LIVE_PROJECT_SAVE_THROTTLE_MS = 750;
+const liveTransportUpdateMethods = new Set<string>([
+  "item/agentMessage/delta",
+  "item/plan/delta",
+  "item/reasoning/summaryTextDelta",
+  "item/reasoning/textDelta",
+  "command/exec/outputDelta",
+  "item/commandExecution/outputDelta",
+  "item/fileChange/outputDelta"
+]);
+
+const compactText = (value: string, maxLength: number): string => {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return normalized.length <= maxLength
+    ? normalized
+    : `${normalized.slice(0, Math.max(0, maxLength - 24)).trimEnd()}...[truncated]`;
+};
+
+interface AgentCredentialCapture {
+  providerName: string;
+  keyLabel: string;
+  apiKey: string;
+  secretKey?: string;
+  notes?: string;
+  freeTier?: boolean;
+}
+
 const userDerivedGoalCheckSources = new Set<GoalAttainmentCheck["source"]>(["success_criterion", "quality_bar", "constraint"]);
 const weakGoalEvidenceStopwords = new Set([
   "accepted",
@@ -204,11 +253,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly workflowAutomationInFlight = new Set<string>();
   private readonly workflowAutomationQueued = new Set<string>();
   private pendingStateEmitTimer?: ReturnType<typeof setTimeout>;
+  private readonly pendingProjectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private suppressTransportExitHandling = false;
 
-  constructor(private readonly appDataDir: string) {
+  constructor(
+    private readonly appDataDir: string,
+    secretCodec?: SecretStorageCodec
+  ) {
     super();
-    this.storage = new WorkbenchStorage(appDataDir);
+    this.storage = new WorkbenchStorage(appDataDir, secretCodec);
   }
 
   private emitState(): void {
@@ -219,8 +272,41 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.pendingStateEmitTimer = setTimeout(() => {
       this.pendingStateEmitTimer = undefined;
       this.emit("stateChanged", this.getState());
-    }, 16);
+    }, STATE_EMIT_THROTTLE_MS);
     this.pendingStateEmitTimer.unref?.();
+  }
+
+  private scheduleProjectSave(project: LoadedProject): void {
+    const projectId = project.record.id;
+    if (this.pendingProjectSaveTimers.has(projectId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingProjectSaveTimers.delete(projectId);
+      void this.saveProject(project).catch((error) => {
+        this.diagnostics.unshift(
+          `Failed to save live project state for ${project.record.identity.projectName}. ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+    }, LIVE_PROJECT_SAVE_THROTTLE_MS);
+    timer.unref?.();
+    this.pendingProjectSaveTimers.set(projectId, timer);
+  }
+
+  private async flushScheduledProjectSaves(): Promise<void> {
+    const pendingProjectIds = [...this.pendingProjectSaveTimers.keys()];
+    for (const projectId of pendingProjectIds) {
+      const timer = this.pendingProjectSaveTimers.get(projectId);
+      if (timer) {
+        clearTimeout(timer);
+        this.pendingProjectSaveTimers.delete(projectId);
+      }
+      const project = this.projects.get(projectId);
+      if (project) {
+        await this.saveProject(project);
+      }
+    }
   }
 
   private getRuntimeSettings(distroName = this.settings.distroName): Pick<AppSettings, "executionMode" | "distroName"> {
@@ -284,6 +370,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ...record.workflow
       },
       userInputRequests: record.userInputRequests ?? [],
+      credentials: {
+        ...defaultProjectCredentialsState(),
+        ...record.credentials,
+        entries: record.credentials?.entries ?? [],
+        requests: record.credentials?.requests ?? []
+      },
       hostPath,
       distroName
     };
@@ -318,6 +410,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       perCycleSummaries: workflow.memory?.perCycleSummaries ?? defaults.memory.perCycleSummaries,
       lastAcceptedDecisions: workflow.memory?.lastAcceptedDecisions ?? defaults.memory.lastAcceptedDecisions,
       knownOpenIssues: workflow.memory?.knownOpenIssues ?? defaults.memory.knownOpenIssues,
+      contextDescriptors: workflow.memory?.contextDescriptors ?? defaults.memory.contextDescriptors,
+      lastRelevantContext: workflow.memory?.lastRelevantContext ?? defaults.memory.lastRelevantContext,
       agentFreshness: {
         ...defaults.memory.agentFreshness,
         ...workflow.memory?.agentFreshness
@@ -326,10 +420,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.humanInterventions ??= [];
     workflow.recommendations ??= [];
     workflow.activityLog ??= [];
+    workflow.activityLog = workflow.activityLog.slice(0, 400).map((event) => ({
+      ...event,
+      detail: event.detail ? compactText(event.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : event.detail
+    }));
     workflow.goalChecklist = hasMeaningfulUltimateGoal(workflow.ultimateGoal)
       ? buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, workflow.goalChecklist ?? [])
       : workflow.goalChecklist ?? [];
     record.userInputRequests ??= [];
+    record.credentials = {
+      ...defaultProjectCredentialsState(),
+      ...record.credentials,
+      entries: record.credentials?.entries ?? [],
+      requests: record.credentials?.requests ?? []
+    };
     this.syncWorkflowSettings(workflow);
     workflow.stepProgress = ensureWorkflowStepProgressState({
       stepProgress: workflow.stepProgress,
@@ -349,6 +453,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.workflowBudgets.maxRepairLoops = this.settings.maxRepairCycles;
     workflow.repair.maxAttempts = this.settings.maxRepairCycles;
     workflow.repairLoopCount = workflow.repair.attemptCount;
+  }
+
+  private buildExternalServiceCostPolicyInstructions(): string {
+    if (this.settings.considerPaidServices) {
+      return [
+        "External service policy: free/no-card APIs and API keys are allowed when they materially improve required functionality.",
+        "When a credential is needed, implement the provider adapter plus demo/mock and missing-credential states, then request the credential through the user-input/API Keys flow with the secret field marked secret.",
+        "Paid services may be considered, but mark them clearly and keep a free/demo/mock path available when practical. Never create billing commitments automatically. Any paid account, billing, or credit-card step must become an explicit user-visible request."
+      ].join(" ");
+    }
+
+    return [
+      "External service policy: free/no-card APIs and API keys are allowed when they materially improve required functionality.",
+      "Prefer no-key, unauthenticated, open-data, demo, or free-tier providers when they fit, but do not avoid a real API solely because it needs a free/no-card key.",
+      "If a free/no-card credential is needed, implement the provider adapter plus demo/mock and missing-credential states, then request the credential through the user-input/API Keys flow with the secret field marked secret.",
+      "Do not require paid API services, subscription plans, billing setup, or credit-card-backed keys."
+    ].join(" ");
   }
 
   private resetWorkflowRepairState(workflow: ProjectWorkflowState): void {
@@ -385,7 +506,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.activityLog.unshift({
       id: nanoid(),
       timestamp: nowIso(),
-      ...entry
+      ...entry,
+      detail: entry.detail ? compactText(entry.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : entry.detail
     });
     if (workflow.activityLog.length > 400) {
       workflow.activityLog.length = 400;
@@ -399,6 +521,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const previous = workflow.activityLog[0];
+    if (
+      previous?.agentId === agent.id &&
+      previous.title === latestEvent.title &&
+      previous.status === (latestEvent.status ?? "info") &&
+      latestEvent.status === "running"
+    ) {
+      previous.timestamp = latestEvent.timestamp;
+      previous.detail = latestEvent.detail ? compactText(latestEvent.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : latestEvent.detail;
+      previous.stepId = latestEvent.stepId;
+      previous.agentCategory = agent.category;
+      return;
+    }
+
     if (
       previous?.agentId === agent.id &&
       previous.timestamp === latestEvent.timestamp &&
@@ -655,6 +790,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.memory.perCycleSummaries = workflow.memory.perCycleSummaries.slice(0, workflow.workflowBudgets.maxCycleSummaries);
     workflow.memory.lastAcceptedDecisions = workflow.memory.lastAcceptedDecisions.slice(0, workflow.workflowBudgets.maxAcceptedDecisions);
     workflow.memory.knownOpenIssues = workflow.memory.knownOpenIssues.slice(0, workflow.workflowBudgets.maxOpenIssues);
+    workflow.memory.contextDescriptors = pruneWorkflowContextDescriptors(workflow.memory.contextDescriptors, 80);
+    workflow.memory.lastRelevantContext = workflow.memory.lastRelevantContext.slice(0, 8);
     workflow.recommendations = workflow.recommendations.slice(0, workflow.workflowBudgets.maxRecommendationOptions);
   }
 
@@ -675,6 +812,68 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     ].filter((entry, index, list) => entry.trim().length > 0 && list.indexOf(entry) === index);
 
     this.pruneWorkflowMemory(workflow);
+  }
+
+  private recordWorkflowContextDescriptor(
+    workflow: ProjectWorkflowState,
+    input: {
+      agentCategory: AgentCategory;
+      summary: string;
+      changedPaths?: string[];
+      relatedPaths?: string[];
+    }
+  ): void {
+    const descriptor = createWorkflowContextDescriptor({
+      workflow,
+      agentCategory: input.agentCategory,
+      summary: input.summary,
+      changedPaths: input.changedPaths,
+      relatedPaths: input.relatedPaths
+    });
+    workflow.memory.contextDescriptors = pruneWorkflowContextDescriptors([
+      descriptor,
+      ...workflow.memory.contextDescriptors.filter((entry) => entry.id !== descriptor.id)
+    ], 80);
+  }
+
+  private recordAgentContextDescriptor(project: LoadedProject, agent: AgentState): void {
+    if (agent.status !== "completed" && agent.status !== "failed" && agent.status !== "conflicted") {
+      return;
+    }
+
+    const workflow = this.ensureWorkflowState(project.record);
+    if (workflow.memory.contextDescriptors.some((entry) => entry.id === `agent:${agent.id}`)) {
+      return;
+    }
+
+    const descriptor = {
+      ...createAgentContextDescriptor(workflow, agent),
+      id: `agent:${agent.id}`
+    };
+    workflow.memory.contextDescriptors = pruneWorkflowContextDescriptors([
+      descriptor,
+      ...workflow.memory.contextDescriptors.filter((entry) => entry.id !== descriptor.id)
+    ], 80);
+  }
+
+  private selectAndRememberRelevantContext(
+    project: LoadedProject,
+    agentCategory: AgentCategory,
+    taskText: string,
+    relatedPaths: string[] = []
+  ): string {
+    const workflow = this.ensureWorkflowState(project.record);
+    const selections = selectRelevantWorkflowContext(workflow.memory.contextDescriptors, {
+      workflow,
+      agentCategory,
+      taskText,
+      relatedPaths
+    }, {
+      maxEntries: 5,
+      maxChars: 2600
+    });
+    workflow.memory.lastRelevantContext = selections;
+    return formatRelevantContextForPrompt(selections);
   }
 
   private recordAcceptedDecision(
@@ -1245,6 +1444,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       openIssueIds: workflow.memory.knownOpenIssues.filter((issue) => issue.status === "open").map((issue) => issue.id),
       createdAt: nowIso()
     });
+    this.recordWorkflowContextDescriptor(workflow, {
+      agentCategory: "merge",
+      summary: [
+        workflow.scopedGoal?.summary,
+        workflow.approvedRecommendation?.title,
+        `Cycle ${workflow.workflowCycle.cycleNumber} completed.`
+      ].filter(Boolean).join(" "),
+      changedPaths: project.record.agents
+        .filter((agent) => agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+        .flatMap((agent) => agent.changedFiles),
+      relatedPaths: [
+        ...(workflow.approvedRecommendation?.relatedPaths ?? []),
+        ...(workflow.scopedGoal?.acceptanceCriteria ?? [])
+      ]
+    });
     if (workflow.appeal.status === "running") {
       workflow.appeal = {
         ...workflow.appeal,
@@ -1370,12 +1584,68 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.diagnostics.unshift(
         `Workflow automation paused. ${error instanceof Error ? error.message : String(error)}`
       );
+      await this.recoverWorkflowAutomationError(projectId, error);
       this.emitState();
     } finally {
       this.workflowAutomationInFlight.delete(projectId);
       if (this.workflowAutomationQueued.delete(projectId)) {
         this.scheduleWorkflowAutomation(projectId);
       }
+    }
+  }
+
+  private async recoverWorkflowAutomationError(projectId: string, error: unknown): Promise<void> {
+    const project = this.projects.get(projectId);
+    if (!project) {
+      return;
+    }
+
+    const workflow = this.ensureWorkflowState(project.record);
+    const detail = error instanceof Error ? error.message : String(error);
+    const approvedRecommendation = workflow.approvedRecommendation;
+    if (approvedRecommendation && !workflow.scopedGoal && this.isRecoverableAgentLaunchError(error)) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "failed",
+        title: "Goal planning recovered with fallback",
+        detail,
+        stepId: "goal_plan"
+      });
+      await this.applyFallbackScopedGoal(project, approvedRecommendation, undefined, true);
+      return;
+    }
+
+    const activeInterruptedAgents = project.record.agents.filter((agent) =>
+      agent.category !== "manual" &&
+      isAgentActive(agent) &&
+      (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+    );
+    if (activeInterruptedAgents.length > 0 && this.isRecoverableAgentLaunchError(error)) {
+      for (const agent of activeInterruptedAgents) {
+        this.markAgentDisconnected(project, agent, `Agent startup or transport request failed. ${detail}`);
+      }
+      project.record.localState.workflowPauseRequested = true;
+      this.resetWorkflowAfterInterruptedAgents(project, activeInterruptedAgents, { markRecoveryHandled: true });
+      this.recordWorkflowActivity(workflow, {
+        source: "system",
+        status: "waiting",
+        title: "Workflow automation paused after agent startup failed",
+        detail,
+        stepId: getWorkflowActiveStepId(workflow)
+      });
+      await this.persistProjectUpdate(project, false);
+      return;
+    }
+
+    if (this.requeueStaleRunningWorkflowSteps(project)) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: "Automation step requeued after runtime error",
+        detail,
+        stepId: getWorkflowActiveStepId(workflow)
+      });
+      await this.persistProjectUpdate(project, true);
     }
   }
 
@@ -1577,6 +1847,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       sandbox === "workspace-write"
         ? "- Any edits, generated files, and command side effects must remain inside the active project root."
         : "- This is a read-only thread. Do not request write access or permissions for anything outside the active project root.",
+      `- ${this.buildExternalServiceCostPolicyInstructions()}`,
+      "- If you independently obtain a legitimate free/no-card credential for this project, do not write it into files. Report it once as AGENT_WORKBENCH_CREDENTIAL {\"providerName\":\"Provider\",\"keyLabel\":\"API key\",\"apiKey\":\"value\",\"secretKey\":\"optional\",\"freeTier\":true,\"notes\":\"where it came from\"}. Do not use this for paid, invented, scraped, or unrelated secrets.",
       "- If the information you want appears to live outside the project root, stop and explain that the workflow boundary forbids it."
     ].join("\n");
   }
@@ -1806,7 +2078,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Inspect the repository and draft the persistent project charter using structured output.",
       this.getDefaultAgentModel()
     );
-    agent.reasoningEffort = this.resolveReasoningEffortForModel(agent.model);
+    const reasoningConfig = this.resolveAgentReasoningEffortForTask("goal", agent.model, `${agent.name}\n\n${agent.taskPrompt}`);
+    agent.reasoningEffort = reasoningConfig.effort;
+    agent.reasoningEffortSource = reasoningConfig.source;
     agent.taskPrompt = `${agentRoles.goal.instructions}\n\n${agent.taskPrompt}`;
     agent.status = "starting";
     agent.currentPhase = "Detecting ultimate goal";
@@ -1891,6 +2165,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     await this.refreshGitHubStatus(false);
+    await this.updateCodexCliOnStartup();
     await this.initializeTransport();
 
     const records = await this.storage.loadAllProjects();
@@ -1950,6 +2225,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.emitState();
   }
 
+  private async updateCodexCliOnStartup(): Promise<void> {
+    if (this.settings.mockMode) {
+      return;
+    }
+
+    const result = await updateCodexCliIfAvailable(this.settings);
+    if (result.status === "updated") {
+      this.diagnostics.unshift(result.message);
+      return;
+    }
+    if (result.status === "failed") {
+      this.diagnostics.unshift(`${result.message} Continuing with the installed Codex CLI.`);
+    }
+  }
+
   async dispose(): Promise<void> {
     this.threadToAgent.clear();
     this.interfaceCreationRepairAttempts.clear();
@@ -1957,6 +2247,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       clearTimeout(this.pendingStateEmitTimer);
       this.pendingStateEmitTimer = undefined;
     }
+    await this.flushScheduledProjectSaves();
     if (!this.transport) {
       return;
     }
@@ -2039,12 +2330,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   async updateSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
     const previousSettings = this.settings;
+    const agentReasoningEfforts = {
+      ...DEFAULT_AGENT_REASONING_EFFORTS,
+      ...(this.settings.agentReasoningEfforts ?? {}),
+      ...(partial.agentReasoningEfforts ?? {})
+    };
     const nextSettings = {
       ...this.settings,
       ...partial,
+      agentReasoningMode: partial.agentReasoningMode ?? this.settings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE,
+      agentReasoningEfforts,
       interfaceCreationConfiguredAt:
         partial.interfaceCreationModel !== undefined ||
-        partial.interfaceCreationReasoningEffort !== undefined
+        partial.interfaceCreationReasoningEffort !== undefined ||
+        partial.agentReasoningMode !== undefined ||
+        partial.agentReasoningEfforts !== undefined
           ? partial.interfaceCreationConfiguredAt ?? this.settings.interfaceCreationConfiguredAt ?? nowIso()
           : this.settings.interfaceCreationConfiguredAt
     };
@@ -2060,8 +2360,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.restartTransportIfNeeded(previousSettings, nextSettings);
     const repairLimitChanged = previousSettings.maxRepairCycles !== nextSettings.maxRepairCycles;
     const reasoningChanged = previousSettings.interfaceCreationReasoningEffort !== nextSettings.interfaceCreationReasoningEffort;
+    const agentReasoningChanged =
+      (previousSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) !== (nextSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) ||
+      JSON.stringify(previousSettings.agentReasoningEfforts ?? {}) !== JSON.stringify(nextSettings.agentReasoningEfforts ?? {});
     const modelChanged = previousSettings.interfaceCreationModel !== nextSettings.interfaceCreationModel;
-    if (repairLimitChanged || reasoningChanged || modelChanged) {
+    if (repairLimitChanged || reasoningChanged || agentReasoningChanged || modelChanged) {
       const interfaceConfig = this.resolveInterfaceCreationConfig();
       for (const project of this.projects.values()) {
         const workflow = this.ensureWorkflowState(project.record);
@@ -2075,6 +2378,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         if (bootstrapAgent) {
           bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
           bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+          bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
         }
         if (repairLimitChanged && this.resumeRepairIfLimitExpanded(project, previousSettings.maxRepairCycles)) {
           await this.persistProjectUpdate(project, true);
@@ -2451,6 +2755,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         interfaceConfig.model ?? "unavailable"
       );
       bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+      bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
       project.record.agents.unshift(bootstrapAgent);
     }
 
@@ -2528,16 +2833,45 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return resolveInterfaceCreationReasoningEffort(modelRecord, this.settings.interfaceCreationReasoningEffort);
   }
 
+  private resolveAgentReasoningEffortForTask(
+    category: AgentCategory,
+    model: string | undefined,
+    taskPrompt: string,
+    mode = this.settings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE,
+    manualEffort?: InterfaceReasoningEffort
+  ): { effort: InterfaceReasoningEffort; source: AgentReasoningMode } {
+    const modelRecord = this.availableModels.find((entry) => entry.model === model);
+    const resolvedMode = mode ?? DEFAULT_AGENT_REASONING_MODE;
+    const configuredManualEffort =
+      manualEffort ??
+      this.settings.agentReasoningEfforts?.[category] ??
+      (category === "bootstrap" ? this.settings.interfaceCreationReasoningEffort : undefined) ??
+      DEFAULT_AGENT_REASONING_EFFORTS[category];
+    return {
+      effort: resolveAgentReasoningEffort(modelRecord, category, taskPrompt, resolvedMode, configuredManualEffort),
+      source: resolvedMode
+    };
+  }
+
   private resolveInterfaceCreationConfig(): {
     model?: string;
-    reasoningEffort?: "low" | "medium" | "high" | "xhigh";
+    reasoningEffort?: InterfaceReasoningEffort;
+    reasoningMode: AgentReasoningMode;
     source: "user" | "recommended";
   } {
     const selectedModel = this.resolveInterfaceCreationModel();
     const modelRecord = this.availableModels.find((entry) => entry.model === selectedModel.model);
+    const reasoningConfig = this.resolveAgentReasoningEffortForTask(
+      "bootstrap",
+      selectedModel.model,
+      "Create a repository interface with architecture, important paths, and onboarding context."
+    );
     return {
       ...selectedModel,
-      reasoningEffort: resolveInterfaceCreationReasoningEffort(modelRecord, this.settings.interfaceCreationReasoningEffort)
+      reasoningMode: reasoningConfig.source,
+      reasoningEffort: modelRecord
+        ? reasoningConfig.effort
+        : resolveInterfaceCreationReasoningEffort(modelRecord, this.settings.interfaceCreationReasoningEffort)
     };
   }
 
@@ -2817,6 +3151,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         selectedConfig.model ?? "unavailable"
       );
       bootstrapAgent.reasoningEffort = selectedConfig.reasoningEffort;
+      bootstrapAgent.reasoningEffortSource = selectedConfig.reasoningMode;
       record.agents.unshift(bootstrapAgent);
     }
 
@@ -2855,6 +3190,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private async saveProject(project: LoadedProject): Promise<void> {
     this.compactProjectRuntimeHistory(project);
+    for (const agent of project.record.agents) {
+      this.recordAgentContextDescriptor(project, agent);
+    }
     this.syncWorkflowState(project);
     project.record.summaryCache = project.summaryCache.list();
     await this.storage.saveProject(project.record);
@@ -3029,6 +3367,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       );
     bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
     bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+    bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
     this.resetAgentForFreshRun(bootstrapAgent, "Queued for repository refresh");
     if (!project.record.agents.some((agent) => agent.id === bootstrapAgent.id)) {
       project.record.agents.unshift(bootstrapAgent);
@@ -3474,10 +3813,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const openIssues = workflow.memory.knownOpenIssues
       .filter((issue) => issue.status === "open")
       .slice(0, 5)
-      .map((issue) => `- ${issue.title}: ${issue.detail}`);
+      .map((issue) => `- ${issue.title}: ${compactText(issue.detail, MAX_PROMPT_DETAIL_LENGTH)}`);
     const recentActivity = workflow.activityLog
       .slice(0, 8)
-      .map((event) => `- [${event.source}] ${event.title}${event.detail ? `: ${event.detail}` : ""}`);
+      .map((event) => `- [${event.source}] ${event.title}${event.detail ? `: ${compactText(event.detail, MAX_PROMPT_DETAIL_LENGTH)}` : ""}`);
     const recentChangedFiles = [...new Set(
       project.record.agents
         .slice()
@@ -3492,9 +3831,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .filter((check) => check.required)
       .slice(0, 24)
       .map((check) =>
-        `- [${check.status}] ${check.title}${check.evidence ? ` -- ${check.evidence}` : ""}`
+        `- [${check.status}] ${check.title}${check.evidence ? ` -- ${compactText(check.evidence, MAX_PROMPT_DETAIL_LENGTH)}` : ""}`
       );
     const outcomeStrategyBrief = buildOutcomeStrategyBrief(recommendationContext);
+    const relevantPriorContext = this.selectAndRememberRelevantContext(
+      project,
+      "recommendation",
+      [
+        customFocus ?? "",
+        workflow.ultimateGoal.summary,
+        workflow.ultimateGoal.detailedIntent,
+        workflow.approvedRecommendation?.title ?? "",
+        workflow.scopedGoal?.summary ?? "",
+        goalChecklist.join("\n"),
+        openIssues.join("\n")
+      ].join("\n"),
+      recentChangedFiles
+    );
 
     return [
       workflowObjective === "optimize"
@@ -3512,13 +3865,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : appealPassPending
           ? "Return 1 to 3 recommendations for the final appeal pass."
         : "Return 0 to 5 recommendations.",
-      "Every recommendation must be a small, concrete, single-cycle task. Break work down. Do not propose a large rewrite, a broad audit, or multiple unrelated actions in one recommendation.",
-      "Prefer recommendations that are easy for a coding agent to execute and for an integrity agent to verify in one cycle.",
+      "Every recommendation must be a concrete, single-cycle task. Prefer the largest coherent reviewable batch when related Goal checks share implementation paths, tests, or evidence; split unrelated work apart.",
+      "Prefer recommendations that are easy for a coding agent to execute and for an integrity agent to verify in one cycle, even when the recommendation covers a small batch of related checks.",
       "When any required Goal checklist item is unmet or unknown, rank direct work on those checklist items ahead of generic stabilization, package-script cleanup, operator-feedback tweaks, or recently changed file follow-up unless there is an explicit open blocker.",
-      "For checklist work, recommend the option that can most directly move one required check from unmet/unknown to met with repository evidence. Avoid claiming a feature check is satisfied through unrelated harness or package-only work.",
-      "Default to small scope. Only use medium scope when the task is still clearly doable by one coding agent in one pass.",
-      "Do not recommend end-to-end milestones, phase-wide deliverables, or umbrella workflows.",
-      "Maintain the Goal checklist. You may add a required check, mark a check unmet/unknown if evidence shows it is not actually done, or mark a check met only when repository evidence or validation output supports it.",
+      "For checklist work, recommend the option that can most directly move one coherent group of related required checks from unmet/unknown to met with repository evidence. Avoid claiming a feature check is satisfied through unrelated harness or package-only work.",
+      "Default to medium scope for cohesive batches of 2-4 related checks, and small scope for a true single-check task. Large scope should still be avoided.",
+      "Do not recommend end-to-end milestones, phase-wide deliverables, or umbrella workflows that mix unrelated areas.",
+      "When a generated or improved interface needs live external data, recommend a provider abstraction with explicit offline demo/mock mode, live adapter mode when credentials are configured, and missing-credentials loading/error/empty states. Do not silently replace needed live data with local-only mock data.",
+      "For trading, brokerage, market-data, analytics, or finance interfaces, do not hardcode one provider unless the user chose it. If a free/no-card API key would unlock the live feature, recommend implementing the adapter and creating a credential request instead of settling for mock-only behavior; paid credentials require explicit operator choice.",
+      "Before ranking implementation work, perform a Goal checklist governance pass. Decide whether the current checklist is complete, missing an absolutely necessary required check, or carrying redundant/unnecessary checks that should no longer block completion.",
+      "Add a new required checklist item only when it is indispensable to the stated Ultimate Goal or an explicit safety/security constraint and is not already covered by an existing check. Do not add speculative nice-to-have work as required.",
+      "When two or more checklist items describe the same obligation, update the strongest existing item and include remove updates for redundant duplicates. For user-derived checks, remove means mark not_applicable with evidence rather than silently deleting the operator's intent.",
+      "If repository evidence shows a checklist item is unnecessary, impossible under the stated non-goals, or redundant with a more precise check, return a goalCheckUpdates entry with action remove, status not_applicable, and concrete rationale.",
+      "Maintain the Goal checklist. You may add a required check, mark a check unmet/unknown if evidence shows it is not actually done, mark a check met only when repository evidence or validation output supports it, or remove/not-applicable checks when they are redundant or no longer necessary.",
       "Do not mark the Ultimate Goal satisfied unless every required Goal checklist item is met and no open blockers remain. Accepted decisions, completed cycles, and passing tests for a small slice are not enough by themselves.",
       "Return goalCheckUpdates as an array every time, even when it is empty. Return one update for every checklist status you add or change. Each met check must include concrete evidence.",
       "Estimate completion from required Goal checklist items only: percentComplete is met required checks divided by total required checks.",
@@ -3533,6 +3892,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : "",
       "Use the deterministic outcome strategy below as the decision frame. It is guidance, not a license to ignore concrete repository evidence.",
       outcomeStrategyBrief,
+      "Use the relevant prior context below when it is directly applicable. Do not replay old logs; carry forward only the selected summaries, decisions, paths, and unresolved issues. Current checklist counts in this prompt override any historical progress counts.",
+      relevantPriorContext,
       "",
       `Project: ${project.record.identity.projectName}`,
       `Project kind: ${project.scan.kind}`,
@@ -3541,9 +3902,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : appealPassPending
           ? "Run one final appeal pass before stopping because the base goal is satisfied."
           : "Stop once the stated Ultimate Goal is satisfied."}`,
-      `Ultimate Goal: ${workflow.ultimateGoal.summary}`,
+      `Ultimate Goal: ${compactText(workflow.ultimateGoal.summary, 800)}`,
       customFocus ? `Custom recommendation focus from the operator: ${customFocus}` : "",
-      workflow.ultimateGoal.detailedIntent ? `Detailed intent: ${workflow.ultimateGoal.detailedIntent}` : "",
+      workflow.ultimateGoal.detailedIntent ? `Detailed intent: ${compactText(workflow.ultimateGoal.detailedIntent, 1_200)}` : "",
       workflow.workflowCycle.cycleNumber > 1 ? `Current cycle: ${workflow.workflowCycle.cycleNumber}` : "",
       workflow.memory.perCycleSummaries[0]?.summary ? `Most recent completed cycle: ${workflow.memory.perCycleSummaries[0].summary}` : "",
       workflow.approvedRecommendation?.title ? `Previous approved recommendation: ${workflow.approvedRecommendation.title}` : "",
@@ -3719,7 +4080,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private recommendationDeduplicationKey(recommendation: ProjectWorkflowState["recommendations"][number]): string {
-    const explicitGoalCheckTarget = recommendation.title.match(/^Satisfy goal check:\s*(.+)$/i)?.[1]?.trim();
+    const explicitGoalCheckTarget = recommendation.title.match(/^Satisfy goal (?:check|batch):\s*(.+)$/i)?.[1]?.trim();
     return explicitGoalCheckTarget
       ? `goal:${this.normalizeGoalCheckMatchText(explicitGoalCheckTarget)}`
       : `title:${this.normalizeGoalCheckMatchText(recommendation.title)}`;
@@ -3735,7 +4096,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const checklistRecommendations = deterministicRecommendations.filter((recommendation) =>
-      /^Satisfy goal check:/i.test(recommendation.title)
+      /^Satisfy goal (?:check|batch):/i.test(recommendation.title)
     );
     if (checklistRecommendations.length === 0) {
       return recommendations.map((recommendation, index) => ({ ...recommendation, rank: index + 1 }));
@@ -4077,7 +4438,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const recentOpenIssues = workflow.memory.knownOpenIssues
       .filter((issue) => issue.status === "open")
       .slice(0, 5)
-      .map((issue) => `- ${issue.title}: ${issue.detail}`);
+      .map((issue) => `- ${issue.title}: ${compactText(issue.detail, MAX_PROMPT_DETAIL_LENGTH)}`);
     const goalChecklist = buildGoalChecklistForAssessment({
       workflow,
       agents: project.record.agents
@@ -4085,35 +4446,56 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .filter((check) => check.required)
       .slice(0, 16)
       .map((check) =>
-        `- [${check.status}] ${check.title}${check.evidence ? ` -- ${check.evidence}` : ""}`
+        `- [${check.status}] ${check.title}${check.evidence ? ` -- ${compactText(check.evidence, MAX_PROMPT_DETAIL_LENGTH)}` : ""}`
       );
     const outcomeStrategyBrief = buildOutcomeStrategyBrief(this.buildWorkflowRecommendationContext(project), {
       maxOpenChecks: 4,
       maxFocusPaths: 4
     });
+    const relevantPriorContext = this.selectAndRememberRelevantContext(
+      project,
+      "goal",
+      [
+        approvedRecommendation.title,
+        approvedRecommendation.summary,
+        approvedRecommendation.rationale,
+        workflow.ultimateGoal.summary,
+        workflow.ultimateGoal.detailedIntent,
+        goalChecklist.join("\n"),
+        recentOpenIssues.join("\n")
+      ].join("\n"),
+      approvedRecommendation.relatedPaths
+    );
 
     return [
       "Turn the approved recommendation into a scoped goal for the next coding pass.",
       "The output must represent one bounded task for a single cycle, not a broad multi-phase project.",
-      "The result must be executable by one coding agent in one pass. If the recommendation is still broad, narrow it to the smallest viable slice and state that slice explicitly.",
+      "The result must be executable by one coding agent in one pass. If related checks share implementation paths, tests, or evidence, plan the largest coherent reviewable batch instead of narrowing to a tiny evidence-only slice.",
+      "Do not scope another coding pass just to re-prove a semantically identical checklist batch that already has direct evidence. If the approved recommendation is about checklist cleanup, focus the brief on the concrete missing evidence or redundant checks named in the recommendation.",
       "`executionBrief` should be a full prompt for the coding agent: what to change, where to focus, what to avoid, and how to know the task is done.",
       "Make acceptanceCriteria concrete and testable.",
-      "Keep acceptanceCriteria to at most 4 bullets and testStrategy to at most 3 focused checks.",
-      "Use the Goal checklist as the completion source of truth. Prefer a scoped plan that turns one unmet or unknown required check into a met check with evidence.",
+      "Keep acceptanceCriteria to at most 6 bullets and testStrategy to at most 4 focused checks.",
+      "Use the Goal checklist as the completion source of truth. Prefer a scoped plan that turns a coherent group of unmet or unknown required checks into met checks with evidence.",
       "Keep constraints aligned with the Ultimate Goal and the repository boundaries.",
       "Use the outcome strategy below to keep the scoped plan pointed at the best finished project outcome.",
       outcomeStrategyBrief,
+      "Use the relevant prior context below when it is directly applicable. Keep the scoped goal compact and do not include unrelated historical notes. Current checklist counts override historical progress counts in prior context.",
+      relevantPriorContext,
       "",
       `Project: ${project.record.identity.projectName}`,
-      `Ultimate Goal: ${workflow.ultimateGoal.summary}`,
-      workflow.ultimateGoal.detailedIntent ? `Detailed intent: ${workflow.ultimateGoal.detailedIntent}` : "",
+      `Ultimate Goal: ${compactText(workflow.ultimateGoal.summary, 800)}`,
+      workflow.ultimateGoal.detailedIntent ? `Detailed intent: ${compactText(workflow.ultimateGoal.detailedIntent, 1_200)}` : "",
       `Approved recommendation: ${approvedRecommendation.title}`,
-      `Recommendation summary: ${approvedRecommendation.summary}`,
-      `Why now: ${approvedRecommendation.rationale}`,
-      `Expected impact: ${approvedRecommendation.expectedImpact}`,
+      `Recommendation summary: ${compactText(approvedRecommendation.summary, 500)}`,
+      `Why now: ${compactText(approvedRecommendation.rationale, 700)}`,
+      `Expected impact: ${compactText(approvedRecommendation.expectedImpact, 500)}`,
       approvedRecommendation.relatedPaths.length ? `Likely paths: ${approvedRecommendation.relatedPaths.join(", ")}` : "",
-      workflow.ultimateGoal.successCriteria.length ? `Ultimate-goal success criteria:\n- ${workflow.ultimateGoal.successCriteria.join("\n- ")}` : "",
-      workflow.ultimateGoal.constraints.length ? `Project constraints:\n- ${workflow.ultimateGoal.constraints.join("\n- ")}` : "",
+      workflow.ultimateGoal.successCriteria.length
+        ? `Ultimate-goal success criteria:\n- ${workflow.ultimateGoal.successCriteria.slice(0, 8).map((entry) => compactText(entry, 260)).join("\n- ")}`
+        : "",
+      workflow.ultimateGoal.constraints.length
+        ? `Project constraints:\n- ${workflow.ultimateGoal.constraints.slice(0, 8).map((entry) => compactText(entry, 260)).join("\n- ")}`
+        : "",
       goalChecklist.length ? `Current Goal checklist:\n${goalChecklist.join("\n")}` : "",
       recentOpenIssues.length ? `Open issues to account for:\n${recentOpenIssues.join("\n")}` : ""
     ]
@@ -4272,7 +4654,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private isRecoverableAgentLaunchError(error: unknown): boolean {
     const detail = error instanceof Error ? error.message : String(error);
-    return /array buffer allocation failed|codex app-server|transport|model|invalid[_ ]json[_ ]schema|invalid schema|response_format|request failed|systemerror|unavailable/i.test(detail);
+    return /array buffer allocation failed|codex app-server|transport|model|invalid[_ ]json[_ ]schema|invalid schema|response_format|request failed|request timed out|timed out|timeout|systemerror|unavailable/i.test(detail);
   }
 
   async approveRecommendation(
@@ -4698,6 +5080,114 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return "The agent paused and needs the requested setup or answers below before it can continue.";
   }
 
+  private inferCredentialRequestText(questions: UserInputRequestQuestion[]): string {
+    return questions.map((question) => `${question.header} ${question.question}`).join(" ").trim();
+  }
+
+  private looksLikeCredentialRequest(questions: UserInputRequestQuestion[]): boolean {
+    const text = this.inferCredentialRequestText(questions);
+    return questions.some((question) => question.isSecret) ||
+      /\b(api key|secret key|access key|token|credential|client secret|bearer|oauth|alpaca|polygon|twelve data)\b/i.test(text);
+  }
+
+  private looksLikePaidCredentialRequest(questions: UserInputRequestQuestion[]): boolean {
+    const text = this.inferCredentialRequestText(questions);
+    const explicitlyFree = /\b(free|free-tier|free tier|no cost|no-cost|no credit card|without payment|unpaid|demo key|public key)\b/i.test(text);
+    if (explicitlyFree) {
+      return false;
+    }
+    return /\b(paid|billing|subscription|credit card|card required|paid tier|premium plan|upgrade plan|invoice|usage charge|metered billing)\b/i.test(text);
+  }
+
+  private inferCredentialProviderName(questions: UserInputRequestQuestion[]): string {
+    const text = this.inferCredentialRequestText(questions);
+    const knownProvider = [
+      "Polygon.io",
+      "Alpaca",
+      "Twelve Data",
+      "Alpha Vantage",
+      "IEX Cloud",
+      "Finnhub",
+      "Binance",
+      "Coinbase"
+    ].find((provider) => new RegExp(provider.replace(".", "\\."), "i").test(text));
+    if (knownProvider) {
+      return knownProvider;
+    }
+
+    const apiKeyMatch = text.match(/\b([A-Z][A-Za-z0-9 ._-]{2,40})\s+(?:api\s+key|key\s+\+\s+secret|credentials?|token)\b/);
+    if (apiKeyMatch?.[1]) {
+      return apiKeyMatch[1].replace(/\s+/g, " ").trim();
+    }
+
+    return "External provider";
+  }
+
+  private inferCredentialKeyLabel(questions: UserInputRequestQuestion[]): string {
+    const text = this.inferCredentialRequestText(questions);
+    if (/\bkey\s*\+\s*secret\b/i.test(text) || /\bsecret key\b/i.test(text)) {
+      return "API key + secret";
+    }
+    if (/\btoken\b/i.test(text)) {
+      return "Access token";
+    }
+    return "API key";
+  }
+
+  private addCredentialRequestForUserInput(
+    project: LoadedProject,
+    agent: AgentState,
+    userInputRequest: UserInputRequestRecord,
+    intervention?: HumanInterventionRecord
+  ): void {
+    if (!this.looksLikeCredentialRequest(userInputRequest.questions)) {
+      return;
+    }
+
+    project.record.credentials = {
+      ...defaultProjectCredentialsState(),
+      ...project.record.credentials,
+      entries: project.record.credentials?.entries ?? [],
+      requests: project.record.credentials?.requests ?? []
+    };
+
+    if (project.record.credentials.requests.some((request) => request.userInputRequestId === userInputRequest.id)) {
+      project.record.layout.activeCenterTab = "credentials";
+      return;
+    }
+
+    const providerName = this.inferCredentialProviderName(userInputRequest.questions);
+    const keyLabel = this.inferCredentialKeyLabel(userInputRequest.questions);
+    const existing = project.record.credentials.requests.find((request) =>
+      request.status === "pending" &&
+      request.providerName.toLowerCase() === providerName.toLowerCase() &&
+      request.keyLabel.toLowerCase() === keyLabel.toLowerCase()
+    );
+    if (existing) {
+      existing.userInputRequestId ??= userInputRequest.id;
+      existing.humanInterventionId ??= intervention?.id;
+      existing.agentId ??= agent.id;
+      existing.freeOnly ??= !this.settings.considerPaidServices;
+      project.record.layout.activeCenterTab = "credentials";
+      return;
+    }
+
+    project.record.credentials.requests.unshift({
+      id: nanoid(),
+      providerName,
+      keyLabel,
+      description: userInputRequest.description,
+      status: "pending",
+      requestedByAgentCategory: agent.category,
+      agentId: agent.id,
+      userInputRequestId: userInputRequest.id,
+      humanInterventionId: intervention?.id,
+      freeOnly: !this.settings.considerPaidServices,
+      createdAt: userInputRequest.createdAt
+    });
+    project.record.layout.activeCenterTab = "credentials";
+  }
+
   private findUserInputRequest(project: LoadedProject, requestId: string): UserInputRequestRecord {
     const request = project.record.userInputRequests.find((entry) => entry.id === requestId);
     if (!request) {
@@ -4839,6 +5329,244 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return request;
   }
 
+  private autoLinkMatchingCredentialRequests(
+    project: LoadedProject,
+    providerName: string,
+    keyLabel: string,
+    explicitRequestIds: string[]
+  ): string[] {
+    const explicit = new Set(explicitRequestIds);
+    for (const request of project.record.credentials.requests) {
+      if (
+        request.status === "pending" &&
+        request.providerName.toLowerCase() === providerName.toLowerCase() &&
+        request.keyLabel.toLowerCase() === keyLabel.toLowerCase()
+      ) {
+        explicit.add(request.id);
+      }
+    }
+    return [...explicit];
+  }
+
+  async saveCredentialEntry(
+    projectId: string,
+    input: {
+      entryId?: string;
+      providerName: string;
+      keyLabel: string;
+      apiKey: string;
+      secretKey?: string;
+      notes?: string;
+      status?: CredentialEntryStatus;
+      linkedRequestIds?: string[];
+    }
+  ): Promise<CredentialEntryMetadata> {
+    const project = this.findProject(projectId);
+    project.record.credentials = {
+      ...defaultProjectCredentialsState(),
+      ...project.record.credentials,
+      entries: project.record.credentials?.entries ?? [],
+      requests: project.record.credentials?.requests ?? []
+    };
+
+    const providerName = input.providerName.trim();
+    const keyLabel = input.keyLabel.trim();
+    const apiKey = input.apiKey.trim();
+    const secretKey = input.secretKey?.trim();
+    if (!providerName || !keyLabel || !apiKey) {
+      throw new Error("Provider name, key label, and API key are required.");
+    }
+
+    const now = nowIso();
+    const existing = input.entryId
+      ? project.record.credentials.entries.find((entry) => entry.id === input.entryId)
+      : undefined;
+    const linkedRequestIds = this.autoLinkMatchingCredentialRequests(
+      project,
+      providerName,
+      keyLabel,
+      input.linkedRequestIds ?? existing?.linkedRequestIds ?? []
+    );
+    const entry: CredentialEntryMetadata = {
+      id: existing?.id ?? nanoid(),
+      providerName,
+      keyLabel,
+      hasApiKey: true,
+      hasSecretKey: Boolean(secretKey),
+      status: input.status ?? existing?.status ?? "active",
+      source: existing?.source ?? "user",
+      freeTier: existing?.freeTier,
+      notes: input.notes?.trim() || undefined,
+      linkedRequestIds,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    };
+
+    await this.storage.saveCredentialSecret(project.record.id, entry.id, {
+      apiKey,
+      secretKey
+    } satisfies CredentialSecretInput);
+
+    project.record.credentials.entries = [
+      entry,
+      ...project.record.credentials.entries.filter((candidate) => candidate.id !== entry.id)
+    ];
+
+    for (const request of project.record.credentials.requests) {
+      if (!linkedRequestIds.includes(request.id)) {
+        continue;
+      }
+      const linkedUserInput = request.userInputRequestId
+        ? project.record.userInputRequests.find((entry) => entry.id === request.userInputRequestId)
+        : undefined;
+      if (linkedUserInput?.status === "pending") {
+        request.status = "pending";
+        request.resolvedAt = undefined;
+        request.notes = "Credential metadata was stored locally. Use Send to waiting agent for explicit approval before any secret is shared.";
+      } else {
+        request.status = "fulfilled";
+        request.resolvedAt = now;
+        request.notes = request.notes ?? "Credential metadata was stored locally. Secret values were not sent to agents automatically.";
+      }
+    }
+
+    this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+      source: "system",
+      status: "completed",
+      title: "Stored local credential metadata",
+      detail: `${providerName} ${keyLabel}`,
+      stepId: "recommendation"
+    });
+    await this.persistProjectUpdate(project);
+    return entry;
+  }
+
+  async deleteCredentialEntry(projectId: string, entryId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    const existing = project.record.credentials?.entries.find((entry) => entry.id === entryId);
+    if (!existing) {
+      throw new Error(`Unknown credential entry: ${entryId}`);
+    }
+
+    await this.storage.deleteCredentialSecret(project.record.id, entryId);
+    project.record.credentials.entries = project.record.credentials.entries.filter((entry) => entry.id !== entryId);
+    this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+      source: "system",
+      status: "completed",
+      title: "Removed local credential metadata",
+      detail: `${existing.providerName} ${existing.keyLabel}`,
+      stepId: "recommendation"
+    });
+    await this.persistProjectUpdate(project);
+  }
+
+  async updateCredentialRequest(
+    projectId: string,
+    requestId: string,
+    status: CredentialRequestStatus,
+    notes = ""
+  ): Promise<CredentialRequestRecord> {
+    const project = this.findProject(projectId);
+    const request = project.record.credentials?.requests.find((entry) => entry.id === requestId);
+    if (!request) {
+      throw new Error(`Unknown credential request: ${requestId}`);
+    }
+
+    request.status = status;
+    request.notes = notes.trim() || undefined;
+    request.resolvedAt = status === "pending" ? undefined : nowIso();
+    await this.persistProjectUpdate(project);
+    return request;
+  }
+
+  private credentialAnswerForQuestion(
+    question: UserInputRequestQuestion,
+    secrets: CredentialSecretInput,
+    entry: CredentialEntryMetadata
+  ): string {
+    const text = `${question.header} ${question.question}`;
+    if (question.isSecret) {
+      if (/\b(secret|private|client secret)\b/i.test(text)) {
+        if (!secrets.secretKey?.trim()) {
+          throw new Error(`The stored credential for ${entry.providerName} does not include a secret key.`);
+        }
+        return secrets.secretKey;
+      }
+      if (!secrets.apiKey.trim()) {
+        throw new Error(`The stored credential for ${entry.providerName} does not include an API key.`);
+      }
+      return secrets.apiKey;
+    }
+
+    return [
+      `Credential approved from the local API Keys section: ${entry.providerName} (${entry.keyLabel}).`,
+      "Use it only for this run, do not write it into project files, logs, portable interface data, or prompts, and preserve demo/mock or missing-credential states."
+    ].join(" ");
+  }
+
+  async submitCredentialRequestToAgent(projectId: string, requestId: string): Promise<CredentialRequestRecord> {
+    const project = this.findProject(projectId);
+    const credentialRequest = project.record.credentials?.requests.find((entry) => entry.id === requestId);
+    if (!credentialRequest) {
+      throw new Error(`Unknown credential request: ${requestId}`);
+    }
+    if (!credentialRequest.userInputRequestId) {
+      throw new Error("This credential request is not linked to a waiting agent input request.");
+    }
+
+    const userInputRequest = this.findUserInputRequest(project, credentialRequest.userInputRequestId);
+    if (userInputRequest.status !== "pending") {
+      throw new Error("The linked agent input request is no longer pending.");
+    }
+
+    const entry = project.record.credentials.entries.find((candidate) =>
+      candidate.status === "active" &&
+      candidate.linkedRequestIds.includes(credentialRequest.id)
+    ) ?? project.record.credentials.entries.find((candidate) =>
+      candidate.status === "active" &&
+      candidate.providerName.toLowerCase() === credentialRequest.providerName.toLowerCase() &&
+      candidate.keyLabel.toLowerCase() === credentialRequest.keyLabel.toLowerCase()
+    );
+    if (!entry) {
+      throw new Error("Store an active credential for this request before sending it to the agent.");
+    }
+
+    const secrets = await this.storage.readCredentialSecret(project.record.id, entry.id);
+    if (!secrets?.apiKey.trim()) {
+      throw new Error("The stored credential secret could not be read.");
+    }
+
+    const answers = userInputRequest.questions.map((question) => this.credentialAnswerForQuestion(question, secrets, entry));
+    await this.submitUserInputRequest(projectId, userInputRequest.id, answers);
+
+    credentialRequest.status = "fulfilled";
+    credentialRequest.resolvedAt = nowIso();
+    credentialRequest.submittedToAgentAt = credentialRequest.resolvedAt;
+    credentialRequest.notes = "Credential was sent to the waiting agent after explicit user approval from the API Keys section.";
+
+    const agent = project.record.agents.find((candidate) => candidate.id === userInputRequest.agentId);
+    if (agent) {
+      reduceAgentRuntimeEvent(agent, {
+        kind: "raw",
+        title: "Credential approved for agent",
+        detail: `${entry.providerName} ${entry.keyLabel}`
+      });
+      this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+    }
+
+    this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+      source: "system",
+      status: "completed",
+      title: "Credential sent to waiting agent",
+      detail: `${entry.providerName} ${entry.keyLabel}`,
+      stepId: getWorkflowActiveStepId(this.ensureWorkflowState(project.record)),
+      agentId: userInputRequest.agentId,
+      agentCategory: userInputRequest.requestedByAgentCategory
+    });
+    await this.persistProjectUpdate(project, true);
+    return credentialRequest;
+  }
+
   async advanceWorkflowStage(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
     const project = this.findProject(projectId);
     this.syncWorkflowState(project);
@@ -4890,7 +5618,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     options?: {
       sandbox?: "workspace-write" | "read-only";
       outputSchema?: JsonValue;
-      effort?: "low" | "medium" | "high" | "xhigh";
+      reasoningMode?: AgentReasoningMode;
+      effort?: InterfaceReasoningEffort;
       initialPhase?: string;
       turnPrompt?: string;
       launchThread?: boolean;
@@ -4926,7 +5655,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     const workflow = this.ensureWorkflowState(project.record);
     const agent = createAgentSkeleton(category, name, prompt, model || this.getDefaultAgentModel());
-    agent.reasoningEffort = this.resolveReasoningEffortForModel(agent.model);
+    const reasoningConfig = this.resolveAgentReasoningEffortForTask(
+      category,
+      agent.model,
+      `${name}\n\n${prompt}`,
+      options?.reasoningMode ?? (options?.effort ? "manual" : undefined),
+      options?.effort
+    );
+    agent.reasoningEffort = reasoningConfig.effort;
+    agent.reasoningEffortSource = reasoningConfig.source;
     agent.workflowCycleNumber = category === "manual" ? undefined : workflow.workflowCycle.cycleNumber;
     agent.taskPrompt = `${agentRoles[category].instructions}\n\n${prompt}`;
     agent.status = launchThread ? "starting" : "running";
@@ -5039,7 +5776,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       sandbox?: "workspace-write" | "read-only";
       prompt?: string;
       outputSchema?: JsonValue;
-      effort?: "low" | "medium" | "high" | "xhigh";
+      effort?: InterfaceReasoningEffort;
     }
   ): Promise<void> {
     if (!this.transport) {
@@ -5047,9 +5784,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const turnPrompt = options?.prompt ?? agent.taskPrompt;
+    const roleInstructions = agentRoles[agent.category].instructions;
     const baseInstructions = options?.outputSchema
-      ? `${agent.taskPrompt}\nWhen an output schema is supplied, return only valid JSON matching that schema exactly. Do not add commentary or markdown fences.`
-      : agent.taskPrompt;
+      ? `${roleInstructions}\nWhen an output schema is supplied, return only valid JSON matching that schema exactly. Do not add commentary or markdown fences.`
+      : roleInstructions;
     const cwd = agent.worktree?.worktreePath ?? project.record.projectRoot;
     await assertExecutionPathWithinProjectRoot(
       project.record.projectRoot,
@@ -5059,7 +5797,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       project.record.distroName,
       "Agent execution"
     );
-    agent.reasoningEffort = options?.effort ?? agent.reasoningEffort ?? this.resolveReasoningEffortForModel(agent.model);
+    if (options?.effort) {
+      agent.reasoningEffort = this.resolveAgentReasoningEffortForTask(
+        agent.category,
+        agent.model,
+        `${agent.name}\n\n${turnPrompt}`,
+        "manual",
+        options.effort
+      ).effort;
+      agent.reasoningEffortSource = "manual";
+    } else if (!agent.reasoningEffort) {
+      const reasoningConfig = this.resolveAgentReasoningEffortForTask(agent.category, agent.model, `${agent.name}\n\n${turnPrompt}`);
+      agent.reasoningEffort = reasoningConfig.effort;
+      agent.reasoningEffortSource = reasoningConfig.source;
+    }
     const sandbox = options?.sandbox ?? "read-only";
     const sandboxPolicy = this.buildRestrictedSandboxPolicy(project, sandbox);
     const threadResponse = await this.transport.startThread({
@@ -5156,6 +5907,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             : ""
         ]
       : [];
+    const relevantPriorContext = this.selectAndRememberRelevantContext(
+      project,
+      "coding",
+      [
+        workflow.scopedGoal?.summary ?? "",
+        workflow.scopedGoal?.executionBrief ?? "",
+        workflow.approvedRecommendation?.title ?? "",
+        workflow.ultimateGoal.summary,
+        activeGoalChecks.join("\n"),
+        repairContext.join("\n")
+      ].join("\n"),
+      workflow.approvedRecommendation?.relatedPaths ?? []
+    );
 
     return [
       `Scoped goal from the goal agent: ${workflow.scopedGoal?.summary ?? "No scoped plan available."}`,
@@ -5167,10 +5931,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ? `Integrity will verify with:\n- ${workflow.scopedGoal.testStrategy.join("\n- ")}`
         : "",
       workflow.ultimateGoal.summary ? `Ultimate Goal: ${workflow.ultimateGoal.summary}` : "",
+      "If this implementation needs live external data, build a provider layer instead of hardcoding local-only mock data. Include demo/mock mode for offline development, a live adapter mode that activates only when local credentials are configured, and explicit missing-credential/error/loading states.",
+      "For trading-style work, keep provider choice generic unless the user selected a provider. Free/no-card APIs are allowed. Use credential requests and explicit user-visible approval/input flow for API keys or secrets; do not embed or infer secrets.",
+      "If a free/no-card API credential is required to validate live behavior, request it through the project credential flow rather than downgrading to mock-only behavior, embedding a secret, or inventing one.",
       outcomeStrategyBrief,
+      "Use the relevant prior context below only when it helps this scoped implementation. Do not include secrets or ask for credentials unless the task genuinely needs them.",
+      relevantPriorContext,
       activeGoalChecks.length ? `Relevant unmet Goal checks:\n${activeGoalChecks.join("\n")}` : "",
       repairContext.join("\n"),
-      "Stay inside the active project folder, run only the most relevant checks for this slice, and summarize what changed."
+      "Stay inside the active project folder, run the most relevant checks for this coherent batch, and summarize what changed. If the work proves adjacent open checks are satisfied by the same files and validation, document that evidence instead of deferring an evidence-only follow-up cycle."
     ]
       .filter((entry) => entry.trim().length > 0)
       .join("\n\n");
@@ -6060,6 +6829,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
     if (this.isProjectMeaningfullyEmpty(project)) {
       bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+      bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
       bootstrapAgent.status = "completed";
       bootstrapAgent.currentPhase = "Skipped for empty project";
       bootstrapAgent.completedAt ??= nowIso();
@@ -6092,6 +6862,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
     bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+    bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
     bootstrapAgent.status = "running";
     bootstrapAgent.currentPhase = "Preparing repository scan for interface creation";
     project.record.interfaceCreation = createQueuedInterfaceCreationState(
@@ -6133,7 +6904,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         projectHostPath: project.record.hostPath,
         identity: project.record.identity,
         validation: project.record.validation,
-        scan: project.scan
+        scan: project.scan,
+        considerPaidServices: this.settings.considerPaidServices
       });
 
       project.record.interfaceCreation.phase = "Running analysis";
@@ -6427,6 +7199,158 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .map((entry) => entry.text ?? "")
       .join("");
     return text.trim() ? text : undefined;
+  }
+
+  private extractAgentCredentialCaptures(text?: string): AgentCredentialCapture[] {
+    if (!text) {
+      return [];
+    }
+
+    const captures: AgentCredentialCapture[] = [];
+    const blockPattern = /AGENT_WORKBENCH_CREDENTIAL\s+({[^\r\n]+})/g;
+    for (const match of text.matchAll(blockPattern)) {
+      try {
+        const parsed = JSON.parse(match[1]) as Partial<AgentCredentialCapture>;
+        const providerName = parsed.providerName?.trim();
+        const keyLabel = parsed.keyLabel?.trim() || "API key";
+        const apiKey = parsed.apiKey?.trim();
+        const secretKey = parsed.secretKey?.trim();
+        if (!providerName || !apiKey) {
+          continue;
+        }
+        captures.push({
+          providerName,
+          keyLabel,
+          apiKey,
+          secretKey: secretKey || undefined,
+          notes: parsed.notes?.trim() || undefined,
+          freeTier: parsed.freeTier
+        });
+      } catch {
+        continue;
+      }
+    }
+    return captures;
+  }
+
+  private redactAgentCredentialCaptures(text?: string): string | undefined {
+    if (!text) {
+      return text;
+    }
+    return text.replace(/AGENT_WORKBENCH_CREDENTIAL\s+({[^\r\n]+})/g, (_full, rawJson: string) => {
+      try {
+        const parsed = JSON.parse(rawJson) as Partial<AgentCredentialCapture>;
+        return `AGENT_WORKBENCH_CREDENTIAL ${JSON.stringify({
+          providerName: parsed.providerName ?? "Provider",
+          keyLabel: parsed.keyLabel ?? "API key",
+          apiKey: "[stored locally]",
+          secretKey: parsed.secretKey ? "[stored locally]" : undefined,
+          freeTier: parsed.freeTier === true,
+          notes: parsed.notes ?? undefined
+        })}`;
+      } catch {
+        return "AGENT_WORKBENCH_CREDENTIAL [redacted]";
+      }
+    });
+  }
+
+  private redactAgentCredentialCapturesFromValue(value: unknown): unknown {
+    if (typeof value === "string") {
+      return this.redactAgentCredentialCaptures(value);
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.redactAgentCredentialCapturesFromValue(entry));
+    }
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, this.redactAgentCredentialCapturesFromValue(entry)])
+      );
+    }
+    return value;
+  }
+
+  private async storeAgentCredentialCaptures(
+    project: LoadedProject,
+    agent: AgentState,
+    text?: string
+  ): Promise<void> {
+    const captures = this.extractAgentCredentialCaptures(text);
+    if (captures.length === 0) {
+      return;
+    }
+
+    project.record.credentials = {
+      ...defaultProjectCredentialsState(),
+      ...project.record.credentials,
+      entries: project.record.credentials?.entries ?? [],
+      requests: project.record.credentials?.requests ?? []
+    };
+
+    const now = nowIso();
+    for (const capture of captures) {
+      if (!this.settings.considerPaidServices && capture.freeTier !== true) {
+        this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+          source: "system",
+          status: "waiting",
+          title: "Ignored unverified credential capture",
+          detail: `${capture.providerName} was not stored because Consider Paid Services is off and the agent did not mark it free.`,
+          stepId: getWorkflowActiveStepId(this.ensureWorkflowState(project.record)),
+          agentId: agent.id,
+          agentCategory: agent.category
+        });
+        continue;
+      }
+
+      const linkedRequestIds = this.autoLinkMatchingCredentialRequests(project, capture.providerName, capture.keyLabel, []);
+      const existing = project.record.credentials.entries.find((entry) =>
+        entry.providerName.toLowerCase() === capture.providerName.toLowerCase() &&
+        entry.keyLabel.toLowerCase() === capture.keyLabel.toLowerCase()
+      );
+      const entry: CredentialEntryMetadata = {
+        id: existing?.id ?? nanoid(),
+        providerName: capture.providerName,
+        keyLabel: capture.keyLabel,
+        hasApiKey: true,
+        hasSecretKey: Boolean(capture.secretKey),
+        status: "active",
+        source: "agent_auto",
+        freeTier: capture.freeTier === true,
+        notes: [
+          capture.notes,
+          capture.freeTier === true
+            ? "Captured automatically from agent output; agent declared it free/no-card."
+            : "Captured automatically from agent output while paid services were allowed."
+        ].filter(Boolean).join(" "),
+        linkedRequestIds,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now
+      };
+
+      await this.storage.saveCredentialSecret(project.record.id, entry.id, {
+        apiKey: capture.apiKey,
+        secretKey: capture.secretKey
+      });
+      project.record.credentials.entries = [
+        entry,
+        ...project.record.credentials.entries.filter((candidate) => candidate.id !== entry.id)
+      ];
+      for (const request of project.record.credentials.requests) {
+        if (linkedRequestIds.includes(request.id) && !request.userInputRequestId) {
+          request.status = "fulfilled";
+          request.resolvedAt = now;
+          request.notes = "Credential was captured automatically from agent output and stored locally.";
+        }
+      }
+      this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+        source: "system",
+        status: "completed",
+        title: "Captured free credential locally",
+        detail: `${entry.providerName} ${entry.keyLabel}`,
+        stepId: getWorkflowActiveStepId(this.ensureWorkflowState(project.record)),
+        agentId: agent.id,
+        agentCategory: agent.category
+      });
+    }
   }
 
   private async finalizeInterfaceCreationFromThread(project: LoadedProject, agent: AgentState): Promise<void> {
@@ -6927,22 +7851,28 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
       case "item/completed":
         if (notification.params.item.type === "agentMessage") {
-          agent.lastMessageSnippet = notification.params.item.text.slice(-240);
+          const agentMessageText = notification.params.item.text;
+          const redactedMessageText = this.redactAgentCredentialCaptures(agentMessageText) ?? agentMessageText;
+          const redactedItem = this.redactAgentCredentialCapturesFromValue(notification.params.item);
+          void this.storeAgentCredentialCaptures(project, agent, agentMessageText)
+            .then(() => this.persistProjectUpdate(project))
+            .catch(() => undefined);
+          agent.lastMessageSnippet = redactedMessageText.slice(-240);
           if (agent.category === "bootstrap") {
-            void this.applyInterfaceCreationOutput(project, agent, notification.params.item.text, "item/completed").catch(() => undefined);
+            void this.applyInterfaceCreationOutput(project, agent, agentMessageText, "item/completed").catch(() => undefined);
           }
           if (agent.category === "goal" && agent.currentPhase === "Detecting ultimate goal") {
-            void this.applyUltimateGoalDetectionOutput(project, agent, notification.params.item.text).catch(() => undefined);
+            void this.applyUltimateGoalDetectionOutput(project, agent, agentMessageText).catch(() => undefined);
           }
           if (agent.category === "recommendation") {
-            void this.applyRecommendationOutput(project, agent, notification.params.item.text, true).catch(() => undefined);
+            void this.applyRecommendationOutput(project, agent, agentMessageText, true).catch(() => undefined);
           }
           if (agent.category === "goal" && agent.name === "Goal Agent" && project.record.workflow.approvedRecommendation) {
             void this.applyScopedGoalOutput(
               project,
               agent,
               project.record.workflow.approvedRecommendation,
-              notification.params.item.text,
+              agentMessageText,
               true
             ).catch(() => undefined);
           }
@@ -6952,8 +7882,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             itemId: notification.params.item.id,
             itemType: notification.params.item.type,
             title: "Agent message",
-            detail: this.sanitizeTextToProjectBoundary(project, notification.params.item.text) ?? notification.params.item.text,
-            raw: notification.params.item
+            detail: this.sanitizeTextToProjectBoundary(project, redactedMessageText) ?? redactedMessageText,
+            raw: redactedItem
           });
         } else if (notification.params.item.type === "commandExecution") {
           const sanitizedCommand = this.sanitizeTextToProjectBoundary(
@@ -7012,6 +7942,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         break;
       case "rawResponseItem/completed": {
         const rawResponseText = this.extractTextFromRawResponseItem(notification.params.item);
+        const redactedResponseText = this.redactAgentCredentialCaptures(rawResponseText);
+        const redactedItem = this.redactAgentCredentialCapturesFromValue(notification.params.item);
+        void this.storeAgentCredentialCaptures(project, agent, rawResponseText)
+          .then(() => this.persistProjectUpdate(project))
+          .catch(() => undefined);
         if (agent.category === "bootstrap" && rawResponseText) {
           void this.applyInterfaceCreationOutput(project, agent, rawResponseText, "rawResponseItem/completed").catch(() => undefined);
         }
@@ -7033,8 +7968,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         reduceAgentRuntimeEvent(agent, {
           kind: "raw",
           title: "rawResponseItem/completed",
-          detail: this.sanitizeTextToProjectBoundary(project, rawResponseText?.slice(0, 240)) ?? rawResponseText?.slice(0, 240),
-          raw: notification.params.item
+          detail: this.sanitizeTextToProjectBoundary(project, redactedResponseText?.slice(0, 240)) ?? redactedResponseText?.slice(0, 240),
+          raw: redactedItem
         });
         break;
       }
@@ -7139,9 +8074,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     this.syncWorkflowStepProgressFromAgent(project, agent);
     this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-    this.saveProject(project).catch(() => undefined);
+    this.scheduleProjectSave(project);
     this.emitState();
-    this.scheduleWorkflowAutomation(project.record.id);
+    if (!liveTransportUpdateMethods.has(notification.method)) {
+      this.scheduleWorkflowAutomation(project.record.id);
+    }
   }
 
   private handleTransportRequest(request: ServerRequest): void {
@@ -7172,7 +8109,41 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
 
       const normalizedQuestions = this.normalizeUserInputRequestQuestions(project, request.params.questions);
+      if (
+        this.looksLikeCredentialRequest(normalizedQuestions) &&
+        !this.settings.considerPaidServices &&
+        this.looksLikePaidCredentialRequest(normalizedQuestions)
+      ) {
+        const answer = [
+          "Paid API services are disabled in Codex Agent Workbench settings.",
+          "Use a free/no-card provider, no-key/open-data source, demo/mock mode, or request only a free-tier credential."
+        ].join(" ");
+        if (this.transport) {
+          await this.transport.respond(request.id, { answers: normalizedQuestions.map(() => answer) });
+        }
+        agent.currentPhase = "Rejected paid credential request";
+        agent.lastActivityAt = nowIso();
+        agent.lastMessageSnippet = answer;
+        reduceAgentRuntimeEvent(agent, {
+          kind: "raw",
+          title: "Paid credential request rejected",
+          detail: answer
+        });
+        this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+          source: "system",
+          status: "waiting",
+          title: "Paid credential request rejected",
+          detail: "The agent was told to use a free provider, no-key source, or demo/mock mode because Consider Paid Services is off.",
+          stepId: getWorkflowActiveStepId(this.ensureWorkflowState(project.record)),
+          agentId: agent.id,
+          agentCategory: agent.category
+        });
+        this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+        await this.persistProjectUpdate(project, true);
+        return;
+      }
       const requestId = nanoid();
+      const isCredentialRequest = this.looksLikeCredentialRequest(normalizedQuestions);
       const userInputRequest: UserInputRequestRecord = {
         id: requestId,
         agentId: agent.id,
@@ -7193,16 +8164,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       await mkdir(this.resolveUserInputRequestInboxHostPath(project, requestId), { recursive: true });
 
       const intervention = await this.createHumanInterventionRecord(project, {
-        kind: normalizedQuestions.some((question) => question.isSecret) ? "credentials" : "external_setup",
+        kind: isCredentialRequest ? "credentials" : "external_setup",
         title: userInputRequest.title,
         description: userInputRequest.description,
-        reason: "The agent paused and needs your external setup or answers before it can continue.",
+        reason: isCredentialRequest
+          ? this.settings.considerPaidServices
+            ? "The agent paused for an API credential. Store it in API Keys, then explicitly send it to the waiting agent if you want it used."
+            : "The agent paused for an API credential. Only provide a free/no-card key; otherwise dismiss it and let the agent use a free provider or demo mode."
+          : "The agent paused and needs your external setup or answers before it can continue.",
         requestedByAgentCategory: agent.category,
-        severity: normalizedQuestions.some((question) => question.isSecret) ? "high" : "medium",
+        severity: isCredentialRequest ? "high" : "medium",
         blocking: true,
         linkedUserInputRequestId: requestId
       }, { persist: false });
       userInputRequest.humanInterventionId = intervention.id;
+      this.addCredentialRequestForUserInput(project, agent, userInputRequest, intervention);
       project.record.userInputRequests.unshift(userInputRequest);
 
       agent.currentPhase = "Waiting for external input";

@@ -1,28 +1,40 @@
 :root {
-  --bg: #f3ede3;
-  --bg-deep: #ece2d4;
-  --surface: rgba(251, 247, 241, 0.94);
-  --surface-strong: rgba(255, 252, 247, 0.98);
-  --surface-muted: rgba(242, 235, 225, 0.9);
-  --line: rgba(25, 40, 68, 0.12);
-  --line-strong: rgba(25, 40, 68, 0.2);
-  --text: #16233c;
-  --muted: #59657a;
-  --accent: #1f365c;
-  --accent-strong: #112441;
-  --accent-soft: rgba(31, 54, 92, 0.12);
-  --warm: #aa6e44;
-  --danger: #a0443e;
-  --success: #3f6a4d;
-  --shadow-lg: 0 22px 50px rgba(17, 28, 47, 0.12);
-  --shadow-md: 0 12px 30px rgba(17, 28, 47, 0.08);
+  --catc-navy: #0f2747;
+  --catc-navy-deep: #071a31;
+  --catc-ink: #1e2430;
+  --catc-beige: #e5d6c3;
+  --catc-ivory: #f7f2ea;
+  --catc-slate: #8e99a8;
+  --catc-gold: #b89a6a;
+  --bg: #071a31;
+  --bg-deep: #041426;
+  --surface: rgba(247, 242, 234, 0.96);
+  --surface-strong: rgba(255, 250, 242, 0.98);
+  --surface-muted: rgba(229, 214, 195, 0.88);
+  --line: rgba(184, 154, 106, 0.32);
+  --line-strong: rgba(184, 154, 106, 0.58);
+  --text: #1e2430;
+  --ink: #1e2430;
+  --muted: #667382;
+  --ink-muted: #667382;
+  --accent: #0f2747;
+  --accent-strong: #071a31;
+  --accent-soft: rgba(184, 154, 106, 0.16);
+  --warm: #b89a6a;
+  --danger: #a64a43;
+  --success: #416f58;
+  --radius-card: 8px;
+  --radius-control: 6px;
+  --shadow-lg: 0 26px 60px rgba(3, 12, 24, 0.38);
+  --shadow-md: 0 14px 32px rgba(3, 12, 24, 0.2);
   color: var(--text);
-  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  font-family: "Aptos", "Inter", "IBM Plex Sans", "Segoe UI", sans-serif;
   background:
-    radial-gradient(circle at top left, rgba(31, 54, 92, 0.16), transparent 34%),
-    radial-gradient(circle at top right, rgba(170, 110, 68, 0.12), transparent 30%),
-    linear-gradient(180deg, #f7f2e8 0%, #efe5d8 52%, #ebdfd0 100%);
-  scrollbar-color: rgba(31, 54, 92, 0.28) transparent;
+    linear-gradient(rgba(247, 242, 234, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.035) 1px, transparent 1px),
+    linear-gradient(135deg, #071a31 0%, #0f2747 52%, #071a31 100%);
+  background-size: 36px 36px, 36px 36px, auto;
+  scrollbar-color: rgba(184, 154, 106, 0.58) transparent;
 }
 
 * {
@@ -58,7 +70,7 @@ img {
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(31, 54, 92, 0.24);
+  background: rgba(184, 154, 106, 0.42);
   border: 2px solid transparent;
   border-radius: 999px;
   background-clip: padding-box;
@@ -78,8 +90,9 @@ strong {
 h1,
 h2,
 h3 {
-  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
-  letter-spacing: -0.02em;
+  font-family: "Aptos Display", "Inter", "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-weight: 800;
+  letter-spacing: 0;
   margin: 0;
 }
 
@@ -95,6 +108,13 @@ p {
   grid-template-rows: auto auto auto auto auto;
   gap: 20px;
   padding: 24px;
+  background:
+    linear-gradient(rgba(247, 242, 234, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.035) 1px, transparent 1px),
+    linear-gradient(135deg, rgba(229, 214, 195, 0) 0 70%, rgba(229, 214, 195, 0.08) 70% 70.5%, rgba(229, 214, 195, 0) 70.5%),
+    linear-gradient(180deg, #071a31 0%, #0f2747 48%, #061629 100%);
+  background-attachment: fixed;
+  background-size: 36px 36px, 36px 36px, 100% 100%, auto;
 }
 
 .shell--loader {
@@ -118,9 +138,11 @@ p {
 .metric-card,
 .card-surface,
 .settings-card {
-  background: var(--surface);
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.98), rgba(247, 242, 234, 0.94)),
+    var(--surface);
   border: 1px solid var(--line);
-  border-radius: 22px;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-md);
 }
 
@@ -129,6 +151,67 @@ p {
   padding: 28px;
   display: grid;
   gap: 22px;
+  position: relative;
+  overflow: hidden;
+}
+
+.loader-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), rgba(184, 154, 106, 0.22) calc(100% - 1px)),
+    radial-gradient(circle, rgba(184, 154, 106, 0.32) 1.2px, transparent 1.6px);
+  background-size: 100% 100%, 18px 18px;
+  mask: linear-gradient(110deg, transparent 0 68%, #000 78% 100%);
+  opacity: 0.78;
+}
+
+.loading-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 24px;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.loading-indicator--compact {
+  min-height: 18px;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.loading-indicator__mark {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background:
+    conic-gradient(from 0deg, rgba(184, 154, 106, 0.1), rgba(184, 154, 106, 0.9), rgba(247, 242, 234, 0.72), rgba(184, 154, 106, 0.1));
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+  animation: loading-spin 0.9s linear infinite;
+}
+
+.loading-indicator--compact .loading-indicator__mark {
+  width: 16px;
+  height: 16px;
+}
+
+@keyframes loading-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-indicator__mark {
+    animation: none;
+    background:
+      linear-gradient(90deg, rgba(184, 154, 106, 0.22), rgba(184, 154, 106, 0.7), rgba(184, 154, 106, 0.22));
+  }
 }
 
 .loader-card--wide {
@@ -140,6 +223,8 @@ p {
   align-items: flex-start;
   justify-content: space-between;
   gap: 18px;
+  position: relative;
+  z-index: 1;
 }
 
 .brand-lockup {
@@ -155,21 +240,57 @@ p {
 .brand-lockup__icon {
   width: 58px;
   height: 58px;
-  border-radius: 18px;
-  box-shadow: 0 12px 24px rgba(17, 36, 65, 0.18);
+  border-radius: var(--radius-card);
+  box-shadow: 0 14px 28px rgba(3, 12, 24, 0.28);
+  outline: 1px solid rgba(184, 154, 106, 0.34);
+  outline-offset: 3px;
 }
 
 .hero-card {
+  position: relative;
+  overflow: hidden;
   display: grid;
   grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.7fr);
   gap: 20px;
   padding: 24px;
   background:
-    linear-gradient(135deg, rgba(31, 54, 92, 0.98), rgba(22, 35, 60, 0.96)),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0));
+    linear-gradient(135deg, rgba(15, 39, 71, 0.98), rgba(7, 26, 49, 0.98)),
+    linear-gradient(180deg, rgba(247, 242, 234, 0.06), rgba(247, 242, 234, 0));
   color: #f8f3eb;
-  border-color: rgba(255, 255, 255, 0.08);
+  border-color: rgba(184, 154, 106, 0.42);
   box-shadow: var(--shadow-lg);
+}
+
+.hero-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(rgba(247, 242, 234, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.06) 1px, transparent 1px),
+    linear-gradient(135deg, transparent 0 58%, rgba(184, 154, 106, 0.78) 58% 58.4%, transparent 58.4%),
+    radial-gradient(circle, rgba(184, 154, 106, 0.55) 1.2px, transparent 1.8px);
+  background-size: 42px 42px, 42px 42px, 100% 100%, 18px 18px;
+  mask: linear-gradient(90deg, transparent 0 38%, #000 56% 100%);
+  opacity: 0.66;
+}
+
+.hero-card::after {
+  content: "";
+  position: absolute;
+  right: -80px;
+  bottom: -110px;
+  width: 380px;
+  height: 260px;
+  border: 1px solid rgba(184, 154, 106, 0.62);
+  background:
+    linear-gradient(90deg, transparent 0 48%, rgba(15, 39, 71, 0.9) 48% 48.4%, transparent 48.4%),
+    linear-gradient(rgba(15, 39, 71, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 39, 71, 0.12) 1px, transparent 1px),
+    rgba(229, 214, 195, 0.92);
+  background-size: 100% 100%, 20px 20px, 20px 20px, auto;
+  transform: rotate(-30deg);
 }
 
 .hero-card strong,
@@ -190,12 +311,24 @@ p {
   display: grid;
   gap: 16px;
   align-content: start;
+  position: relative;
+  z-index: 1;
 }
 
 .hero-card .notice {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.12);
   color: #f8f3eb;
+}
+
+.hero-card .metric-card,
+.hero-card .metric-card strong,
+.hero-card .metric-card span {
+  color: var(--catc-ink);
+}
+
+.hero-card .metric-card__label {
+  color: var(--warm);
 }
 
 .hero-card--intake {
@@ -219,9 +352,9 @@ p {
 
 .project-hero__main,
 .project-hero__stats {
-  background: linear-gradient(180deg, rgba(255, 252, 247, 0.88), rgba(250, 243, 234, 0.94));
+  background: linear-gradient(180deg, rgba(255, 250, 242, 0.97), rgba(247, 242, 234, 0.94));
   border: 1px solid var(--line);
-  border-radius: 24px;
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-md);
   padding: 24px;
 }
@@ -229,6 +362,44 @@ p {
 .project-hero__main {
   display: grid;
   gap: 14px;
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(135deg, rgba(15, 39, 71, 0.98), rgba(7, 26, 49, 0.98)),
+    var(--catc-navy);
+  border-color: rgba(184, 154, 106, 0.42);
+  color: var(--catc-ivory);
+}
+
+.project-hero__main::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(rgba(247, 242, 234, 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.055) 1px, transparent 1px),
+    linear-gradient(135deg, transparent 0 76%, rgba(184, 154, 106, 0.76) 76% 76.4%, transparent 76.4%),
+    radial-gradient(circle, rgba(184, 154, 106, 0.5) 1.1px, transparent 1.6px);
+  background-size: 36px 36px, 36px 36px, 100% 100%, 16px 16px;
+  mask: linear-gradient(90deg, transparent 0 46%, #000 72% 100%);
+  opacity: 0.72;
+}
+
+.project-hero__main > * {
+  position: relative;
+  z-index: 1;
+}
+
+.project-hero__main h2,
+.project-hero__main strong,
+.project-hero__summary {
+  color: var(--catc-ivory);
+}
+
+.project-hero__main .eyebrow,
+.project-hero__main .topbar__meta {
+  color: rgba(247, 242, 234, 0.72);
 }
 
 .project-hero__summary {
@@ -246,7 +417,10 @@ p {
   padding: 18px;
   display: grid;
   gap: 6px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(247, 241, 232, 0.88));
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.95), rgba(229, 214, 195, 0.6)),
+    var(--surface-strong);
+  border-left: 3px solid rgba(184, 154, 106, 0.78);
 }
 
 .metric-card strong {
@@ -284,10 +458,10 @@ p {
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
-  border-radius: 14px;
-  border: 1px solid rgba(25, 40, 68, 0.12);
-  background: rgba(255, 252, 247, 0.74);
-  color: var(--accent-strong);
+  border-radius: var(--radius-control);
+  border: 1px solid rgba(184, 154, 106, 0.32);
+  background: rgba(7, 26, 49, 0.58);
+  color: var(--catc-ivory);
   cursor: pointer;
   transition:
     background 140ms ease,
@@ -298,14 +472,15 @@ p {
 
 .workspace-tab:hover {
   transform: translateY(-1px);
-  border-color: rgba(31, 54, 92, 0.18);
-  background: rgba(255, 252, 247, 0.9);
+  border-color: rgba(184, 154, 106, 0.58);
+  background: rgba(15, 39, 71, 0.92);
 }
 
 .workspace-tab--active {
-  background: linear-gradient(180deg, rgba(31, 54, 92, 0.1), rgba(255, 255, 255, 0.92));
-  border-color: rgba(31, 54, 92, 0.24);
-  box-shadow: inset 0 0 0 1px rgba(31, 54, 92, 0.08);
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.98), rgba(229, 214, 195, 0.88));
+  border-color: rgba(184, 154, 106, 0.74);
+  color: var(--catc-ink);
+  box-shadow: inset 0 -2px 0 rgba(184, 154, 106, 0.82);
 }
 
 .workspace-tab__count {
@@ -316,8 +491,8 @@ p {
   height: 1.6rem;
   padding-inline: 0.4rem;
   border-radius: 999px;
-  background: rgba(31, 54, 92, 0.1);
-  color: var(--accent);
+  background: rgba(184, 154, 106, 0.18);
+  color: inherit;
   font-size: 0.78rem;
 }
 
@@ -480,6 +655,7 @@ p {
 .candidate-card__meta,
 .actions-row,
 .agent-card__meta,
+.agent-reasoning-picker,
 .settings-section__heading,
 .recent-project__meta {
   display: flex;
@@ -597,6 +773,13 @@ p {
   font-size: 0.84rem;
 }
 
+.agent-reasoning-picker,
+.reasoning-role-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
 .agent-card p {
   color: var(--muted);
   display: -webkit-box;
@@ -687,9 +870,10 @@ p {
 .primary-button,
 .secondary-button {
   border: 1px solid transparent;
-  border-radius: 14px;
+  border-radius: var(--radius-control);
   padding: 10px 14px;
   cursor: pointer;
+  font-weight: 700;
   transition:
     background 140ms ease,
     border-color 140ms ease,
@@ -703,35 +887,47 @@ p {
 }
 
 .primary-button {
-  background: var(--accent);
-  color: #f8f3eb;
-  box-shadow: 0 10px 18px rgba(17, 36, 65, 0.14);
+  background: linear-gradient(180deg, #c7aa77, var(--catc-gold));
+  color: var(--catc-ink);
+  box-shadow: 0 10px 18px rgba(3, 12, 24, 0.18);
 }
 
 .primary-button:hover {
-  background: var(--accent-strong);
+  background: linear-gradient(180deg, #d4bb8d, #c09d61);
 }
 
 .secondary-button {
-  background: rgba(31, 54, 92, 0.08);
-  border-color: rgba(31, 54, 92, 0.12);
+  background: rgba(15, 39, 71, 0.08);
+  border-color: rgba(184, 154, 106, 0.42);
   color: var(--accent-strong);
+}
+
+.secondary-button:hover {
+  background: rgba(15, 39, 71, 0.13);
+  border-color: rgba(184, 154, 106, 0.64);
 }
 
 .primary-button:disabled,
 .secondary-button:disabled {
-  opacity: 0.55;
+  opacity: 0.66;
   cursor: not-allowed;
   transform: none;
+}
+
+.hero-card .secondary-button:disabled {
+  background: rgba(247, 242, 234, 0.08);
+  border-color: rgba(247, 242, 234, 0.22);
+  color: rgba(247, 242, 234, 0.78);
+  opacity: 0.82;
 }
 
 .input,
 .textarea {
   width: 100%;
-  border: 1px solid rgba(25, 40, 68, 0.14);
-  border-radius: 14px;
+  border: 1px solid rgba(15, 39, 71, 0.18);
+  border-radius: var(--radius-control);
   padding: 11px 12px;
-  background: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 250, 242, 0.9);
   color: var(--text);
 }
 
@@ -741,7 +937,7 @@ p {
 .candidate-card:focus,
 .tree-row:focus,
 .recent-project:focus {
-  outline: 2px solid rgba(31, 54, 92, 0.22);
+  outline: 2px solid rgba(184, 154, 106, 0.5);
   outline-offset: 2px;
 }
 
@@ -1168,6 +1364,14 @@ p {
   padding-right: 4px;
 }
 
+.workflow-feed-card__scroll--tall {
+  max-height: 540px;
+}
+
+.workflow-feed-card__scroll--commands {
+  max-height: 300px;
+}
+
 .workflow-agent-list-card {
   padding: 20px;
   display: grid;
@@ -1175,6 +1379,25 @@ p {
 }
 
 .workflow-agent-list {
+  display: grid;
+  gap: 12px;
+}
+
+.workflow-agent-list--virtual {
+  position: relative;
+  display: block;
+  overflow: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+.workflow-agent-list__spacer {
+  position: relative;
+}
+
+.workflow-agent-list__window {
+  position: absolute;
+  inset: 0 0 auto 0;
   display: grid;
   gap: 12px;
 }
@@ -1492,6 +1715,10 @@ p {
   content: "-";
 }
 
+.workflow-noisy-detail {
+  display: none;
+}
+
 .workflow-secondary__content {
   padding: 18px;
 }
@@ -1526,6 +1753,55 @@ p {
 
 .workflow-user-input-card {
   gap: 14px;
+}
+
+.workflow-log-workspace,
+.agent-history-workspace,
+.credentials-workspace {
+  align-content: start;
+}
+
+.agent-history-layout,
+.credentials-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.agent-history-layout__lists,
+.agent-history-layout__detail,
+.credentials-list,
+.credential-entry-grid {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.credential-entry-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.credential-entry {
+  align-content: start;
+}
+
+.credential-secret-preview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(25, 40, 68, 0.06);
+  color: var(--accent-strong);
+}
+
+.credential-secret-preview code {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
 }
 
 .workflow-user-input-card__callout,
@@ -1870,6 +2146,12 @@ p {
   min-width: 0;
 }
 
+.notice--compact {
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.86rem;
+}
+
 .notice--error {
   background: rgba(160, 68, 62, 0.1);
   border-color: rgba(160, 68, 62, 0.18);
@@ -2021,6 +2303,21 @@ p {
   color: var(--ink-muted);
 }
 
+.checkbox-field {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.checkbox-field input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
 .model-option {
   background: rgba(255, 252, 247, 0.94);
   border: 1px solid rgba(25, 40, 68, 0.12);
@@ -2034,6 +2331,217 @@ p {
   border-color: rgba(31, 54, 92, 0.34);
   box-shadow: inset 0 0 0 1px rgba(31, 54, 92, 0.12);
   background: linear-gradient(180deg, rgba(31, 54, 92, 0.06), rgba(255, 255, 255, 0.9));
+}
+
+.shell > .app-header h1 {
+  color: var(--catc-ivory);
+}
+
+.shell > .app-header .eyebrow {
+  color: rgba(229, 214, 195, 0.82);
+}
+
+.shell > .app-header .secondary-button {
+  background: rgba(247, 242, 234, 0.08);
+  border-color: rgba(184, 154, 106, 0.46);
+  color: var(--catc-ivory);
+}
+
+.shell > .app-header .secondary-button:hover {
+  background: rgba(247, 242, 234, 0.14);
+}
+
+.loader-card > *,
+.settings-panel > * {
+  position: relative;
+  z-index: 1;
+}
+
+.section-title {
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(184, 154, 106, 0.36);
+}
+
+.eyebrow,
+.workflow-option__label,
+.workflow-option__rank-label,
+.agent-focus__label,
+.metric-card__label {
+  color: var(--warm);
+  font-weight: 800;
+}
+
+.panel,
+.candidate-card,
+.agent-card,
+.overview-card,
+.metric-card,
+.card-surface,
+.settings-card,
+.recent-project,
+.agent-lane,
+.lane-note,
+.workflow-at-glance,
+.workflow-autopilot-card,
+.workflow-goal-progress,
+.workflow-primary-action,
+.workflow-goal-panel__section,
+.workflow-manual-handoff__section,
+.workflow-option,
+.workflow-option__callout,
+.workflow-transcript__run,
+.workflow-transcript__command,
+.workflow-transcript__entry,
+.notice,
+.settings-panel,
+.model-option,
+.workflow-secondary__details,
+.workflow-stage-pill,
+.workflow-step-card,
+.workflow-step-rail__item,
+.workflow-at-glance__fact,
+.workflow-user-input-card__callout,
+.workflow-user-input-card__attachments,
+.workflow-user-input-card__question,
+.credential-secret-preview {
+  border-radius: var(--radius-card);
+}
+
+.agent-card,
+.overview-card,
+.candidate-card,
+.settings-card,
+.workflow-option,
+.workflow-transcript__entry,
+.workflow-transcript__run,
+.recent-project,
+.model-option {
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.96), rgba(247, 242, 234, 0.9)),
+    var(--surface);
+  border-color: rgba(184, 154, 106, 0.3);
+}
+
+.overview-card--feature,
+.launcher-action--featured,
+.agent-card--selected,
+.workspace-tab--active,
+.workflow-step-card--current,
+.workflow-step-rail__item--current,
+.workflow-stage-pill--current,
+.workflow-transcript__run--active,
+.model-option--selected {
+  background:
+    linear-gradient(180deg, rgba(184, 154, 106, 0.18), rgba(255, 250, 242, 0.94)),
+    var(--surface-strong);
+  border-color: rgba(184, 154, 106, 0.58);
+}
+
+.badge,
+.tag,
+.status-pill {
+  border: 1px solid rgba(184, 154, 106, 0.28);
+  border-radius: 999px;
+  font-weight: 800;
+}
+
+.badge {
+  background: rgba(15, 39, 71, 0.08);
+  color: var(--catc-ink);
+}
+
+.tag {
+  background: rgba(15, 39, 71, 0.07);
+  color: var(--catc-navy);
+}
+
+.badge-source,
+.badge-unvalidated,
+.status-idle,
+.status-starting,
+.status-waiting_approval,
+.status-disconnected {
+  background: rgba(15, 39, 71, 0.12);
+  color: var(--catc-navy);
+}
+
+.badge-stale,
+.status-running {
+  background: rgba(184, 154, 106, 0.18);
+  color: #735a2f;
+}
+
+.hero-card .badge,
+.hero-card .tag,
+.hero-card .status-pill,
+.project-hero__main .badge,
+.project-hero__main .tag,
+.project-hero__main .status-pill,
+.shell > .app-header .badge,
+.shell > .app-header .tag,
+.shell > .app-header .status-pill {
+  background: rgba(247, 242, 234, 0.16);
+  border-color: rgba(229, 214, 195, 0.5);
+  color: var(--catc-ivory);
+}
+
+.hero-card .secondary-button {
+  background: rgba(247, 242, 234, 0.1);
+  border-color: rgba(229, 214, 195, 0.5);
+  color: var(--catc-ivory);
+}
+
+.hero-card .secondary-button:hover {
+  background: rgba(247, 242, 234, 0.18);
+  border-color: rgba(229, 214, 195, 0.72);
+}
+
+.tree,
+.workflow-agent-list--virtual,
+.workflow-transcript__runs-list,
+.workflow-transcript__list,
+.workflow-feed-card__scroll,
+.goal-checklist-preview {
+  background:
+    linear-gradient(rgba(15, 39, 71, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 39, 71, 0.035) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.tree-row,
+.recent-project {
+  border-radius: var(--radius-control);
+}
+
+.tree-row:hover,
+.tree-row--selected,
+.recent-project:hover {
+  background: rgba(184, 154, 106, 0.16);
+}
+
+.workflow-control-center,
+.agent-workspace {
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.96), rgba(247, 242, 234, 0.92)),
+    linear-gradient(rgba(15, 39, 71, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 39, 71, 0.04) 1px, transparent 1px);
+  background-size: auto, 34px 34px, 34px 34px;
+}
+
+.workflow-at-glance {
+  border-color: rgba(184, 154, 106, 0.48);
+}
+
+.settings-modal {
+  background: rgba(3, 12, 24, 0.62);
+  backdrop-filter: blur(4px);
+}
+
+.settings-panel {
+  background:
+    linear-gradient(180deg, rgba(255, 250, 242, 0.98), rgba(247, 242, 234, 0.96)),
+    var(--surface);
+  border-color: rgba(184, 154, 106, 0.5);
 }
 
 code {
@@ -2136,12 +2644,40 @@ code {
 
   .brand-lockup {
     gap: 12px;
+    width: 100%;
+    align-items: center;
+  }
+
+  .app-header {
+    flex-direction: column;
+  }
+
+  .app-header > .actions-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .brand-lockup h1 {
+    font-size: 2rem;
+    line-height: 1.05;
   }
 
   .brand-lockup__icon {
     width: 48px;
     height: 48px;
-    border-radius: 14px;
+    border-radius: var(--radius-card);
+  }
+
+  .hero-card h2 {
+    font-size: 1.8rem;
+    line-height: 1.1;
+  }
+
+  .hero-card::after {
+    right: -170px;
+    bottom: -150px;
+    opacity: 0.74;
   }
 
   .actions-row,
@@ -2166,6 +2702,9 @@ code {
   .workflow-feed-card__grid,
   .workflow-at-glance,
   .workflow-at-glance__facts,
+  .agent-history-layout,
+  .credentials-grid,
+  .credential-entry-grid,
   .workflow-grid,
   .workflow-cycle-grid,
   .workflow-goal-panel__grid,
@@ -2179,5 +2718,9 @@ code {
   .workflow-transcript__list,
   .workflow-feed-card__scroll {
     max-height: 280px;
+  }
+
+  .credential-secret-preview {
+    grid-template-columns: 1fr;
   }
 }

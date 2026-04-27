@@ -3,14 +3,22 @@ import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { getPreferredInterfaceCreationReasoningEffort, resolveInterfaceCreationReasoningEffort } from "@shared/modelConfig";
+import {
+  getAutomaticAgentReasoningEffort,
+  getPreferredInterfaceCreationReasoningEffort,
+  resolveAgentReasoningEffort,
+  resolveInterfaceCreationReasoningEffort
+} from "@shared/modelConfig";
 import { SummaryCache } from "@shared/summaryCache";
 import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/workflowRepairReport";
-import { humanInterventionRecordSchema, portableInterfaceSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
+import { humanInterventionRecordSchema, portableInterfaceSchema, projectCredentialsStateSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
 import { getPreloadEntryPath, getRendererBase, getRendererEntryPath } from "@shared/electronAppPaths";
 import { calculateValidationStatus } from "@shared/validation";
 import {
   approvalDecisionRequestSchema,
+  credentialEntrySaveRequestSchema,
+  credentialRequestSubmitToAgentSchema,
+  credentialRequestUpdateSchema,
   createAgentRequestSchema,
   downloadInterfaceRequestSchema,
   downloadLogsRequestSchema,
@@ -67,6 +75,7 @@ import {
   parseWslCodexRuntimeResolutionOutput,
   parseWslCommandResolutionOutput
 } from "@runtime/execution";
+import { compareCodexVersions, parseCodexCliVersion, parseNpmPackageVersion } from "@runtime/codexUpdate";
 import { buildProjectShellHandoffPrompt, buildWindowsProjectShellLaunchPlan, openProjectShellWindow } from "@runtime/projectShell";
 import { createTempDir, initGitRepo, commitAll } from "./helpers";
 import { executionPathToHostPath, resolveProjectPath, windowsPathToWslPath } from "@shared/pathUtils";
@@ -87,6 +96,15 @@ import {
   sanitizeScopedGoalForSingleAgent
 } from "@runtime/workflowGuardrails";
 import { buildRepairStrategyContext } from "@runtime/workflowRepairPlanner";
+import {
+  createAgentContextDescriptor,
+  createWorkflowContextDescriptor,
+  formatRelevantContextForPrompt,
+  pruneWorkflowContextDescriptors,
+  selectRelevantWorkflowContext
+} from "@runtime/contextSelector";
+import { buildDiscoveredModels } from "@runtime/modelCatalog";
+import type { Model } from "@generated/app-server/v2";
 
 type SpawnProcess = typeof import("node:child_process").spawn;
 type ExecFileProcess = typeof import("node:child_process").execFile;
@@ -176,7 +194,8 @@ describe("path utils", () => {
       maxRepairCycles: 3,
       autoApproveCommands: false,
       autoApproveGitCommits: false,
-      autoApproveGitPushes: false
+      autoApproveGitPushes: false,
+      considerPaidServices: false
     }, "win32");
     expect(resolved.wslPath).toBe("/home/nicot/project");
     expect(resolved.hostPath).toBe("\\\\wsl$\\Ubuntu\\home\\nicot\\project");
@@ -472,6 +491,28 @@ describe("repo stats", () => {
 });
 
 describe("reasoning defaults", () => {
+  const makeModel = ({ model, ...overrides }: Partial<Model> & Pick<Model, "model">): Model => ({
+    id: model,
+    model,
+    upgrade: null,
+    upgradeInfo: null,
+    availabilityNux: null,
+    displayName: model,
+    description: "",
+    hidden: false,
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Low reasoning" },
+      { reasoningEffort: "medium", description: "Medium reasoning" },
+      { reasoningEffort: "high", description: "High reasoning" },
+      { reasoningEffort: "xhigh", description: "Extra high reasoning" }
+    ],
+    defaultReasoningEffort: "medium",
+    inputModalities: ["text"],
+    supportsPersonality: true,
+    isDefault: false,
+    ...overrides
+  });
+
   it("keeps interface reasoning cost-conscious unless explicitly overridden", () => {
     const costConsciousModel: Pick<DiscoveredModel, "model" | "displayName" | "description" | "supportedReasoningEfforts" | "defaultReasoningEffort"> = {
       model: "gpt-5.4-mini",
@@ -492,6 +533,41 @@ describe("reasoning defaults", () => {
     expect(getPreferredInterfaceCreationReasoningEffort(deeperModel)).toBe("medium");
     expect(resolveInterfaceCreationReasoningEffort(deeperModel, "low")).toBe("medium");
     expect(resolveInterfaceCreationReasoningEffort(deeperModel, "xhigh")).toBe("xhigh");
+  });
+
+  it("auto-selects deeper reasoning for coding and lighter reasoning for simple merges", () => {
+    const model: Pick<DiscoveredModel, "supportedReasoningEfforts"> = {
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]
+    };
+
+    expect(getAutomaticAgentReasoningEffort("coding", "Implement a workflow IPC refactor.", model)).toBe("xhigh");
+    expect(getAutomaticAgentReasoningEffort("coding", "Fix a small label typo.", model)).toBe("high");
+    expect(getAutomaticAgentReasoningEffort("merge", "Integrate validated work deterministically.", model)).toBe("low");
+    expect(getAutomaticAgentReasoningEffort("merge", "Resolve merge conflicts across branches.", model)).toBe("medium");
+  });
+
+  it("clamps automatic and manual reasoning to supported model efforts", () => {
+    const model: Pick<DiscoveredModel, "supportedReasoningEfforts"> = {
+      supportedReasoningEfforts: ["low", "medium", "high"]
+    };
+
+    expect(resolveAgentReasoningEffort(model, "coding", "Implement the scoped task.", "auto")).toBe("high");
+    expect(resolveAgentReasoningEffort(model, "manual", "Explain the repository.", "manual", "xhigh")).toBe("high");
+    expect(resolveAgentReasoningEffort(model, "manual", "Explain the repository.", "manual", "low")).toBe("low");
+  });
+
+  it("surfaces hidden models from the newest discovered GPT generation", () => {
+    const discovered = buildDiscoveredModels([
+      makeModel({ model: "gpt-5.4-mini", displayName: "GPT-5.4 Mini" }),
+      makeModel({ model: "gpt-5.5", displayName: "GPT-5.5", hidden: true, defaultReasoningEffort: "high" }),
+      makeModel({ model: "gpt-4.1", displayName: "GPT-4.1", hidden: true })
+    ]);
+
+    expect(discovered.map((model) => model.model)).toContain("gpt-5.5");
+    expect(discovered.map((model) => model.model)).not.toContain("gpt-4.1");
+    expect(discovered[0]?.model).toBe("gpt-5.5");
+    expect(discovered[0]?.recommendedForInterfaceCreation).toBe(true);
+    expect(discovered[0]?.labels).toContain("CLI listed");
   });
 });
 
@@ -549,6 +625,14 @@ describe("schema validation and IPC", () => {
     expect(projectLoadRequestSchema.parse({ inputPath: "/repo" }).inputPath).toBe("/repo");
     expect(projectOpenRequestSchema.parse({ projectId: "saved-project" }).projectId).toBe("saved-project");
     expect(createAgentRequestSchema.parse({ projectId: "p", category: "coding", name: "Agent", prompt: "Do it", model: "gpt-5.4" }).category).toBe("coding");
+    expect(credentialEntrySaveRequestSchema.parse({
+      projectId: "p",
+      providerName: "Polygon.io",
+      keyLabel: "API key",
+      apiKey: "secret"
+    }).status).toBe("active");
+    expect(credentialRequestUpdateSchema.parse({ projectId: "p", requestId: "r", status: "dismissed" }).status).toBe("dismissed");
+    expect(credentialRequestSubmitToAgentSchema.parse({ projectId: "p", requestId: "r" }).requestId).toBe("r");
     expect(approvalDecisionRequestSchema.parse({ projectId: "p", agentId: "a", approvalId: "x", decision: "accept" }).decision).toBe("accept");
     expect(downloadInterfaceRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(downloadLogsRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
@@ -569,7 +653,8 @@ describe("schema validation and IPC", () => {
         interfaceCreationReasoningEffort: "medium",
         autoApproveCommands: false,
         autoApproveGitCommits: false,
-        autoApproveGitPushes: false
+        autoApproveGitPushes: false,
+        considerPaidServices: false
       },
       summary: {
         projectName: "repo",
@@ -812,6 +897,15 @@ describe("schema validation and IPC", () => {
     });
   });
 
+  it("parses and compares Codex CLI versions for startup updates", () => {
+    expect(parseCodexCliVersion("codex-cli 0.125.0")).toBe("0.125.0");
+    expect(parseCodexCliVersion("warning\ncodex-cli 0.126.1\n")).toBe("0.126.1");
+    expect(parseNpmPackageVersion("npm notice 11.0.0 is available\n0.126.1\n")).toBe("0.126.1");
+    expect(compareCodexVersions("0.125.0", "0.126.0")).toBeLessThan(0);
+    expect(compareCodexVersions("0.126.0", "0.126.0")).toBe(0);
+    expect(compareCodexVersions("0.127.0", "0.126.0")).toBeGreaterThan(0);
+  });
+
   it("does not misclassify resolved WSL launch failures as missing installs", () => {
     expect(
       describeExecutionFailure(
@@ -958,6 +1052,17 @@ describe("workflow state", () => {
     expect(workflow.workflowStage).toBe("charter_needed");
     expect(workflow.stepProgress.ultimate_goal.stepId).toBe("ultimate_goal");
     expect(workflow.stepProgress.merge.stepId).toBe("merge");
+    expect(workflow.memory.contextDescriptors).toEqual([]);
+    expect(projectCredentialsStateSchema.parse({}).entries).toEqual([]);
+    expect(projectCredentialsStateSchema.parse({
+      requests: [{
+        id: "cred-1",
+        providerName: "Polygon.io",
+        keyLabel: "API key",
+        description: "Free-tier key",
+        createdAt: "2026-04-07T00:00:00.000Z"
+      }]
+    }).requests[0].freeOnly).toBe(true);
     expect(intervention.status).toBe("pending");
     expect(intervention.blocking).toBe(true);
   });
@@ -1016,6 +1121,114 @@ describe("workflow state", () => {
     };
 
     expect(deriveWorkflowProjection(blocked, []).stage).toBe("blocked_human");
+  });
+
+  it("selects relevant prior context deterministically and explains why", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a trading dashboard with live market data and safe credentials.",
+      detailedIntent: "The app should use provider adapters rather than hardcoded mock data.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.workflowStage = "goal_ready";
+    workflow.workflowCycle = {
+      ...workflow.workflowCycle,
+      cycleNumber: 3
+    };
+
+    const tradingDescriptor = createWorkflowContextDescriptor({
+      workflow,
+      agentCategory: "coding",
+      summary: "Added Polygon market data provider abstraction and credential-missing empty states.",
+      changedPaths: ["src/providers/marketData.ts", "src/renderer/TradingDashboard.tsx"],
+      relatedPaths: ["src/providers/marketData.ts"],
+      now: "2026-04-07T00:00:00.000Z"
+    });
+    const unrelatedDescriptor = createWorkflowContextDescriptor({
+      workflow,
+      agentCategory: "coding",
+      summary: "Adjusted package metadata for Windows distribution.",
+      changedPaths: ["package.json"],
+      now: "2026-04-07T00:01:00.000Z"
+    });
+
+    const selected = selectRelevantWorkflowContext([unrelatedDescriptor, tradingDescriptor], {
+      workflow,
+      agentCategory: "coding",
+      taskText: "Wire the live trading provider credentials into the dashboard loading state.",
+      relatedPaths: ["src/providers/marketData.ts"]
+    });
+
+    expect(selected[0]?.descriptorId).toBe(tradingDescriptor.id);
+    expect(selected[0]?.reasons.join(" ")).toContain("shared");
+    expect(formatRelevantContextForPrompt(selected)).toContain("Relevant prior context");
+  });
+
+  it("omits stale historical checklist counts from selected prior context", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a trading dashboard with live market data and safe credentials.",
+      detailedIntent: "The app should use provider adapters rather than hardcoded mock data.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+
+    const descriptor = createWorkflowContextDescriptor({
+      workflow,
+      agentCategory: "coding",
+      summary: "Cycle 4 recommendation said completion remains 8/39 and 8/39 required goal checks met (21%) while adding market provider tests.",
+      changedPaths: ["src/providers/marketData.ts"],
+      now: "2026-04-07T00:00:00.000Z"
+    });
+
+    const selected = selectRelevantWorkflowContext([descriptor], {
+      workflow,
+      agentCategory: "coding",
+      taskText: "Improve market provider tests and credential handling.",
+      relatedPaths: ["src/providers/marketData.ts"]
+    });
+    const formatted = formatRelevantContextForPrompt(selected);
+
+    expect(formatted).toContain("[historical progress count omitted]");
+    expect(formatted).not.toContain("8/39");
+  });
+
+  it("keeps completed agent context tied to the agent's original cycle", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle = {
+      ...workflow.workflowCycle,
+      cycleNumber: 74
+    };
+    const agent = {
+      ...createAgentSkeleton("coding", "Coding Pass 1", "Implement transaction fixtures.", "gpt-5.4"),
+      workflowCycleNumber: 12,
+      status: "completed" as const,
+      changedFiles: ["src/analytics/transactionHistory.test.ts"],
+      lastMessageSnippet: "Added transaction-aware fixture evidence."
+    };
+
+    const descriptor = createAgentContextDescriptor(workflow, agent, "2026-04-07T00:00:00.000Z");
+
+    expect(descriptor.cycleNumber).toBe(12);
+  });
+
+  it("prunes context descriptors by newest update first", () => {
+    const workflow = defaultProjectWorkflowState();
+    const descriptors = [0, 1, 2].map((index) =>
+      createWorkflowContextDescriptor({
+        workflow,
+        agentCategory: "coding",
+        summary: `Descriptor ${index}`,
+        changedPaths: [`src/${index}.ts`],
+        now: `2026-04-07T00:0${index}:00.000Z`
+      })
+    );
+
+    expect(pruneWorkflowContextDescriptors(descriptors, 2).map((descriptor) => descriptor.summary)).toEqual([
+      "Descriptor 2",
+      "Descriptor 1"
+    ]);
   });
 
   it("creates a scoped goal from an approved recommendation and charter", () => {
@@ -1126,6 +1339,29 @@ describe("workflow state", () => {
       new Date("2026-04-07T00:05:00.000Z").getTime(),
       10 * 60 * 1000
     )).toBeNull();
+  });
+
+  it("classifies stale starting agents without threads as startup stalls", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 4;
+    const startingAgent: AgentState = {
+      ...createAgentSkeleton("coding", "Coding Pass 1", "Prompt", "gpt-5.4-mini"),
+      workflowCycleNumber: 4,
+      status: "starting",
+      createdAt: "2026-04-07T00:00:00.000Z"
+    };
+
+    expect(getWorkflowRecoveryCandidate(
+      workflow,
+      [startingAgent],
+      new Date("2026-04-07T00:30:00.000Z").getTime(),
+      10 * 60 * 1000
+    )).toMatchObject({
+      kind: "startup_stalled",
+      agent: {
+        id: startingAgent.id
+      }
+    });
   });
 
   it("selects the next automation action conservatively from workflow state", () => {
@@ -1380,6 +1616,48 @@ describe("workflow state", () => {
     ];
 
     expect(pickAutopilotRecommendation(recommendations, workflow)?.id).toBe("rec-1");
+  });
+
+  it("prefers coherent goal batches over single-check churn when both target the checklist", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(
+      {
+        ...emptyUltimateGoal("user"),
+        summary: "Build a market research dashboard.",
+        successCriteria: [
+          "App includes drawdown visualization and recovery analysis",
+          "App includes rolling volatility and rolling Sharpe metrics"
+        ]
+      },
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+
+    const recommendations = [
+      makeRecommendation({
+        id: "rec-batch",
+        rank: 2,
+        title: "Satisfy goal batch: performance analytics",
+        summary: "Implement one coherent performance analytics batch covering 2 related required checks with shared code, tests, and evidence.",
+        rationale: "These checks share implementation paths and validation evidence.",
+        expectedImpact: "This can move multiple required Goal checklist items to met in one cycle.",
+        confidence: 0.82,
+        priority: "high",
+        estimatedScope: "medium"
+      }),
+      makeRecommendation({
+        id: "rec-single",
+        rank: 1,
+        title: "Satisfy goal check: App includes drawdown visualization and recovery analysis",
+        summary: "Gather implementation and validation evidence for this required check.",
+        rationale: "The goal checklist blocks completion here.",
+        expectedImpact: "This moves the Ultimate Goal percentage by converting an explicit required check into evidenced completion.",
+        confidence: 0.9,
+        priority: "high"
+      })
+    ];
+
+    expect(pickAutopilotRecommendation(recommendations, workflow)?.id).toBe("rec-batch");
   });
 });
 
@@ -2148,10 +2426,12 @@ describe("workflow guardrails", () => {
     });
 
     expect(scopedGoal.summary.length).toBeLessThanOrEqual(110);
-    expect(scopedGoal.executionBrief).toContain("one coding agent pass");
-    expect(scopedGoal.constraints).toContain("Keep this work scoped to one coding agent pass.");
-    expect(scopedGoal.acceptanceCriteria).toHaveLength(4);
-    expect(scopedGoal.testStrategy).toHaveLength(3);
+    expect(scopedGoal.executionBrief).toContain("one coherent coding pass");
+    expect(scopedGoal.executionBrief).toContain("largest reviewable batch");
+    expect(scopedGoal.constraints).toContain("Keep this work scoped to one coherent coding agent pass.");
+    expect(scopedGoal.constraints).toContain("Batch related checks only when they share implementation paths, tests, or evidence.");
+    expect(scopedGoal.acceptanceCriteria).toHaveLength(5);
+    expect(scopedGoal.testStrategy).toHaveLength(4);
   });
 
   it("stops retries early for environment blockers but keeps repeated failures repairable", () => {
@@ -2515,10 +2795,133 @@ describe("workflow recommendations", () => {
       maxOptions: 5
     });
 
-    expect(recommendations[0]?.title).toContain("Satisfy goal check: App includes drawdown");
-    expect(recommendations.slice(0, 2).every((entry) => entry.title.startsWith("Satisfy goal check:"))).toBe(true);
+    expect(recommendations[0]?.title).toContain("Satisfy goal batch:");
+    expect(recommendations[0]?.summary).toContain("related required checks");
+    expect(recommendations[0]?.estimatedScope).toBe("medium");
+    expect(recommendations.slice(0, 2).every((entry) => /^Satisfy goal (?:batch|check):/.test(entry.title))).toBe(true);
     const stabilizeIndex = recommendations.findIndex((entry) => entry.title.startsWith("Stabilize recent work"));
     expect(stabilizeIndex === -1 || stabilizeIndex > 1).toBe(true);
+  });
+
+  it("consolidates duplicate semantic checklist constraints before computing progress", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a portfolio intelligence dashboard.",
+      constraints: [
+        "Preserve a clean separation between data connectors, normalized data schemas, analytics engines, recommendation logic, and UI components."
+      ],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    const baseChecklist = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+    const canonicalConstraint = baseChecklist.find((check) => check.source === "constraint");
+    expect(canonicalConstraint).toBeTruthy();
+
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      baseChecklist,
+      [
+        {
+          action: "add",
+          id: "constraint-architecture-separation",
+          title: "Constraint preserved: Preserve a clean separation between data connectors, normalized data schemas, analytics engines, recommendation logic, and UI components.",
+          required: true,
+          status: "unmet",
+          evidence: "The supplied workflow source of truth lists this as a highest-impact open check.",
+          relatedPaths: ["docs/goal-evidence.md"]
+        },
+        {
+          action: "update",
+          id: canonicalConstraint?.id,
+          title: canonicalConstraint?.title ?? "Constraint preserved: Preserve a clean separation between data connectors, normalized data schemas, analytics...",
+          status: "met",
+          evidence: "src/architecture/layerSeparation.test.ts asserts zero forbidden dependencies between connector, schema, analytics, recommendation, and UI layers.",
+          relatedPaths: ["src/architecture/layerSeparation.test.ts"]
+        }
+      ],
+      { timestamp: "2026-04-07T00:03:00.000Z" }
+    );
+
+    const separationChecks = workflow.goalChecklist.filter((check) =>
+      `${check.title} ${check.description}`.toLowerCase().includes("separation")
+    );
+    expect(separationChecks).toHaveLength(1);
+    expect(separationChecks[0]?.status).toBe("met");
+    expect(separationChecks[0]?.evidence).toContain("Consolidated");
+
+    workflow.workflowCycle.status = "completed";
+    const progress = estimateUltimateGoalProgress({
+      workflow,
+      agents: [makePassedIntegrityAgent()],
+      scan: {
+        kind: "git",
+        files: [],
+        stats: {
+          projectRoot: "/repo",
+          kind: "git",
+          totalFiles: 1,
+          totalFolders: 1,
+          totalSizeBytes: 1_024,
+          includedFiles: 1,
+          includedFolders: 1,
+          includedSizeBytes: 1_024,
+          excludedFiles: 0,
+          excludedFolders: 0,
+          excludedSizeBytes: 0,
+          excludedPaths: [],
+          fileTypeBreakdown: { TypeScript: 1 },
+          languageBreakdown: { TypeScript: 1 },
+          entryPoints: ["src/App.tsx"],
+          manifestFiles: ["package.json"],
+          testsPresent: true,
+          primaryManagers: ["npm"],
+          explanation: "Dashboard repo"
+        },
+        dependencies: []
+      },
+      overview: undefined,
+      objective: "deliver",
+      maxOptions: 5
+    });
+
+    expect(progress.percentComplete).toBe(100);
+  });
+
+  it("turns redundant checklist removals into non-blocking not-applicable checks", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a local-first market dashboard.",
+      successCriteria: ["Dashboard renders portfolio holdings"],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    const baseChecklist = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      [],
+      "2026-04-07T00:00:00.000Z"
+    );
+    const holdingsCheck = baseChecklist.find((check) => check.title === "Dashboard renders portfolio holdings");
+    expect(holdingsCheck).toBeTruthy();
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      baseChecklist,
+      [
+        {
+          action: "remove",
+          id: holdingsCheck?.id,
+          title: holdingsCheck?.title ?? "Dashboard renders portfolio holdings",
+          status: "not_applicable",
+          evidence: "A later repository inspection found this user-derived check is redundant with a more precise portfolio snapshot check."
+        }
+      ],
+      { timestamp: "2026-04-07T00:03:00.000Z" }
+    );
+
+    const removedCheck = workflow.goalChecklist.find((check) => check.id === holdingsCheck?.id);
+    expect(removedCheck?.required).toBe(false);
+    expect(removedCheck?.status).toBe("not_applicable");
   });
 
   it("keeps long unknown checklist items ahead of generic fallback recommendations", () => {
@@ -2589,8 +2992,82 @@ describe("workflow recommendations", () => {
     });
 
     expect(recommendations.length).toBeGreaterThan(0);
-    expect(recommendations[0]?.title).toContain("Satisfy goal check:");
+    expect(recommendations[0]?.title).toMatch(/^Satisfy goal (?:batch|check):/);
     expect(recommendations[0]?.title).not.toContain("operator feedback");
+  });
+
+  it("does not seed checklist recommendations from unrelated recent files", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a portfolio intelligence dashboard with comparable company analysis.",
+      detailedIntent: "The app should add peer analysis without confusing it with the last social-news slice.",
+      successCriteria: [
+        "The app includes a comparable company analysis module that can generate peer groups for each holding, compare valuation, growth, margins, profitability, leverage, momentum, sentiment, and recent news, and explain why each peer was selected."
+      ],
+      constraints: ["Keep the implementation deterministic."],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      [],
+      "2026-04-07T00:00:00.000Z"
+    ).map((check) => ({
+      ...check,
+      status: "unmet" as const,
+      evidence: "No comparable-company module exists yet.",
+      relatedPaths: ["src", "docs/goal-evidence.md"]
+    }));
+
+    const recommendations = buildWorkflowRecommendations({
+      workflow,
+      agents: [
+        {
+          ...createAgentSkeleton("coding", "Previous Social News Pass", "Implement social monitoring.", "gpt-5.4"),
+          changedFiles: ["src/analytics/socialNewsMonitor.ts", "src/analytics/socialNewsMonitor.test.ts"]
+        }
+      ],
+      scan: {
+        kind: "git",
+        files: [
+          { absolutePath: "/repo/src/App.tsx", relativePath: "src/App.tsx", size: 4_096, language: "TypeScript" },
+          { absolutePath: "/repo/src/App.test.tsx", relativePath: "src/App.test.tsx", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/src/analytics/socialNewsMonitor.ts", relativePath: "src/analytics/socialNewsMonitor.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/src/analytics/socialNewsMonitor.test.ts", relativePath: "src/analytics/socialNewsMonitor.test.ts", size: 2_048, language: "TypeScript" },
+          { absolutePath: "/repo/docs/goal-evidence.md", relativePath: "docs/goal-evidence.md", size: 1_024, language: "Markdown" }
+        ],
+        stats: {
+          projectRoot: "/repo",
+          kind: "git",
+          totalFiles: 5,
+          totalFolders: 4,
+          totalSizeBytes: 11_264,
+          includedFiles: 5,
+          includedFolders: 4,
+          includedSizeBytes: 11_264,
+          excludedFiles: 0,
+          excludedFolders: 0,
+          excludedSizeBytes: 0,
+          excludedPaths: [],
+          fileTypeBreakdown: { TypeScript: 4, Markdown: 1 },
+          languageBreakdown: { TypeScript: 4, Markdown: 1 },
+          entryPoints: ["src/App.tsx"],
+          manifestFiles: ["package.json"],
+          testsPresent: true,
+          primaryManagers: ["npm"],
+          explanation: "Portfolio dashboard repo"
+        },
+        dependencies: []
+      },
+      overview: undefined,
+      objective: "deliver",
+      maxOptions: 5
+    });
+
+    expect(recommendations[0]?.title).toContain("Satisfy goal check:");
+    expect(recommendations[0]?.relatedPaths).toContain("docs/goal-evidence.md");
+    expect(recommendations[0]?.relatedPaths).toContain("src/App.tsx");
+    expect(recommendations[0]?.relatedPaths).not.toContain("src/analytics/socialNewsMonitor.ts");
   });
 
   it("builds an outcome strategy brief from the Ultimate Goal and open checklist", () => {
@@ -2653,7 +3130,8 @@ describe("workflow recommendations", () => {
     });
 
     expect(brief).toContain("Outcome strategy:");
-    expect(brief).toContain("Primary next move: Satisfy the highest-impact open goal check");
+    expect(brief).toContain("Primary next move: Satisfy the highest-impact coherent batch");
+    expect(brief).toContain("Efficient batching opportunity:");
     expect(brief).toContain("App includes drawdown visualization");
     expect(brief).toContain("Quality bar:");
     expect(brief).toContain("Keep offline mode usable");

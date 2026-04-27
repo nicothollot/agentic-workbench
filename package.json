@@ -12,7 +12,7 @@
     "mock": "cross-env AWB_MOCK_MODE=1 node scripts/dev.mjs",
     "start": "electron .",
     "generate:icons": "node scripts/generate-icons.mjs",
-    "build": "node scripts/package-app.mjs",
+    "build": "npm run build:app",
     "build:app": "npm run clean && npm run generate:icons && npm run build:renderer && npm run build:electron",
     "build:renderer": "vite build",
     "build:electron": "vite build -c vite.main.config.ts && vite build -c vite.preload.config.ts",

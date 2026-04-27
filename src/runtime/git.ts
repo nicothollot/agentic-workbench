@@ -1,12 +1,14 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { nanoid } from "nanoid";
 import { slugify } from "@shared/utils";
 import type { AppSettings, WorktreeAssignment } from "@shared/types";
 import type { GitMetadata } from "./repoScanner";
-import { RuntimeCommandExecutor } from "./execution";
+import { resolveExecutionMode, RuntimeCommandExecutor } from "./execution";
 import { joinExecutionPathWithinProject } from "./projectBoundary";
 
 type RuntimeSettings = Pick<AppSettings, "executionMode" | "distroName">;
+const WORKBENCH_GIT_EXCLUDE_ENTRY = ".agent-workbench/";
 
 const execGit = async (settings: RuntimeSettings, projectRoot: string, args: string[]): Promise<string> => {
   const executor = new RuntimeCommandExecutor(settings);
@@ -32,6 +34,59 @@ const isContainedPath = (root: string, candidate: string): boolean => {
 };
 
 const uniquePaths = (paths: string[]): string[] => [...new Set(paths.filter(Boolean))];
+
+const isWorkbenchExcludeEntry = (line: string): boolean => {
+  const trimmed = line.trim();
+  return trimmed === WORKBENCH_GIT_EXCLUDE_ENTRY || trimmed === ".agent-workbench";
+};
+
+const ensureManagedWorktreeGitExclude = async (projectRoot: string, settings: RuntimeSettings): Promise<void> => {
+  if (resolveExecutionMode(settings) === "wsl") {
+    const executor = new RuntimeCommandExecutor(settings);
+    await executor.execStructuredCommand({
+      command: "sh",
+      args: [
+        "-c",
+        [
+          "set -eu",
+          `entry='${WORKBENCH_GIT_EXCLUDE_ENTRY}'`,
+          "exclude_path=\"$(git rev-parse --git-path info/exclude)\"",
+          "mkdir -p \"$(dirname \"$exclude_path\")\"",
+          "touch \"$exclude_path\"",
+          "if ! grep -qxF \"$entry\" \"$exclude_path\" && ! grep -qxF '.agent-workbench' \"$exclude_path\"; then",
+          "  printf '\\n%s\\n' \"$entry\" >> \"$exclude_path\"",
+          "fi"
+        ].join("\n")
+      ],
+      cwd: projectRoot
+    });
+    return;
+  }
+
+  const rawExcludePath = await execGit(settings, projectRoot, ["rev-parse", "--git-path", "info/exclude"]);
+  const pathModule = getPathModule(projectRoot);
+  const excludePath = pathModule.isAbsolute(rawExcludePath)
+    ? rawExcludePath
+    : pathModule.resolve(projectRoot, rawExcludePath);
+
+  await mkdir(pathModule.dirname(excludePath), { recursive: true });
+
+  let existing = "";
+  try {
+    existing = await readFile(excludePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  if (existing.split(/\r?\n/).some(isWorkbenchExcludeEntry)) {
+    return;
+  }
+
+  const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+  await writeFile(excludePath, `${existing}${separator}${WORKBENCH_GIT_EXCLUDE_ENTRY}\n`, "utf8");
+};
 
 const parseStatusEntries = (output: string): string[] =>
   uniquePaths(
@@ -111,6 +166,7 @@ export const createWorktreeAssignment = async (
     nanoid(6)
   );
 
+  await ensureManagedWorktreeGitExclude(projectRoot, settings);
   await execGit(settings, projectRoot, ["worktree", "add", "-b", branch, worktreePath, targetBranch]);
 
   return {

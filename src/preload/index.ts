@@ -1,10 +1,15 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   AgentCategory,
+  AgentReasoningMode,
   ApprovalDecision,
+  CredentialEntryMetadata,
+  CredentialEntryStatus,
+  CredentialRequestRecord,
   FileSummary,
   GitHubStatus,
   HumanInterventionRecord,
+  InterfaceReasoningEffort,
   LocalProjectState,
   LoadedProjectView,
   OpenProjectShellResult,
@@ -16,6 +21,7 @@ import type {
 } from "@shared/types";
 
 const invoke = async <T>(channel: string, payload?: unknown): Promise<T> => await ipcRenderer.invoke(channel, payload) as T;
+const STATE_UPDATE_COALESCE_MS = 50;
 
 export interface WorkbenchApi {
   getState(): Promise<WorkbenchState>;
@@ -35,6 +41,27 @@ export interface WorkbenchApi {
   updateLayout(projectId: string, payload: Record<string, unknown>): Promise<void>;
   updateUiState(projectId: string, payload: Partial<LocalProjectState>): Promise<void>;
   openProjectShell(projectId: string): Promise<OpenProjectShellResult>;
+  saveCredentialEntry(
+    projectId: string,
+    payload: {
+      entryId?: string;
+      providerName: string;
+      keyLabel: string;
+      apiKey: string;
+      secretKey?: string;
+      notes?: string;
+      status?: CredentialEntryStatus;
+      linkedRequestIds?: string[];
+    }
+  ): Promise<CredentialEntryMetadata>;
+  deleteCredentialEntry(projectId: string, entryId: string): Promise<void>;
+  updateCredentialRequest(
+    projectId: string,
+    requestId: string,
+    status: CredentialRequestRecord["status"],
+    notes?: string
+  ): Promise<CredentialRequestRecord>;
+  submitCredentialRequestToAgent(projectId: string, requestId: string): Promise<CredentialRequestRecord>;
   updateUltimateGoal(projectId: string, goal: Omit<UltimateGoal, "confirmedAt" | "lastUpdatedAt">, confirm?: boolean): Promise<UltimateGoal>;
   detectUltimateGoal(projectId: string): Promise<UltimateGoal>;
   importUltimateGoalText(projectId: string): Promise<UltimateGoalImportPreview | null>;
@@ -60,7 +87,15 @@ export interface WorkbenchApi {
   downloadInterface(projectId: string): Promise<string | null>;
   downloadLogs(projectId: string): Promise<string | null>;
   importInterface(projectRootPath: string, importPath: string, allowMismatch?: boolean): Promise<LoadedProjectView>;
-  createAgent(projectId: string, category: AgentCategory, name: string, prompt: string, model: string): Promise<unknown>;
+  createAgent(
+    projectId: string,
+    category: AgentCategory,
+    name: string,
+    prompt: string,
+    model: string,
+    reasoningMode?: AgentReasoningMode,
+    reasoningEffort?: InterfaceReasoningEffort
+  ): Promise<unknown>;
   approve(projectId: string, agentId: string, approvalId: string, decision: ApprovalDecision): Promise<void>;
   runIntegrity(projectId: string): Promise<void>;
   runMerge(projectId: string): Promise<void>;
@@ -87,7 +122,7 @@ const api: WorkbenchApi = {
       if (frameId !== null) {
         return;
       }
-      frameId = setTimeout(flush, 16);
+      frameId = setTimeout(flush, STATE_UPDATE_COALESCE_MS);
     };
     ipcRenderer.on("state:updated", wrapped);
     return () => {
@@ -112,6 +147,14 @@ const api: WorkbenchApi = {
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),
+  saveCredentialEntry: async (projectId, payload) =>
+    await invoke<CredentialEntryMetadata>("credentials:saveEntry", { projectId, ...payload }),
+  deleteCredentialEntry: async (projectId, entryId) =>
+    await invoke<void>("credentials:deleteEntry", { projectId, entryId }),
+  updateCredentialRequest: async (projectId, requestId, status, notes) =>
+    await invoke<CredentialRequestRecord>("credentials:updateRequest", { projectId, requestId, status, notes }),
+  submitCredentialRequestToAgent: async (projectId, requestId) =>
+    await invoke<CredentialRequestRecord>("credentials:submitRequestToAgent", { projectId, requestId }),
   updateUltimateGoal: async (projectId, goal, confirm = true) =>
     await invoke<UltimateGoal>("workflow:updateUltimateGoal", { projectId, goal, confirm }),
   detectUltimateGoal: async (projectId) => await invoke<UltimateGoal>("workflow:detectUltimateGoal", { projectId }),
@@ -138,8 +181,8 @@ const api: WorkbenchApi = {
   downloadLogs: async (projectId) => await invoke<string | null>("project:downloadLogs", { projectId }),
   importInterface: async (projectRootPath, importPath, allowMismatch = false) =>
     await invoke<LoadedProjectView>("project:importInterface", { projectRootPath, importPath, allowMismatch }),
-  createAgent: async (projectId, category, name, prompt, model) =>
-    await invoke<unknown>("agent:create", { projectId, category, name, prompt, model }),
+  createAgent: async (projectId, category, name, prompt, model, reasoningMode, reasoningEffort) =>
+    await invoke<unknown>("agent:create", { projectId, category, name, prompt, model, reasoningMode, reasoningEffort }),
   approve: async (projectId, agentId, approvalId, decision) =>
     await invoke<void>("agent:approve", { projectId, agentId, approvalId, decision }),
   runIntegrity: async (projectId) => await invoke<void>("agent:runIntegrity", projectId),

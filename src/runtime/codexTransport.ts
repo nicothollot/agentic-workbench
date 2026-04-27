@@ -38,6 +38,8 @@ interface CodexLaunchPlan {
   resolvedUser?: string;
 }
 
+const DEFAULT_CODEX_REQUEST_TIMEOUT_MS = 120_000;
+
 export class CodexAppServerTransport extends EventEmitter<TransportEventMap> implements CodexTransport {
   static async resolveLaunchPlan(
     settings: AppSettings,
@@ -186,8 +188,32 @@ export class CodexAppServerTransport extends EventEmitter<TransportEventMap> imp
     };
     const id = request.id;
     return await new Promise<TResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve: (value) => resolve(value as TResponse), reject });
-      this.process.stdin.write(`${JSON.stringify(message)}\n`, "utf8");
+      const timeout = setTimeout(() => {
+        if (!this.pending.delete(id)) {
+          return;
+        }
+        reject(new Error(`Codex app-server request timed out after ${DEFAULT_CODEX_REQUEST_TIMEOUT_MS / 1000}s: ${request.method}`));
+      }, DEFAULT_CODEX_REQUEST_TIMEOUT_MS);
+      timeout.unref();
+
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value as TResponse);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+
+      try {
+        this.process.stdin.write(`${JSON.stringify(message)}\n`, "utf8");
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -209,14 +235,34 @@ export class CodexAppServerTransport extends EventEmitter<TransportEventMap> imp
   }
 
   async listModels(): Promise<ModelListResponse> {
-    return await this.call<ModelListResponse>({
-      id: this.requestId++,
-      method: "model/list",
-      params: {
-        cursor: null,
-        limit: 100
+    const data: ModelListResponse["data"] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+
+    do {
+      const response: ModelListResponse = await this.call<ModelListResponse>({
+        id: this.requestId++,
+        method: "model/list",
+        params: {
+          cursor,
+          limit: 100,
+          includeHidden: true
+        }
+      });
+      data.push(...response.data);
+      cursor = response.nextCursor;
+      if (cursor) {
+        if (seenCursors.has(cursor)) {
+          throw new Error(`Codex model discovery returned a repeated cursor: ${cursor}`);
+        }
+        seenCursors.add(cursor);
       }
-    });
+    } while (cursor);
+
+    return {
+      data,
+      nextCursor: null
+    };
   }
 
   async startThread(params: ThreadStartParams): Promise<ThreadStartResponse> {

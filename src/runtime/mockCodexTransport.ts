@@ -320,6 +320,26 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       data: [
         {
+          id: "gpt-5.5",
+          model: "gpt-5.5",
+          upgrade: null,
+          upgradeInfo: null,
+          availabilityNux: null,
+          displayName: "GPT-5.5",
+          description: "Mock newest GPT model",
+          hidden: true,
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low", description: "Low reasoning" },
+            { reasoningEffort: "medium", description: "Medium reasoning" },
+            { reasoningEffort: "high", description: "High reasoning" },
+            { reasoningEffort: "xhigh", description: "Extra high reasoning" }
+          ],
+          defaultReasoningEffort: "high",
+          inputModalities: ["text"],
+          supportsPersonality: true,
+          isDefault: false
+        },
+        {
           id: "gpt-5.4-mini",
           model: "gpt-5.4-mini",
           upgrade: null,

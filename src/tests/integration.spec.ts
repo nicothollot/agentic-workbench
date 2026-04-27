@@ -135,6 +135,21 @@ class FailingScopedGoalTransport extends MockCodexTransport {
   }
 }
 
+class CapturingPromptTransport extends MockCodexTransport {
+  readonly threadStarts: Array<Parameters<MockCodexTransport["startThread"]>[0]> = [];
+  readonly turnStarts: Array<Parameters<MockCodexTransport["startTurn"]>[0]> = [];
+
+  async startThread(params: Parameters<MockCodexTransport["startThread"]>[0]): ReturnType<MockCodexTransport["startThread"]> {
+    this.threadStarts.push(params);
+    return await super.startThread(params);
+  }
+
+  async startTurn(params: Parameters<MockCodexTransport["startTurn"]>[0]): ReturnType<MockCodexTransport["startTurn"]> {
+    this.turnStarts.push(params);
+    return await super.startTurn(params);
+  }
+}
+
 describe("integration flows", () => {
   it("does not report an existing interface on a true first open", async () => {
     const root = await createSampleRepo("first-open");
@@ -296,7 +311,16 @@ describe("integration flows", () => {
     await serviceA.loadProject(root);
     const selected = await serviceA.selectPendingInterface("fresh");
     await new Promise((resolve) => setTimeout(resolve, 80));
+    await serviceA.saveCredentialEntry(selected.record.id, {
+      providerName: "Polygon.io",
+      keyLabel: "API key",
+      apiKey: "polygon-secret",
+      notes: "local only"
+    });
     const exportPath = await serviceA.exportInterface(selected.record.id);
+    const exportedPayload = JSON.parse(await readFile(exportPath, "utf8")) as Record<string, unknown>;
+    expect(exportedPayload.credentials).toBeUndefined();
+    expect(JSON.stringify(exportedPayload)).not.toContain("polygon-secret");
 
     const appDataB = await createTempDir("appdata-roundtrip-b");
     const serviceB = await createService(appDataB);
@@ -306,6 +330,7 @@ describe("integration flows", () => {
     const project = serviceB.getState().projects.find((entry) => entry.record.id === imported.record.id);
     expect(project?.record.overview?.summary.length).toBeGreaterThan(10);
     expect(project?.record.agents.some((agent) => agent.category === "bootstrap")).toBe(true);
+    expect(project?.record.credentials.entries).toEqual([]);
   });
 
   it("downloads a shareable interface file and can import it from outside the project root", async () => {
@@ -359,11 +384,19 @@ describe("integration flows", () => {
     await service.updateSettings({
       interfaceCreationModel: stateBefore.availableModels[0]?.model,
       interfaceCreationReasoningEffort: "high",
+      agentReasoningMode: "manual",
+      agentReasoningEfforts: {
+        coding: "xhigh",
+        merge: "low"
+      },
       maxRepairCycles: 4
     });
 
     const stateAfter = service.getState();
     expect(stateAfter.settings.interfaceCreationReasoningEffort).toBe("high");
+    expect(stateAfter.settings.agentReasoningMode).toBe("manual");
+    expect(stateAfter.settings.agentReasoningEfforts?.coding).toBe("xhigh");
+    expect(stateAfter.settings.agentReasoningEfforts?.merge).toBe("low");
     expect(stateAfter.settings.maxRepairCycles).toBe(4);
     expect(stateAfter.settings.interfaceCreationConfiguredAt).toBeTruthy();
   });
@@ -423,7 +456,10 @@ describe("integration flows", () => {
     const appData = await createTempDir("appdata-reasoning-applied");
     const service = await createService(appData);
     await service.updateSettings({
-      interfaceCreationReasoningEffort: "high"
+      agentReasoningMode: "manual",
+      agentReasoningEfforts: {
+        bootstrap: "high"
+      }
     });
 
     await service.loadProject(root, "create");
@@ -440,7 +476,10 @@ describe("integration flows", () => {
     const service = await createService(appData);
     await service.updateSettings({
       interfaceCreationModel: "gpt-5.4",
-      interfaceCreationReasoningEffort: "xhigh"
+      agentReasoningMode: "manual",
+      agentReasoningEfforts: {
+        goal: "xhigh"
+      }
     });
 
     await service.loadProject(root, "create");
@@ -453,6 +492,26 @@ describe("integration flows", () => {
     const goalAgent = getProjectRecord(service, selected.record.id)?.agents.find((agent) => agent.category === "goal");
     expect(goalAgent?.model).toBe("gpt-5.4");
     expect(goalAgent?.reasoningEffort).toBe("xhigh");
+    expect(goalAgent?.reasoningEffortSource).toBe("manual");
+  });
+
+  it("auto-selects high-depth reasoning for coding agents and low-depth reasoning for simple merge agents", async () => {
+    const root = await createSampleRepo("workflow-agent-auto-reasoning");
+    const appData = await createTempDir("appdata-workflow-agent-auto-reasoning");
+    const service = await createService(appData);
+
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    const codingAgent = await service.createAgent(selected.record.id, "coding", "Coding Agent", "Implement a small workflow fix.", "gpt-5.4");
+    expect(["high", "xhigh"]).toContain(codingAgent.reasoningEffort);
+    expect(codingAgent.reasoningEffortSource).toBe("auto");
+
+    await service.runMerge(selected.record.id);
+    const mergeAgent = getProjectRecord(service, selected.record.id)?.agents.find((agent) => agent.category === "merge");
+    expect(["low", "medium"]).toContain(mergeAgent?.reasoningEffort);
+    expect(mergeAgent?.reasoningEffortSource).toBe("auto");
   });
 
   it("replaces an existing local interface in place instead of silently creating a duplicate", async () => {
@@ -627,6 +686,38 @@ describe("integration flows", () => {
     await waitFor(
       () => getProjectRecord(service, projectId)?.agents.find((entry) => entry.id === agent.id)?.approvals[0]?.status === "approved"
     );
+  });
+
+  it("keeps live thread instructions role-scoped and sends the task prompt once", async () => {
+    const root = await createSampleRepo("prompt-structure");
+    const appData = await createTempDir("appdata-prompt-structure");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    const transport = new CapturingPromptTransport();
+    (service as unknown as { transport: MockCodexTransport }).transport = transport;
+    const taskPrompt = "Update the code with the distinctive prompt-structure marker.";
+    await service.createAgent(selected.record.id, "coding", "Prompt Agent", taskPrompt, "gpt-5.4");
+
+    const baseInstructions = transport.threadStarts.at(-1)?.baseInstructions ?? "";
+    const developerInstructions = transport.threadStarts.at(-1)?.developerInstructions ?? "";
+    const turnText = transport.turnStarts
+      .at(-1)
+      ?.input
+      .filter((entry): entry is Extract<(typeof transport.turnStarts)[number]["input"][number], { type: "text" }> => entry.type === "text")
+      .map((entry) => entry.text)
+      .join("\n") ?? "";
+
+    expect(baseInstructions).toContain("Make the largest coherent, reviewable change");
+    expect(baseInstructions).not.toContain(taskPrompt);
+    expect(developerInstructions).toContain("Project boundary rules");
+    expect(developerInstructions).toContain("External service policy");
+    expect(developerInstructions).toContain("free/no-card APIs and API keys are allowed");
+    expect(developerInstructions).toContain("request the credential through the user-input/API Keys flow");
+    expect(turnText).toContain(taskPrompt);
+    expect(turnText).not.toContain("Make the largest coherent, reviewable change");
   });
 
   it("auto-approves git commit and push approvals when those toggles are enabled", async () => {
@@ -1326,6 +1417,150 @@ describe("integration flows", () => {
     ).toBe("resolved");
   });
 
+  it("routes mid-run credential requests to API Keys and sends stored secrets only after explicit approval", async () => {
+    const root = await createSampleRepo("credential-request-flow");
+    const appData = await createTempDir("appdata-credential-request-flow");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = getProjectRecord(service, selected.record.id);
+    if (!project) {
+      throw new Error("Project record missing after selection.");
+    }
+    const runtime = service as any;
+
+    const agent = createAgentSkeleton("coding", "Coding Agent", "Need live data", "gpt-test");
+    agent.threadId = "thread-credential-flow";
+    project.agents.unshift(agent);
+    runtime.threadToAgent.set(agent.threadId, {
+      projectId: selected.record.id,
+      agentId: agent.id
+    });
+
+    const respond = vi.fn(async () => undefined);
+    runtime.transport = { respond };
+
+    await runtime.processTransportRequest({
+      method: "item/tool/requestUserInput",
+      id: "request-credential-flow",
+      params: {
+        threadId: agent.threadId,
+        turnId: "turn-1",
+        itemId: "item-1",
+        questions: [
+          {
+            id: "api_key",
+            header: "Polygon.io API key",
+            question: "Paste the free-tier Polygon.io API key. Do not use a paid plan.",
+            isOther: false,
+            isSecret: true,
+            options: null
+          },
+          {
+            id: "notes",
+            header: "Credential notes",
+            question: "Confirm this is a free/no-card API key.",
+            isOther: true,
+            isSecret: false,
+            options: null
+          }
+        ]
+      }
+    });
+
+    const afterRequest = getProjectRecord(service, selected.record.id);
+    const credentialRequest = afterRequest?.credentials.requests[0];
+    const userInputRequest = afterRequest?.userInputRequests[0];
+    expect(afterRequest?.layout.activeCenterTab).toBe("credentials");
+    expect(afterRequest?.workflow.workflowStage).toBe("blocked_human");
+    expect(credentialRequest).toMatchObject({
+      providerName: "Polygon.io",
+      keyLabel: "API key",
+      status: "pending",
+      freeOnly: true,
+      userInputRequestId: userInputRequest?.id
+    });
+
+    await service.saveCredentialEntry(selected.record.id, {
+      providerName: "Polygon.io",
+      keyLabel: "API key",
+      apiKey: "free-polygon-key",
+      notes: "Free tier, no card.",
+      linkedRequestIds: [credentialRequest?.id ?? ""]
+    });
+
+    const storedRequest = getProjectRecord(service, selected.record.id)?.credentials.requests.find((entry) => entry.id === credentialRequest?.id);
+    expect(storedRequest?.status).toBe("pending");
+    expect(storedRequest?.notes).toContain("explicit approval");
+
+    await service.submitCredentialRequestToAgent(selected.record.id, credentialRequest?.id ?? "");
+
+    expect(respond).toHaveBeenCalledWith("request-credential-flow", {
+      answers: [
+        "free-polygon-key",
+        expect.stringContaining("Credential approved from the local API Keys section")
+      ]
+    });
+    const afterSubmit = getProjectRecord(service, selected.record.id);
+    expect(afterSubmit?.credentials.requests.find((entry) => entry.id === credentialRequest?.id)?.status).toBe("fulfilled");
+    expect(afterSubmit?.userInputRequests.find((entry) => entry.id === userInputRequest?.id)?.status).toBe("submitted");
+    expect(afterSubmit?.workflow.humanInterventions.find((entry) => entry.linkedUserInputRequestId === userInputRequest?.id)?.status).toBe("resolved");
+  });
+
+  it("rejects paid credential requests when Consider Paid Services is off", async () => {
+    const root = await createSampleRepo("paid-credential-rejected");
+    const appData = await createTempDir("appdata-paid-credential-rejected");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = getProjectRecord(service, selected.record.id);
+    if (!project) {
+      throw new Error("Project record missing after selection.");
+    }
+    const runtime = service as any;
+
+    const agent = createAgentSkeleton("coding", "Coding Agent", "Need paid data", "gpt-test");
+    agent.threadId = "thread-paid-credential";
+    project.agents.unshift(agent);
+    runtime.threadToAgent.set(agent.threadId, {
+      projectId: selected.record.id,
+      agentId: agent.id
+    });
+
+    const respond = vi.fn(async () => undefined);
+    runtime.transport = { respond };
+
+    await runtime.processTransportRequest({
+      method: "item/tool/requestUserInput",
+      id: "request-paid-credential",
+      params: {
+        threadId: agent.threadId,
+        turnId: "turn-1",
+        itemId: "item-1",
+        questions: [
+          {
+            id: "api_key",
+            header: "Premium market data API key",
+            question: "Enter the paid subscription API key after setting up billing with a credit card.",
+            isOther: false,
+            isSecret: true,
+            options: null
+          }
+        ]
+      }
+    });
+
+    expect(respond).toHaveBeenCalledWith("request-paid-credential", {
+      answers: [
+        expect.stringContaining("Paid API services are disabled")
+      ]
+    });
+    const record = getProjectRecord(service, selected.record.id);
+    expect(record?.userInputRequests).toEqual([]);
+    expect(record?.credentials.requests).toEqual([]);
+    expect(record?.workflow.workflowStage).not.toBe("blocked_human");
+  });
+
   it("persists the ultimate goal across service restarts", async () => {
     const root = await createSampleRepo("workflow-persistence");
     const appData = await createTempDir("appdata-workflow-persistence");
@@ -1834,6 +2069,54 @@ describe("integration flows", () => {
     expect(resumedWorkflow.scopedGoal?.sourceRecommendationId).toBe(recommendationId);
     expect(resumedWorkflow.activityLog.some((event) => event.title === "Goal agent launch failed; using fallback scoped plan")).toBe(true);
     expect(service.getState().diagnostics.some((entry) => entry.includes("Array buffer allocation failed"))).toBe(true);
+  }, 12_000);
+
+  it("recovers goal planning when a recoverable automation error escapes before an agent starts", async () => {
+    const root = await createSampleFolder("goal-plan-outer-error-fallback", {
+      lint: "echo lint",
+      typecheck: "echo typecheck",
+      test: "echo test",
+      build: "echo build"
+    });
+    const appData = await createTempDir("appdata-goal-plan-outer-error-fallback");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    await service.updateUltimateGoal(
+      selected.record.id,
+      {
+        summary: "Recover escaped automation failures.",
+        detailedIntent: "A recoverable runtime failure should not leave an approved recommendation stranded before goal planning creates a scoped goal.",
+        successCriteria: ["A deterministic scoped goal is created without a manual retry."],
+        constraints: ["Keep the approved recommendation intact."],
+        nonGoals: ["Do not regenerate recommendations after the recommendation was approved."],
+        targetAudience: "Operators using autopilot.",
+        qualityBar: "Autopilot should continue from durable workflow state.",
+        source: "user"
+      },
+      true
+    );
+
+    const recommendationId = await waitFor(() => getProjectRecord(service, selected.record.id)?.workflow.recommendations[0]?.id);
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: true });
+    await service.approveRecommendation(selected.record.id, recommendationId);
+
+    service.createScopedGoal = async () => {
+      throw new Error("Array buffer allocation failed");
+    };
+
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: false });
+
+    const recoveredWorkflow = await waitFor(() => {
+      const workflow = getProjectRecord(service, selected.record.id)?.workflow;
+      return workflow?.scopedGoal ? workflow : null;
+    }, 8_000);
+
+    expect(recoveredWorkflow.approvedRecommendation?.recommendationId).toBe(recommendationId);
+    expect(recoveredWorkflow.scopedGoal?.sourceRecommendationId).toBe(recommendationId);
+    expect(recoveredWorkflow.activityLog.some((event) => event.title === "Goal planning recovered with fallback")).toBe(true);
   }, 12_000);
 
   it("rechecks stale satisfied goal evidence and regenerates checklist recommendations after continue", async () => {
@@ -2666,6 +2949,42 @@ describe("integration flows", () => {
     const command = await waitFor(() => getProjectRecord(service, selected.record.id)?.agents.find((entry) => entry.id === agent.id)?.commandLog[0]);
     expect(command.command).toBe("/bin/bash -lc \"printf '' > test.txt\"");
     expect(command.cwd).toBe(root);
+  });
+
+  it("coalesces streaming agent deltas into a single workflow activity row", async () => {
+    const root = await createSampleFolder("streaming-activity-coalesce");
+    const appData = await createTempDir("appdata-streaming-activity-coalesce");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    const agent = await service.createAgent(selected.record.id, "coding", "Streaming Agent", "Stream progress.", "gpt-5.4");
+
+    (service as any).handleTransportNotification({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: agent.threadId,
+        itemId: "message-1",
+        delta: "First "
+      }
+    });
+    (service as any).handleTransportNotification({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: agent.threadId,
+        itemId: "message-1",
+        delta: "second"
+      }
+    });
+
+    const record = getProjectRecord(service, selected.record.id);
+    const streamingRows = record?.workflow.activityLog.filter((event) =>
+      event.agentId === agent.id && event.title === "Agent message"
+    ) ?? [];
+    expect(streamingRows).toHaveLength(1);
+    expect(streamingRows[0].detail).toContain("First");
+    expect(streamingRows[0].detail).toContain("second");
   });
 
   it("creates manual agents separately from the workflow cycle while preserving git worktree isolation", async () => {

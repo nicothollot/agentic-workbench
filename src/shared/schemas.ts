@@ -91,6 +91,18 @@ export const agentLifecycleStatusSchema = z.enum([
   "disconnected"
 ]);
 export const approvalDecisionSchema = z.enum(["accept", "acceptForSession", "decline", "cancel"]);
+export const credentialEntryStatusSchema = z.enum(["active", "needs_attention", "disabled"]);
+export const credentialRequestStatusSchema = z.enum(["pending", "fulfilled", "dismissed"]);
+export const agentReasoningModeSchema = z.enum(["auto", "manual"]);
+export const agentReasoningEffortsSchema = z.object({
+  bootstrap: interfaceReasoningEffortSchema.optional(),
+  goal: interfaceReasoningEffortSchema.optional(),
+  coding: interfaceReasoningEffortSchema.optional(),
+  integrity: interfaceReasoningEffortSchema.optional(),
+  merge: interfaceReasoningEffortSchema.optional(),
+  recommendation: interfaceReasoningEffortSchema.optional(),
+  manual: interfaceReasoningEffortSchema.optional()
+});
 
 export const linkedGitHubAccountSchema = z.object({
   username: z.string().min(1),
@@ -118,10 +130,13 @@ export const appSettingsSchema = z.object({
   interfaceCreationModel: z.string().min(1).optional(),
   interfaceCreationReasoningEffort: interfaceReasoningEffortSchema.optional(),
   interfaceCreationConfiguredAt: isoDatetime().optional(),
+  agentReasoningMode: agentReasoningModeSchema.default("auto"),
+  agentReasoningEfforts: agentReasoningEffortsSchema.default({}),
   githubAccount: linkedGitHubAccountSchema.optional(),
   autoApproveCommands: z.boolean().default(false),
   autoApproveGitCommits: z.boolean().default(false),
-  autoApproveGitPushes: z.boolean().default(false)
+  autoApproveGitPushes: z.boolean().default(false),
+  considerPaidServices: z.boolean().default(false)
 });
 
 export const reviewLogRuntimeContextSchema = z.object({
@@ -131,9 +146,12 @@ export const reviewLogRuntimeContextSchema = z.object({
   maxRepairCycles: z.number().int().min(1).max(10),
   interfaceCreationModel: z.string().min(1).optional(),
   interfaceCreationReasoningEffort: interfaceReasoningEffortSchema.optional(),
+  agentReasoningMode: agentReasoningModeSchema.optional(),
+  agentReasoningEfforts: agentReasoningEffortsSchema.optional(),
   autoApproveCommands: z.boolean(),
   autoApproveGitCommits: z.boolean(),
-  autoApproveGitPushes: z.boolean()
+  autoApproveGitPushes: z.boolean(),
+  considerPaidServices: z.boolean().default(false)
 });
 
 export const projectIdentitySchema = z.object({
@@ -267,7 +285,7 @@ export const layoutConfigSchema = z.object({
   leftPanelWidth: z.number().int().positive(),
   rightPanelWidth: z.number().int().positive(),
   bottomPanelHeight: z.number().int().positive(),
-  activeCenterTab: z.enum(["overview", "file", "diff", "reports"])
+  activeCenterTab: z.enum(["overview", "workflow", "logs", "agents", "credentials", "file", "diff", "reports"])
 });
 
 export const localProjectStateSchema = z.object({
@@ -429,6 +447,43 @@ export const userInputRequestSchema = z.object({
   submittedAt: isoDatetime().optional()
 });
 
+export const credentialRequestRecordSchema = z.object({
+  id: z.string().min(1),
+  providerName: z.string().min(1),
+  keyLabel: z.string().min(1),
+  description: z.string().min(1),
+  status: credentialRequestStatusSchema.default("pending"),
+  requestedByAgentCategory: agentCategorySchema.optional(),
+  agentId: z.string().min(1).optional(),
+  userInputRequestId: z.string().min(1).optional(),
+  humanInterventionId: z.string().min(1).optional(),
+  freeOnly: z.boolean().default(true),
+  createdAt: isoDatetime(),
+  resolvedAt: isoDatetime().optional(),
+  submittedToAgentAt: isoDatetime().optional(),
+  notes: z.string().optional()
+});
+
+export const credentialEntryMetadataSchema = z.object({
+  id: z.string().min(1),
+  providerName: z.string().min(1),
+  keyLabel: z.string().min(1),
+  hasApiKey: z.boolean().default(false),
+  hasSecretKey: z.boolean().default(false),
+  status: credentialEntryStatusSchema.default("active"),
+  source: z.enum(["user", "agent_auto"]).default("user"),
+  freeTier: z.boolean().optional(),
+  notes: z.string().optional(),
+  linkedRequestIds: z.array(z.string().min(1)).default([]),
+  createdAt: isoDatetime(),
+  updatedAt: isoDatetime()
+});
+
+export const projectCredentialsStateSchema = z.object({
+  entries: z.array(credentialEntryMetadataSchema).default([]),
+  requests: z.array(credentialRequestRecordSchema).default([])
+});
+
 export const workflowCycleSummarySchema = z.object({
   cycleNumber: z.number().int().positive(),
   summary: z.string().min(1),
@@ -463,13 +518,45 @@ export const agentFreshnessMarkerSchema = z.object({
   lastSummarizedAt: isoDatetime().optional()
 });
 
+export const workflowContextDescriptorSchema = z.object({
+  id: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  agentCategory: agentCategorySchema,
+  workflowStage: workflowStageSchema,
+  goalTokens: z.array(z.string()).default([]),
+  workTypeTags: z.array(z.string()).default([]),
+  changedPaths: z.array(z.string()).default([]),
+  relatedPaths: z.array(z.string()).default([]),
+  acceptedDecisionIds: z.array(z.string()).default([]),
+  openIssueIds: z.array(z.string()).default([]),
+  resolvedIssueIds: z.array(z.string()).default([]),
+  summary: z.string().default(""),
+  featureWeights: z.record(z.number()).default({}),
+  createdAt: isoDatetime(),
+  updatedAt: isoDatetime()
+});
+
+export const workflowRelevantContextSelectionSchema = z.object({
+  descriptorId: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  agentCategory: agentCategorySchema,
+  score: z.number().nonnegative(),
+  reasons: z.array(z.string()).default([]),
+  summary: z.string().default(""),
+  paths: z.array(z.string()).default([]),
+  decisionIds: z.array(z.string()).default([]),
+  issueIds: z.array(z.string()).default([])
+});
+
 export const workflowMemorySchema = z.object({
   canonicalSummary: z.string().default(""),
   canonicalFacts: z.array(z.string()).default([]),
   perCycleSummaries: z.array(workflowCycleSummarySchema).default([]),
   lastAcceptedDecisions: z.array(workflowAcceptedDecisionSchema).default([]),
   knownOpenIssues: z.array(workflowOpenIssueSchema).default([]),
-  agentFreshness: z.record(agentCategorySchema, agentFreshnessMarkerSchema).default(defaultProjectWorkflowState().memory.agentFreshness)
+  agentFreshness: z.record(agentCategorySchema, agentFreshnessMarkerSchema).default(defaultProjectWorkflowState().memory.agentFreshness),
+  contextDescriptors: z.array(workflowContextDescriptorSchema).default([]),
+  lastRelevantContext: z.array(workflowRelevantContextSelectionSchema).default([])
 });
 
 export const workflowStepProgressSchema = z.object({
@@ -687,6 +774,7 @@ export const agentStateSchema = z.object({
   taskPrompt: z.string().min(1),
   model: z.string().min(1),
   reasoningEffort: interfaceReasoningEffortSchema.optional(),
+  reasoningEffortSource: agentReasoningModeSchema.optional(),
   workflowCycleNumber: z.number().int().positive().optional(),
   createdAt: isoDatetime(),
   startedAt: isoDatetime().optional(),
@@ -756,7 +844,8 @@ export const localProjectRecordSchema = z.object({
   dependencies: z.array(dependencyRecordSchema),
   summaryCache: z.array(fileSummarySchema),
   agents: z.array(agentStateSchema),
-  userInputRequests: z.array(userInputRequestSchema).default([])
+  userInputRequests: z.array(userInputRequestSchema).default([]),
+  credentials: projectCredentialsStateSchema.default({ entries: [], requests: [] })
 });
 
 export const reviewLogSummarySchema = z.object({

@@ -496,23 +496,34 @@ const checklistAlignmentScore = (
   const openChecks = openRequiredGoalChecks(workflow);
   let score = 0;
 
-  if (/^satisfy goal check:/i.test(title)) {
+  const isGoalCheckRecommendation = /^satisfy goal check:/i.test(title);
+  const isGoalBatchRecommendation = /^satisfy goal batch:/i.test(title);
+  if (isGoalBatchRecommendation) {
+    score += 240;
+  } else if (isGoalCheckRecommendation) {
     score += 100;
   }
   if (/\b(?:goal checklist|required check|checklist item)\b/i.test(`${recommendation.summary} ${recommendation.rationale}`)) {
     score += 34;
   }
+  if (/\b(?:related required checks|multiple required|coherent batch|shared code|shared implementation)\b/i.test(`${recommendation.summary} ${recommendation.rationale} ${recommendation.expectedImpact}`)) {
+    score += 24;
+  }
   if (/\bUltimate Goal percentage\b/i.test(recommendation.expectedImpact)) {
     score += 28;
   }
 
+  let matchedChecks = 0;
   for (const check of openChecks) {
     const candidates = [check.title, check.description]
       .map(normalizeRecommendationMatchText)
       .filter((entry) => entry.length >= 8);
     if (candidates.some((candidate) => text.includes(candidate) || candidate.includes(text))) {
       score += goalCheckSourceScore(check.source) + goalCheckStatusScore(check.status);
-      break;
+      matchedChecks += 1;
+      if (!isGoalBatchRecommendation || matchedChecks >= 3) {
+        break;
+      }
     }
   }
 

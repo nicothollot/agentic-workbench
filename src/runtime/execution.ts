@@ -17,6 +17,7 @@ export interface StructuredCommandSpec {
   cwd?: string;
   env?: Record<string, string | undefined>;
   runtimePathDirs?: string[];
+  timeoutMs?: number;
 }
 
 export interface ShellCommandSpec {
@@ -24,6 +25,7 @@ export interface ShellCommandSpec {
   cwd?: string;
   env?: Record<string, string | undefined>;
   runtimePathDirs?: string[];
+  timeoutMs?: number;
 }
 
 export interface ExecutionPlan {
@@ -717,7 +719,8 @@ export class RuntimeCommandExecutor {
         plan.args,
         {
           ...(plan.options as ExecFileOptionsWithStringEncoding),
-          encoding: "utf8"
+          encoding: "utf8",
+          timeout: spec.timeoutMs
         }
       );
       return {
@@ -928,7 +931,8 @@ export class RuntimeCommandExecutor {
         plan.args,
         {
           ...(plan.options as ExecFileOptionsWithStringEncoding),
-          encoding: "utf8"
+          encoding: "utf8",
+          timeout: spec.timeoutMs
         }
       );
       return {

@@ -80,7 +80,7 @@ export interface WorkflowRepairCounterView {
 }
 
 export interface WorkflowRecoveryCandidate {
-  kind: "disconnected" | "stale";
+  kind: "disconnected" | "stale" | "startup_stalled";
   agent: AgentState;
 }
 
@@ -161,7 +161,7 @@ export const getWorkflowRecoveryCandidate = (
     const lastActivity = toTime(activeAgent.lastActivityAt ?? activeAgent.startedAt ?? activeAgent.createdAt);
     return lastActivity > 0 && nowMs - lastActivity > staleMs
       ? {
-        kind: "stale",
+        kind: activeAgent.status === "starting" && !activeAgent.threadId ? "startup_stalled" : "stale",
         agent: activeAgent
       }
       : null;

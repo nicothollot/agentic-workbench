@@ -15,6 +15,8 @@ export type AgentLifecycleStatus =
 export type ApprovalKind = "command" | "file-change" | "permissions" | "apply-patch";
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 export type InterfaceReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type AgentReasoningMode = "auto" | "manual";
+export type AgentReasoningEfforts = Partial<Record<AgentCategory, InterfaceReasoningEffort>>;
 export type InterfaceCreationStatus = "idle" | "queued" | "running" | "completed" | "failed";
 export type ModelCatalogSource = "live" | "mock" | "unavailable";
 export type ExecutionMode = "local" | "wsl";
@@ -83,6 +85,9 @@ export type HumanInterventionSeverity = "low" | "medium" | "high" | "critical";
 export type HumanInterventionStatus = "pending" | "resolved" | "dismissed";
 export type WorkflowDecisionKind = "ultimate_goal" | "recommendation" | "scoped_goal" | "human_intervention" | "merge";
 export type UserInputRequestStatus = "pending" | "submitted";
+export type CredentialEntryStatus = "active" | "needs_attention" | "disabled";
+export type CredentialRequestStatus = "pending" | "fulfilled" | "dismissed";
+export type WorkspaceCenterTab = "overview" | "workflow" | "logs" | "agents" | "credentials" | "file" | "diff" | "reports";
 
 export interface AppSettings {
   executionMode: ExecutionMode;
@@ -97,10 +102,13 @@ export interface AppSettings {
   interfaceCreationModel?: string;
   interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
   interfaceCreationConfiguredAt?: string;
+  agentReasoningMode?: AgentReasoningMode;
+  agentReasoningEfforts?: AgentReasoningEfforts;
   githubAccount?: LinkedGitHubAccount;
   autoApproveCommands: boolean;
   autoApproveGitCommits: boolean;
   autoApproveGitPushes: boolean;
+  considerPaidServices: boolean;
 }
 
 export interface ReviewLogRuntimeContext {
@@ -110,9 +118,12 @@ export interface ReviewLogRuntimeContext {
   maxRepairCycles: number;
   interfaceCreationModel?: string;
   interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
+  agentReasoningMode?: AgentReasoningMode;
+  agentReasoningEfforts?: AgentReasoningEfforts;
   autoApproveCommands: boolean;
   autoApproveGitCommits: boolean;
   autoApproveGitPushes: boolean;
+  considerPaidServices: boolean;
 }
 
 export interface LinkedGitHubAccount {
@@ -304,6 +315,43 @@ export interface UserInputRequestRecord {
   submittedAt?: string;
 }
 
+export interface CredentialRequestRecord {
+  id: string;
+  providerName: string;
+  keyLabel: string;
+  description: string;
+  status: CredentialRequestStatus;
+  requestedByAgentCategory?: AgentCategory;
+  agentId?: string;
+  userInputRequestId?: string;
+  humanInterventionId?: string;
+  freeOnly?: boolean;
+  createdAt: string;
+  resolvedAt?: string;
+  submittedToAgentAt?: string;
+  notes?: string;
+}
+
+export interface CredentialEntryMetadata {
+  id: string;
+  providerName: string;
+  keyLabel: string;
+  hasApiKey: boolean;
+  hasSecretKey: boolean;
+  status: CredentialEntryStatus;
+  source?: "user" | "agent_auto";
+  freeTier?: boolean;
+  notes?: string;
+  linkedRequestIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectCredentialsState {
+  entries: CredentialEntryMetadata[];
+  requests: CredentialRequestRecord[];
+}
+
 export interface WorkflowCycleSummary {
   cycleNumber: number;
   summary: string;
@@ -338,6 +386,36 @@ export interface AgentFreshnessMarker {
   lastSummarizedAt?: string;
 }
 
+export interface WorkflowContextDescriptor {
+  id: string;
+  cycleNumber: number;
+  agentCategory: AgentCategory;
+  workflowStage: WorkflowStage;
+  goalTokens: string[];
+  workTypeTags: string[];
+  changedPaths: string[];
+  relatedPaths: string[];
+  acceptedDecisionIds: string[];
+  openIssueIds: string[];
+  resolvedIssueIds: string[];
+  summary: string;
+  featureWeights: Record<string, number>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkflowRelevantContextSelection {
+  descriptorId: string;
+  cycleNumber: number;
+  agentCategory: AgentCategory;
+  score: number;
+  reasons: string[];
+  summary: string;
+  paths: string[];
+  decisionIds: string[];
+  issueIds: string[];
+}
+
 export interface WorkflowMemory {
   canonicalSummary: string;
   canonicalFacts: string[];
@@ -345,6 +423,8 @@ export interface WorkflowMemory {
   lastAcceptedDecisions: WorkflowAcceptedDecision[];
   knownOpenIssues: WorkflowOpenIssue[];
   agentFreshness: Partial<Record<AgentCategory, AgentFreshnessMarker>>;
+  contextDescriptors: WorkflowContextDescriptor[];
+  lastRelevantContext: WorkflowRelevantContextSelection[];
 }
 
 export interface WorkflowActivityEvent {
@@ -593,7 +673,7 @@ export interface LayoutConfig {
   leftPanelWidth: number;
   rightPanelWidth: number;
   bottomPanelHeight: number;
-  activeCenterTab: "overview" | "file" | "diff" | "reports";
+  activeCenterTab: WorkspaceCenterTab;
 }
 
 export interface LocalProjectState {
@@ -726,6 +806,7 @@ export interface AgentState {
   taskPrompt: string;
   model: string;
   reasoningEffort?: InterfaceReasoningEffort;
+  reasoningEffortSource?: AgentReasoningMode;
   workflowCycleNumber?: number;
   createdAt: string;
   startedAt?: string;
@@ -785,6 +866,7 @@ export interface LocalProjectRecord {
   summaryCache: FileSummary[];
   agents: AgentState[];
   userInputRequests: UserInputRequestRecord[];
+  credentials: ProjectCredentialsState;
 }
 
 export interface ReviewLogSummary {

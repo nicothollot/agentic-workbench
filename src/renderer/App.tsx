@@ -1,6 +1,12 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { APP_NAME, PROJECT_SHELL_LAUNCHER_CMD_PATH, PROJECT_SHELL_LAUNCH_LOG_PATH } from "@shared/constants";
-import { INTERFACE_REASONING_EFFORTS, resolveInterfaceCreationReasoningEffort } from "@shared/modelConfig";
+import {
+  DEFAULT_AGENT_REASONING_EFFORTS,
+  DEFAULT_AGENT_REASONING_MODE,
+  INTERFACE_REASONING_EFFORTS,
+  resolveAgentReasoningEffort,
+  resolveInterfaceCreationReasoningEffort
+} from "@shared/modelConfig";
 import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/workflowRepairReport";
 import {
   buildWorkflowGoalView,
@@ -16,8 +22,11 @@ import {
 } from "@shared/workflowView";
 import type {
   AgentCategory,
+  AgentReasoningEfforts,
+  AgentReasoningMode,
   AgentState,
   ApprovalRequestRecord,
+  CredentialEntryMetadata,
   DiscoveredModel,
   ExecutionMode,
   FileSummary,
@@ -37,6 +46,7 @@ import type {
   UltimateGoal,
   ValidationStatus,
   WorkflowActivityEvent,
+  WorkspaceCenterTab,
   WorkflowRecommendationOption,
   WorkbenchState
 } from "@shared/types";
@@ -252,11 +262,28 @@ const reasoningEffortLabel = (value: InterfaceReasoningEffort): string =>
 
 const reasoningEffortDescription = (value: InterfaceReasoningEffort): string =>
   ({
-    low: "Faster and cheaper for routine repository framing.",
-    medium: "Balanced default for most interface creation runs.",
-    high: "More deliberate analysis for trickier projects.",
-    xhigh: "Deepest available analysis when extra cost is justified."
+    low: "Fast coordination for simple deterministic work.",
+    medium: "Balanced planning and repository review.",
+    high: "Careful analysis for complex tasks and implementation.",
+    xhigh: "Deepest analysis for coding and high-risk changes."
   })[value];
+
+const configurableAgentCategories: AgentCategory[] = [
+  "bootstrap",
+  "goal",
+  "coding",
+  "integrity",
+  "merge",
+  "recommendation",
+  "manual"
+];
+
+const normalizeAgentReasoningEfforts = (efforts?: AgentReasoningEfforts): Record<AgentCategory, InterfaceReasoningEffort> => ({
+  ...DEFAULT_AGENT_REASONING_EFFORTS,
+  ...(efforts ?? {})
+});
+
+const normalizeReasoningMode = (mode?: AgentReasoningMode): AgentReasoningMode => mode ?? DEFAULT_AGENT_REASONING_MODE;
 
 const exclusionRuleLabel = (rule: "default" | "gitignore"): string =>
   rule === "default" ? "Built-in default exclusion" : ".gitignore exclusion";
@@ -519,6 +546,19 @@ const SourceBadge = ({ source }: { source: SummarySource }) => (
   <span className="badge badge-source">{sourceLabel(source)}</span>
 );
 
+const LoadingIndicator = ({
+  label,
+  compact = false
+}: {
+  label: string;
+  compact?: boolean;
+}) => (
+  <div className={`loading-indicator ${compact ? "loading-indicator--compact" : ""}`} role="status" aria-live="polite" aria-label={label}>
+    <span className="loading-indicator__mark" aria-hidden="true" />
+    <span>{label}</span>
+  </div>
+);
+
 const SectionTitle = ({
   eyebrow,
   title,
@@ -711,12 +751,59 @@ const AgentCard = ({
     </div>
     <div className="agent-card__meta">
       <span>{agent.lastActivityAt ? `Updated ${formatDateTime(agent.lastActivityAt)}` : "Waiting to start"}</span>
+      <span>{agent.reasoningEffort ? `${reasoningEffortLabel(agent.reasoningEffort)}${agent.reasoningEffortSource === "auto" ? " auto" : agent.reasoningEffortSource === "manual" ? " manual" : ""}` : "Default reasoning"}</span>
       <span>{agent.approvals.filter((approval) => approval.status === "pending").length} approvals</span>
       <span>{agent.changedFiles.length} changed files</span>
     </div>
     <p>{agentPreviewText(agent, workflow)}</p>
   </button>
 );
+
+const WindowedAgentList = ({
+  agents,
+  workflow,
+  selectedAgentId,
+  emptyCopy,
+  onSelect,
+  height = 420
+}: {
+  agents: AgentState[];
+  workflow?: ProjectWorkflowState;
+  selectedAgentId?: string;
+  emptyCopy: string;
+  onSelect: (agentId: string) => void;
+  height?: number;
+}) => {
+  const [scrollTop, setScrollTop] = useState(0);
+  const rowHeight = 152;
+  const overscan = 4;
+  const visibleStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleCount = Math.ceil(height / rowHeight) + overscan * 2;
+  const visibleAgents = agents.slice(visibleStart, visibleStart + visibleCount);
+  const totalHeight = agents.length * rowHeight;
+
+  if (!agents.length) {
+    return <div className="empty-copy">{emptyCopy}</div>;
+  }
+
+  return (
+    <div className="workflow-agent-list workflow-agent-list--virtual" style={{ height }} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
+      <div className="workflow-agent-list__spacer" style={{ height: totalHeight }}>
+        <div className="workflow-agent-list__window" style={{ transform: `translateY(${visibleStart * rowHeight}px)` }}>
+          {visibleAgents.map((agent) => (
+            <AgentCard
+              key={agent.id}
+              agent={agent}
+              workflow={workflow}
+              selected={selectedAgentId === agent.id}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
 
 const AgentLane = ({
   eyebrow,
@@ -790,6 +877,7 @@ const AgentFocusPanel = ({ agent, workflow }: { agent?: AgentState; workflow?: P
       </div>
       <div className="agent-focus__meta">
         <span>{agent.model}</span>
+        <span>{agent.reasoningEffort ? `${reasoningEffortLabel(agent.reasoningEffort)} reasoning${agent.reasoningEffortSource ? ` (${agent.reasoningEffortSource})` : ""}` : "Default reasoning"}</span>
         <span>{agent.threadId ?? "No thread yet"}</span>
         <span>{agent.worktree?.branch ?? "No worktree"}</span>
       </div>
@@ -891,6 +979,286 @@ const AgentFocusPanel = ({ agent, workflow }: { agent?: AgentState; workflow?: P
         </div>
       </section>
     </aside>
+  );
+};
+
+const CredentialsPanel = ({
+  project,
+  onSaved,
+  onError
+}: {
+  project: LoadedProjectView;
+  onSaved: (message: string) => void;
+  onError: (error: unknown) => void;
+}) => {
+  const [draft, setDraft] = useState({
+    entryId: "",
+    providerName: "",
+    keyLabel: "API key",
+    apiKey: "",
+    secretKey: "",
+    notes: "",
+    status: "active" as CredentialEntryMetadata["status"],
+    linkedRequestIds: [] as string[]
+  });
+  const [busy, setBusy] = useState(false);
+  const [submitBusyRequestId, setSubmitBusyRequestId] = useState<string>();
+  const credentials = project.record.credentials;
+  const pendingRequests = credentials.requests.filter((request) => request.status === "pending");
+  const entriesByLinkedRequest = useMemo(() => {
+    const map = new Map<string, CredentialEntryMetadata>();
+    for (const entry of credentials.entries) {
+      for (const requestId of entry.linkedRequestIds) {
+        map.set(requestId, entry);
+      }
+    }
+    return map;
+  }, [credentials.entries]);
+
+  useEffect(() => {
+    setDraft({
+      entryId: "",
+      providerName: "",
+      keyLabel: "API key",
+      apiKey: "",
+      secretKey: "",
+      notes: "",
+      status: "active",
+      linkedRequestIds: []
+    });
+  }, [project.record.id]);
+
+  const applyRequestToDraft = (requestId: string) => {
+    const request = credentials.requests.find((entry) => entry.id === requestId);
+    if (!request) {
+      return;
+    }
+    setDraft((current) => ({
+      ...current,
+      providerName: request.providerName,
+      keyLabel: request.keyLabel,
+      linkedRequestIds: current.linkedRequestIds.includes(request.id)
+        ? current.linkedRequestIds
+        : [...current.linkedRequestIds, request.id]
+    }));
+  };
+
+  const editEntry = (entry: CredentialEntryMetadata) => {
+    setDraft({
+      entryId: entry.id,
+      providerName: entry.providerName,
+      keyLabel: entry.keyLabel,
+      apiKey: "",
+      secretKey: "",
+      notes: entry.notes ?? "",
+      status: entry.status,
+      linkedRequestIds: entry.linkedRequestIds
+    });
+  };
+
+  const saveCredential = async () => {
+    try {
+      setBusy(true);
+      await window.workbench.saveCredentialEntry(project.record.id, {
+        entryId: draft.entryId || undefined,
+        providerName: draft.providerName,
+        keyLabel: draft.keyLabel,
+        apiKey: draft.apiKey,
+        secretKey: draft.secretKey || undefined,
+        notes: draft.notes || undefined,
+        status: draft.status,
+        linkedRequestIds: draft.linkedRequestIds
+      });
+      setDraft({
+        entryId: "",
+        providerName: "",
+        keyLabel: "API key",
+        apiKey: "",
+        secretKey: "",
+        notes: "",
+        status: "active",
+        linkedRequestIds: []
+      });
+      onSaved("Stored credential metadata locally. Secret values were not sent to agents.");
+    } catch (error) {
+      onError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteCredential = async (entryId: string) => {
+    try {
+      setBusy(true);
+      await window.workbench.deleteCredentialEntry(project.record.id, entryId);
+      onSaved("Removed the local credential entry.");
+    } catch (error) {
+      onError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const dismissRequest = async (requestId: string) => {
+    try {
+      await window.workbench.updateCredentialRequest(project.record.id, requestId, "dismissed", "Dismissed by the user.");
+      onSaved("Dismissed the credential request.");
+    } catch (error) {
+      onError(error);
+    }
+  };
+
+  const submitRequestToAgent = async (requestId: string) => {
+    try {
+      setSubmitBusyRequestId(requestId);
+      await window.workbench.submitCredentialRequestToAgent(project.record.id, requestId);
+      onSaved("Sent the stored credential to the waiting agent with explicit approval.");
+    } catch (error) {
+      onError(error);
+    } finally {
+      setSubmitBusyRequestId(undefined);
+    }
+  };
+
+  return (
+    <section className="workflow-control-center panel credentials-workspace">
+      <SectionTitle
+        eyebrow="Local credentials"
+        title="API Keys / Credentials"
+        meta={<span className="badge">{credentials.entries.length} stored • {pendingRequests.length} pending</span>}
+      />
+      <div className="notice">
+        Secret values are stored only on this machine and are never added to portable interface files, review logs, or prompts automatically.
+        Send a secret to an agent only through an explicit pending input request.
+      </div>
+      <div className="credentials-grid">
+        <article className="overview-card workflow-panel">
+          <SectionTitle eyebrow="Requests" title="Pending credential requests" meta={<span className="badge">{pendingRequests.length}</span>} />
+          <div className="workflow-option-list credentials-list">
+            {pendingRequests.length ? pendingRequests.map((request) => (
+              <article key={request.id} className="workflow-option workflow-option--blocked">
+                <div className="candidate-card__title-row">
+                  <strong>{request.providerName} {request.keyLabel}</strong>
+                  <span className="badge badge-incompatible">Pending</span>
+                </div>
+                <p>{request.description}</p>
+                <div className="notice notice--compact">
+                  {request.freeOnly ?? true
+                    ? "Free/no-card credential only. If this provider requires payment, dismiss the request and let the agent choose a free provider or demo mode."
+                    : "Paid services may be considered because the setting is enabled, but billing still requires explicit approval."}
+                </div>
+                {entriesByLinkedRequest.get(request.id) ? (
+                  <div className="lane-note">
+                    <strong>Stored credential ready</strong>
+                    <span>Use Send to waiting agent only if you want this secret shared with the current run.</span>
+                  </div>
+                ) : null}
+                <div className="workflow-option__meta">
+                  <span>{request.requestedByAgentCategory ? agentCategoryLabel(request.requestedByAgentCategory) : "Workflow"}</span>
+                  <span>Requested {formatDateTime(request.createdAt)}</span>
+                </div>
+                <div className="actions-row">
+                  <button className="primary-button" type="button" onClick={() => applyRequestToDraft(request.id)}>Use in credential form</button>
+                  {request.userInputRequestId && entriesByLinkedRequest.get(request.id) ? (
+                    <button
+                      className="primary-button"
+                      type="button"
+                      disabled={submitBusyRequestId === request.id}
+                      onClick={() => void submitRequestToAgent(request.id)}
+                    >
+                      {submitBusyRequestId === request.id ? "Sending..." : "Send to waiting agent"}
+                    </button>
+                  ) : null}
+                  <button className="secondary-button" type="button" onClick={() => void dismissRequest(request.id)}>Dismiss</button>
+                </div>
+              </article>
+            )) : <div className="empty-copy">No credential requests are pending.</div>}
+          </div>
+        </article>
+
+        <article className="overview-card workflow-panel">
+          <SectionTitle eyebrow={draft.entryId ? "Replace" : "Add"} title={draft.entryId ? "Replace stored credential" : "Add credential"} />
+          <div className="workflow-form">
+            <label className="form-field">
+              <span>Provider</span>
+              <input className="input" value={draft.providerName} onChange={(event) => setDraft({ ...draft, providerName: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>Key label</span>
+              <input className="input" value={draft.keyLabel} onChange={(event) => setDraft({ ...draft, keyLabel: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>API key</span>
+              <input
+                className="input"
+                type="password"
+                autoComplete="off"
+                value={draft.apiKey}
+                onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })}
+              />
+            </label>
+            <label className="form-field">
+              <span>Secret key</span>
+              <input
+                className="input"
+                type="password"
+                autoComplete="off"
+                value={draft.secretKey}
+                onChange={(event) => setDraft({ ...draft, secretKey: event.target.value })}
+              />
+            </label>
+            <label className="form-field">
+              <span>Status</span>
+              <select className="input" value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as CredentialEntryMetadata["status"] })}>
+                <option value="active">Active</option>
+                <option value="needs_attention">Needs attention</option>
+                <option value="disabled">Disabled</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Notes</span>
+              <textarea className="textarea" value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} />
+            </label>
+          </div>
+          <div className="actions-row">
+            <button className="primary-button" disabled={busy || !draft.providerName.trim() || !draft.keyLabel.trim() || !draft.apiKey.trim()} onClick={() => void saveCredential()}>
+              {busy ? "Saving..." : draft.entryId ? "Replace credential" : "Store credential"}
+            </button>
+            {draft.entryId ? (
+              <button className="secondary-button" type="button" onClick={() => setDraft({ ...draft, entryId: "", apiKey: "", secretKey: "" })}>Cancel replace</button>
+            ) : null}
+          </div>
+        </article>
+      </div>
+
+      <article className="overview-card workflow-panel">
+        <SectionTitle eyebrow="Stored locally" title="Configured providers" meta={<span className="badge">{credentials.entries.length}</span>} />
+        <div className="credential-entry-grid">
+          {credentials.entries.length ? credentials.entries.map((entry) => (
+            <article key={entry.id} className="workflow-option credential-entry">
+              <div className="candidate-card__title-row">
+                <strong>{entry.providerName}</strong>
+                <span className={`badge ${entry.status === "active" ? "badge-exact" : "badge-source"}`}>{entry.status.replace("_", " ")}</span>
+              </div>
+              <div className="credential-secret-preview">
+                <span>{entry.keyLabel}</span>
+                <code>{entry.hasApiKey ? "••••••••" : "No API key"}</code>
+                <code>{entry.hasSecretKey ? "secret ••••••••" : "No secret key"}</code>
+              </div>
+              {entry.notes ? <p>{entry.notes}</p> : null}
+              <div className="workflow-option__meta">
+                <span>Updated {formatDateTime(entry.updatedAt)}</span>
+                <span>{entry.linkedRequestIds.length} linked requests</span>
+              </div>
+              <div className="actions-row">
+                <button className="secondary-button" type="button" onClick={() => editEntry(entry)}>Replace</button>
+                <button className="secondary-button" type="button" disabled={busy} onClick={() => void deleteCredential(entry.id)}>Remove</button>
+              </div>
+            </article>
+          )) : <div className="empty-copy">No credentials are stored for this project.</div>}
+        </div>
+      </article>
+    </section>
   );
 };
 
@@ -1376,9 +1744,12 @@ const SettingsDialog = ({
     maxRepairCycles: number;
     interfaceCreationModel: string;
     interfaceCreationReasoningEffort: InterfaceReasoningEffort;
+    agentReasoningMode: AgentReasoningMode;
+    agentReasoningEfforts: Record<AgentCategory, InterfaceReasoningEffort>;
     autoApproveCommands: boolean;
     autoApproveGitCommits: boolean;
     autoApproveGitPushes: boolean;
+    considerPaidServices: boolean;
   };
   github: GitHubStatus;
   onChange: (next: {
@@ -1391,9 +1762,12 @@ const SettingsDialog = ({
     maxRepairCycles?: number;
     interfaceCreationModel?: string;
     interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
+    agentReasoningMode?: AgentReasoningMode;
+    agentReasoningEfforts?: AgentReasoningEfforts;
     autoApproveCommands?: boolean;
     autoApproveGitCommits?: boolean;
     autoApproveGitPushes?: boolean;
+    considerPaidServices?: boolean;
   }) => void;
   onSave: () => void;
   onClose: () => void;
@@ -1404,6 +1778,15 @@ const SettingsDialog = ({
   const supportedReasoningEfforts = selectedModel?.supportedReasoningEfforts.length
     ? selectedModel.supportedReasoningEfforts
     : INTERFACE_REASONING_EFFORTS;
+  const agentReasoningEfforts = normalizeAgentReasoningEfforts(settingsDraft.agentReasoningEfforts);
+  const setAgentReasoningEffort = (category: AgentCategory, effort: InterfaceReasoningEffort) => {
+    onChange({
+      agentReasoningEfforts: {
+        ...agentReasoningEfforts,
+        [category]: effort
+      }
+    });
+  };
 
   return (
     <div className="settings-modal">
@@ -1540,27 +1923,60 @@ const SettingsDialog = ({
         <div className="settings-section">
           <div className="settings-card">
             <div className="settings-section__heading">
-              <strong>Reasoning effort</strong>
-              <span className="badge">Explicit</span>
+              <strong>Agent reasoning</strong>
+              <span className="badge">{settingsDraft.agentReasoningMode === "auto" ? "Automatic" : "Manual"}</span>
             </div>
             <p className="settings-card__copy">
-              This reasoning effort is applied directly to agent-backed runs for the selected model when the model supports it.
+              Automatic mode sizes reasoning to the agent role and task. Manual mode uses the per-role values below.
             </p>
-            <select
-              className="input"
-              value={settingsDraft.interfaceCreationReasoningEffort}
-              onChange={(event) => onChange({ interfaceCreationReasoningEffort: event.target.value as InterfaceReasoningEffort })}
-              disabled={!state.availableModels.length}
-            >
-              {supportedReasoningEfforts.map((effort) => (
-                <option key={effort} value={effort}>
-                  {reasoningEffortLabel(effort)}: {reasoningEffortDescription(effort)}
-                </option>
-              ))}
-            </select>
+            <label className="form-field">
+              <span>Selection mode</span>
+              <select
+                className="input"
+                value={settingsDraft.agentReasoningMode}
+                onChange={(event) => onChange({ agentReasoningMode: event.target.value as AgentReasoningMode })}
+                disabled={!state.availableModels.length}
+              >
+                <option value="auto">Automatic per task</option>
+                <option value="manual">Manual per agent role</option>
+              </select>
+            </label>
+            <div className="reasoning-role-grid">
+              {configurableAgentCategories.map((category) => {
+                const automaticEffort = resolveAgentReasoningEffort(
+                  selectedModel,
+                  category,
+                  `${agentCategoryLabel(category)} ${DEFAULT_AGENT_REASONING_EFFORTS[category]}`,
+                  "auto",
+                  agentReasoningEfforts[category]
+                );
+                return (
+                  <label key={category} className="form-field">
+                    <span>{agentCategoryLabel(category)}</span>
+                    <select
+                      className="input"
+                      value={agentReasoningEfforts[category]}
+                      onChange={(event) => setAgentReasoningEffort(category, event.target.value as InterfaceReasoningEffort)}
+                      disabled={!state.availableModels.length || settingsDraft.agentReasoningMode === "auto"}
+                    >
+                      {supportedReasoningEfforts.map((effort) => (
+                        <option key={effort} value={effort}>
+                          {reasoningEffortLabel(effort)}: {reasoningEffortDescription(effort)}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="agent-card__subtle">
+                      Auto: {reasoningEffortLabel(automaticEffort)}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
             <div className="tag-row">
               {selectedModel?.defaultReasoningEffort ? <span className="tag">Model default: {selectedModel.defaultReasoningEffort}</span> : null}
               <span className="tag">Supported: {supportedReasoningEfforts.map(reasoningEffortLabel).join(", ")}</span>
+              <span className="tag">Coding auto: {reasoningEffortLabel(resolveAgentReasoningEffort(selectedModel, "coding", "Implement the scoped coding task.", "auto"))}</span>
+              <span className="tag">Merge auto: {reasoningEffortLabel(resolveAgentReasoningEffort(selectedModel, "merge", "Integrate validated work deterministically.", "auto"))}</span>
             </div>
           </div>
           <div className="settings-card">
@@ -1605,6 +2021,23 @@ const SettingsDialog = ({
               </select>
             </label>
           </div>
+          <div className="settings-card">
+            <div className="settings-section__heading">
+              <strong>External services</strong>
+              <span className="badge">API cost</span>
+            </div>
+            <p className="settings-card__copy">
+              Keep this off to make agents prefer no-key, open-data, demo, and free-tier providers. Paid accounts, billing setup, and credit-card-backed keys remain out of scope.
+            </p>
+            <label className="checkbox-field">
+              <input
+                type="checkbox"
+                checked={settingsDraft.considerPaidServices}
+                onChange={(event) => onChange({ considerPaidServices: event.target.checked })}
+              />
+              <span>Consider Paid Services</span>
+            </label>
+          </div>
         </div>
         <div className="settings-section">
           <div className="settings-card">
@@ -1647,6 +2080,57 @@ const SettingsDialog = ({
           <button className="secondary-button" onClick={onClose}>Close</button>
         </div>
       </div>
+    </div>
+  );
+};
+
+const AgentReasoningPicker = ({
+  category,
+  model,
+  taskPrompt,
+  mode,
+  effort,
+  onModeChange,
+  onEffortChange
+}: {
+  category: AgentCategory;
+  model?: DiscoveredModel;
+  taskPrompt: string;
+  mode: AgentReasoningMode;
+  effort: InterfaceReasoningEffort;
+  onModeChange: (mode: AgentReasoningMode) => void;
+  onEffortChange: (effort: InterfaceReasoningEffort) => void;
+}) => {
+  const supportedReasoningEfforts = model?.supportedReasoningEfforts.length
+    ? model.supportedReasoningEfforts
+    : INTERFACE_REASONING_EFFORTS;
+  const normalizedEffort = resolveAgentReasoningEffort(model, category, taskPrompt, "manual", effort);
+  const automaticEffort = resolveAgentReasoningEffort(model, category, taskPrompt, "auto", normalizedEffort);
+
+  return (
+    <div className="agent-reasoning-picker">
+      <label className="form-field">
+        <span>Reasoning</span>
+        <select className="input" value={mode} onChange={(event) => onModeChange(event.target.value as AgentReasoningMode)}>
+          <option value="auto">Automatic ({reasoningEffortLabel(automaticEffort)})</option>
+          <option value="manual">Manual</option>
+        </select>
+      </label>
+      <label className="form-field">
+        <span>Manual effort</span>
+        <select
+          className="input"
+          value={normalizedEffort}
+          onChange={(event) => onEffortChange(event.target.value as InterfaceReasoningEffort)}
+          disabled={mode === "auto"}
+        >
+          {supportedReasoningEfforts.map((candidate) => (
+            <option key={candidate} value={candidate}>
+              {reasoningEffortLabel(candidate)}: {reasoningEffortDescription(candidate)}
+            </option>
+          ))}
+        </select>
+      </label>
     </div>
   );
 };
@@ -1702,11 +2186,22 @@ const LauncherActionCard = ({
 export const App = () => {
   const [state, setState] = useState<WorkbenchState | null>(null);
   const [pendingLoad, setPendingLoad] = useState<ProjectLoadResult | null>(null);
+  const [initialStateLoading, setInitialStateLoading] = useState(true);
+  const [projectLoadBusy, setProjectLoadBusy] = useState<"open" | "create" | "import" | null>(null);
+  const [openingRecentProjectId, setOpeningRecentProjectId] = useState<string>();
   const [selectedFile, setSelectedFile] = useState<string>();
   const [fileSummary, setFileSummary] = useState<FileSummary | null>(null);
-  const [codingAgentForm, setCodingAgentForm] = useState({ name: "Implement Task", prompt: "", model: "" });
+  const [codingAgentForm, setCodingAgentForm] = useState({
+    name: "Implement Task",
+    prompt: "",
+    model: "",
+    reasoningMode: "auto" as AgentReasoningMode,
+    reasoningEffort: DEFAULT_AGENT_REASONING_EFFORTS.coding
+  });
   const [manualAgentPrompt, setManualAgentPrompt] = useState("");
   const [manualAgentModel, setManualAgentModel] = useState("");
+  const [manualAgentReasoningMode, setManualAgentReasoningMode] = useState<AgentReasoningMode>("auto");
+  const [manualAgentReasoningEffort, setManualAgentReasoningEffort] = useState<InterfaceReasoningEffort>(DEFAULT_AGENT_REASONING_EFFORTS.manual);
   const [customRecommendationPrompt, setCustomRecommendationPrompt] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showExistingChoice, setShowExistingChoice] = useState(false);
@@ -1720,9 +2215,12 @@ export const App = () => {
     maxRepairCycles: 3,
     interfaceCreationModel: "",
     interfaceCreationReasoningEffort: "medium" as InterfaceReasoningEffort,
+    agentReasoningMode: DEFAULT_AGENT_REASONING_MODE,
+    agentReasoningEfforts: normalizeAgentReasoningEfforts(),
     autoApproveCommands: false,
     autoApproveGitCommits: false,
-    autoApproveGitPushes: false
+    autoApproveGitPushes: false,
+    considerPaidServices: false
   });
   const [notice, setNotice] = useState<NoticeState>();
   const [launchIntent, setLaunchIntent] = useState<"open" | "create">("open");
@@ -1747,7 +2245,9 @@ export const App = () => {
   const [userInputAttachmentBusyId, setUserInputAttachmentBusyId] = useState<string>();
 
   useEffect(() => {
-    void window.workbench.getState().then((result) => startTransition(() => setState(result)));
+    void window.workbench.getState()
+      .then((result) => startTransition(() => setState(result)))
+      .finally(() => setInitialStateLoading(false));
     return window.workbench.onStateUpdated((nextState) => {
       startTransition(() => setState(nextState));
     });
@@ -1774,6 +2274,11 @@ export const App = () => {
   const interfaceCreationConfiguredAt = state?.settings.interfaceCreationConfiguredAt;
   const settingsModel = state?.settings.interfaceCreationModel;
   const settingsReasoning = state?.settings.interfaceCreationReasoningEffort;
+  const settingsAgentReasoningMode = normalizeReasoningMode(state?.settings.agentReasoningMode);
+  const settingsAgentReasoningEfforts = useMemo(
+    () => normalizeAgentReasoningEfforts(state?.settings.agentReasoningEfforts),
+    [state?.settings.agentReasoningEfforts]
+  );
   const settingsExecutionMode = state?.settings.executionMode ?? "local";
   const settingsDistroName = state?.settings.distroName ?? "";
   const settingsCodexBinaryPath = state?.settings.codexBinaryPath ?? "codex";
@@ -1784,6 +2289,7 @@ export const App = () => {
   const settingsAutoApproveCommands = state?.settings.autoApproveCommands ?? false;
   const settingsAutoApproveGitCommits = state?.settings.autoApproveGitCommits ?? false;
   const settingsAutoApproveGitPushes = state?.settings.autoApproveGitPushes ?? false;
+  const settingsConsiderPaidServices = state?.settings.considerPaidServices ?? false;
   const githubStatus = state?.github;
   const githubLinked = githubStatus?.state === "linked" || githubStatus?.state === "needs_ssh";
   const githubSshReady = githubStatus?.sshReady ?? false;
@@ -1867,9 +2373,15 @@ export const App = () => {
     if (workflowRecoveryCandidate && workflowPendingApprovals.length === 0) {
       return {
         kind: "recover_workflow",
-        title: workflowRecoveryCandidate.kind === "disconnected" ? "Workflow was interrupted" : "Workflow may be stalled",
+        title: workflowRecoveryCandidate.kind === "disconnected"
+          ? "Workflow was interrupted"
+          : workflowRecoveryCandidate.kind === "startup_stalled"
+            ? "Agent startup may be stalled"
+            : "Workflow may be stalled",
         description: workflowRecoveryCandidate.kind === "disconnected"
           ? `${workflowRecoveryCandidate.agent.name} lost its Codex connection. Continue from the last saved workflow decision.`
+          : workflowRecoveryCandidate.kind === "startup_stalled"
+            ? `${workflowRecoveryCandidate.agent.name} has not received a Codex thread yet. Continue from the saved workflow state to restart the step.`
           : `${workflowRecoveryCandidate.agent.name} has not reported progress recently. Continue from the last saved workflow decision if it stopped responding.`,
         actionLabel: "Continue from saved state"
       };
@@ -1988,7 +2500,11 @@ export const App = () => {
     () => allAgents.find((agent) => agent.id === focusedAgentId) ?? allAgents[0],
     [allAgents, focusedAgentId]
   );
-  const activeWorkspaceTab = activeProject?.record.layout.activeCenterTab === "reports" ? "agents" : "overview";
+  const activeWorkspaceTab: WorkspaceCenterTab = activeProject?.record.layout.activeCenterTab === "reports"
+    ? "workflow"
+    : activeProject?.record.layout.activeCenterTab === "file" || activeProject?.record.layout.activeCenterTab === "diff"
+      ? "overview"
+      : activeProject?.record.layout.activeCenterTab ?? "overview";
   const workflowRunState = workflow && activeProject
     ? workflowPauseRequested
       ? workflowHasActiveAgent
@@ -2016,15 +2532,13 @@ export const App = () => {
   );
   const overviewRefreshRunning = overviewRefreshBusy || activeProject?.record.interfaceCreation?.status === "running";
 
-  const setWorkspaceTab = async (tab: "overview" | "agents") => {
+  const setWorkspaceTab = async (tab: Extract<WorkspaceCenterTab, "overview" | "workflow" | "logs" | "agents" | "credentials">) => {
     if (!activeProject) {
       return;
     }
 
     try {
-      await window.workbench.updateLayout(activeProject.record.id, {
-        activeCenterTab: tab === "agents" ? "reports" : "overview"
-      });
+      await window.workbench.updateLayout(activeProject.record.id, { activeCenterTab: tab });
     } catch (error) {
       handleError(error);
     }
@@ -2056,13 +2570,25 @@ export const App = () => {
 
     setCodingAgentForm((current) => {
       const nextModel = current.model && availableModels.some((model) => model.model === current.model) ? current.model : recommendedModel;
-      return current.model === nextModel ? current : { ...current, model: nextModel };
+      const nextReasoningEffort = resolveAgentReasoningEffort(
+        modelOptionsByName.get(nextModel),
+        "coding",
+        current.prompt || current.name,
+        "manual",
+        current.reasoningEffort
+      );
+      return current.model === nextModel && current.reasoningEffort === nextReasoningEffort
+        ? current
+        : { ...current, model: nextModel, reasoningEffort: nextReasoningEffort };
     });
     setManualAgentModel((current) => current && availableModels.some((model) => model.model === current) ? current : recommendedModel);
+    setManualAgentReasoningEffort((current) =>
+      resolveAgentReasoningEffort(modelOptionsByName.get(manualAgentModel || recommendedModel), "manual", manualAgentPrompt, "manual", current)
+    );
     if (!interfaceCreationConfiguredAt) {
       setShowSettings(true);
     }
-  }, [availableModels, interfaceCreationConfiguredAt, recommendedModel, stateLoaded]);
+  }, [availableModels, interfaceCreationConfiguredAt, manualAgentModel, manualAgentPrompt, modelOptionsByName, recommendedModel, stateLoaded]);
 
   useEffect(() => {
     setManualAgentPrompt("");
@@ -2086,9 +2612,12 @@ export const App = () => {
       current.maxRepairCycles === settingsMaxRepairCycles &&
       current.interfaceCreationModel === nextModel &&
       current.interfaceCreationReasoningEffort === nextReasoning &&
+      current.agentReasoningMode === settingsAgentReasoningMode &&
+      JSON.stringify(current.agentReasoningEfforts) === JSON.stringify(settingsAgentReasoningEfforts) &&
       current.autoApproveCommands === settingsAutoApproveCommands &&
       current.autoApproveGitCommits === settingsAutoApproveGitCommits &&
-      current.autoApproveGitPushes === settingsAutoApproveGitPushes
+      current.autoApproveGitPushes === settingsAutoApproveGitPushes &&
+      current.considerPaidServices === settingsConsiderPaidServices
         ? current
         : {
           executionMode: settingsExecutionMode,
@@ -2100,9 +2629,12 @@ export const App = () => {
           maxRepairCycles: settingsMaxRepairCycles,
           interfaceCreationModel: nextModel,
           interfaceCreationReasoningEffort: nextReasoning,
+          agentReasoningMode: settingsAgentReasoningMode,
+          agentReasoningEfforts: settingsAgentReasoningEfforts,
           autoApproveCommands: settingsAutoApproveCommands,
           autoApproveGitCommits: settingsAutoApproveGitCommits,
-          autoApproveGitPushes: settingsAutoApproveGitPushes
+          autoApproveGitPushes: settingsAutoApproveGitPushes,
+          considerPaidServices: settingsConsiderPaidServices
         }
     );
   }, [
@@ -2111,6 +2643,9 @@ export const App = () => {
     settingsAutoApproveCommands,
     settingsAutoApproveGitCommits,
     settingsAutoApproveGitPushes,
+    settingsAgentReasoningEfforts,
+    settingsAgentReasoningMode,
+    settingsConsiderPaidServices,
     settingsCodexBinaryPath,
     settingsCodexHome,
     settingsDistroName,
@@ -2215,6 +2750,7 @@ export const App = () => {
       if (!folder) {
         return;
       }
+      setProjectLoadBusy(intent);
       setLaunchIntent(intent);
       setNotice(undefined);
       setShowExistingChoice(false);
@@ -2223,6 +2759,8 @@ export const App = () => {
       setPendingLoad(await window.workbench.loadProject(folder, intent));
     } catch (error) {
       handleError(error);
+    } finally {
+      setProjectLoadBusy(null);
     }
   };
 
@@ -2233,9 +2771,12 @@ export const App = () => {
       setShowExistingChoice(false);
       setFileSummary(null);
       setSelectedFile(undefined);
+      setOpeningRecentProjectId(projectId);
       await window.workbench.openProject(projectId);
     } catch (error) {
       handleError(error);
+    } finally {
+      setOpeningRecentProjectId(undefined);
     }
   };
 
@@ -2243,6 +2784,8 @@ export const App = () => {
     try {
       setNotice(undefined);
       setPendingLoad(null);
+      setProjectLoadBusy(null);
+      setOpeningRecentProjectId(undefined);
       setShowExistingChoice(false);
       setLaunchIntent("open");
       setFileSummary(null);
@@ -2255,6 +2798,7 @@ export const App = () => {
 
   const importBundle = async () => {
     try {
+      setProjectLoadBusy("import");
       setLaunchIntent("open");
       setNotice(undefined);
       const imported = await window.workbench.importInterfaceBundle();
@@ -2265,6 +2809,8 @@ export const App = () => {
       setShowExistingChoice(false);
     } catch (error) {
       handleError(error);
+    } finally {
+      setProjectLoadBusy(null);
     }
   };
 
@@ -2377,23 +2923,29 @@ export const App = () => {
 
   const selectCandidate = async (candidate: InterfaceCandidate) => {
     try {
+      setProjectLoadBusy("open");
       setNotice(undefined);
       await window.workbench.selectInterface(candidate.source, candidate.path);
       setPendingLoad(null);
       setShowExistingChoice(false);
     } catch (error) {
       handleError(error);
+    } finally {
+      setProjectLoadBusy(null);
     }
   };
 
   const createFresh = async () => {
     try {
+      setProjectLoadBusy("create");
       setNotice(undefined);
       await window.workbench.selectInterface("fresh");
       setPendingLoad(null);
       setShowExistingChoice(false);
     } catch (error) {
       handleError(error);
+    } finally {
+      setProjectLoadBusy(null);
     }
   };
 
@@ -2469,7 +3021,9 @@ export const App = () => {
         "coding",
         codingAgentForm.name,
         codingAgentForm.prompt,
-        codingAgentForm.model
+        codingAgentForm.model,
+        codingAgentForm.reasoningMode,
+        codingAgentForm.reasoningMode === "manual" ? codingAgentForm.reasoningEffort : undefined
       );
       setCodingAgentForm((current) => ({ ...current, prompt: "" }));
     } catch (error) {
@@ -2489,7 +3043,9 @@ export const App = () => {
         "manual",
         buildManualAgentName(manualAgentPrompt),
         manualAgentPrompt,
-        manualAgentModel
+        manualAgentModel,
+        manualAgentReasoningMode,
+        manualAgentReasoningMode === "manual" ? manualAgentReasoningEffort : undefined
       );
       setManualAgentPrompt("");
     } catch (error) {
@@ -2868,10 +3424,13 @@ export const App = () => {
         warnOnMntMount: settingsDraft.warnOnMntMount,
         maxRepairCycles: settingsDraft.maxRepairCycles,
         interfaceCreationModel: settingsDraft.interfaceCreationModel || undefined,
-        interfaceCreationReasoningEffort: settingsDraft.interfaceCreationReasoningEffort,
+        interfaceCreationReasoningEffort: settingsDraft.agentReasoningEfforts.bootstrap ?? settingsDraft.interfaceCreationReasoningEffort,
+        agentReasoningMode: settingsDraft.agentReasoningMode,
+        agentReasoningEfforts: settingsDraft.agentReasoningEfforts,
         autoApproveCommands: settingsDraft.autoApproveCommands,
         autoApproveGitCommits: settingsDraft.autoApproveGitCommits,
-        autoApproveGitPushes: settingsDraft.autoApproveGitPushes
+        autoApproveGitPushes: settingsDraft.autoApproveGitPushes,
+        considerPaidServices: settingsDraft.considerPaidServices
       });
       setShowSettings(false);
     } catch (error) {
@@ -2910,7 +3469,7 @@ export const App = () => {
             actions={<div className="badge">Loading</div>}
           />
           <div className="empty-state">
-            <p>Loading workbench state and recent projects.</p>
+            <LoadingIndicator label={initialStateLoading ? "Loading workbench state and recent projects" : "Buffering workspace state"} />
           </div>
         </div>
       </div>
@@ -2928,6 +3487,15 @@ export const App = () => {
           modelOptionsByName.get(nextModel),
           next.interfaceCreationReasoningEffort ?? current.interfaceCreationReasoningEffort
         ) ?? current.interfaceCreationReasoningEffort;
+        const rawAgentReasoningEfforts = normalizeAgentReasoningEfforts(
+          next.agentReasoningEfforts ?? current.agentReasoningEfforts
+        );
+        const nextAgentReasoningEfforts = Object.fromEntries(
+          configurableAgentCategories.map((category) => [
+            category,
+            resolveAgentReasoningEffort(modelOptionsByName.get(nextModel), category, agentCategoryLabel(category), "manual", rawAgentReasoningEfforts[category])
+          ])
+        ) as Record<AgentCategory, InterfaceReasoningEffort>;
         return {
           executionMode: next.executionMode ?? current.executionMode,
           distroName: next.distroName ?? current.distroName,
@@ -2937,10 +3505,13 @@ export const App = () => {
           warnOnMntMount: next.warnOnMntMount ?? current.warnOnMntMount,
           maxRepairCycles: next.maxRepairCycles ?? current.maxRepairCycles,
           interfaceCreationModel: nextModel,
-          interfaceCreationReasoningEffort: nextReasoning,
+          interfaceCreationReasoningEffort: nextAgentReasoningEfforts.bootstrap ?? nextReasoning,
+          agentReasoningMode: next.agentReasoningMode ?? current.agentReasoningMode,
+          agentReasoningEfforts: nextAgentReasoningEfforts,
           autoApproveCommands: next.autoApproveCommands ?? current.autoApproveCommands,
           autoApproveGitCommits: next.autoApproveGitCommits ?? current.autoApproveGitCommits,
-          autoApproveGitPushes: next.autoApproveGitPushes ?? current.autoApproveGitPushes
+          autoApproveGitPushes: next.autoApproveGitPushes ?? current.autoApproveGitPushes,
+          considerPaidServices: next.considerPaidServices ?? current.considerPaidServices
         };
       })}
       onSave={saveSettings}
@@ -3091,8 +3662,12 @@ export const App = () => {
                 The workbench now starts from a proper launcher so GitHub linking, project selection, imports, and settings all begin from one clear home screen.
               </p>
               <div className="actions-row">
-                <button className="primary-button" disabled={launcherActionsLocked} onClick={() => void openFolder("open")}>Open GitHub Repo</button>
-                <button className="secondary-button" disabled={createWorkspaceLocked} onClick={() => void openFolder("create")}>Create New Workspace</button>
+                <button className="primary-button" disabled={launcherActionsLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("open")}>
+                  {projectLoadBusy === "open" ? <LoadingIndicator label="Opening" compact /> : "Open GitHub Repo"}
+                </button>
+                <button className="secondary-button" disabled={createWorkspaceLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("create")}>
+                  {projectLoadBusy === "create" ? <LoadingIndicator label="Creating" compact /> : "Create New Workspace"}
+                </button>
               </div>
             </div>
             <div className="hero-card__aside">
@@ -3105,6 +3680,19 @@ export const App = () => {
             </div>
           </section>
           {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
+          {projectLoadBusy ? (
+            <div className="notice notice--status notice--running">
+              <LoadingIndicator
+                label={
+                  projectLoadBusy === "create"
+                    ? "Preparing workspace and scanning repository"
+                    : projectLoadBusy === "import"
+                      ? "Importing portable interface"
+                      : "Opening project and scanning repository"
+                }
+              />
+            </div>
+          ) : null}
           {!githubLinked && githubStatus ? <div className="notice notice--error">{githubStatus.message}</div> : null}
           {githubStatus?.state === "needs_ssh" ? <div className="notice">{githubStatus.message}</div> : null}
           <section className="launcher-grid">
@@ -3116,7 +3704,7 @@ export const App = () => {
                 actionLabel="Choose Folder"
                 onAction={() => void openFolder("open")}
                 featured
-                disabled={launcherActionsLocked}
+                disabled={launcherActionsLocked || Boolean(projectLoadBusy)}
               />
               <LauncherActionCard
                 eyebrow="Create"
@@ -3124,7 +3712,7 @@ export const App = () => {
                 copy="Start from a folder selection, initialize a GitHub SSH repository when needed, and generate a fresh interface or deliberately replace an older saved version."
                 actionLabel="Start New Workspace"
                 onAction={() => void openFolder("create")}
-                disabled={createWorkspaceLocked}
+                disabled={createWorkspaceLocked || Boolean(projectLoadBusy)}
               />
               <LauncherActionCard
                 eyebrow="Import"
@@ -3132,7 +3720,7 @@ export const App = () => {
                 copy="Bring in a portable interface file, validate it against a project folder, and open the result in the same window."
                 actionLabel="Import Interface"
                 onAction={() => void importBundle()}
-                disabled={launcherActionsLocked}
+                disabled={launcherActionsLocked || Boolean(projectLoadBusy)}
               />
               <LauncherActionCard
                 eyebrow="Preferences"
@@ -3146,13 +3734,22 @@ export const App = () => {
               <SectionTitle eyebrow="Reopen" title="Recent Projects" />
               <div className="recent-list">
                 {recentProjects.length ? recentProjects.map((project) => (
-                  <button key={project.record.id} className="recent-project" disabled={launcherActionsLocked} onClick={() => void openRecentProject(project.record.id)}>
+                  <button
+                    key={project.record.id}
+                    className="recent-project"
+                    disabled={launcherActionsLocked || Boolean(openingRecentProjectId)}
+                    onClick={() => void openRecentProject(project.record.id)}
+                  >
                     <div>
                       <strong>{project.record.identity.projectName}</strong>
                       <div className="recent-project__path">{project.record.displayPath}</div>
                     </div>
                     <div className="recent-project__meta">
-                      <span>{formatDateTime(project.record.localState.lastOpenedAt)}</span>
+                      {openingRecentProjectId === project.record.id ? (
+                        <LoadingIndicator label="Opening" compact />
+                      ) : (
+                        <span>{formatDateTime(project.record.localState.lastOpenedAt)}</span>
+                      )}
                       <ValidationBadge status={project.validationStatus} />
                     </div>
                   </button>
@@ -3243,6 +3840,9 @@ export const App = () => {
             <strong>Creating Interface</strong>
             <span className={`status-pill status-${activeProject.record.interfaceCreation.status}`}>{activeProject.record.interfaceCreation.status}</span>
           </div>
+          {activeProject.record.interfaceCreation.status === "queued" || activeProject.record.interfaceCreation.status === "running" ? (
+            <LoadingIndicator label={activeProject.record.interfaceCreation.message} />
+          ) : null}
           <div>{activeProject.record.interfaceCreation.phase}</div>
           <p>{activeProject.record.interfaceCreation.message}</p>
           <div className="candidate-card__meta">
@@ -3267,9 +3867,27 @@ export const App = () => {
           />
           <WorkspaceTabButton
             label="Workflow"
+            active={activeWorkspaceTab === "workflow"}
+            count={pendingUserInputRequests.length + pendingHumanInterventions.length}
+            onClick={() => void setWorkspaceTab("workflow")}
+          />
+          <WorkspaceTabButton
+            label="Logs"
+            active={activeWorkspaceTab === "logs"}
+            count={pendingApprovals.length}
+            onClick={() => void setWorkspaceTab("logs")}
+          />
+          <WorkspaceTabButton
+            label="Agent History"
             active={activeWorkspaceTab === "agents"}
             count={allAgents.length}
             onClick={() => void setWorkspaceTab("agents")}
+          />
+          <WorkspaceTabButton
+            label="API Keys"
+            active={activeWorkspaceTab === "credentials"}
+            count={(activeProject.record.credentials?.requests ?? []).filter((request) => request.status === "pending").length}
+            onClick={() => void setWorkspaceTab("credentials")}
           />
         </div>
 
@@ -3411,7 +4029,7 @@ export const App = () => {
           </section>
         ) : null}
 
-        {activeWorkspaceTab === "agents" ? (
+        {activeWorkspaceTab === "workflow" ? (
           <section className="workflow-control-center panel workflow-control-center--minimal">
             <header className="workflow-control-center__header">
               <div>
@@ -3721,7 +4339,7 @@ export const App = () => {
                   </details>
                 ) : null}
 
-                <details className="workflow-secondary__details">
+                <details className="workflow-secondary__details workflow-noisy-detail">
                   <summary>
                     <span>Manual agent</span>
                     <span className="badge">{manualAgents.length}</span>
@@ -3745,6 +4363,15 @@ export const App = () => {
                     <select className="input" value={manualAgentModel} onChange={(event) => setManualAgentModel(event.target.value)}>
                       {state.availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
                     </select>
+                    <AgentReasoningPicker
+                      category="manual"
+                      model={modelOptionsByName.get(manualAgentModel)}
+                      taskPrompt={manualAgentPrompt}
+                      mode={manualAgentReasoningMode}
+                      effort={manualAgentReasoningEffort}
+                      onModeChange={setManualAgentReasoningMode}
+                      onEffortChange={setManualAgentReasoningEffort}
+                    />
                     <div className="actions-row">
                       <button className="primary-button" disabled={!manualAgentPrompt.trim() || !manualAgentModel} onClick={() => void createManualAgent()}>
                         Run manual agent
@@ -3933,7 +4560,7 @@ export const App = () => {
                   </article>
                 ) : null}
 
-                <details className="workflow-secondary__details">
+                <details className="workflow-secondary__details workflow-noisy-detail">
                   <summary>
                     <span>Approvals and recent activity</span>
                     <span className="badge">{pendingApprovals.length} approvals</span>
@@ -4083,7 +4710,7 @@ export const App = () => {
                   </div>
                 </details>
 
-                <details className="workflow-secondary__details">
+                <details className="workflow-secondary__details workflow-noisy-detail">
                   <summary>Advanced traces</summary>
                   <div className="workflow-secondary__content">
                     <LiveUpdatesPanel
@@ -4156,7 +4783,7 @@ export const App = () => {
                   </div>
                 </details>
 
-                <details className="workflow-secondary__details">
+                <details className="workflow-secondary__details workflow-noisy-detail">
                   <summary>Developer controls</summary>
                   <div className="workflow-secondary__content">
                   <p className="agent-card__subtle">
@@ -4185,6 +4812,15 @@ export const App = () => {
                     <select className="input" value={codingAgentForm.model} onChange={(event) => setCodingAgentForm({ ...codingAgentForm, model: event.target.value })}>
                       {state.availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
                     </select>
+                    <AgentReasoningPicker
+                      category="coding"
+                      model={modelOptionsByName.get(codingAgentForm.model)}
+                      taskPrompt={`${codingAgentForm.name}\n${codingAgentForm.prompt}`}
+                      mode={codingAgentForm.reasoningMode}
+                      effort={codingAgentForm.reasoningEffort}
+                      onModeChange={(reasoningMode) => setCodingAgentForm({ ...codingAgentForm, reasoningMode })}
+                      onEffortChange={(reasoningEffort) => setCodingAgentForm({ ...codingAgentForm, reasoningEffort })}
+                    />
                     <button className="primary-button" disabled={!codingAgentForm.prompt.trim() || !codingAgentForm.model} onClick={() => void createCodingAgent()}>
                       Create manual coding agent
                     </button>
@@ -4195,49 +4831,182 @@ export const App = () => {
 
               <aside className="workflow-minimal-layout__side">
                 <article className="overview-card workflow-agent-list-card workflow-agent-list-card--bounded">
-                  <SectionTitle eyebrow="Agent call history" title="Workflow runs" meta={<span className="badge">{workflowAgents.length}</span>} />
-                  <p className="agent-card__subtle">
-                    Each workflow agent is constrained to the active project folder. Select a run to inspect its full explanation.
-                  </p>
-                  <div className="workflow-agent-list">
-                    {workflowAgents.length ? workflowAgents.map((agent) => (
-                      <AgentCard
-                        key={agent.id}
-                        agent={agent}
-                        workflow={workflow}
-                        selected={activeAgent?.id === agent.id}
-                        onSelect={(agentId) => void selectAgent(agentId)}
-                      />
+                  <SectionTitle
+                    eyebrow="Context selector"
+                    title="Relevant prior context"
+                    meta={<span className="badge">{activeProject.record.workflow.memory.lastRelevantContext.length}</span>}
+                  />
+                  <div className="workflow-option-list">
+                    {activeProject.record.workflow.memory.lastRelevantContext.length ? activeProject.record.workflow.memory.lastRelevantContext.map((selection) => (
+                      <div key={selection.descriptorId} className="lane-note">
+                        <strong>Cycle {selection.cycleNumber} · {agentCategoryLabel(selection.agentCategory)}</strong>
+                        <span>{selection.summary}</span>
+                        {selection.paths.length ? <span>Paths: {selection.paths.join(", ")}</span> : null}
+                        {selection.reasons.length ? <span>Why: {selection.reasons.join("; ")}</span> : null}
+                      </div>
                     )) : (
-                      <div className="empty-copy">No workflow agents have started yet.</div>
+                      <div className="empty-copy">Relevant prior context will appear after the next recommendation, planning, or coding prompt is prepared.</div>
                     )}
                   </div>
                 </article>
 
                 <article className="overview-card workflow-agent-list-card workflow-agent-list-card--bounded">
-                  <SectionTitle eyebrow="Manual agents" title="Independent runs" meta={<span className="badge">{manualAgents.length}</span>} />
-                  <p className="agent-card__subtle">
-                    These runs stay outside the cycle and are useful for repo questions or one-off changes.
-                  </p>
-                  <div className="workflow-agent-list">
-                    {manualAgents.length ? manualAgents.map((agent) => (
-                      <AgentCard
-                        key={agent.id}
-                        agent={agent}
-                        workflow={workflow}
-                        selected={activeAgent?.id === agent.id}
-                        onSelect={(agentId) => void selectAgent(agentId)}
-                      />
-                    )) : (
-                      <div className="empty-copy">No manual agents have started yet.</div>
-                    )}
-                  </div>
+                  <SectionTitle eyebrow="Current run" title="Active agent" meta={<span className="badge">{currentWorkflowAgent?.status ?? "idle"}</span>} />
+                  {currentWorkflowAgent ? (
+                    <AgentCard
+                      agent={currentWorkflowAgent}
+                      workflow={workflow}
+                      selected={activeAgent?.id === currentWorkflowAgent.id}
+                      onSelect={(agentId) => void selectAgent(agentId)}
+                    />
+                  ) : (
+                    <div className="empty-copy">No workflow agent is active right now.</div>
+                  )}
                 </article>
-
-                <AgentFocusPanel agent={activeAgent} workflow={workflow} />
               </aside>
             </div>
           </section>
+        ) : null}
+
+        {activeWorkspaceTab === "logs" ? (
+          <section className="workflow-control-center panel workflow-log-workspace">
+            <SectionTitle eyebrow="Execution feed" title="Logs" meta={<span className="badge">{pendingApprovals.length} approvals pending</span>} />
+            <div className="workflow-feed-card__grid">
+              <div className="panel support-panel workflow-feed-card__panel">
+                <SectionTitle eyebrow="Approvals" title="Pending requests" />
+                <div className="workflow-feed-card__scroll workflow-feed-card__scroll--tall">
+                  <div className="approval-list">
+                    {pendingApprovals.length ? pendingApprovals.map((approval) => (
+                      <div key={approval.id} className="approval-row">
+                        <div>
+                          <strong>{approval.summary}</strong>
+                          <div>{approval.reason ?? approval.command ?? "Approval required"}</div>
+                        </div>
+                        <div className="actions-row">
+                          <button className="primary-button" onClick={() => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}>Accept</button>
+                          <button className="secondary-button" onClick={() => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}>Reject</button>
+                        </div>
+                      </div>
+                    )) : <div className="empty-copy">No approvals are currently waiting.</div>}
+                  </div>
+                </div>
+              </div>
+
+              <div className="panel support-panel workflow-feed-card__panel">
+                <SectionTitle eyebrow="Workflow" title="Activity log" />
+                <div className="workflow-feed-card__scroll workflow-feed-card__scroll--tall">
+                  <div className="activity-list">
+                    {workflow?.activityLog.length ? [...workflow.activityLog]
+                      .sort((left, right) => toTime(right.timestamp) - toTime(left.timestamp))
+                      .slice(0, 200)
+                      .map((event) => (
+                        <div key={event.id} className="activity-row">
+                          <strong>{event.title}</strong>
+                          <span>{event.detail ?? workflowActivitySourceLabel(event.source)} · {formatClockTime(event.timestamp)}</span>
+                        </div>
+                      )) : <div className="empty-copy">Workflow activity will appear here once work starts.</div>}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <article className="overview-card workflow-panel">
+              <SectionTitle eyebrow="Commands" title="Recent command snippets" />
+              <div className="workflow-feed-card__scroll workflow-feed-card__scroll--commands">
+                <div className="activity-list">
+                  {allAgents.flatMap((agent) =>
+                    agent.commandLog.map((command) => ({ agent, command }))
+                  ).slice(0, 120).map(({ agent, command }) => (
+                    <div key={`${agent.id}:${command.itemId ?? command.startedAt}`} className="activity-row">
+                      <strong>{agent.name}</strong>
+                      <span>{command.command} · {command.status}</span>
+                    </div>
+                  ))}
+                  {allAgents.every((agent) => agent.commandLog.length === 0) ? (
+                    <div className="empty-copy">No command snippets have been recorded yet.</div>
+                  ) : null}
+                </div>
+              </div>
+            </article>
+          </section>
+        ) : null}
+
+        {activeWorkspaceTab === "agents" ? (
+          <section className="workflow-control-center panel agent-history-workspace">
+            <SectionTitle eyebrow="Run history" title="Agent History" meta={<span className="badge">{allAgents.length} runs</span>} />
+            <div className="agent-history-layout">
+              <div className="agent-history-layout__lists">
+                <article className="overview-card workflow-agent-list-card">
+                  <SectionTitle eyebrow="Workflow" title="Workflow runs" meta={<span className="badge">{workflowAgents.length}</span>} />
+                  <WindowedAgentList
+                    agents={workflowAgents}
+                    workflow={workflow}
+                    selectedAgentId={activeAgent?.id}
+                    emptyCopy="No workflow agents have started yet."
+                    onSelect={(agentId) => void selectAgent(agentId)}
+                  />
+                </article>
+                <article className="overview-card workflow-agent-list-card">
+                  <SectionTitle eyebrow="Manual" title="Independent runs" meta={<span className="badge">{manualAgents.length}</span>} />
+                  <div className="agent-form card-surface">
+                    <textarea
+                      className="textarea"
+                      placeholder="Ask a question about the repo or describe a change outside the workflow cycle."
+                      value={manualAgentPrompt}
+                      onChange={(event) => setManualAgentPrompt(event.target.value)}
+                    />
+                    <select className="input" value={manualAgentModel} onChange={(event) => setManualAgentModel(event.target.value)}>
+                      {state.availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
+                    </select>
+                    <AgentReasoningPicker
+                      category="manual"
+                      model={modelOptionsByName.get(manualAgentModel)}
+                      taskPrompt={manualAgentPrompt}
+                      mode={manualAgentReasoningMode}
+                      effort={manualAgentReasoningEffort}
+                      onModeChange={setManualAgentReasoningMode}
+                      onEffortChange={setManualAgentReasoningEffort}
+                    />
+                    <div className="actions-row">
+                      <button className="primary-button" disabled={!manualAgentPrompt.trim() || !manualAgentModel} onClick={() => void createManualAgent()}>
+                        Run manual agent
+                      </button>
+                      <span className="agent-card__subtle">{manualPendingApprovalCount} manual approvals pending</span>
+                    </div>
+                  </div>
+                  <WindowedAgentList
+                    agents={manualAgents}
+                    workflow={workflow}
+                    selectedAgentId={activeAgent?.id}
+                    emptyCopy="No manual agents have started yet."
+                    onSelect={(agentId) => void selectAgent(agentId)}
+                    height={320}
+                  />
+                </article>
+              </div>
+              <div className="agent-history-layout__detail">
+                <AgentFocusPanel agent={activeAgent} workflow={workflow} />
+                <article className="overview-card workflow-panel">
+                  <SectionTitle eyebrow="Developer" title="Workflow controls" />
+                  <div className="actions-row">
+                    <button className="secondary-button" disabled={!activeProject.record.workflow.approvedRecommendation} onClick={() => void createScopedGoal()}>
+                      Create scoped goal
+                    </button>
+                    <button className="secondary-button" disabled={recommendationRegenerationLocked} onClick={() => void runRecommendation()}>
+                      Run recommendation
+                    </button>
+                    <button className="secondary-button" onClick={() => void window.workbench.runIntegrity(activeProject.record.id)}>Run integrity</button>
+                    <button className="secondary-button" onClick={() => void window.workbench.runMerge(activeProject.record.id)}>Run merge</button>
+                    <button className="secondary-button" onClick={() => void advanceWorkflowStage()}>Advance workflow stage</button>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </section>
+        ) : null}
+
+        {activeWorkspaceTab === "credentials" ? (
+          <CredentialsPanel project={activeProject} onSaved={showInfoNotice} onError={handleError} />
         ) : null}
       </main>
 

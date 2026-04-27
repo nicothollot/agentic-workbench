@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell } from "electron";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { APP_ID, APP_NAME } from "@shared/constants";
@@ -9,6 +9,10 @@ import {
   approvalDecisionRequestSchema,
   createScopedGoalRequestSchema,
   createAgentRequestSchema,
+  credentialEntryDeleteRequestSchema,
+  credentialEntrySaveRequestSchema,
+  credentialRequestSubmitToAgentSchema,
+  credentialRequestUpdateSchema,
   downloadInterfaceRequestSchema,
   downloadLogsRequestSchema,
   detectUltimateGoalRequestSchema,
@@ -260,6 +264,22 @@ const registerIpc = (): void => {
     const parsed = openProjectShellRequestSchema.parse(payload);
     return await appService?.openProjectShell(parsed.projectId);
   });
+  ipcMain.handle("credentials:saveEntry", async (_event, payload) => {
+    const parsed = credentialEntrySaveRequestSchema.parse(payload);
+    return await appService?.saveCredentialEntry(parsed.projectId, parsed);
+  });
+  ipcMain.handle("credentials:deleteEntry", async (_event, payload) => {
+    const parsed = credentialEntryDeleteRequestSchema.parse(payload);
+    return await appService?.deleteCredentialEntry(parsed.projectId, parsed.entryId);
+  });
+  ipcMain.handle("credentials:updateRequest", async (_event, payload) => {
+    const parsed = credentialRequestUpdateSchema.parse(payload);
+    return await appService?.updateCredentialRequest(parsed.projectId, parsed.requestId, parsed.status, parsed.notes);
+  });
+  ipcMain.handle("credentials:submitRequestToAgent", async (_event, payload) => {
+    const parsed = credentialRequestSubmitToAgentSchema.parse(payload);
+    return await appService?.submitCredentialRequestToAgent(parsed.projectId, parsed.requestId);
+  });
   ipcMain.handle("workflow:updateUltimateGoal", async (_event, payload) => {
     const parsed = updateUltimateGoalRequestSchema.parse(payload);
     return await appService?.updateUltimateGoal(parsed.projectId, parsed.goal, parsed.confirm);
@@ -343,7 +363,10 @@ const registerIpc = (): void => {
   ipcMain.handle("project:revalidate", async (_event, projectId: string) => await appService?.revalidateProject(projectId));
   ipcMain.handle("agent:create", async (_event, payload) => {
     const parsed = createAgentRequestSchema.parse(payload);
-    return await appService?.createAgent(parsed.projectId, parsed.category, parsed.name, parsed.prompt, parsed.model);
+    return await appService?.createAgent(parsed.projectId, parsed.category, parsed.name, parsed.prompt, parsed.model, {
+      reasoningMode: parsed.reasoningMode,
+      effort: parsed.reasoningEffort
+    });
   });
   ipcMain.handle("agent:approve", async (_event, payload) => {
     const parsed = approvalDecisionRequestSchema.parse(payload);
@@ -424,7 +447,7 @@ const registerIpc = (): void => {
 };
 
 void app.whenReady().then(async () => {
-  appService = new AppService(app.getPath("userData"));
+  appService = new AppService(app.getPath("userData"), safeStorage);
   await appService.initialize();
   appService.on("stateChanged", (state) => sendState(state));
   registerIpc();

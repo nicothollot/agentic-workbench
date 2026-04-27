@@ -1,5 +1,6 @@
 import { nanoid } from "nanoid";
 import { APP_VERSION, DEFAULT_CODEX_BINARY, DEFAULT_DISTRO_NAME, DEFAULT_WORKTREE_BASE_DIR, PORTABLE_INTERFACE_VERSION } from "./constants";
+import { DEFAULT_AGENT_REASONING_EFFORTS, DEFAULT_AGENT_REASONING_MODE } from "./modelConfig";
 import type {
   AgentCategory,
   AgentFreshnessMarker,
@@ -8,6 +9,7 @@ import type {
   LayoutConfig,
   LocalProjectRecord,
   LocalProjectState,
+  ProjectCredentialsState,
   PortableProjectInterface,
   ProjectIdentity,
   ProjectWorkflowState,
@@ -31,9 +33,12 @@ export const defaultSettings = (): AppSettings => ({
   mockMode: false,
   maxRepairCycles: 3,
   interfaceCreationReasoningEffort: "medium",
+  agentReasoningMode: DEFAULT_AGENT_REASONING_MODE,
+  agentReasoningEfforts: { ...DEFAULT_AGENT_REASONING_EFFORTS },
   autoApproveCommands: false,
   autoApproveGitCommits: false,
-  autoApproveGitPushes: false
+  autoApproveGitPushes: false,
+  considerPaidServices: false
 });
 
 export const defaultLayout = (): LayoutConfig => ({
@@ -105,9 +110,16 @@ export const defaultWorkflowMemory = (): WorkflowMemory => {
     agentFreshness: Object.fromEntries(categories.map((category) => [category, defaultAgentFreshnessMarker()])) as Record<
       AgentCategory,
       AgentFreshnessMarker
-    >
+    >,
+    contextDescriptors: [],
+    lastRelevantContext: []
   };
 };
+
+export const defaultProjectCredentialsState = (): ProjectCredentialsState => ({
+  entries: [],
+  requests: []
+});
 
 export const workflowStepOrder: WorkflowStepId[] = [
   "ultimate_goal",
@@ -193,7 +205,8 @@ export const createLocalProjectRecord = (
   dependencies: [],
   summaryCache: [],
   agents: [],
-  userInputRequests: []
+  userInputRequests: [],
+  credentials: defaultProjectCredentialsState()
 });
 
 export const createPortableInterface = (record: LocalProjectRecord): PortableProjectInterface => ({

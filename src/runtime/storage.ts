@@ -23,6 +23,31 @@ type PathReplacement = {
   to: string;
 };
 
+export interface SecretStorageCodec {
+  encryptString(value: string): Buffer;
+  decryptString(encrypted: Buffer): string;
+  isEncryptionAvailable(): boolean;
+}
+
+export interface CredentialSecretInput {
+  apiKey: string;
+  secretKey?: string;
+}
+
+type StoredSecretValue = {
+  encoding: "safeStorage" | "plain";
+  value: string;
+};
+
+type CredentialSecretStore = {
+  version: 1;
+  entries: Record<string, {
+    apiKey: StoredSecretValue;
+    secretKey?: StoredSecretValue;
+    updatedAt: string;
+  }>;
+};
+
 const buildReviewLogRuntimeContext = (settings: AppSettings): ReviewLogRuntimeContext => ({
   executionMode: settings.executionMode,
   distroName: settings.distroName,
@@ -30,9 +55,12 @@ const buildReviewLogRuntimeContext = (settings: AppSettings): ReviewLogRuntimeCo
   maxRepairCycles: settings.maxRepairCycles,
   interfaceCreationModel: settings.interfaceCreationModel,
   interfaceCreationReasoningEffort: settings.interfaceCreationReasoningEffort,
+  agentReasoningMode: settings.agentReasoningMode,
+  agentReasoningEfforts: settings.agentReasoningEfforts,
   autoApproveCommands: settings.autoApproveCommands,
   autoApproveGitCommits: settings.autoApproveGitCommits,
-  autoApproveGitPushes: settings.autoApproveGitPushes
+  autoApproveGitPushes: settings.autoApproveGitPushes,
+  considerPaidServices: settings.considerPaidServices
 });
 
 const createAgentCategoryCounts = (): Record<AgentCategory, number> => ({
@@ -195,6 +223,7 @@ const sanitizeReviewValue = (value: unknown, replacements: PathReplacement[]): u
 
 const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
   const notes = ["Project root paths were replaced with <project-root>."];
+  notes.push("Local credential metadata and secret values were excluded.");
 
   if (record.agents.some((agent) => agent.worktree)) {
     notes.push("Managed worktree paths were replaced with <managed-worktrees> and <agent-worktree>.");
@@ -208,7 +237,10 @@ const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
 };
 
 export class WorkbenchStorage {
-  constructor(private readonly appDataDir: string) {}
+  constructor(
+    private readonly appDataDir: string,
+    private readonly secretCodec?: SecretStorageCodec
+  ) {}
 
   private buildPortableInterfacePayload(record: LocalProjectRecord): PortableProjectInterface {
     const portable = createPortableInterface(record);
@@ -271,6 +303,10 @@ export class WorkbenchStorage {
     return path.join(this.projectDir(projectId), "state.json");
   }
 
+  private projectCredentialSecretPath(projectId: string): string {
+    return path.join(this.projectDir(projectId), "credentials.secrets.json");
+  }
+
   private registryPath(): string {
     return path.join(this.appDataDir, "registry.json");
   }
@@ -314,6 +350,88 @@ export class WorkbenchStorage {
     await this.ensureBaseDirs();
     await mkdir(this.projectDir(record.id), { recursive: true });
     await writeFile(this.projectStatePath(record.id), JSON.stringify(record, null, 2));
+  }
+
+  private encodeSecretValue(value: string): StoredSecretValue {
+    if (this.secretCodec?.isEncryptionAvailable()) {
+      return {
+        encoding: "safeStorage",
+        value: this.secretCodec.encryptString(value).toString("base64")
+      };
+    }
+
+    return {
+      encoding: "plain",
+      value
+    };
+  }
+
+  private decodeSecretValue(value: StoredSecretValue): string {
+    if (value.encoding === "safeStorage" && this.secretCodec?.isEncryptionAvailable()) {
+      return this.secretCodec.decryptString(Buffer.from(value.value, "base64"));
+    }
+
+    return value.value;
+  }
+
+  private async loadCredentialSecretStore(projectId: string): Promise<CredentialSecretStore> {
+    try {
+      const raw = await readFile(this.projectCredentialSecretPath(projectId), "utf8");
+      const parsed = JSON.parse(raw) as CredentialSecretStore;
+      return {
+        version: 1,
+        entries: parsed.entries ?? {}
+      };
+    } catch {
+      return {
+        version: 1,
+        entries: {}
+      };
+    }
+  }
+
+  private async saveCredentialSecretStore(projectId: string, store: CredentialSecretStore): Promise<void> {
+    await this.ensureBaseDirs();
+    await mkdir(this.projectDir(projectId), { recursive: true });
+    await writeFile(this.projectCredentialSecretPath(projectId), JSON.stringify(store, null, 2));
+  }
+
+  async saveCredentialSecret(projectId: string, entryId: string, secrets: CredentialSecretInput): Promise<void> {
+    const store = await this.loadCredentialSecretStore(projectId);
+    store.entries[entryId] = {
+      apiKey: this.encodeSecretValue(secrets.apiKey),
+      secretKey: secrets.secretKey?.trim() ? this.encodeSecretValue(secrets.secretKey.trim()) : undefined,
+      updatedAt: nowIso()
+    };
+    await this.saveCredentialSecretStore(projectId, store);
+  }
+
+  async deleteCredentialSecret(projectId: string, entryId: string): Promise<void> {
+    const store = await this.loadCredentialSecretStore(projectId);
+    delete store.entries[entryId];
+    await this.saveCredentialSecretStore(projectId, store);
+  }
+
+  async hasCredentialSecret(projectId: string, entryId: string): Promise<{ hasApiKey: boolean; hasSecretKey: boolean }> {
+    const store = await this.loadCredentialSecretStore(projectId);
+    const entry = store.entries[entryId];
+    return {
+      hasApiKey: Boolean(entry?.apiKey),
+      hasSecretKey: Boolean(entry?.secretKey)
+    };
+  }
+
+  async readCredentialSecret(projectId: string, entryId: string): Promise<CredentialSecretInput | null> {
+    const store = await this.loadCredentialSecretStore(projectId);
+    const entry = store.entries[entryId];
+    if (!entry) {
+      return null;
+    }
+
+    return {
+      apiKey: this.decodeSecretValue(entry.apiKey),
+      secretKey: entry.secretKey ? this.decodeSecretValue(entry.secretKey) : undefined
+    };
   }
 
   async loadProject(projectId: string): Promise<LocalProjectRecord | null> {
