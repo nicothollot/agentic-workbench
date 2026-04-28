@@ -1,39 +1,48 @@
 :root {
-  --catc-navy: #0f2747;
-  --catc-navy-deep: #071a31;
-  --catc-ink: #1e2430;
-  --catc-beige: #e5d6c3;
-  --catc-ivory: #f7f2ea;
-  --catc-slate: #8e99a8;
-  --catc-gold: #b89a6a;
-  --bg: #071a31;
-  --bg-deep: #041426;
-  --surface: rgba(247, 242, 234, 0.96);
-  --surface-strong: rgba(255, 250, 242, 0.98);
-  --surface-muted: rgba(229, 214, 195, 0.88);
-  --line: rgba(184, 154, 106, 0.32);
-  --line-strong: rgba(184, 154, 106, 0.58);
+  --brand-navy: #0f2747;
+  --brand-night: #07182d;
+  --brand-navy-deep: #071b33;
+  --brand-black: #05090e;
+  --brand-ink: #1e2430;
+  --brand-beige: #e5d6c3;
+  --brand-ivory: #f7f2ea;
+  --brand-slate: #8e99a8;
+  --brand-gold: #b89a6a;
+  --brand-green: #2a7354;
+  --bg: #07182d;
+  --bg-deep: #05090e;
+  --surface: rgba(247, 242, 234, 0.94);
+  --surface-strong: rgba(247, 242, 234, 0.98);
+  --surface-muted: rgba(229, 214, 195, 0.76);
+  --line: rgba(184, 154, 106, 0.34);
+  --line-strong: rgba(184, 154, 106, 0.68);
   --text: #1e2430;
   --ink: #1e2430;
   --muted: #667382;
   --ink-muted: #667382;
   --accent: #0f2747;
-  --accent-strong: #071a31;
+  --accent-strong: #07182d;
   --accent-soft: rgba(184, 154, 106, 0.16);
   --warm: #b89a6a;
   --danger: #a64a43;
-  --success: #416f58;
+  --success: #2a7354;
   --radius-card: 8px;
   --radius-control: 6px;
-  --shadow-lg: 0 26px 60px rgba(3, 12, 24, 0.38);
-  --shadow-md: 0 14px 32px rgba(3, 12, 24, 0.2);
+  --clip-panel: polygon(0 0, calc(100% - 22px) 0, 100% 22px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+  --clip-card: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 0 100%);
+  --clip-slab: polygon(0 0, 100% 0, 100% calc(100% - 18px), calc(100% - 18px) 100%, 0 100%);
+  --shadow-lg: 0 32px 110px rgba(0, 0, 0, 0.34);
+  --shadow-md: 0 24px 72px rgba(0, 0, 0, 0.18);
+  --font-body: "Manrope", "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-heading: "Sora", "Manrope", "Inter", "Segoe UI", system-ui, sans-serif;
   color: var(--text);
-  font-family: "Aptos", "Inter", "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-family: var(--font-body);
   background:
-    linear-gradient(rgba(247, 242, 234, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(247, 242, 234, 0.035) 1px, transparent 1px),
-    linear-gradient(135deg, #071a31 0%, #0f2747 52%, #071a31 100%);
-  background-size: 36px 36px, 36px 36px, auto;
+    linear-gradient(116deg, transparent 0 70%, rgba(184, 154, 106, 0.12) 70.1% 70.35%, transparent 70.45%),
+    linear-gradient(rgba(247, 242, 234, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.08) 1px, transparent 1px),
+    linear-gradient(180deg, #071b33 0%, #0f2747 44%, #07182d 100%);
+  background-size: 100% 100%, 56px 56px, 56px 56px, auto;
   scrollbar-color: rgba(184, 154, 106, 0.58) transparent;
 }
 
@@ -90,7 +99,7 @@ strong {
 h1,
 h2,
 h3 {
-  font-family: "Aptos Display", "Inter", "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-family: var(--font-heading);
   font-weight: 800;
   letter-spacing: 0;
   margin: 0;
@@ -234,7 +243,8 @@ p {
 }
 
 .brand-lockup h1 {
-  font-size: clamp(1.8rem, 2vw, 2.3rem);
+  font-size: 2.25rem;
+  line-height: 1;
 }
 
 .brand-lockup__icon {
@@ -324,7 +334,7 @@ p {
 .hero-card .metric-card,
 .hero-card .metric-card strong,
 .hero-card .metric-card span {
-  color: var(--catc-ink);
+  color: var(--brand-ink);
 }
 
 .hero-card .metric-card__label {
@@ -366,9 +376,9 @@ p {
   overflow: hidden;
   background:
     linear-gradient(135deg, rgba(15, 39, 71, 0.98), rgba(7, 26, 49, 0.98)),
-    var(--catc-navy);
+    var(--brand-navy);
   border-color: rgba(184, 154, 106, 0.42);
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
 }
 
 .project-hero__main::after {
@@ -394,7 +404,7 @@ p {
 .project-hero__main h2,
 .project-hero__main strong,
 .project-hero__summary {
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
 }
 
 .project-hero__main .eyebrow,
@@ -431,7 +441,7 @@ p {
   color: var(--muted);
   font-size: 0.78rem;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
 }
 
 .stat-strip {
@@ -461,7 +471,7 @@ p {
   border-radius: var(--radius-control);
   border: 1px solid rgba(184, 154, 106, 0.32);
   background: rgba(7, 26, 49, 0.58);
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
   cursor: pointer;
   transition:
     background 140ms ease,
@@ -479,7 +489,7 @@ p {
 .workspace-tab--active {
   background: linear-gradient(180deg, rgba(247, 242, 234, 0.98), rgba(229, 214, 195, 0.88));
   border-color: rgba(184, 154, 106, 0.74);
-  color: var(--catc-ink);
+  color: var(--brand-ink);
   box-shadow: inset 0 -2px 0 rgba(184, 154, 106, 0.82);
 }
 
@@ -819,7 +829,7 @@ p {
   border-radius: 999px;
   font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   max-width: 100%;
 }
 
@@ -887,8 +897,8 @@ p {
 }
 
 .primary-button {
-  background: linear-gradient(180deg, #c7aa77, var(--catc-gold));
-  color: var(--catc-ink);
+  background: linear-gradient(180deg, #c7aa77, var(--brand-gold));
+  color: var(--brand-ink);
   box-shadow: 0 10px 18px rgba(3, 12, 24, 0.18);
 }
 
@@ -1097,7 +1107,7 @@ p {
 
 .agent-focus__label {
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   font-size: 0.72rem;
   color: var(--muted);
 }
@@ -1381,6 +1391,29 @@ p {
 .workflow-agent-list {
   display: grid;
   gap: 12px;
+}
+
+.workflow-agent-list--paged {
+  max-height: 640px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.workflow-agent-list__pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.workflow-agent-list__pager-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .workflow-agent-list--virtual {
@@ -1924,7 +1957,7 @@ p {
 .workflow-option__rank-label,
 .workflow-option__label {
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   font-size: 0.72rem;
   color: var(--muted);
 }
@@ -2201,7 +2234,7 @@ p {
 
 .eyebrow {
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: 0;
   color: var(--muted);
   font-size: 0.72rem;
 }
@@ -2334,7 +2367,7 @@ p {
 }
 
 .shell > .app-header h1 {
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
 }
 
 .shell > .app-header .eyebrow {
@@ -2344,7 +2377,7 @@ p {
 .shell > .app-header .secondary-button {
   background: rgba(247, 242, 234, 0.08);
   border-color: rgba(184, 154, 106, 0.46);
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
 }
 
 .shell > .app-header .secondary-button:hover {
@@ -2447,12 +2480,12 @@ p {
 
 .badge {
   background: rgba(15, 39, 71, 0.08);
-  color: var(--catc-ink);
+  color: var(--brand-ink);
 }
 
 .tag {
   background: rgba(15, 39, 71, 0.07);
-  color: var(--catc-navy);
+  color: var(--brand-navy);
 }
 
 .badge-source,
@@ -2462,7 +2495,7 @@ p {
 .status-waiting_approval,
 .status-disconnected {
   background: rgba(15, 39, 71, 0.12);
-  color: var(--catc-navy);
+  color: var(--brand-navy);
 }
 
 .badge-stale,
@@ -2482,13 +2515,13 @@ p {
 .shell > .app-header .status-pill {
   background: rgba(247, 242, 234, 0.16);
   border-color: rgba(229, 214, 195, 0.5);
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
 }
 
 .hero-card .secondary-button {
   background: rgba(247, 242, 234, 0.1);
   border-color: rgba(229, 214, 195, 0.5);
-  color: var(--catc-ivory);
+  color: var(--brand-ivory);
 }
 
 .hero-card .secondary-button:hover {
@@ -2497,6 +2530,7 @@ p {
 }
 
 .tree,
+.workflow-agent-list--paged,
 .workflow-agent-list--virtual,
 .workflow-transcript__runs-list,
 .workflow-transcript__list,
@@ -2722,5 +2756,649 @@ code {
 
   .credential-secret-preview {
     grid-template-columns: 1fr;
+  }
+}
+
+.shell {
+  position: relative;
+  isolation: isolate;
+  overflow-x: hidden;
+  gap: 18px;
+  color: var(--brand-ivory);
+  background:
+    linear-gradient(118deg, transparent 0 62%, rgba(184, 154, 106, 0.16) 62.1% 62.35%, transparent 62.45%),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.06), transparent 16%, transparent 84%, rgba(184, 154, 106, 0.07)),
+    linear-gradient(rgba(247, 242, 234, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.08) 1px, transparent 1px),
+    linear-gradient(180deg, #071b33 0%, #0f2747 44%, #07182d 100%);
+  background-attachment: fixed;
+  background-size: 100% 100%, 100% 100%, 56px 56px, 56px 56px, auto;
+}
+
+.shell::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(148deg, transparent 0 18%, rgba(229, 214, 195, 0.1) 18.1% 18.25%, transparent 18.35%),
+    linear-gradient(32deg, transparent 0 82%, rgba(142, 153, 168, 0.12) 82.1% 82.35%, transparent 82.45%);
+  opacity: 0.86;
+}
+
+.shell > * {
+  position: relative;
+  z-index: 1;
+}
+
+.app-header {
+  padding: 16px 18px;
+  border: 1px solid rgba(229, 214, 195, 0.18);
+  background:
+    linear-gradient(180deg, rgba(15, 39, 71, 0.88), rgba(7, 24, 45, 0.84)),
+    linear-gradient(90deg, rgba(184, 154, 106, 0.16), transparent 38%);
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.2);
+  clip-path: var(--clip-panel);
+  backdrop-filter: blur(14px);
+}
+
+.brand-lockup__icon {
+  width: 54px;
+  height: 54px;
+  border-radius: var(--radius-control);
+  outline: 1px solid rgba(229, 214, 195, 0.28);
+  outline-offset: 3px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.26);
+}
+
+.brand-lockup h1 {
+  color: var(--brand-ivory);
+  font-size: 2.15rem;
+}
+
+.shell > .app-header .eyebrow,
+.app-header .eyebrow {
+  color: rgba(229, 214, 195, 0.78);
+}
+
+.loader-card,
+.panel,
+.candidate-card,
+.agent-card,
+.overview-card,
+.hero-card,
+.metric-card,
+.card-surface,
+.settings-card,
+.settings-panel,
+.recent-project,
+.agent-lane,
+.lane-note,
+.workflow-control-center,
+.agent-workspace,
+.workflow-at-glance,
+.workflow-autopilot-card,
+.workflow-goal-progress,
+.workflow-primary-action,
+.workflow-goal-panel__section,
+.workflow-manual-handoff__section,
+.workflow-option,
+.workflow-option__callout,
+.workflow-transcript__run,
+.workflow-transcript__command,
+.workflow-transcript__entry,
+.notice,
+.model-option,
+.workflow-secondary__details,
+.workflow-stage-pill,
+.workflow-step-card,
+.workflow-step-rail__item,
+.workflow-at-glance__fact,
+.workflow-user-input-card__callout,
+.workflow-user-input-card__attachments,
+.workflow-user-input-card__question,
+.credential-secret-preview {
+  position: relative;
+  border-radius: var(--radius-card);
+}
+
+.loader-card,
+.panel,
+.candidate-card,
+.agent-card,
+.overview-card,
+.metric-card,
+.card-surface,
+.settings-card,
+.recent-project,
+.agent-lane,
+.lane-note,
+.workflow-autopilot-card,
+.workflow-goal-progress,
+.workflow-primary-action,
+.workflow-goal-panel__section,
+.workflow-manual-handoff__section,
+.workflow-option,
+.workflow-option__callout,
+.workflow-transcript__run,
+.workflow-transcript__command,
+.workflow-transcript__entry,
+.notice,
+.model-option,
+.workflow-secondary__details,
+.workflow-stage-pill,
+.workflow-step-card,
+.workflow-step-rail__item,
+.workflow-at-glance__fact,
+.workflow-user-input-card__callout,
+.workflow-user-input-card__attachments,
+.workflow-user-input-card__question,
+.credential-secret-preview {
+  clip-path: var(--clip-card);
+}
+
+.loader-card,
+.panel,
+.overview-card,
+.candidate-card,
+.agent-card,
+.settings-card,
+.model-option,
+.workflow-option,
+.workflow-transcript__run,
+.workflow-transcript__entry,
+.recent-project,
+.card-surface {
+  background:
+    linear-gradient(180deg, rgba(247, 242, 234, 0.98), rgba(229, 214, 195, 0.9)),
+    var(--surface);
+  border-color: rgba(184, 154, 106, 0.38);
+  box-shadow: 0 22px 72px rgba(0, 0, 0, 0.12);
+}
+
+.loader-card::before,
+.panel::before,
+.overview-card::before,
+.candidate-card::before,
+.agent-card::before,
+.settings-card::before,
+.model-option::before,
+.workflow-option::before,
+.workflow-transcript__entry::before,
+.workflow-transcript__run::before,
+.recent-project::before,
+.card-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(15, 39, 71, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 39, 71, 0.04) 1px, transparent 1px),
+    linear-gradient(135deg, transparent 0 76%, rgba(184, 154, 106, 0.16) 76.1% 100%);
+  background-size: 28px 28px, 28px 28px, 100% 100%;
+  opacity: 0.42;
+}
+
+.loader-card > *,
+.panel > *,
+.overview-card > *,
+.candidate-card > *,
+.agent-card > *,
+.settings-card > *,
+.model-option > *,
+.workflow-option > *,
+.workflow-transcript__entry > *,
+.workflow-transcript__run > *,
+.recent-project > *,
+.card-surface > * {
+  position: relative;
+  z-index: 1;
+}
+
+.hero-card,
+.project-hero__main,
+.workflow-at-glance {
+  clip-path: var(--clip-panel);
+  border-color: rgba(229, 214, 195, 0.22);
+  background:
+    linear-gradient(180deg, rgba(15, 39, 71, 0.96), rgba(7, 24, 45, 0.98)),
+    linear-gradient(90deg, rgba(184, 154, 106, 0.18), transparent 40%);
+  color: var(--brand-ivory);
+  box-shadow: var(--shadow-lg);
+}
+
+.hero-card::before,
+.project-hero__main::after,
+.workflow-at-glance::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(247, 242, 234, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.08) 1px, transparent 1px),
+    linear-gradient(132deg, transparent 0 68%, rgba(184, 154, 106, 0.48) 68.1% 68.35%, transparent 68.45%);
+  background-size: 46px 46px, 46px 46px, 100% 100%;
+  opacity: 0.72;
+  mask: linear-gradient(90deg, transparent 0 30%, #000 54% 100%);
+}
+
+.hero-card::after {
+  content: "";
+  position: absolute;
+  right: -10%;
+  bottom: -34%;
+  width: 46%;
+  height: 58%;
+  border: 1px solid rgba(229, 214, 195, 0.24);
+  background:
+    linear-gradient(90deg, rgba(229, 214, 195, 0.18), transparent 64%),
+    linear-gradient(rgba(247, 242, 234, 0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(247, 242, 234, 0.08) 1px, transparent 1px);
+  background-size: 100% 100%, 22px 22px, 22px 22px;
+  transform: rotate(-24deg);
+  opacity: 0.8;
+}
+
+.hero-card__content,
+.hero-card__aside,
+.project-hero__main > *,
+.workflow-at-glance > * {
+  position: relative;
+  z-index: 1;
+}
+
+.hero-card h2,
+.project-hero__main h2 {
+  color: var(--brand-ivory);
+  font-size: 2.45rem;
+  line-height: 1.02;
+}
+
+.hero-card__lead,
+.project-hero__summary,
+.workflow-at-glance p {
+  color: rgba(247, 242, 234, 0.78);
+}
+
+.project-hero__stats {
+  align-content: stretch;
+}
+
+.metric-card {
+  overflow: hidden;
+  clip-path: var(--clip-slab);
+  background:
+    linear-gradient(180deg, rgba(247, 242, 234, 0.96), rgba(229, 214, 195, 0.82)),
+    var(--surface);
+  border: 1px solid rgba(184, 154, 106, 0.42);
+  border-left: 0;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.12);
+}
+
+.metric-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(180deg, rgba(184, 154, 106, 0.95), rgba(142, 153, 168, 0.48), transparent);
+}
+
+.metric-card strong {
+  color: var(--brand-ink);
+}
+
+.metric-card__label,
+.eyebrow,
+.workflow-option__label,
+.workflow-option__rank-label,
+.agent-focus__label {
+  color: #8a6a35;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.section-title {
+  position: relative;
+  border-bottom-color: rgba(184, 154, 106, 0.34);
+}
+
+.section-title::after {
+  content: "";
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  width: 46px;
+  height: 2px;
+  background: rgba(184, 154, 106, 0.9);
+}
+
+.workspace-tabs {
+  padding: 7px;
+  border: 1px solid rgba(229, 214, 195, 0.2);
+  background:
+    linear-gradient(180deg, rgba(7, 24, 45, 0.78), rgba(15, 39, 71, 0.62)),
+    linear-gradient(90deg, rgba(184, 154, 106, 0.16), transparent);
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.18);
+  clip-path: var(--clip-slab);
+}
+
+.workspace-tab {
+  border-color: transparent;
+  background: transparent;
+  color: rgba(247, 242, 234, 0.74);
+  min-height: 42px;
+  border-radius: var(--radius-control);
+  letter-spacing: 0;
+}
+
+.workspace-tab:hover {
+  background: rgba(247, 242, 234, 0.08);
+  border-color: rgba(229, 214, 195, 0.22);
+}
+
+.workspace-tab--active {
+  background: linear-gradient(180deg, rgba(247, 242, 234, 0.96), rgba(229, 214, 195, 0.9));
+  color: var(--brand-ink);
+  border-color: rgba(184, 154, 106, 0.72);
+  box-shadow: inset 0 -2px 0 rgba(184, 154, 106, 0.9);
+}
+
+.workspace-tab__count {
+  background: rgba(15, 39, 71, 0.1);
+  border: 1px solid rgba(184, 154, 106, 0.28);
+}
+
+.primary-button,
+.secondary-button {
+  border-radius: var(--radius-control);
+  min-height: 42px;
+  letter-spacing: 0;
+  box-shadow: none;
+}
+
+.primary-button {
+  background: linear-gradient(180deg, #e5d6c3, #b89a6a);
+  border-color: rgba(229, 214, 195, 0.7);
+  color: var(--brand-ink);
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.18);
+}
+
+.primary-button:hover {
+  background: linear-gradient(180deg, #f0e5d5, #c4a66e);
+}
+
+.secondary-button {
+  background: rgba(15, 39, 71, 0.08);
+  border-color: rgba(15, 39, 71, 0.16);
+  color: var(--brand-navy);
+}
+
+.secondary-button:hover {
+  background: rgba(15, 39, 71, 0.13);
+  border-color: rgba(184, 154, 106, 0.56);
+}
+
+.app-header .secondary-button,
+.hero-card .secondary-button,
+.project-hero__main .secondary-button {
+  background: rgba(247, 242, 234, 0.08);
+  border-color: rgba(229, 214, 195, 0.34);
+  color: var(--brand-ivory);
+}
+
+.app-header .secondary-button:hover,
+.hero-card .secondary-button:hover,
+.project-hero__main .secondary-button:hover {
+  background: rgba(247, 242, 234, 0.16);
+  border-color: rgba(229, 214, 195, 0.58);
+}
+
+.badge,
+.tag,
+.status-pill {
+  border-radius: 999px;
+  letter-spacing: 0;
+  font-weight: 800;
+}
+
+.badge {
+  background: rgba(15, 39, 71, 0.08);
+  color: var(--brand-ink);
+}
+
+.tag {
+  background: rgba(15, 39, 71, 0.07);
+  color: var(--brand-navy);
+}
+
+.badge-source,
+.badge-unvalidated,
+.status-idle,
+.status-starting,
+.status-waiting_approval,
+.status-disconnected {
+  color: var(--brand-navy);
+}
+
+.badge-exact,
+.status-completed {
+  background: rgba(42, 115, 84, 0.13);
+  color: var(--brand-green);
+}
+
+.badge-stale,
+.status-running {
+  background: rgba(184, 154, 106, 0.18);
+  color: #735a2f;
+}
+
+.hero-card .badge,
+.hero-card .tag,
+.hero-card .status-pill,
+.project-hero__main .badge,
+.project-hero__main .tag,
+.project-hero__main .status-pill,
+.app-header .badge,
+.app-header .tag,
+.app-header .status-pill {
+  background: rgba(247, 242, 234, 0.14);
+  border-color: rgba(229, 214, 195, 0.42);
+  color: var(--brand-ivory);
+}
+
+.input,
+.textarea,
+select.input {
+  border-radius: var(--radius-control);
+  border-color: rgba(15, 39, 71, 0.16);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 242, 234, 0.78)),
+    var(--surface);
+  color: var(--brand-ink);
+}
+
+.input:focus,
+.textarea:focus,
+.model-option:focus,
+.candidate-card:focus,
+.tree-row:focus,
+.recent-project:focus {
+  outline: 2px solid rgba(184, 154, 106, 0.62);
+}
+
+.tree,
+.workflow-agent-list--paged,
+.workflow-agent-list--virtual,
+.workflow-transcript__runs-list,
+.workflow-transcript__list,
+.workflow-feed-card__scroll,
+.goal-checklist-preview {
+  background:
+    linear-gradient(rgba(15, 39, 71, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 39, 71, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.tree-row,
+.recent-project {
+  border-radius: var(--radius-control);
+}
+
+.tree-row:hover,
+.tree-row--selected,
+.recent-project:hover {
+  background: rgba(184, 154, 106, 0.16);
+}
+
+.agent-card:hover,
+.candidate-card:hover,
+.model-option:hover {
+  border-color: rgba(184, 154, 106, 0.7);
+  box-shadow: 0 24px 76px rgba(0, 0, 0, 0.16);
+}
+
+.agent-card--selected,
+.overview-card--feature,
+.launcher-action--featured,
+.workflow-step-card--current,
+.workflow-step-rail__item--current,
+.workflow-stage-pill--current,
+.workflow-transcript__run--active,
+.model-option--selected {
+  background:
+    linear-gradient(180deg, rgba(184, 154, 106, 0.2), rgba(247, 242, 234, 0.96)),
+    var(--surface-strong);
+  border-color: rgba(184, 154, 106, 0.68);
+}
+
+.workflow-control-center,
+.agent-workspace {
+  clip-path: var(--clip-panel);
+  border-color: rgba(184, 154, 106, 0.42);
+  background:
+    linear-gradient(180deg, rgba(247, 242, 234, 0.98), rgba(229, 214, 195, 0.9)),
+    linear-gradient(rgba(15, 39, 71, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 39, 71, 0.04) 1px, transparent 1px);
+  background-size: auto, 34px 34px, 34px 34px;
+  box-shadow: var(--shadow-md);
+}
+
+.workflow-at-glance h3,
+.workflow-at-glance strong,
+.workflow-at-glance .workflow-option__label,
+.workflow-at-glance__main p {
+  color: var(--brand-ivory);
+}
+
+.workflow-at-glance__fact {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(229, 214, 195, 0.16);
+  color: var(--brand-ivory);
+}
+
+.workflow-at-glance__fact span,
+.workflow-at-glance__fact em,
+.workflow-at-glance__next,
+.workflow-at-glance__brief .workflow-option__label {
+  color: rgba(229, 214, 195, 0.72);
+}
+
+.workflow-primary-action {
+  border-color: rgba(184, 154, 106, 0.46);
+}
+
+.workflow-primary-action--blocked {
+  border-color: rgba(160, 68, 62, 0.34);
+}
+
+.workflow-option__rank,
+.workflow-step-card__marker span,
+.workflow-step-rail__index,
+.workflow-stage-pill__step {
+  border-radius: var(--radius-control);
+  background: rgba(15, 39, 71, 0.08);
+  border: 1px solid rgba(184, 154, 106, 0.22);
+}
+
+.settings-modal {
+  background: rgba(5, 9, 14, 0.66);
+  backdrop-filter: blur(8px);
+}
+
+.settings-panel {
+  clip-path: var(--clip-panel);
+  background:
+    linear-gradient(180deg, rgba(247, 242, 234, 0.98), rgba(229, 214, 195, 0.94)),
+    var(--surface);
+  border-color: rgba(184, 154, 106, 0.58);
+}
+
+.settings-panel__icon {
+  border-radius: var(--radius-control);
+  border: 1px solid rgba(184, 154, 106, 0.38);
+}
+
+@media (max-width: 1180px) {
+  .hero-card h2,
+  .project-hero__main h2 {
+    font-size: 2.05rem;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-header,
+  .loader-card,
+  .panel,
+  .candidate-card,
+  .agent-card,
+  .overview-card,
+  .hero-card,
+  .metric-card,
+  .card-surface,
+  .settings-card,
+  .settings-panel,
+  .recent-project,
+  .agent-lane,
+  .lane-note,
+  .workflow-control-center,
+  .agent-workspace,
+  .workflow-at-glance,
+  .workflow-autopilot-card,
+  .workflow-goal-progress,
+  .workflow-primary-action,
+  .workflow-option,
+  .workflow-transcript__run,
+  .workflow-transcript__entry,
+  .notice,
+  .model-option,
+  .workflow-secondary__details,
+  .workflow-stage-pill,
+  .workflow-step-card,
+  .workflow-step-rail__item,
+  .workflow-at-glance__fact,
+  .workflow-user-input-card__callout,
+  .workflow-user-input-card__attachments,
+  .workflow-user-input-card__question,
+  .credential-secret-preview {
+    clip-path: none;
+  }
+
+  .brand-lockup h1 {
+    font-size: 1.85rem;
+  }
+
+  .hero-card h2,
+  .project-hero__main h2 {
+    font-size: 1.75rem;
+    line-height: 1.08;
+  }
+
+  .hero-card::after {
+    opacity: 0.38;
   }
 }

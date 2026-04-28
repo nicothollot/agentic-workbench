@@ -70,6 +70,7 @@ type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
 
 const interfaceIconUrl = new URL("../../assets/branding/interface_icon.png", import.meta.url).href;
 const WORKFLOW_AGENT_STALE_MS = 10 * 60 * 1000;
+const AGENT_HISTORY_PAGE_SIZE = 20;
 
 const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "Ultimate Goal authoring format for Codex Agent Workbench",
@@ -759,49 +760,90 @@ const AgentCard = ({
   </button>
 );
 
-const WindowedAgentList = ({
+const PagedAgentList = ({
   agents,
   workflow,
   selectedAgentId,
   emptyCopy,
   onSelect,
-  height = 420
+  pageSize = AGENT_HISTORY_PAGE_SIZE
 }: {
   agents: AgentState[];
   workflow?: ProjectWorkflowState;
   selectedAgentId?: string;
   emptyCopy: string;
   onSelect: (agentId: string) => void;
-  height?: number;
+  pageSize?: number;
 }) => {
-  const [scrollTop, setScrollTop] = useState(0);
-  const rowHeight = 152;
-  const overscan = 4;
-  const visibleStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
-  const visibleCount = Math.ceil(height / rowHeight) + overscan * 2;
-  const visibleAgents = agents.slice(visibleStart, visibleStart + visibleCount);
-  const totalHeight = agents.length * rowHeight;
+  const [pageIndex, setPageIndex] = useState(0);
+  const previousSelectedAgentId = useRef<string | undefined>(undefined);
+  const totalPages = Math.max(1, Math.ceil(agents.length / pageSize));
+  const boundedPageIndex = Math.min(pageIndex, totalPages - 1);
+  const pageStart = boundedPageIndex * pageSize;
+  const visibleAgents = agents.slice(pageStart, pageStart + pageSize);
+  const pageEnd = Math.min(pageStart + visibleAgents.length, agents.length);
+
+  useEffect(() => {
+    setPageIndex((current) => Math.min(current, totalPages - 1));
+  }, [totalPages]);
+
+  useEffect(() => {
+    if (previousSelectedAgentId.current === selectedAgentId) {
+      return;
+    }
+    previousSelectedAgentId.current = selectedAgentId;
+
+    if (!selectedAgentId) {
+      return;
+    }
+
+    const selectedIndex = agents.findIndex((agent) => agent.id === selectedAgentId);
+    if (selectedIndex >= 0) {
+      setPageIndex(Math.floor(selectedIndex / pageSize));
+    }
+  }, [agents, pageSize, selectedAgentId]);
 
   if (!agents.length) {
     return <div className="empty-copy">{emptyCopy}</div>;
   }
 
   return (
-    <div className="workflow-agent-list workflow-agent-list--virtual" style={{ height }} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}>
-      <div className="workflow-agent-list__spacer" style={{ height: totalHeight }}>
-        <div className="workflow-agent-list__window" style={{ transform: `translateY(${visibleStart * rowHeight}px)` }}>
-          {visibleAgents.map((agent) => (
-            <AgentCard
-              key={agent.id}
-              agent={agent}
-              workflow={workflow}
-              selected={selectedAgentId === agent.id}
-              onSelect={onSelect}
-            />
-          ))}
+    <>
+      <div className="workflow-agent-list__pager">
+        <span>
+          Showing {pageStart + 1}-{pageEnd} of {agents.length}
+        </span>
+        <div className="workflow-agent-list__pager-actions">
+          <button
+            className="secondary-button"
+            disabled={boundedPageIndex === 0}
+            onClick={() => setPageIndex((current) => Math.max(0, current - 1))}
+            type="button"
+          >
+            Previous {pageSize}
+          </button>
+          <button
+            className="secondary-button"
+            disabled={boundedPageIndex >= totalPages - 1}
+            onClick={() => setPageIndex((current) => Math.min(totalPages - 1, current + 1))}
+            type="button"
+          >
+            Next {pageSize}
+          </button>
         </div>
       </div>
-    </div>
+      <div className="workflow-agent-list workflow-agent-list--paged">
+        {visibleAgents.map((agent) => (
+          <AgentCard
+            key={agent.id}
+            agent={agent}
+            workflow={workflow}
+            selected={selectedAgentId === agent.id}
+            onSelect={onSelect}
+          />
+        ))}
+      </div>
+    </>
   );
 };
 
@@ -4938,7 +4980,7 @@ export const App = () => {
               <div className="agent-history-layout__lists">
                 <article className="overview-card workflow-agent-list-card">
                   <SectionTitle eyebrow="Workflow" title="Workflow runs" meta={<span className="badge">{workflowAgents.length}</span>} />
-                  <WindowedAgentList
+                  <PagedAgentList
                     agents={workflowAgents}
                     workflow={workflow}
                     selectedAgentId={activeAgent?.id}
@@ -4974,13 +5016,12 @@ export const App = () => {
                       <span className="agent-card__subtle">{manualPendingApprovalCount} manual approvals pending</span>
                     </div>
                   </div>
-                  <WindowedAgentList
+                  <PagedAgentList
                     agents={manualAgents}
                     workflow={workflow}
                     selectedAgentId={activeAgent?.id}
                     emptyCopy="No manual agents have started yet."
                     onSelect={(agentId) => void selectAgent(agentId)}
-                    height={320}
                   />
                 </article>
               </div>
