@@ -17,7 +17,7 @@ export const DEFAULT_AGENT_REASONING_EFFORTS: Record<AgentCategory, InterfaceRea
   coding: "xhigh",
   integrity: "medium",
   merge: "low",
-  recommendation: "high",
+  recommendation: "medium",
   manual: "medium"
 };
 
@@ -92,6 +92,10 @@ const automaticReasoningPreferenceForTask = (
   const lightweightCoding = taskHas(taskPrompt, /\b(copy|docs?|readme|typo|comment|formatting|rename|text|label|small|trivial)\b/);
   const complexMerge = taskHas(taskPrompt, /\b(conflict|conflicted|resolve|rebase|cherry[- ]?pick|release|branches|failed|manual)\b/);
   const complexPlanning = taskHas(taskPrompt, /\b(architecture|strategy|large|monorepo|security|migration|ambiguous|unknown|workflow|roadmap)\b/);
+  const complexRecommendation = taskHas(
+    taskPrompt,
+    /\b(architecture|strategy|security|migration|ambiguous|monorepo|cross[- ]?module|provider|credential|live data|authentication|ipc|electron|concurrency|performance|major|large)\b/
+  );
   const manualChange = taskHas(taskPrompt, /\b(implement|change|edit|write|fix|debug|refactor|test|build|merge|resolve|security|architecture)\b/);
   const manualQuestion = taskHas(taskPrompt, /\b(explain|summari[sz]e|where|what|why|status|inspect|review)\b/);
 
@@ -118,8 +122,8 @@ const automaticReasoningPreferenceForTask = (
       };
     case "recommendation":
       return {
-        preferred: complexPlanning ? ["high", "medium"] : ["medium", "high"],
-        fallbackDirection: "highest"
+        preferred: complexRecommendation ? ["high", "medium"] : ["medium", "low"],
+        fallbackDirection: "lowest"
       };
     case "bootstrap":
       return {

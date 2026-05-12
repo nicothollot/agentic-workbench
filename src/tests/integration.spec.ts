@@ -720,6 +720,27 @@ describe("integration flows", () => {
     expect(turnText).not.toContain("Make the largest coherent, reviewable change");
   });
 
+  it("starts read-only agents with the current sandbox policy shape", async () => {
+    const root = await createSampleRepo("readonly-sandbox-policy");
+    const appData = await createTempDir("appdata-readonly-sandbox-policy");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    const transport = new CapturingPromptTransport();
+    (service as unknown as { transport: MockCodexTransport }).transport = transport;
+    await service.createAgent(selected.record.id, "integrity", "Read-only Agent", "Inspect without editing.", "gpt-5.4");
+
+    const sandboxPolicy = transport.turnStarts.at(-1)?.sandboxPolicy;
+    expect(sandboxPolicy).toEqual({
+      type: "readOnly",
+      networkAccess: false
+    });
+    expect(JSON.stringify(sandboxPolicy)).not.toContain("readOnlyAccess");
+    expect(JSON.stringify(sandboxPolicy)).not.toContain("\"access\"");
+  });
+
   it("auto-approves git commit and push approvals when those toggles are enabled", async () => {
     const root = await createSampleRepo("approval-auto-git");
     const appData = await createTempDir("appdata-approval-auto-git");
@@ -1030,6 +1051,58 @@ describe("integration flows", () => {
     expect(mergeAgent?.status).toBe("completed");
     expect(mergeAgent?.mergeReport?.summary).toContain("opened checkout");
     expect(await readFile(path.join(root, "src/index.ts"), "utf8")).toContain("merged");
+  });
+
+  it("keeps a successful merge completed when the post-merge project refresh fails", async () => {
+    const root = await createSampleRepo("merge-refresh-failure");
+    const appData = await createTempDir("appdata-merge-refresh-failure");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    project.record.workflow.ultimateGoal = {
+      ...project.record.workflow.ultimateGoal,
+      summary: "Verify merge completion survives refresh errors.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    project.record.workflow.scopedGoal = {
+      id: "scoped-goal-refresh-failure",
+      sourceRecommendationId: "rec-refresh-failure",
+      summary: "Merge a branch even if overview refresh fails.",
+      executionBrief: "Merge the branch and keep the workflow state successful.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    project.record.workflow.stepProgress.coding.status = "completed";
+    project.record.workflow.stepProgress.integrity.status = "completed";
+
+    await execFileAsync("git", ["checkout", "-b", "feature-refresh"], { cwd: root });
+    await writeFile(path.join(root, "src/index.ts"), "export const value = 'merged despite refresh failure';\n");
+    await commitAll(root, "feature refresh");
+    await execFileAsync("git", ["checkout", "main"], { cwd: root });
+
+    project.record.agents.push({
+      ...createAgentSkeleton("coding", "Agent A", "Task A", "gpt-5.4"),
+      worktree: { baseDir: appData, worktreePath: root, branch: "feature-refresh", targetBranch: "main" }
+    });
+    (service as any).scanCurrentProject = async () => {
+      const error = new Error("EISDIR: illegal operation on a directory, lstat 'node_modules/.bin/vite'");
+      (error as NodeJS.ErrnoException).code = "EISDIR";
+      throw error;
+    };
+
+    await service.runMerge(selected.record.id);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const mergeAgent = record?.agents.find((entry) => entry.category === "merge");
+    expect(mergeAgent?.status).toBe("completed");
+    expect(record?.workflow.workflowStage).toBe("merged");
+    expect(record?.workflow.workflowStopReason).toBe("none");
+    expect(record?.workflow.repair.status).not.toBe("merge_conflicts");
+    expect(await readFile(path.join(root, "src/index.ts"), "utf8")).toContain("merged despite refresh failure");
+    expect(service.getState().diagnostics[0]).toContain("project overview refresh failed");
   });
 
   it("runs git integrity checks in a review worktree based on the latest coding branch", async () => {

@@ -7,6 +7,7 @@ import type {
   GoalCheckStatus,
   ProjectOverview,
   ProjectWorkflowState,
+  WorkflowTaskMap,
   UltimateGoal,
   UltimateGoalCompletionState,
   WorkflowObjective,
@@ -257,6 +258,8 @@ const chooseMergedGoalCheckStatus = (checks: GoalAttainmentCheck[]): GoalCheckSt
 };
 
 const chooseMergedGoalCheckEvidence = (checks: GoalAttainmentCheck[]): string => {
+  const stripConsolidationNotes = (value: string): string =>
+    normalizeSpace(value.replace(/\bConsolidated \d+ semantically equivalent checklist entries\./gi, " "));
   const evidenceChecks = checks
     .filter((check) => check.evidence.trim())
     .sort((left, right) => {
@@ -264,7 +267,7 @@ const chooseMergedGoalCheckEvidence = (checks: GoalAttainmentCheck[]): string =>
       const rightStrong = isWeakChecklistEvidence(right.evidence) ? 0 : 1;
       return rightStrong - leftStrong || goalCheckTime(right.updatedAt) - goalCheckTime(left.updatedAt);
     });
-  const primaryEvidence = evidenceChecks[0]?.evidence.trim() ?? "";
+  const primaryEvidence = stripConsolidationNotes(evidenceChecks[0]?.evidence.trim() ?? "");
   if (checks.length <= 1) {
     return primaryEvidence;
   }
@@ -374,10 +377,16 @@ const goalCheckBatchTopicPatterns: Array<[string, RegExp]> = [
   ["settings and auditability", /\b(settings|configuration|assumption|threshold|target weight|alert|cadence|audit|formula|limitation|assumption)\b/i]
 ];
 
+const goalCheckBatchTopicIndex = new Map(goalCheckBatchTopicPatterns.map(([label], index) => [label, index]));
+
 interface GoalCheckBatch {
   label: string;
   checks: GoalAttainmentCheck[];
   relatedPaths: string[];
+}
+
+interface GoalCheckTaskGroup extends GoalCheckBatch {
+  score: number;
 }
 
 const goalCheckSearchText = (check: GoalAttainmentCheck): string =>
@@ -400,31 +409,20 @@ const goalCheckBatchTopics = (check: GoalAttainmentCheck): string[] => {
   return unique(pathTopics.length > 0 ? pathTopics : tokenize(text).slice(0, 2));
 };
 
-const goalCheckBatchPathRoots = (check: GoalAttainmentCheck): string[] =>
-  unique((check.relatedPaths ?? [])
-    .map((entry) => entry.replace(/\\/g, "/").split("/").filter(Boolean))
-    .filter((parts) => parts.length >= 2 && parts[0] !== "docs")
-    .map((parts) => parts.slice(0, 2).join("/"))
-    .filter(Boolean));
-
-const goalChecksCanBatch = (
-  left: GoalAttainmentCheck,
-  right: GoalAttainmentCheck,
-  leftTopics = goalCheckBatchTopics(left),
-  rightTopics = goalCheckBatchTopics(right)
-): boolean => {
-  if (!batchableGoalCheckSources.has(left.source) || !batchableGoalCheckSources.has(right.source)) {
-    return false;
+const goalCheckTopicPriority = (check: GoalAttainmentCheck, topic: string): number => {
+  const normalizedTopic = normalizeGoalCheckSemanticText(topic);
+  const normalizedText = normalizeGoalCheckSemanticText(goalCheckSearchText(check));
+  const topicIndex = goalCheckBatchTopicIndex.get(topic) ?? goalCheckBatchTopicPatterns.length;
+  if (normalizedText.startsWith(normalizedTopic) || normalizedText.includes(` ${normalizedTopic} `)) {
+    return -100 + topicIndex;
   }
-
-  const sharedTopic = leftTopics.some((topic) => rightTopics.includes(topic));
-  if (sharedTopic) {
-    return true;
+  if (
+    topic === "security and brokerage safety" &&
+    /\b(secret|secrets|credential|credentials|api key|api keys|oauth|token|brokerage|broker|read-only|trade|trades|orders?|security-sensitive|runtime-side)\b/i.test(goalCheckSearchText(check))
+  ) {
+    return -80 + topicIndex;
   }
-
-  const leftRoots = goalCheckBatchPathRoots(left);
-  const rightRoots = goalCheckBatchPathRoots(right);
-  return leftRoots.length > 0 && leftRoots.some((root) => rightRoots.includes(root));
+  return topicIndex;
 };
 
 const rankGoalCheckBatch = (checks: GoalAttainmentCheck[]): number =>
@@ -432,14 +430,22 @@ const rankGoalCheckBatch = (checks: GoalAttainmentCheck[]): number =>
   Math.min(checks.length, 4) * 22;
 
 const buildGoalCheckBatchLabel = (checks: GoalAttainmentCheck[]): string => {
-  const topicCounts = new Map<string, number>();
+  const topicStats = new Map<string, { count: number; priority: number }>();
   for (const check of checks) {
     for (const topic of goalCheckBatchTopics(check)) {
-      topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
+      const existing = topicStats.get(topic);
+      topicStats.set(topic, {
+        count: (existing?.count ?? 0) + 1,
+        priority: Math.min(existing?.priority ?? Number.POSITIVE_INFINITY, goalCheckTopicPriority(check, topic))
+      });
     }
   }
-  const [topic] = [...topicCounts.entries()]
-    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0] ?? [];
+  const [topic] = [...topicStats.entries()]
+    .sort((left, right) =>
+      right[1].count - left[1].count ||
+      left[1].priority - right[1].priority ||
+      left[0].localeCompare(right[0])
+    )[0] ?? [];
   return topic ?? "related goal checks";
 };
 
@@ -451,54 +457,39 @@ const collectGoalCheckBatchPaths = (context: WorkflowRecommendationContext, chec
   ]).slice(0, 4);
 };
 
+const buildGoalCheckTaskGroups = (
+  context: WorkflowRecommendationContext,
+  rankedChecks: GoalAttainmentCheck[]
+): GoalCheckTaskGroup[] => {
+  const groups = new Map<string, GoalAttainmentCheck[]>();
+  const candidates = rankedChecks.filter((check) => batchableGoalCheckSources.has(check.source));
+
+  for (const check of candidates) {
+    const label = buildGoalCheckBatchLabel([check]);
+    groups.set(label, [...(groups.get(label) ?? []), check]);
+  }
+
+  return [...groups.entries()]
+    .map(([label, checks]) => ({
+      label,
+      checks: rankGoalChecksByCompletionImpact(checks),
+      relatedPaths: collectGoalCheckBatchPaths(context, checks),
+      score: rankGoalCheckBatch(checks)
+    }))
+    .sort((left, right) =>
+      right.score - left.score ||
+      right.checks.length - left.checks.length ||
+      left.label.localeCompare(right.label)
+    );
+};
+
 const buildGoalCheckBatches = (
   context: WorkflowRecommendationContext,
   rankedChecks: GoalAttainmentCheck[]
-): GoalCheckBatch[] => {
-  const candidates = rankedChecks.filter((check) => batchableGoalCheckSources.has(check.source)).slice(0, 12);
-  const batches = candidates
-    .map((seed, index) => {
-      const seedTopics = goalCheckBatchTopics(seed);
-      const checks = [seed];
-      for (const candidate of candidates) {
-        if (candidate.id === seed.id || checks.length >= 4) {
-          continue;
-        }
-        if (goalChecksCanBatch(seed, candidate, seedTopics)) {
-          checks.push(candidate);
-        }
-      }
-
-      return {
-        index,
-        checks: rankGoalChecksByCompletionImpact(checks),
-        score: rankGoalCheckBatch(checks)
-      };
-    })
+): GoalCheckBatch[] =>
+  buildGoalCheckTaskGroups(context, rankedChecks)
     .filter((batch) => batch.checks.length >= 2)
-    .sort((left, right) =>
-      right.score - left.score ||
-      left.index - right.index ||
-      left.checks[0].title.localeCompare(right.checks[0].title)
-    );
-
-  const seenSignatures = new Set<string>();
-  return batches
-    .filter((batch) => {
-      const signature = batch.checks.map((check) => check.id).sort().join("|");
-      if (seenSignatures.has(signature)) {
-        return false;
-      }
-      seenSignatures.add(signature);
-      return true;
-    })
-    .map((batch) => ({
-      label: buildGoalCheckBatchLabel(batch.checks),
-      checks: batch.checks,
-      relatedPaths: collectGoalCheckBatchPaths(context, batch.checks)
-    }))
-    .slice(0, 2);
-};
+    .map(({ label, checks, relatedPaths }) => ({ label, checks, relatedPaths }));
 
 export interface GoalCheckUpdateInput {
   action?: "add" | "update" | "remove";
@@ -879,6 +870,75 @@ const summarizeChecklistProgress = (checklist: GoalAttainmentCheck[]): {
     unmet,
     percentComplete
   };
+};
+
+export interface ChecklistTaskMapBriefOptions {
+  maxGroups?: number;
+  maxRepresentativeChecks?: number;
+}
+
+export const buildChecklistTaskMap = (
+  context: WorkflowRecommendationContext,
+  timestamp = nowIso()
+): WorkflowTaskMap => {
+  const checklist = buildGoalChecklistForAssessment(context, timestamp);
+  const required = checklist.filter(isRequiredForCompletion);
+  const groups = buildGoalCheckTaskGroups(context, rankGoalChecksByCompletionImpact(required));
+
+  return {
+    groups: groups.map((group) => {
+      const openChecks = group.checks.filter((check) => !isMetForCompletion(check));
+      const metChecks = group.checks.filter(isMetForCompletion);
+      const representativeChecks = rankGoalChecksByCompletionImpact(
+        openChecks.length ? openChecks : group.checks
+      ).slice(0, 5).map((check) => check.title);
+      return {
+        id: `task:${stableHash(group.label)}`,
+        title: group.label,
+        rationale: `Grouped by shared checklist semantics, likely implementation paths, tests, or validation evidence for ${group.label}.`,
+        checkIds: group.checks.map((check) => check.id),
+        representativeChecks,
+        relatedPaths: group.relatedPaths,
+        openCheckCount: openChecks.length,
+        metCheckCount: metChecks.length,
+        status: openChecks.length === 0 ? "complete" : "open",
+        priority: group.score
+      };
+    }),
+    totalRequiredChecks: required.length,
+    openRequiredChecks: required.filter((check) => !isMetForCompletion(check)).length,
+    updatedAt: timestamp
+  };
+};
+
+export const buildChecklistTaskMapBrief = (
+  context: WorkflowRecommendationContext,
+  options: ChecklistTaskMapBriefOptions = {}
+): string => {
+  const maxGroups = options.maxGroups ?? 8;
+  const maxRepresentativeChecks = options.maxRepresentativeChecks ?? 4;
+  const taskMap = buildChecklistTaskMap(context);
+  const groups = taskMap.groups.filter((group) => group.status !== "complete");
+  const visibleGroups = groups.slice(0, maxGroups);
+  const hiddenGroups = Math.max(0, groups.length - visibleGroups.length);
+
+  return [
+    "Checklist task map:",
+    `- Required checklist size: ${taskMap.totalRequiredChecks}. Open required checks: ${taskMap.openRequiredChecks}.`,
+    groups.length
+      ? `- Estimated task groups from checklist semantics: ${groups.length}. Each group is a candidate cycle/task area; do not treat individual checklist items as separate cycles when they belong to the same group.`
+      : "- Estimated task groups from checklist semantics: none open.",
+    ...visibleGroups.map((group) => {
+      const representatives = group.representativeChecks.slice(0, maxRepresentativeChecks);
+      const hiddenChecks = Math.max(0, group.openCheckCount - representatives.length);
+      return `- ${group.title}: ${group.openCheckCount} open required check${group.openCheckCount === 1 ? "" : "s"}; representative checks: ${formatOutcomeBriefList(representatives, representatives.length, "none")}${hiddenChecks > 0 ? `; plus ${hiddenChecks} related check${hiddenChecks === 1 ? "" : "s"}` : ""}${group.relatedPaths.length ? `; likely paths: ${group.relatedPaths.join(", ")}` : ""}.`;
+    }),
+    hiddenGroups > 0
+      ? `- ${hiddenGroups} additional task group${hiddenGroups === 1 ? "" : "s"} exist beyond this prompt excerpt; use the group counts, repository evidence, and checklist updates to keep the task plan adaptive.`
+      : ""
+  ]
+    .filter((line) => line.trim().length > 0)
+    .join("\n");
 };
 
 const topGoalKeywords = (context: WorkflowRecommendationContext): string[] =>
@@ -1353,15 +1413,16 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
   }
 
   for (const [index, batch] of goalCheckBatches.entries()) {
+    const representativeChecks = batch.checks.slice(0, 3).map((check) => check.title).join("; ");
     pushDraft(drafts, {
       key: `goal-batch:${batch.checks.map((check) => check.id).sort().join("|")}`,
       score: 134 - index * 5,
       title: `Satisfy goal batch: ${truncate(batch.label, 72)}`,
-      summary: `Implement one coherent ${batch.label} batch covering ${batch.checks.length} related required checks with shared code, tests, and evidence.`,
-      rationale: "These checks share implementation paths, validation evidence, or architectural concerns, so batching them avoids evidence-only follow-up cycles while keeping the work reviewable.",
-      expectedImpact: "This can move multiple required Goal checklist items to met in one cycle instead of spending separate cycles on adjacent evidence.",
+      summary: `Treat ${batch.label} as the next SWE task group covering ${batch.checks.length} related required checks.`,
+      rationale: `These checks belong together by implementation path, validation evidence, or architecture. Representative checks: ${truncate(representativeChecks, 150)}.`,
+      expectedImpact: "This turns a coherent task group into repository evidence instead of spending cycles on isolated checklist items.",
       priority: "high",
-      confidence: 0.91 - index * 0.04,
+      confidence: Math.max(0.55, 0.91 - index * 0.04),
       estimatedScope: "medium",
       riskLevel: batch.checks.length >= 4 ? "high" : "medium",
       relatedPaths: batch.relatedPaths

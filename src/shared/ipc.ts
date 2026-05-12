@@ -103,6 +103,26 @@ export const fileSummaryRequestSchema = z.object({
   relativePath: z.string().min(1)
 });
 
+export const agentListRequestSchema = z.object({
+  projectId: z.string().min(1),
+  scope: z.enum(["all", "workflow", "manual"]).default("all"),
+  offset: z.number().int().min(0).default(0),
+  limit: z.number().int().min(1).max(100).default(20)
+});
+
+export const agentDetailRequestSchema = z.object({
+  projectId: z.string().min(1),
+  agentId: z.string().min(1)
+});
+
+export const projectLogFeedRequestSchema = z.object({
+  projectId: z.string().min(1),
+  activityOffset: z.number().int().min(0).default(0),
+  activityLimit: z.number().int().min(1).max(200).default(80),
+  commandOffset: z.number().int().min(0).default(0),
+  commandLimit: z.number().int().min(1).max(120).default(50)
+});
+
 export const layoutUpdateRequestSchema = z.object({
   projectId: z.string().min(1),
   leftPanelWidth: z.number().int().positive().optional(),
@@ -220,7 +240,10 @@ export const rendererStateSchema = z.object({
   ).default([]),
   codexAvailability: z.object({
     source: z.enum(["live", "mock", "unavailable"]),
-    message: z.string().optional()
+    message: z.string().optional(),
+    installedCodexVersion: z.string().optional(),
+    generatedProtocolVersion: z.string().optional(),
+    protocolCompatibility: z.enum(["compatible", "installed-newer", "installed-older", "unknown"]).optional()
   }).optional(),
   diagnostics: z.array(z.string()).default([])
 });
@@ -244,6 +267,9 @@ export type IpcChannel =
   | "project:downloadLogs"
   | "project:importInterface"
   | "project:getFileSummary"
+  | "project:listAgents"
+  | "project:getAgent"
+  | "project:getLogFeed"
   | "project:updateLayout"
   | "project:updateUiState"
   | "project:openProjectShell"

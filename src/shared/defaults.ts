@@ -146,6 +146,12 @@ export const defaultWorkflowStepProgressState = (): Record<WorkflowStepId, Workf
 export const defaultProjectWorkflowState = (): ProjectWorkflowState => ({
   ultimateGoal: emptyUltimateGoal(),
   goalChecklist: [],
+  taskMap: {
+    groups: [],
+    totalRequiredChecks: 0,
+    openRequiredChecks: 0,
+    updatedAt: new Date(0).toISOString()
+  },
   workflowCycle: defaultWorkflowCycle(),
   workflowStage: "charter_needed",
   repairLoopCount: 0,

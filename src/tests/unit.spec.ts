@@ -16,12 +16,15 @@ import { getPreloadEntryPath, getRendererBase, getRendererEntryPath } from "@sha
 import { calculateValidationStatus } from "@shared/validation";
 import {
   approvalDecisionRequestSchema,
+  agentDetailRequestSchema,
+  agentListRequestSchema,
   credentialEntrySaveRequestSchema,
   credentialRequestSubmitToAgentSchema,
   credentialRequestUpdateSchema,
   createAgentRequestSchema,
   downloadInterfaceRequestSchema,
   downloadLogsRequestSchema,
+  projectLogFeedRequestSchema,
   projectLoadRequestSchema,
   projectOpenRequestSchema,
   refreshOverviewRequestSchema
@@ -75,7 +78,7 @@ import {
   parseWslCodexRuntimeResolutionOutput,
   parseWslCommandResolutionOutput
 } from "@runtime/execution";
-import { compareCodexVersions, parseCodexCliVersion, parseNpmPackageVersion } from "@runtime/codexUpdate";
+import { assessCodexProtocolCompatibility, compareCodexVersions, parseCodexCliVersion, parseNpmPackageVersion } from "@runtime/codexUpdate";
 import { buildProjectShellHandoffPrompt, buildWindowsProjectShellLaunchPlan, openProjectShellWindow } from "@runtime/projectShell";
 import { createTempDir, initGitRepo, commitAll } from "./helpers";
 import { executionPathToHostPath, resolveProjectPath, windowsPathToWslPath } from "@shared/pathUtils";
@@ -83,12 +86,15 @@ import {
   applyGoalChecklistUpdates,
   assessUltimateGoalCompletion,
   buildAppealRecommendations,
+  buildChecklistTaskMap,
+  buildChecklistTaskMapBrief,
   buildGoalChecklistForAssessment,
   buildGoalChecklistFromUltimateGoal,
   buildOutcomeStrategyBrief,
   buildWorkflowRecommendations,
   estimateUltimateGoalProgress,
-  isVisualProject
+  isVisualProject,
+  type WorkflowRecommendationContext
 } from "@runtime/workflowRecommendations";
 import {
   assessIntegrityFailure,
@@ -509,6 +515,7 @@ describe("reasoning defaults", () => {
     defaultReasoningEffort: "medium",
     inputModalities: ["text"],
     supportsPersonality: true,
+    additionalSpeedTiers: [],
     isDefault: false,
     ...overrides
   });
@@ -544,6 +551,8 @@ describe("reasoning defaults", () => {
     expect(getAutomaticAgentReasoningEffort("coding", "Fix a small label typo.", model)).toBe("high");
     expect(getAutomaticAgentReasoningEffort("merge", "Integrate validated work deterministically.", model)).toBe("low");
     expect(getAutomaticAgentReasoningEffort("merge", "Resolve merge conflicts across branches.", model)).toBe("medium");
+    expect(getAutomaticAgentReasoningEffort("recommendation", "Recommend the next workflow checklist task group.", model)).toBe("medium");
+    expect(getAutomaticAgentReasoningEffort("recommendation", "Recommend the next security architecture migration step.", model)).toBe("high");
   });
 
   it("clamps automatic and manual reasoning to supported model efforts", () => {
@@ -637,6 +646,9 @@ describe("schema validation and IPC", () => {
     expect(downloadInterfaceRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(downloadLogsRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(refreshOverviewRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
+    expect(agentListRequestSchema.parse({ projectId: "p", scope: "workflow" }).limit).toBe(20);
+    expect(agentDetailRequestSchema.parse({ projectId: "p", agentId: "a" }).agentId).toBe("a");
+    expect(projectLogFeedRequestSchema.parse({ projectId: "p" }).commandLimit).toBe(50);
   });
 
   it("validates the project review log bundle format", () => {
@@ -904,6 +916,25 @@ describe("schema validation and IPC", () => {
     expect(compareCodexVersions("0.125.0", "0.126.0")).toBeLessThan(0);
     expect(compareCodexVersions("0.126.0", "0.126.0")).toBe(0);
     expect(compareCodexVersions("0.127.0", "0.126.0")).toBeGreaterThan(0);
+  });
+
+  it("detects Codex app-server protocol drift before live agents launch", () => {
+    expect(assessCodexProtocolCompatibility("0.128.0", "0.128.0")).toMatchObject({
+      status: "compatible",
+      compatible: true
+    });
+    expect(assessCodexProtocolCompatibility("0.129.0", "0.128.0")).toMatchObject({
+      status: "installed-newer",
+      compatible: false
+    });
+    expect(assessCodexProtocolCompatibility("0.127.0", "0.128.0")).toMatchObject({
+      status: "installed-older",
+      compatible: false
+    });
+    expect(assessCodexProtocolCompatibility(undefined, "0.128.0")).toMatchObject({
+      status: "unknown",
+      compatible: false
+    });
   });
 
   it("does not misclassify resolved WSL launch failures as missing installs", () => {
@@ -2051,6 +2082,54 @@ describe("workflow view helpers", () => {
     expect(workflowSectionProminence(workflow).manualHandoff).toBe(true);
   });
 
+  it("does not classify checkout update failures without conflicts as merge conflicts", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Finish the integration flow.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.approvedRecommendation = approveRecommendation(makeRecommendation({
+      id: "rec-merge-checkout",
+      title: "Integrate validated work",
+      summary: "Merge the completed branch.",
+      rationale: "The work passed validation."
+    }));
+    workflow.scopedGoal = {
+      id: "goal-merge-checkout",
+      sourceRecommendationId: "rec-merge-checkout",
+      summary: "Integrate validated work",
+      executionBrief: "Merge the completed branch.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-07T00:01:00.000Z"
+    };
+    workflow.workflowCycle.status = "ready_to_merge";
+    workflow.stepProgress.coding.status = "completed";
+    workflow.stepProgress.integrity.status = "completed";
+    workflow.stepProgress.merge.status = "failed";
+
+    const mergeAgent: AgentState = {
+      ...createAgentSkeleton("merge", "Merge Agent", "Integrate validated work.", "gpt-5.4"),
+      status: "failed",
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      mergeReport: {
+        summary: "Merged cleanly in the integration worktree, but the opened checkout was not updated.",
+        targetBranch: "main",
+        mergedBranches: ["awb/coding-pass"],
+        conflicts: [],
+        conflictCycleCount: 0,
+        generatedAt: "2026-04-07T00:04:00.000Z"
+      }
+    };
+
+    expect(deriveWorkflowProjection(workflow, [mergeAgent])).toMatchObject({
+      stage: "ready_to_merge",
+      stopReason: "none"
+    });
+  });
+
   it("marks repairing and retrying validation in the timeline instead of leaving a stale failed state", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {
@@ -2852,6 +2931,16 @@ describe("workflow recommendations", () => {
     expect(separationChecks[0]?.status).toBe("met");
     expect(separationChecks[0]?.evidence).toContain("Consolidated");
 
+    const reconsolidated = buildGoalChecklistFromUltimateGoal(
+      workflow.ultimateGoal,
+      workflow.goalChecklist,
+      "2026-04-07T00:04:00.000Z"
+    );
+    const reconsolidatedConstraint = reconsolidated.find((check) =>
+      `${check.title} ${check.description}`.toLowerCase().includes("separation")
+    );
+    expect(reconsolidatedConstraint?.evidence.match(/Consolidated/g)).toHaveLength(1);
+
     workflow.workflowCycle.status = "completed";
     const progress = estimateUltimateGoalProgress({
       workflow,
@@ -2922,6 +3011,93 @@ describe("workflow recommendations", () => {
     const removedCheck = workflow.goalChecklist.find((check) => check.id === holdingsCheck?.id);
     expect(removedCheck?.required).toBe(false);
     expect(removedCheck?.status).toBe("not_applicable");
+  });
+
+  it("keeps large detected ultimate-goal checklists available for adaptive recommendations", () => {
+    const detectedGoal = {
+      ...emptyUltimateGoal("detected"),
+      summary: "Build a compact workflow target.",
+      successCriteria: Array.from({ length: 20 }, (_entry, index) => `Detected success criterion ${index + 1}`),
+      constraints: Array.from({ length: 12 }, (_entry, index) => `Detected constraint ${index + 1}`),
+      qualityBar: "The result is easy to validate.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+
+    const checklist = buildGoalChecklistFromUltimateGoal(detectedGoal, [], "2026-04-07T00:00:00.000Z");
+    const successCriteria = checklist.filter((check) => check.source === "success_criterion");
+    const constraints = checklist.filter((check) => check.source === "constraint");
+
+    expect(successCriteria).toHaveLength(20);
+    expect(constraints).toHaveLength(12);
+    expect(checklist.find((check) => check.source === "quality_bar")).toBeTruthy();
+  });
+
+  it("summarizes large checklists into semantic task groups instead of fixed item chunks", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a complete portfolio intelligence workstation.",
+      successCriteria: [
+        "Portfolio view shows holdings, market value, cash, and weights",
+        "Portfolio view explains sector, industry, and theme concentration",
+        "Performance analytics include returns, drawdown, volatility, and Sharpe",
+        "Performance analytics reconcile deposits, withdrawals, dividends, fees, and cash flows",
+        "Research intelligence includes news, filings, earnings, and peer comparisons",
+        "Research intelligence includes sentiment, watchlists, and company-specific notes",
+        "Risk and rebalance intelligence shows factor exposure, drift, stress, and target-weight recommendations"
+      ],
+      constraints: [
+        "Keep brokerage credentials and API keys out of source code",
+        "Keep live providers credential-gated with offline demo mode"
+      ],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z");
+
+    const context: WorkflowRecommendationContext = {
+      workflow,
+      agents: [],
+      scan: {
+        kind: "git",
+        files: [],
+        stats: {
+          projectRoot: "/repo",
+          kind: "git",
+          totalFiles: 1,
+          totalFolders: 1,
+          totalSizeBytes: 1_024,
+          includedFiles: 1,
+          includedFolders: 1,
+          includedSizeBytes: 1_024,
+          excludedFiles: 0,
+          excludedFolders: 0,
+          excludedSizeBytes: 0,
+          excludedPaths: [],
+          fileTypeBreakdown: { TypeScript: 1 },
+          languageBreakdown: { TypeScript: 1 },
+          entryPoints: ["src/App.tsx"],
+          manifestFiles: ["package.json"],
+          testsPresent: true,
+          primaryManagers: ["npm"],
+          explanation: "Portfolio dashboard repo"
+        },
+        dependencies: []
+      },
+      overview: undefined,
+      objective: "deliver",
+      maxOptions: 5
+    };
+    const persistedTaskMap = buildChecklistTaskMap(context, "2026-04-07T00:01:00.000Z");
+    const taskMap = buildChecklistTaskMapBrief(context);
+
+    expect(persistedTaskMap.totalRequiredChecks).toBeGreaterThan(7);
+    expect(persistedTaskMap.groups.some((group) => group.title === "performance analytics" && group.openCheckCount >= 2)).toBe(true);
+    expect(persistedTaskMap.groups.some((group) => group.title === "security and brokerage safety")).toBe(true);
+    expect(taskMap).toContain("Estimated task groups from checklist semantics");
+    expect(taskMap).toContain("performance analytics");
+    expect(taskMap).toContain("research intelligence");
+    expect(taskMap).toContain("security and brokerage safety");
+    expect(taskMap).not.toContain("random");
   });
 
   it("keeps long unknown checklist items ahead of generic fallback recommendations", () => {
@@ -4214,6 +4390,55 @@ describe("event reducer", () => {
     expect(messageEvents[0]?.status).toBe("completed");
     expect(agent.approvals).toHaveLength(1);
     expect(agent.status).toBe("waiting_approval");
+  });
+
+  it("summarizes structured agent JSON for display", () => {
+    const agent: AgentState = createAgentSkeleton("recommendation", "Recommendation", "Prompt", "gpt-5.4");
+    reduceAgentRuntimeEvent(agent, {
+      kind: "agent-message-delta",
+      threadId: "thread-1",
+      itemId: "item-1",
+      delta: "{\"summary\":"
+    });
+    expect(agent.lastMessageSnippet).toBe("Receiving structured agent output...");
+
+    reduceAgentRuntimeEvent(agent, {
+      kind: "item-completed",
+      threadId: "thread-1",
+      itemId: "item-1",
+      itemType: "agentMessage",
+      title: "Agent message",
+      detail: JSON.stringify({
+        summary: "Pick the next coherent implementation batch.",
+        ultimateGoalProgress: { percentComplete: 42, rationale: "Several required checks remain." },
+        recommendations: [
+          { title: "Build the company guide data model", summary: "Covers company profiles, compensation context, and source notes." }
+        ],
+        goalCheckUpdates: [
+          { title: "Compensation context required", status: "unmet" },
+          { title: "Local fixture separation", status: "met" }
+        ]
+      })
+    });
+
+    const event = agent.events.find((entry) => entry.type === "message");
+    expect(event?.detail).toContain("Summary: Pick the next coherent implementation batch.");
+    expect(event?.detail).toContain("Recommendations:");
+    expect(event?.detail).toContain("Checklist updates: 2");
+    expect(event?.detail).not.toContain("{\"summary\"");
+    expect(agent.lastMessageSnippet).toContain("Summary: Pick the next coherent implementation batch.");
+  });
+
+  it("strips terminal control sequences from event display text", () => {
+    const agent: AgentState = createAgentSkeleton("coding", "Agent", "Prompt", "gpt-5.4");
+    reduceAgentRuntimeEvent(agent, {
+      kind: "command-output",
+      threadId: "thread-1",
+      itemId: "item-1",
+      delta: "\u001b[31mfailed\u001b[0m\r\nnext"
+    });
+
+    expect(agent.events[0]?.detail).toBe("failed\nnext");
   });
 
   it("caps bulky raw event payloads before they enter persisted agent state", () => {

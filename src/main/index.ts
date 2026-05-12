@@ -5,6 +5,8 @@ import { APP_ID, APP_NAME } from "@shared/constants";
 import { getPreloadEntryPath, getRendererEntryPath } from "@shared/electronAppPaths";
 import {
   advanceWorkflowStageRequestSchema,
+  agentDetailRequestSchema,
+  agentListRequestSchema,
   approveRecommendationRequestSchema,
   approvalDecisionRequestSchema,
   createScopedGoalRequestSchema,
@@ -23,6 +25,7 @@ import {
   layoutUpdateRequestSchema,
   openProjectShellRequestSchema,
   projectLoadRequestSchema,
+  projectLogFeedRequestSchema,
   projectOpenRequestSchema,
   projectSelectionDecisionSchema,
   refreshOverviewRequestSchema,
@@ -173,7 +176,7 @@ const createMainWindow = async (): Promise<void> => {
 };
 
 const registerIpc = (): void => {
-  ipcMain.handle("app:getState", () => appService?.getState());
+  ipcMain.handle("app:getState", () => appService?.getRendererState());
   ipcMain.handle("github:refreshStatus", async () => await appService?.refreshGitHubStatus());
   ipcMain.handle("settings:get", () => appService?.getState().settings);
   ipcMain.handle("settings:update", async (_event, payload) => appService?.updateSettings(appSettingsSchema.partial().parse(payload)));
@@ -251,6 +254,18 @@ const registerIpc = (): void => {
   ipcMain.handle("project:getFileSummary", async (_event, payload) => {
     const parsed = fileSummaryRequestSchema.parse(payload);
     return await appService?.getFileSummary(parsed.projectId, parsed.relativePath);
+  });
+  ipcMain.handle("project:listAgents", (_event, payload) => {
+    const parsed = agentListRequestSchema.parse(payload);
+    return appService?.listAgents(parsed.projectId, parsed.scope, parsed.offset, parsed.limit);
+  });
+  ipcMain.handle("project:getAgent", (_event, payload) => {
+    const parsed = agentDetailRequestSchema.parse(payload);
+    return appService?.getAgent(parsed.projectId, parsed.agentId);
+  });
+  ipcMain.handle("project:getLogFeed", (_event, payload) => {
+    const parsed = projectLogFeedRequestSchema.parse(payload);
+    return appService?.getProjectLogFeed(parsed.projectId, parsed);
   });
   ipcMain.handle("project:updateLayout", async (_event, payload) => {
     const parsed = layoutUpdateRequestSchema.parse(payload);
@@ -452,7 +467,7 @@ void app.whenReady().then(async () => {
   appService.on("stateChanged", (state) => sendState(state));
   registerIpc();
   await createMainWindow();
-  sendState(appService.getState());
+  sendState(appService.getRendererState());
 
   app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) {

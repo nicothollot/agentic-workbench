@@ -155,6 +155,9 @@ export interface DiscoveredModel {
 export interface CodexAvailability {
   source: ModelCatalogSource;
   message?: string;
+  installedCodexVersion?: string;
+  generatedProtocolVersion?: string;
+  protocolCompatibility?: "compatible" | "installed-newer" | "installed-older" | "unknown";
 }
 
 export interface UltimateGoal {
@@ -232,6 +235,26 @@ export interface GoalAttainmentCheck {
   relatedPaths: string[];
   ownerAgentId?: string;
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkflowTaskMapGroup {
+  id: string;
+  title: string;
+  rationale: string;
+  checkIds: string[];
+  representativeChecks: string[];
+  relatedPaths: string[];
+  openCheckCount: number;
+  metCheckCount: number;
+  status: "open" | "in_progress" | "complete";
+  priority: number;
+}
+
+export interface WorkflowTaskMap {
+  groups: WorkflowTaskMapGroup[];
+  totalRequiredChecks: number;
+  openRequiredChecks: number;
   updatedAt: string;
 }
 
@@ -508,6 +531,7 @@ export interface ProjectWorkflowState {
   ultimateGoalProgress?: UltimateGoalProgressEstimate;
   ultimateGoalCompletion?: UltimateGoalCompletionAssessment;
   goalChecklist: GoalAttainmentCheck[];
+  taskMap: WorkflowTaskMap;
   workflowCycle: WorkflowCycle;
   approvedRecommendation?: ApprovedRecommendation;
   scopedGoal?: ScopedGoal;
@@ -827,6 +851,47 @@ export interface AgentState {
   integrityReport?: IntegrityReport;
   mergeReport?: MergeReport;
   recommendationReport?: RecommendationReport;
+}
+
+export type AgentHistoryScope = "all" | "workflow" | "manual";
+
+export interface AgentListResponse {
+  projectId: string;
+  scope: AgentHistoryScope;
+  offset: number;
+  limit: number;
+  total: number;
+  agents: AgentState[];
+}
+
+export interface ProjectCommandLogEntry {
+  id: string;
+  agentId: string;
+  agentName: string;
+  agentCategory: AgentCategory;
+  itemId?: string;
+  command: string;
+  cwd?: string;
+  status: string;
+  startedAt: string;
+  completedAt?: string;
+  exitCode?: number | null;
+}
+
+export interface ProjectLogFeedResponse {
+  projectId: string;
+  activity: {
+    offset: number;
+    limit: number;
+    total: number;
+    entries: WorkflowActivityEvent[];
+  };
+  commands: {
+    offset: number;
+    limit: number;
+    total: number;
+    entries: ProjectCommandLogEntry[];
+  };
 }
 
 export interface PortableProjectInterface {

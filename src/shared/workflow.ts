@@ -185,10 +185,7 @@ export const deriveWorkflowProjection = (
     };
   }
 
-  if (
-    mergeHasCurrentProgress &&
-    (workflow.stepProgress.merge.status === "failed" || latestMergeAgent?.mergeReport?.conflicts.length)
-  ) {
+  if (mergeHasCurrentProgress && latestMergeAgent?.mergeReport?.conflicts.length) {
     return {
       stage: "repair_loop",
       stopReason: "merge_conflicts",

@@ -2222,6 +2222,18 @@ p {
   border-bottom: 0;
 }
 
+.activity-row strong {
+  flex: 0 0 min(34%, 260px);
+}
+
+.activity-row span {
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: normal;
+}
+
 .path-summary {
   border-top: 1px solid rgba(25, 40, 68, 0.1);
   padding-top: 12px;
@@ -2915,6 +2927,24 @@ code {
     var(--surface);
   border-color: rgba(184, 154, 106, 0.38);
   box-shadow: 0 22px 72px rgba(0, 0, 0, 0.12);
+}
+
+.loader-card,
+.panel,
+.overview-card,
+.candidate-card,
+.agent-card,
+.settings-card,
+.model-option,
+.workflow-option,
+.workflow-transcript__run,
+.workflow-transcript__entry,
+.recent-project,
+.card-surface,
+.workflow-control-center,
+.agent-workspace,
+.workflow-secondary__details {
+  color: var(--brand-ink);
 }
 
 .loader-card::before,

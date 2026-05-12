@@ -1,7 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   AgentCategory,
+  AgentHistoryScope,
+  AgentListResponse,
   AgentReasoningMode,
+  AgentState,
   ApprovalDecision,
   CredentialEntryMetadata,
   CredentialEntryStatus,
@@ -13,6 +16,7 @@ import type {
   LocalProjectState,
   LoadedProjectView,
   OpenProjectShellResult,
+  ProjectLogFeedResponse,
   ProjectLoadResult,
   UserInputRequestRecord,
   UltimateGoalImportPreview,
@@ -38,6 +42,17 @@ export interface WorkbenchApi {
   selectInterface(source: "portable" | "local" | "fresh", path?: string, freshBehavior?: "replace" | "duplicate"): Promise<LoadedProjectView>;
   updateSettings(payload: Record<string, unknown>): Promise<unknown>;
   getFileSummary(projectId: string, relativePath: string): Promise<FileSummary>;
+  listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
+  getAgent(projectId: string, agentId: string): Promise<AgentState>;
+  getLogFeed(
+    projectId: string,
+    options?: {
+      activityOffset?: number;
+      activityLimit?: number;
+      commandOffset?: number;
+      commandLimit?: number;
+    }
+  ): Promise<ProjectLogFeedResponse>;
   updateLayout(projectId: string, payload: Record<string, unknown>): Promise<void>;
   updateUiState(projectId: string, payload: Partial<LocalProjectState>): Promise<void>;
   openProjectShell(projectId: string): Promise<OpenProjectShellResult>;
@@ -181,6 +196,12 @@ const api: WorkbenchApi = {
   downloadLogs: async (projectId) => await invoke<string | null>("project:downloadLogs", { projectId }),
   importInterface: async (projectRootPath, importPath, allowMismatch = false) =>
     await invoke<LoadedProjectView>("project:importInterface", { projectRootPath, importPath, allowMismatch }),
+  listAgents: async (projectId, scope = "all", offset = 0, limit = 20) =>
+    await invoke<AgentListResponse>("project:listAgents", { projectId, scope, offset, limit }),
+  getAgent: async (projectId, agentId) =>
+    await invoke<AgentState>("project:getAgent", { projectId, agentId }),
+  getLogFeed: async (projectId, options = {}) =>
+    await invoke<ProjectLogFeedResponse>("project:getLogFeed", { projectId, ...options }),
   createAgent: async (projectId, category, name, prompt, model, reasoningMode, reasoningEffort) =>
     await invoke<unknown>("agent:create", { projectId, category, name, prompt, model, reasoningMode, reasoningEffort }),
   approve: async (projectId, agentId, approvalId, decision) =>

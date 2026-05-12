@@ -307,6 +307,34 @@ const extractWorkflowObjective = (input: TurnStartParams["input"]): MockRecommen
 export class MockCodexTransport extends EventEmitter<TransportEventMap> implements CodexTransport {
   private readonly threads = new Map<string, { id: string; cwd: string; model: string; turns: Array<{ id: string; items: Array<{ id: string; type: string; text?: string }> }> }>();
 
+  private buildMockTurn(id: string, items: ReturnType<MockCodexTransport["buildMockThreadItem"]>[], status: "inProgress" | "completed") {
+    return {
+      id,
+      items,
+      status,
+      error: null,
+      startedAt: Math.floor(Date.now() / 1000),
+      completedAt: status === "completed" ? Math.floor(Date.now() / 1000) : null,
+      durationMs: status === "completed" ? 0 : null
+    };
+  }
+
+  private buildMockThreadItem(item: { id: string; type: string; text?: string }) {
+    return item.type === "agentMessage"
+      ? {
+          type: "agentMessage" as const,
+          id: item.id,
+          text: item.text ?? "",
+          phase: null,
+          memoryCitation: null
+        }
+      : {
+          type: "userMessage" as const,
+          id: item.id,
+          content: []
+        };
+  }
+
   async initialize(): Promise<InitializeResponse> {
     return {
       userAgent: "mock-codex-agent-workbench",
@@ -337,6 +365,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           defaultReasoningEffort: "high",
           inputModalities: ["text"],
           supportsPersonality: true,
+          additionalSpeedTiers: [],
           isDefault: false
         },
         {
@@ -356,6 +385,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           defaultReasoningEffort: "medium",
           inputModalities: ["text"],
           supportsPersonality: true,
+          additionalSpeedTiers: [],
           isDefault: true
         },
         {
@@ -376,6 +406,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           defaultReasoningEffort: "high",
           inputModalities: ["text"],
           supportsPersonality: true,
+          additionalSpeedTiers: [],
           isDefault: false
         }
       ],
@@ -394,6 +425,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       thread: {
         id: threadId,
+        forkedFromId: null,
         preview: "",
         ephemeral: false,
         modelProvider: "openai",
@@ -414,16 +446,18 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       modelProvider: "openai",
       serviceTier: null,
       cwd: params.cwd ?? "/tmp",
+      instructionSources: [],
       approvalPolicy: params.approvalPolicy ?? "on-request",
       approvalsReviewer: "user",
       sandbox: {
         type: "workspaceWrite",
         writableRoots: [],
-        readOnlyAccess: { type: "fullAccess" },
         networkAccess: false,
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false
       },
+      permissionProfile: null,
+      activePermissionProfile: null,
       reasoningEffort: null
     };
   }
@@ -436,6 +470,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       thread: {
         id: thread.id,
+        forkedFromId: null,
         preview: "",
         ephemeral: false,
         modelProvider: "openai",
@@ -450,41 +485,24 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         agentRole: null,
         gitInfo: null,
         name: null,
-        turns: thread.turns.map((turn) => ({
-          id: turn.id,
-          items: turn.items.map((item) =>
-            item.type === "agentMessage"
-              ? {
-                  type: "agentMessage",
-                  id: item.id,
-                  text: item.text ?? "",
-                  phase: null,
-                  memoryCitation: null
-                }
-              : {
-                  type: "userMessage",
-                  id: item.id,
-                  content: []
-                }
-          ),
-          status: "completed",
-          error: null
-        }))
+        turns: thread.turns.map((turn) => this.buildMockTurn(turn.id, turn.items.map((item) => this.buildMockThreadItem(item)), "completed"))
       },
       model: thread.model,
       modelProvider: "openai",
       serviceTier: null,
       cwd: thread.cwd,
+      instructionSources: [],
       approvalPolicy: "on-request",
       approvalsReviewer: "user",
       sandbox: {
         type: "workspaceWrite",
         writableRoots: [],
-        readOnlyAccess: { type: "fullAccess" },
         networkAccess: false,
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false
       },
+      permissionProfile: null,
+      activePermissionProfile: null,
       reasoningEffort: null
     };
   }
@@ -499,6 +517,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       thread: {
         id: thread.id,
+        forkedFromId: null,
         preview: "",
         ephemeral: false,
         modelProvider: "openai",
@@ -513,26 +532,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         agentRole: null,
         gitInfo: null,
         name: null,
-        turns: thread.turns.map((turn) => ({
-          id: turn.id,
-          items: turn.items.map((item) =>
-            item.type === "agentMessage"
-              ? {
-                  type: "agentMessage",
-                  id: item.id,
-                  text: item.text ?? "",
-                  phase: null,
-                  memoryCitation: null
-                }
-              : {
-                  type: "userMessage",
-                  id: item.id,
-                  content: []
-                }
-          ),
-          status: "completed",
-          error: null
-        }))
+        turns: thread.turns.map((turn) => this.buildMockTurn(turn.id, turn.items.map((item) => this.buildMockThreadItem(item)), "completed"))
       }
     };
   }
@@ -573,12 +573,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         method: "turn/started",
         params: {
           threadId: params.threadId,
-          turn: {
-            id: turnId,
-            items: [],
-            status: "inProgress",
-            error: null
-          }
+          turn: this.buildMockTurn(turnId, [], "inProgress")
         }
       } satisfies ServerNotification);
       this.emit("notification", {
@@ -608,12 +603,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         method: "turn/completed",
         params: {
           threadId: params.threadId,
-          turn: {
-            id: turnId,
-            items: [],
-            status: "completed",
-            error: null
-          }
+          turn: this.buildMockTurn(turnId, [], "completed")
         }
       } satisfies ServerNotification);
     }, MOCK_TURN_COMPLETION_DELAY_MS);
@@ -623,7 +613,10 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         id: turnId,
         items: [],
         status: "inProgress",
-        error: null
+        error: null,
+        startedAt: Math.floor(Date.now() / 1000),
+        completedAt: null,
+        durationMs: null
       }
     };
   }

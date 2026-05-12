@@ -39,7 +39,7 @@ type ExclusionRule = "default" | "gitignore";
 
 const isSkippableScanError = (error: unknown): boolean => {
   const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
-  return code === "EACCES" || code === "EPERM" || code === "ENOENT";
+  return code === "EACCES" || code === "EPERM" || code === "ENOENT" || code === "EISDIR";
 };
 
 const sourceLikeExtensions = new Set([

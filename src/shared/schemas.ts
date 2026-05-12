@@ -367,6 +367,26 @@ export const goalAttainmentCheckSchema = z.object({
   updatedAt: isoDatetime()
 });
 
+export const workflowTaskMapGroupSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  rationale: z.string().default(""),
+  checkIds: z.array(z.string()).default([]),
+  representativeChecks: z.array(z.string()).default([]),
+  relatedPaths: z.array(z.string()).default([]),
+  openCheckCount: z.number().int().nonnegative().default(0),
+  metCheckCount: z.number().int().nonnegative().default(0),
+  status: z.enum(["open", "in_progress", "complete"]).default("open"),
+  priority: z.number().default(0)
+});
+
+export const workflowTaskMapSchema = z.object({
+  groups: z.array(workflowTaskMapGroupSchema).default([]),
+  totalRequiredChecks: z.number().int().nonnegative().default(0),
+  openRequiredChecks: z.number().int().nonnegative().default(0),
+  updatedAt: isoDatetime().default(defaultProjectWorkflowState().taskMap.updatedAt)
+});
+
 export const workflowCycleSchema = z.object({
   cycleNumber: z.number().int().positive().default(1),
   approvedRecommendationId: z.string().optional(),
@@ -649,6 +669,7 @@ export const projectWorkflowStateSchema = z.object({
   ultimateGoalProgress: ultimateGoalProgressEstimateSchema.optional(),
   ultimateGoalCompletion: ultimateGoalCompletionAssessmentSchema.optional(),
   goalChecklist: z.array(goalAttainmentCheckSchema).default([]),
+  taskMap: workflowTaskMapSchema.default(defaultProjectWorkflowState().taskMap),
   workflowCycle: workflowCycleSchema.default(defaultProjectWorkflowState().workflowCycle),
   approvedRecommendation: approvedRecommendationSchema.optional(),
   scopedGoal: scopedGoalSchema.optional(),

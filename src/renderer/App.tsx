@@ -22,6 +22,7 @@ import {
 } from "@shared/workflowView";
 import type {
   AgentCategory,
+  AgentListResponse,
   AgentReasoningEfforts,
   AgentReasoningMode,
   AgentState,
@@ -36,6 +37,7 @@ import type {
   InterfaceCandidate,
   LoadedProjectView,
   ProjectLoadResult,
+  ProjectLogFeedResponse,
   ProjectWorkflowState,
   RuntimeEventRecord,
   SummarySource,
@@ -56,6 +58,14 @@ type NoticeState = {
   tone: "info" | "error";
 };
 
+type AgentPageView = Pick<AgentListResponse, "agents" | "total" | "offset" | "limit"> & {
+  loading: boolean;
+};
+
+type LogFeedView = ProjectLogFeedResponse & {
+  loading: boolean;
+};
+
 type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
   kind: "resume_workflow";
   title: string;
@@ -71,6 +81,8 @@ type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
 const interfaceIconUrl = new URL("../../assets/branding/interface_icon.png", import.meta.url).href;
 const WORKFLOW_AGENT_STALE_MS = 10 * 60 * 1000;
 const AGENT_HISTORY_PAGE_SIZE = 20;
+const LOG_ACTIVITY_PAGE_SIZE = 80;
+const LOG_COMMAND_PAGE_SIZE = 50;
 
 const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "Ultimate Goal authoring format for Codex Agent Workbench",
@@ -81,7 +93,7 @@ const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "",
   `You are drafting an Ultimate Goal for the project named "${projectName}". The result will be imported into Codex Agent Workbench, which will infer a goal checklist and then run repeated recommendation, scoped planning, coding, integrity validation, and merge cycles against the repository.`,
   "",
-  "Write the goal so each success criterion can become an observable checklist item. Be concrete about user-visible behavior, acceptance conditions, quality expectations, constraints, and what is out of scope. Avoid secrets, credentials, machine-specific paths, or private environment details.",
+  "Write the goal so each success criterion can become an observable checklist item. Keep criteria outcome-focused and merge near-duplicates instead of splitting tiny implementation details apart. Be concrete about user-visible behavior, acceptance conditions, quality expectations, constraints, and what is out of scope. Avoid secrets, credentials, machine-specific paths, or private environment details.",
   "",
   "Return plain text only. Do not wrap the result in Markdown fences. Use exactly these section headings:",
   "",
@@ -153,6 +165,9 @@ const availabilityMessage = (state: WorkbenchState): string => {
   }
 
   if (availability.source === "live") {
+    if (availability.installedCodexVersion && availability.generatedProtocolVersion) {
+      return `Codex model discovery is available. CLI ${availability.installedCodexVersion}, app-server protocol ${availability.generatedProtocolVersion}.`;
+    }
     return "Codex model discovery is available.";
   }
 
@@ -766,6 +781,9 @@ const PagedAgentList = ({
   selectedAgentId,
   emptyCopy,
   onSelect,
+  totalAgents,
+  pageIndex,
+  onPageChange,
   pageSize = AGENT_HISTORY_PAGE_SIZE
 }: {
   agents: AgentState[];
@@ -773,21 +791,31 @@ const PagedAgentList = ({
   selectedAgentId?: string;
   emptyCopy: string;
   onSelect: (agentId: string) => void;
+  totalAgents?: number;
+  pageIndex?: number;
+  onPageChange?: (pageIndex: number) => void;
   pageSize?: number;
 }) => {
-  const [pageIndex, setPageIndex] = useState(0);
+  const [localPageIndex, setLocalPageIndex] = useState(0);
   const previousSelectedAgentId = useRef<string | undefined>(undefined);
-  const totalPages = Math.max(1, Math.ceil(agents.length / pageSize));
-  const boundedPageIndex = Math.min(pageIndex, totalPages - 1);
+  const isControlled = typeof totalAgents === "number" && typeof pageIndex === "number" && onPageChange;
+  const total = totalAgents ?? agents.length;
+  const currentPageIndex = pageIndex ?? localPageIndex;
+  const setCurrentPageIndex = onPageChange ?? setLocalPageIndex;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const boundedPageIndex = Math.min(currentPageIndex, totalPages - 1);
   const pageStart = boundedPageIndex * pageSize;
-  const visibleAgents = agents.slice(pageStart, pageStart + pageSize);
-  const pageEnd = Math.min(pageStart + visibleAgents.length, agents.length);
+  const visibleAgents = isControlled ? agents : agents.slice(pageStart, pageStart + pageSize);
+  const pageEnd = Math.min(pageStart + visibleAgents.length, total);
 
   useEffect(() => {
-    setPageIndex((current) => Math.min(current, totalPages - 1));
-  }, [totalPages]);
+    setCurrentPageIndex(Math.min(currentPageIndex, totalPages - 1));
+  }, [currentPageIndex, setCurrentPageIndex, totalPages]);
 
   useEffect(() => {
+    if (isControlled) {
+      return;
+    }
     if (previousSelectedAgentId.current === selectedAgentId) {
       return;
     }
@@ -799,11 +827,11 @@ const PagedAgentList = ({
 
     const selectedIndex = agents.findIndex((agent) => agent.id === selectedAgentId);
     if (selectedIndex >= 0) {
-      setPageIndex(Math.floor(selectedIndex / pageSize));
+      setLocalPageIndex(Math.floor(selectedIndex / pageSize));
     }
-  }, [agents, pageSize, selectedAgentId]);
+  }, [agents, isControlled, pageSize, selectedAgentId]);
 
-  if (!agents.length) {
+  if (!total) {
     return <div className="empty-copy">{emptyCopy}</div>;
   }
 
@@ -811,13 +839,13 @@ const PagedAgentList = ({
     <>
       <div className="workflow-agent-list__pager">
         <span>
-          Showing {pageStart + 1}-{pageEnd} of {agents.length}
+          Showing {pageStart + 1}-{pageEnd} of {total}
         </span>
         <div className="workflow-agent-list__pager-actions">
           <button
             className="secondary-button"
             disabled={boundedPageIndex === 0}
-            onClick={() => setPageIndex((current) => Math.max(0, current - 1))}
+            onClick={() => setCurrentPageIndex(Math.max(0, boundedPageIndex - 1))}
             type="button"
           >
             Previous {pageSize}
@@ -825,7 +853,7 @@ const PagedAgentList = ({
           <button
             className="secondary-button"
             disabled={boundedPageIndex >= totalPages - 1}
-            onClick={() => setPageIndex((current) => Math.min(totalPages - 1, current + 1))}
+            onClick={() => setCurrentPageIndex(Math.min(totalPages - 1, boundedPageIndex + 1))}
             type="button"
           >
             Next {pageSize}
@@ -844,6 +872,54 @@ const PagedAgentList = ({
         ))}
       </div>
     </>
+  );
+};
+
+const FeedPager = ({
+  label,
+  pageIndex,
+  pageSize,
+  total,
+  visibleCount,
+  onPageChange
+}: {
+  label: string;
+  pageIndex: number;
+  pageSize: number;
+  total: number;
+  visibleCount: number;
+  onPageChange: (pageIndex: number) => void;
+}) => {
+  if (total === 0) {
+    return null;
+  }
+
+  const pageStart = pageIndex * pageSize;
+  const pageEnd = Math.min(pageStart + visibleCount, total);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  return (
+    <div className="workflow-agent-list__pager">
+      <span>{label}: {pageStart + 1}-{pageEnd} of {total}</span>
+      <div className="workflow-agent-list__pager-actions">
+        <button
+          className="secondary-button"
+          disabled={pageIndex === 0}
+          onClick={() => onPageChange(Math.max(0, pageIndex - 1))}
+          type="button"
+        >
+          Previous
+        </button>
+        <button
+          className="secondary-button"
+          disabled={pageIndex >= totalPages - 1}
+          onClick={() => onPageChange(Math.min(totalPages - 1, pageIndex + 1))}
+          type="button"
+        >
+          Next
+        </button>
+      </div>
+    </div>
   );
 };
 
@@ -1363,12 +1439,14 @@ const UltimateGoalProgressCard = ({
   progress,
   completion,
   checklist,
+  taskMap,
   objective,
   appeal
 }: {
   progress?: ProjectWorkflowState["ultimateGoalProgress"];
   completion?: ProjectWorkflowState["ultimateGoalCompletion"];
   checklist?: ProjectWorkflowState["goalChecklist"];
+  taskMap?: ProjectWorkflowState["taskMap"];
   objective: LoadedProjectView["record"]["localState"]["workflowObjective"];
   appeal?: ProjectWorkflowState["appeal"];
 }) => {
@@ -1385,6 +1463,12 @@ const UltimateGoalProgressCard = ({
   });
   const requiredChecks = allChecks.filter((check) => check.required && check.status !== "not_applicable");
   const metChecks = requiredChecks.filter((check) => check.status === "met");
+  const visibleChecks = allChecks.slice(0, 20);
+  const hiddenCheckCount = Math.max(0, allChecks.length - visibleChecks.length);
+  const openTaskGroups = (taskMap?.groups ?? [])
+    .filter((group) => group.status !== "complete")
+    .sort((left, right) => right.priority - left.priority || left.title.localeCompare(right.title))
+    .slice(0, 5);
 
   return (
     <section className="workflow-goal-progress">
@@ -1423,13 +1507,36 @@ const UltimateGoalProgressCard = ({
           </span>
         </div>
       ) : null}
+      {openTaskGroups.length > 0 ? (
+        <div className="goal-checklist-preview">
+          <div className="goal-checklist-preview__header">
+            <strong>Task map</strong>
+            <span>{taskMap?.openRequiredChecks ?? 0} open checks across {taskMap?.groups.filter((group) => group.status !== "complete").length ?? 0} groups</span>
+          </div>
+          {openTaskGroups.map((group) => (
+            <div key={group.id} className="goal-checklist-preview__item">
+              <span className="badge goal-check-badge goal-check-badge--unknown">{group.openCheckCount}</span>
+              <div className="goal-checklist-preview__copy">
+                <strong>{group.title}</strong>
+                <span>
+                  {group.representativeChecks.slice(0, 3).join(" · ")}
+                  {group.relatedPaths.length ? ` · ${group.relatedPaths.slice(0, 3).join(", ")}` : ""}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {allChecks.length > 0 ? (
         <div className="goal-checklist-preview">
           <div className="goal-checklist-preview__header">
             <strong>Full goal checklist</strong>
-            <span>{allChecks.length} item{allChecks.length === 1 ? "" : "s"}</span>
+            <span>
+              {hiddenCheckCount > 0 ? `Showing ${visibleChecks.length} of ` : ""}
+              {allChecks.length} item{allChecks.length === 1 ? "" : "s"}
+            </span>
           </div>
-          {allChecks.map((check) => (
+          {visibleChecks.map((check) => (
             <div key={check.id} className="goal-checklist-preview__item">
               <span className={`badge goal-check-badge goal-check-badge--${check.status}`}>
                 {goalCheckStatusLabel(check.status)}
@@ -1443,6 +1550,11 @@ const UltimateGoalProgressCard = ({
               </div>
             </div>
           ))}
+          {hiddenCheckCount > 0 ? (
+            <p className="agent-card__subtle">
+              {hiddenCheckCount} lower-priority checklist item{hiddenCheckCount === 1 ? "" : "s"} hidden in this panel.
+            </p>
+          ) : null}
         </div>
       ) : null}
       <p>{progress.rationale}</p>
@@ -1467,6 +1579,7 @@ const WorkflowStepRail = ({
             <span className={`badge workflow-step-badge workflow-step-badge--${step.displayStatus}`}>{step.displayStatusLabel}</span>
           </div>
           <p>{step.isCurrent ? (step.currentActivity ?? step.description) : step.description}</p>
+          {step.isCurrent && step.currentSubstep ? <p className="agent-card__subtle">{step.currentSubstep}</p> : null}
           <div className="workflow-step-card__meta">
             {step.agentCategory ? <span>{agentCategoryLabel(step.agentCategory)}</span> : null}
             {step.updatedAt ? <span>Updated {formatClockTime(step.updatedAt)}</span> : null}
@@ -2285,6 +2398,41 @@ export const App = () => {
   const [overviewRefreshBusy, setOverviewRefreshBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
   const [userInputAttachmentBusyId, setUserInputAttachmentBusyId] = useState<string>();
+  const [workflowAgentPageIndex, setWorkflowAgentPageIndex] = useState(0);
+  const [manualAgentPageIndex, setManualAgentPageIndex] = useState(0);
+  const [workflowAgentPage, setWorkflowAgentPage] = useState<AgentPageView>({
+    agents: [],
+    total: 0,
+    offset: 0,
+    limit: AGENT_HISTORY_PAGE_SIZE,
+    loading: false
+  });
+  const [manualAgentPage, setManualAgentPage] = useState<AgentPageView>({
+    agents: [],
+    total: 0,
+    offset: 0,
+    limit: AGENT_HISTORY_PAGE_SIZE,
+    loading: false
+  });
+  const [agentDetail, setAgentDetail] = useState<AgentState>();
+  const [activityLogPageIndex, setActivityLogPageIndex] = useState(0);
+  const [commandLogPageIndex, setCommandLogPageIndex] = useState(0);
+  const [logFeed, setLogFeed] = useState<LogFeedView>({
+    projectId: "",
+    activity: {
+      offset: 0,
+      limit: LOG_ACTIVITY_PAGE_SIZE,
+      total: 0,
+      entries: []
+    },
+    commands: {
+      offset: 0,
+      limit: LOG_COMMAND_PAGE_SIZE,
+      total: 0,
+      entries: []
+    },
+    loading: false
+  });
 
   useEffect(() => {
     void window.workbench.getState()
@@ -2353,6 +2501,10 @@ export const App = () => {
   const deferredTreeFilter = useDeferredValue(treeFilterDraft);
   const workflow = activeProject?.record.workflow;
   const allAgents = useMemo(() => activeProject ? sortAgentsByActivity(activeProject.record.agents) : [], [activeProject]);
+  const agentHistoryVersion = useMemo(
+    () => allAgents.map((agent) => `${agent.id}:${agent.status}:${agent.lastActivityAt ?? ""}:${agent.approvals.length}:${agent.changedFiles.length}`).join("|"),
+    [allAgents]
+  );
   const workflowAgents = useMemo(() => allAgents.filter((agent) => agent.category !== "manual"), [allAgents]);
   const workflowHasActiveAgent = useMemo(() => workflowAgents.some((agent) => isWorkflowAgentActive(agent)), [workflowAgents]);
   const manualAgents = useMemo(() => allAgents.filter((agent) => agent.category === "manual"), [allAgents]);
@@ -2542,6 +2694,7 @@ export const App = () => {
     () => allAgents.find((agent) => agent.id === focusedAgentId) ?? allAgents[0],
     [allAgents, focusedAgentId]
   );
+  const activeAgentForDetail = agentDetail?.id === activeAgent?.id ? agentDetail : activeAgent;
   const activeWorkspaceTab: WorkspaceCenterTab = activeProject?.record.layout.activeCenterTab === "reports"
     ? "workflow"
     : activeProject?.record.layout.activeCenterTab === "file" || activeProject?.record.layout.activeCenterTab === "diff"
@@ -2718,12 +2871,114 @@ export const App = () => {
     if (!activeProjectId) {
       setTreeFilterDraft("");
       setFocusedAgentId(undefined);
+      setWorkflowAgentPageIndex(0);
+      setManualAgentPageIndex(0);
+      setActivityLogPageIndex(0);
+      setCommandLogPageIndex(0);
+      setAgentDetail(undefined);
       return;
     }
 
     setTreeFilterDraft(storedTreeFilter);
     setFocusedAgentId(storedActiveAgentId);
   }, [activeProjectId, storedActiveAgentId, storedTreeFilter]);
+
+  useEffect(() => {
+    setWorkflowAgentPageIndex(0);
+    setManualAgentPageIndex(0);
+    setActivityLogPageIndex(0);
+    setCommandLogPageIndex(0);
+    setAgentDetail(undefined);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "agents") {
+      return;
+    }
+
+    let cancelled = false;
+    setWorkflowAgentPage((current) => ({ ...current, loading: true }));
+    void window.workbench.listAgents(
+      activeProjectId,
+      "workflow",
+      workflowAgentPageIndex * AGENT_HISTORY_PAGE_SIZE,
+      AGENT_HISTORY_PAGE_SIZE
+    ).then((page) => {
+      if (!cancelled) {
+        setWorkflowAgentPage({ ...page, loading: false });
+      }
+    }).catch(handleError);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeWorkspaceTab, agentHistoryVersion, workflowAgentPageIndex]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "agents") {
+      return;
+    }
+
+    let cancelled = false;
+    setManualAgentPage((current) => ({ ...current, loading: true }));
+    void window.workbench.listAgents(
+      activeProjectId,
+      "manual",
+      manualAgentPageIndex * AGENT_HISTORY_PAGE_SIZE,
+      AGENT_HISTORY_PAGE_SIZE
+    ).then((page) => {
+      if (!cancelled) {
+        setManualAgentPage({ ...page, loading: false });
+      }
+    }).catch(handleError);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeWorkspaceTab, agentHistoryVersion, manualAgentPageIndex]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "agents" || !activeAgent?.id) {
+      setAgentDetail(undefined);
+      return;
+    }
+
+    let cancelled = false;
+    void window.workbench.getAgent(activeProjectId, activeAgent.id)
+      .then((agent) => {
+        if (!cancelled) {
+          setAgentDetail(agent);
+        }
+      })
+      .catch(handleError);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeAgent?.id, activeProjectId, activeWorkspaceTab, agentHistoryVersion]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "logs") {
+      return;
+    }
+
+    let cancelled = false;
+    setLogFeed((current) => ({ ...current, loading: true }));
+    void window.workbench.getLogFeed(activeProjectId, {
+      activityOffset: activityLogPageIndex * LOG_ACTIVITY_PAGE_SIZE,
+      activityLimit: LOG_ACTIVITY_PAGE_SIZE,
+      commandOffset: commandLogPageIndex * LOG_COMMAND_PAGE_SIZE,
+      commandLimit: LOG_COMMAND_PAGE_SIZE
+    }).then((feed) => {
+      if (!cancelled) {
+        setLogFeed({ ...feed, loading: false });
+      }
+    }).catch(handleError);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeWorkspaceTab, activityLogPageIndex, agentHistoryVersion, commandLogPageIndex]);
 
   useEffect(() => {
     if (!activeProjectId || treeFilterDraft === storedTreeFilter) {
@@ -4205,6 +4460,7 @@ export const App = () => {
                         progress={workflow?.ultimateGoalProgress}
                         completion={workflow?.ultimateGoalCompletion}
                         checklist={workflow?.goalChecklist}
+                        taskMap={workflow?.taskMap}
                         objective={workflowObjective}
                         appeal={workflow?.appeal}
                       />
@@ -4935,12 +5191,18 @@ export const App = () => {
               </div>
 
               <div className="panel support-panel workflow-feed-card__panel">
-                <SectionTitle eyebrow="Workflow" title="Activity log" />
+                <SectionTitle eyebrow="Workflow" title="Activity log" meta={logFeed.loading ? <span className="badge">Loading</span> : null} />
+                <FeedPager
+                  label="Activity"
+                  pageIndex={activityLogPageIndex}
+                  pageSize={LOG_ACTIVITY_PAGE_SIZE}
+                  total={logFeed.activity.total}
+                  visibleCount={logFeed.activity.entries.length}
+                  onPageChange={setActivityLogPageIndex}
+                />
                 <div className="workflow-feed-card__scroll workflow-feed-card__scroll--tall">
                   <div className="activity-list">
-                    {workflow?.activityLog.length ? [...workflow.activityLog]
-                      .sort((left, right) => toTime(right.timestamp) - toTime(left.timestamp))
-                      .slice(0, 200)
+                    {logFeed.activity.entries.length ? logFeed.activity.entries
                       .map((event) => (
                         <div key={event.id} className="activity-row">
                           <strong>{event.title}</strong>
@@ -4953,18 +5215,24 @@ export const App = () => {
             </div>
 
             <article className="overview-card workflow-panel">
-              <SectionTitle eyebrow="Commands" title="Recent command snippets" />
+              <SectionTitle eyebrow="Commands" title="Command snippets" meta={logFeed.loading ? <span className="badge">Loading</span> : null} />
+              <FeedPager
+                label="Commands"
+                pageIndex={commandLogPageIndex}
+                pageSize={LOG_COMMAND_PAGE_SIZE}
+                total={logFeed.commands.total}
+                visibleCount={logFeed.commands.entries.length}
+                onPageChange={setCommandLogPageIndex}
+              />
               <div className="workflow-feed-card__scroll workflow-feed-card__scroll--commands">
                 <div className="activity-list">
-                  {allAgents.flatMap((agent) =>
-                    agent.commandLog.map((command) => ({ agent, command }))
-                  ).slice(0, 120).map(({ agent, command }) => (
-                    <div key={`${agent.id}:${command.itemId ?? command.startedAt}`} className="activity-row">
-                      <strong>{agent.name}</strong>
+                  {logFeed.commands.entries.map((command) => (
+                    <div key={command.id} className="activity-row">
+                      <strong>{command.agentName}</strong>
                       <span>{command.command} · {command.status}</span>
                     </div>
                   ))}
-                  {allAgents.every((agent) => agent.commandLog.length === 0) ? (
+                  {logFeed.commands.entries.length === 0 ? (
                     <div className="empty-copy">No command snippets have been recorded yet.</div>
                   ) : null}
                 </div>
@@ -4979,17 +5247,28 @@ export const App = () => {
             <div className="agent-history-layout">
               <div className="agent-history-layout__lists">
                 <article className="overview-card workflow-agent-list-card">
-                  <SectionTitle eyebrow="Workflow" title="Workflow runs" meta={<span className="badge">{workflowAgents.length}</span>} />
+                  <SectionTitle
+                    eyebrow="Workflow"
+                    title="Workflow runs"
+                    meta={<span className="badge">{workflowAgentPage.loading ? "Loading" : `${workflowAgentPage.total} runs`}</span>}
+                  />
                   <PagedAgentList
-                    agents={workflowAgents}
+                    agents={workflowAgentPage.agents}
                     workflow={workflow}
                     selectedAgentId={activeAgent?.id}
+                    totalAgents={workflowAgentPage.total}
+                    pageIndex={workflowAgentPageIndex}
+                    onPageChange={setWorkflowAgentPageIndex}
                     emptyCopy="No workflow agents have started yet."
                     onSelect={(agentId) => void selectAgent(agentId)}
                   />
                 </article>
                 <article className="overview-card workflow-agent-list-card">
-                  <SectionTitle eyebrow="Manual" title="Independent runs" meta={<span className="badge">{manualAgents.length}</span>} />
+                  <SectionTitle
+                    eyebrow="Manual"
+                    title="Independent runs"
+                    meta={<span className="badge">{manualAgentPage.loading ? "Loading" : `${manualAgentPage.total} runs`}</span>}
+                  />
                   <div className="agent-form card-surface">
                     <textarea
                       className="textarea"
@@ -5017,16 +5296,19 @@ export const App = () => {
                     </div>
                   </div>
                   <PagedAgentList
-                    agents={manualAgents}
+                    agents={manualAgentPage.agents}
                     workflow={workflow}
                     selectedAgentId={activeAgent?.id}
+                    totalAgents={manualAgentPage.total}
+                    pageIndex={manualAgentPageIndex}
+                    onPageChange={setManualAgentPageIndex}
                     emptyCopy="No manual agents have started yet."
                     onSelect={(agentId) => void selectAgent(agentId)}
                   />
                 </article>
               </div>
               <div className="agent-history-layout__detail">
-                <AgentFocusPanel agent={activeAgent} workflow={workflow} />
+                <AgentFocusPanel agent={activeAgentForDetail} workflow={workflow} />
                 <article className="overview-card workflow-panel">
                   <SectionTitle eyebrow="Developer" title="Workflow controls" />
                   <div className="actions-row">

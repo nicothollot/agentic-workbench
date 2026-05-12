@@ -42,18 +42,149 @@ const MAX_EVENT_RAW_STRING_LENGTH = 2_000;
 const MAX_EVENT_RAW_ARRAY_LENGTH = 20;
 const MAX_EVENT_RAW_OBJECT_KEYS = 40;
 const MAX_EVENT_RAW_DEPTH = 4;
+const STRUCTURED_STREAM_PLACEHOLDER = "Receiving structured agent output...";
 
-const capDetail = (value: string, maxLength = MAX_EVENT_DETAIL_LENGTH): string =>
-  value.length <= maxLength ? value : value.slice(-maxLength);
+const ANSI_ESCAPE_PATTERN = new RegExp(
+  String.raw`(?:\u001B\][\s\S]*?(?:\u0007|\u001B\\))|(?:[\u001B\u009B][[\]()#;?]*(?:[0-?]*[ -/]*[@-~]))`,
+  "g"
+);
+const CONTROL_CHARACTER_PATTERN = new RegExp(String.raw`[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]`, "g");
+
+const sanitizeDisplayText = (value: string): string =>
+  value
+    .replace(ANSI_ESCAPE_PATTERN, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(CONTROL_CHARACTER_PATTERN, "")
+    .replace(/\n{5,}/g, "\n\n\n\n");
+
+const capDetail = (value: string, maxLength = MAX_EVENT_DETAIL_LENGTH): string => {
+  const sanitized = sanitizeDisplayText(value);
+  return sanitized.length <= maxLength ? sanitized : sanitized.slice(-maxLength);
+};
+
+const capLeadingDetail = (value: string, maxLength: number): string => {
+  const sanitized = sanitizeDisplayText(value);
+  return sanitized.length <= maxLength
+    ? sanitized
+    : `${sanitized.slice(0, Math.max(0, maxLength - 15)).trimEnd()}...[truncated]`;
+};
+
+const compactDisplayText = (value: unknown, maxLength: number): string | undefined => {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const sanitized = sanitizeDisplayText(value).trim().replace(/[ \t]{2,}/g, " ");
+  return sanitized.length <= maxLength ? sanitized : `${sanitized.slice(0, Math.max(0, maxLength - 15)).trimEnd()}...[truncated]`;
+};
+
+const startsLikeStructuredJson = (value: string): boolean => {
+  const trimmed = value.trimStart();
+  return trimmed.startsWith("{") || trimmed.startsWith("[");
+};
+
+const tryParseJson = (value: string): unknown => {
+  const trimmed = sanitizeDisplayText(value).trim();
+  if (!startsLikeStructuredJson(trimmed)) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return undefined;
+  }
+};
+
+const countGoalCheckUpdateStatuses = (updates: unknown[]): string => {
+  const counts = new Map<string, number>();
+  for (const update of updates) {
+    if (!update || typeof update !== "object") {
+      continue;
+    }
+    const status = (update as { status?: unknown }).status;
+    if (typeof status === "string" && status.length > 0) {
+      counts.set(status, (counts.get(status) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([status, count]) => `${status} ${count}`)
+    .join(", ");
+};
+
+const summarizeStructuredAgentMessage = (detail: string): string | undefined => {
+  const parsed = tryParseJson(detail);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    return undefined;
+  }
+
+  const message = parsed as Record<string, unknown>;
+  const recommendations = Array.isArray(message.recommendations) ? message.recommendations : [];
+  const goalCheckUpdates = Array.isArray(message.goalCheckUpdates) ? message.goalCheckUpdates : [];
+  if (!("summary" in message) && recommendations.length === 0 && goalCheckUpdates.length === 0) {
+    return undefined;
+  }
+
+  const lines: string[] = [];
+  const summary = compactDisplayText(message.summary, 360);
+  if (summary) {
+    lines.push(`Summary: ${summary}`);
+  }
+
+  const progress = message.ultimateGoalProgress;
+  if (progress && typeof progress === "object") {
+    const percentComplete = (progress as { percentComplete?: unknown }).percentComplete;
+    const rationale = compactDisplayText((progress as { rationale?: unknown }).rationale, 220);
+    if (typeof percentComplete === "number") {
+      lines.push(`Goal progress: ${Math.round(percentComplete)}%${rationale ? ` - ${rationale}` : ""}`);
+    }
+  }
+
+  if (recommendations.length > 0) {
+    lines.push("Recommendations:");
+    for (const [index, recommendation] of recommendations.slice(0, 5).entries()) {
+      if (!recommendation || typeof recommendation !== "object") {
+        continue;
+      }
+      const title = compactDisplayText((recommendation as { title?: unknown }).title, 120) ?? `Option ${index + 1}`;
+      const summaryLine = compactDisplayText((recommendation as { summary?: unknown }).summary, 180);
+      lines.push(`${index + 1}. ${title}${summaryLine ? ` - ${summaryLine}` : ""}`);
+    }
+  }
+
+  if (goalCheckUpdates.length > 0) {
+    const statusSummary = countGoalCheckUpdateStatuses(goalCheckUpdates);
+    const targetTitles = goalCheckUpdates
+      .slice(0, 6)
+      .map((update) => update && typeof update === "object" ? compactDisplayText((update as { title?: unknown }).title, 80) : undefined)
+      .filter((title): title is string => Boolean(title));
+    lines.push(`Checklist updates: ${goalCheckUpdates.length}${statusSummary ? ` (${statusSummary})` : ""}.`);
+    if (targetTitles.length > 0) {
+      lines.push(`Targets: ${targetTitles.join("; ")}${goalCheckUpdates.length > targetTitles.length ? "; ..." : ""}`);
+    }
+  }
+
+  return lines.length > 0 ? lines.join("\n") : undefined;
+};
+
+const formatAgentMessageDetailForDisplay = (detail: string): string =>
+  summarizeStructuredAgentMessage(detail) ?? capDetail(detail);
+
+const formatStreamingDetailForDisplay = (
+  type: RuntimeEventRecord["type"],
+  detail: string
+): string => type === "message" && startsLikeStructuredJson(detail)
+  ? STRUCTURED_STREAM_PLACEHOLDER
+  : detail;
 
 const compactRawValue = (value: unknown, depth = 0): unknown => {
   if (value === null || value === undefined) {
     return value;
   }
   if (typeof value === "string") {
-    return value.length <= MAX_EVENT_RAW_STRING_LENGTH
-      ? value
-      : `${value.slice(0, MAX_EVENT_RAW_STRING_LENGTH).trimEnd()}...[truncated ${value.length - MAX_EVENT_RAW_STRING_LENGTH} chars]`;
+    const sanitized = sanitizeDisplayText(value);
+    return sanitized.length <= MAX_EVENT_RAW_STRING_LENGTH
+      ? sanitized
+      : `${sanitized.slice(0, MAX_EVENT_RAW_STRING_LENGTH).trimEnd()}...[truncated ${sanitized.length - MAX_EVENT_RAW_STRING_LENGTH} chars]`;
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return value;
@@ -145,9 +276,12 @@ const upsertStreamingEvent = (
   const index = findStreamingEventIndex(agent, type, options?.itemId);
   if (index >= 0) {
     const [existing] = agent.events.splice(index, 1);
+    const nextDetail = existing.detail === STRUCTURED_STREAM_PLACEHOLDER
+      ? STRUCTURED_STREAM_PLACEHOLDER
+      : formatStreamingDetailForDisplay(type, `${existing.detail ?? ""}${delta}`);
     existing.timestamp = timestamp;
     existing.title = title;
-    existing.detail = capDetail(`${existing.detail ?? ""}${delta}`, options?.maxLength);
+    existing.detail = capDetail(nextDetail, options?.maxLength);
     existing.status = options?.status ?? existing.status ?? "running";
     existing.stepId = getStepIdForAgent(agent);
     existing.agentCategory = agent.category;
@@ -156,7 +290,7 @@ const upsertStreamingEvent = (
     return;
   }
 
-  pushEvent(agent, type, title, capDetail(delta, options?.maxLength), undefined, {
+  pushEvent(agent, type, title, capDetail(formatStreamingDetailForDisplay(type, delta), options?.maxLength), undefined, {
     status: options?.status ?? "running",
     itemId: options?.itemId
   });
@@ -244,15 +378,21 @@ export const reduceAgentRuntimeEvent = (agent: AgentState, event: WorkbenchTrans
       }
       agent.currentSubtask = undefined;
       if (event.itemType === "agentMessage") {
+        const displayDetail = formatAgentMessageDetailForDisplay(event.detail ?? "");
+        agent.lastMessageSnippet = capLeadingDetail(displayDetail, 240);
         if (finalizeStreamingEvent(agent, "message", "Agent message", event.detail, {
           status: event.status === "failed" ? "failed" : "completed",
           itemId: event.itemId,
           raw: event.raw,
           maxLength: 8_000
         })) {
+          const finalized = agent.events.find((entry) => entry.itemId === event.itemId && entry.type === "message");
+          if (finalized) {
+            finalized.detail = capDetail(displayDetail, 8_000);
+          }
           return agent;
         }
-        pushEvent(agent, "message", "Agent message", capDetail(event.detail ?? "", 8_000), event.raw, {
+        pushEvent(agent, "message", "Agent message", displayDetail, event.raw, {
           status: event.status === "failed" ? "failed" : "completed",
           itemId: event.itemId
         });
@@ -297,7 +437,12 @@ export const reduceAgentRuntimeEvent = (agent: AgentState, event: WorkbenchTrans
       return agent;
     }
     case "agent-message-delta":
-      agent.lastMessageSnippet = capDetail(`${agent.lastMessageSnippet ?? ""}${event.delta}`, 240);
+      if (agent.lastMessageSnippet === STRUCTURED_STREAM_PLACEHOLDER) {
+        agent.lastMessageSnippet = STRUCTURED_STREAM_PLACEHOLDER;
+      } else {
+        const nextSnippet = formatStreamingDetailForDisplay("message", `${agent.lastMessageSnippet ?? ""}${event.delta}`);
+        agent.lastMessageSnippet = capDetail(nextSnippet, 240);
+      }
       upsertStreamingEvent(agent, "message", "Agent message", event.delta, {
         status: "running",
         itemId: event.itemId,
@@ -328,7 +473,7 @@ export const reduceAgentRuntimeEvent = (agent: AgentState, event: WorkbenchTrans
     case "command-output": {
       const lastCommand = agent.commandLog.find((entry) => entry.itemId === event.itemId) ?? agent.commandLog[0];
       if (lastCommand) {
-        lastCommand.output = `${lastCommand.output}${event.delta}`.slice(-12_000);
+        lastCommand.output = capDetail(`${lastCommand.output}${event.delta}`, 12_000);
       }
       upsertStreamingEvent(agent, "command", "Command output", event.delta, {
         status: "running",
