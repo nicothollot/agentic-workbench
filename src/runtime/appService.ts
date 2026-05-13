@@ -6,7 +6,7 @@ import type { ServerNotification, ServerRequest } from "@generated/app-server";
 import type { JsonValue } from "@generated/app-server/serde_json/JsonValue";
 import type { SandboxPolicy, ToolRequestUserInputQuestion } from "@generated/app-server/v2";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, USER_INPUT_REQUESTS_PATH } from "@shared/constants";
-import { createAgentSkeleton, createLocalProjectRecord, defaultProjectCredentialsState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
+import { createAgentSkeleton, createLocalProjectRecord, defaultLocalState, defaultProjectCredentialsState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
 import { agentRoles } from "@shared/agentRoles";
 import {
   DEFAULT_AGENT_REASONING_EFFORTS,
@@ -32,6 +32,8 @@ import type {
   AgentListResponse,
   ApprovedRecommendation,
   AppSettings,
+  AutopilotPauseReason,
+  AutopilotPolicy,
   ApprovalDecision,
   ApprovalRequestRecord,
   CodexAvailability,
@@ -50,6 +52,7 @@ import type {
   OpenProjectShellResult,
   ProjectAccessProbe,
   ProjectLogFeedResponse,
+  ProjectRepositoryView,
   ProjectWorkflowState,
   ProjectLoadResult,
   RepoTreeNode,
@@ -60,21 +63,32 @@ import type {
   UltimateGoalProgressEstimate,
   UltimateGoal,
   ValidationStatus,
+  WorkflowMode,
   WorkflowStepId,
+  WorkPackage,
   WorkbenchState
 } from "@shared/types";
 import { nowIso } from "@shared/utils";
 import { calculateValidationStatus } from "@shared/validation";
 import {
+  createScopedGoalFromWorkPackage,
   createScopedGoalFromRecommendation,
   deriveWorkflowProjection,
   ensureWorkflowStepProgressState,
   getWorkflowActiveStepId,
+  getWorkflowModeConfig,
   getNextWorkflowAutomationAction,
+  getWorkflowPreviewRequest,
   hasConfirmedUltimateGoal,
   hasMeaningfulUltimateGoal,
+  isPreviewRecommendation,
   latestAgentByCategory,
-  pickAutopilotRecommendation
+  normalizeWorkflowPreviewRequest,
+  pickAutopilotRecommendation,
+  resolveEffectiveAutopilotPolicy,
+  shouldAutopilotPause,
+  validateAutopilotPolicy,
+  workPackageRequiresModelScoping
 } from "@shared/workflow";
 import { buildDeterministicFileSummary, buildDeterministicOverview } from "./fileSummary";
 import {
@@ -122,6 +136,7 @@ import {
 import { hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult } from "./repoScanner";
 import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
 import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
+import { sanitizeWorkflowState } from "./stateSanitizer";
 import { readUltimateGoalTextImport } from "./ultimateGoalImport";
 import { buildProjectShellHandoffPrompt, openProjectShellWindow } from "./projectShell";
 import {
@@ -135,6 +150,7 @@ import {
   assessUltimateGoalCompletion,
   applyGoalChecklistUpdates,
   buildAppealRecommendations,
+  buildChecklistWorkPackages,
   buildChecklistTaskMap,
   buildChecklistTaskMapBrief,
   buildGoalChecklistForAssessment,
@@ -178,15 +194,25 @@ const MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH = 1_200;
 const MAX_PROMPT_DETAIL_LENGTH = 280;
 const MAX_RECOMMENDATION_PROMPT_DETAIL_LENGTH = 180;
 const MAX_RECOMMENDATION_PROMPT_CHECKLIST_ITEMS = 14;
-const RENDERER_AGENT_EVENT_PREVIEW_LIMIT = 6;
-const RENDERER_AGENT_COMMAND_PREVIEW_LIMIT = 2;
-const RENDERER_AGENT_DETAIL_EVENT_LIMIT = 250;
-const RENDERER_AGENT_DETAIL_COMMAND_LIMIT = 80;
-const RENDERER_COMMAND_TEXT_LIMIT = 8_000;
-const RENDERER_COMMAND_OUTPUT_LIMIT = 12_000;
-const STATE_EMIT_THROTTLE_MS = 100;
+const RENDERER_AGENT_EVENT_PREVIEW_LIMIT = 3;
+const RENDERER_AGENT_COMMAND_PREVIEW_LIMIT = 1;
+const RENDERER_RECENT_AGENT_PREVIEW_LIMIT = 30;
+const RENDERER_AGENT_DETAIL_EVENT_LIMIT = 40;
+const RENDERER_AGENT_DETAIL_COMMAND_LIMIT = 8;
+const RENDERER_COMMAND_TEXT_LIMIT = 4_000;
+const RENDERER_COMMAND_OUTPUT_LIMIT = 6_000;
+const RENDERER_RAW_EVENT_LIMIT = 4_000;
+const RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT = 32;
+const RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT = 8;
+const STATE_EMIT_THROTTLE_MS = 350;
 const LIVE_PROJECT_SAVE_THROTTLE_MS = 750;
+const WORKFLOW_AUTOMATION_SCHEDULE_DELAY_MS = 150;
+const WSL_WINDOWS_MOUNT_PATH = /^\/mnt\/[a-z](?:\/|$)/i;
 const liveTransportUpdateMethods = new Set<string>([
+  "thread/tokenUsage/updated",
+  "turn/plan/updated",
+  "rawResponseItem/completed",
+  "item/reasoning/summaryPartAdded",
   "item/agentMessage/delta",
   "item/plan/delta",
   "item/reasoning/summaryTextDelta",
@@ -195,12 +221,65 @@ const liveTransportUpdateMethods = new Set<string>([
   "item/commandExecution/outputDelta",
   "item/fileChange/outputDelta"
 ]);
+const workflowActivitySuppressedTransportMethods = new Set<string>([
+  "thread/tokenUsage/updated",
+  "turn/plan/updated",
+  "rawResponseItem/completed",
+  "item/reasoning/summaryPartAdded"
+]);
+const ignoredRendererUpdateMethods = new Set<string>([
+  "thread/tokenUsage/updated",
+  "item/reasoning/summaryPartAdded"
+]);
+const immediateTransportFlushMethods = new Set<string>([
+  "turn/completed",
+  "error"
+]);
 
 const compactText = (value: string, maxLength: number): string => {
   const normalized = value.trim().replace(/\s+/g, " ");
   return normalized.length <= maxLength
     ? normalized
     : `${normalized.slice(0, Math.max(0, maxLength - 24)).trimEnd()}...[truncated]`;
+};
+
+const compactRawForRenderer = (value: unknown): unknown => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    return compactText(value, RENDERER_RAW_EVENT_LIMIT);
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return compactText(String(value), RENDERER_RAW_EVENT_LIMIT);
+  }
+  try {
+    return compactText(JSON.stringify(value), RENDERER_RAW_EVENT_LIMIT);
+  } catch (error) {
+    return compactText(error instanceof Error ? error.message : "Unserializable raw event", RENDERER_RAW_EVENT_LIMIT);
+  }
+};
+
+const compactRepoTreePreview = (nodes: RepoTreeNode[]): RepoTreeNode[] => {
+  const compactNode = (node: RepoTreeNode, depth: number): RepoTreeNode => {
+    const preview: RepoTreeNode = {
+      path: node.path,
+      name: node.name,
+      type: node.type,
+      size: node.size,
+      language: node.language
+    };
+    if (node.type === "directory" && node.children && depth === 0) {
+      preview.children = node.children
+        .slice(0, RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT)
+        .map((child) => compactNode(child, depth + 1));
+    }
+    return preview;
+  };
+
+  return nodes
+    .slice(0, RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT)
+    .map((node) => compactNode(node, 0));
 };
 
 interface AgentCredentialCapture {
@@ -270,9 +349,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly interfaceCreationRepairAttempts = new Map<string, number>();
   private readonly workflowAutomationInFlight = new Set<string>();
   private readonly workflowAutomationQueued = new Set<string>();
+  private readonly workflowAutomationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly workflowRecoveryInFlight = new Set<string>();
   private pendingStateEmitTimer?: ReturnType<typeof setTimeout>;
   private readonly pendingProjectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private suppressTransportExitHandling = false;
+  private transportInitialization?: Promise<void>;
+  private readonly debugWorkflowPerf = process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
+  private readonly workflowPerfCounters = new Map<string, { count: number; startedAt: number; lastLoggedAt: number }>();
 
   constructor(
     private readonly appDataDir: string,
@@ -282,6 +366,52 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.storage = new WorkbenchStorage(appDataDir, secretCodec);
   }
 
+  private logWorkflowPerf(message: string): void {
+    if (this.debugWorkflowPerf) {
+      console.info(`[workflow-perf] ${message}`);
+    }
+  }
+
+  private recordWorkflowPerfCounter(name: string, detail?: string): void {
+    if (!this.debugWorkflowPerf) {
+      return;
+    }
+
+    const now = performance.now();
+    const counter = this.workflowPerfCounters.get(name) ?? { count: 0, startedAt: now, lastLoggedAt: now };
+    counter.count += 1;
+    if (now - counter.lastLoggedAt >= 1_000) {
+      const elapsedSeconds = Math.max(0.001, (now - counter.startedAt) / 1_000);
+      this.logWorkflowPerf(`${name}: ${counter.count} total, ${(counter.count / elapsedSeconds).toFixed(1)}/s${detail ? `, ${detail}` : ""}`);
+      counter.lastLoggedAt = now;
+    }
+    this.workflowPerfCounters.set(name, counter);
+  }
+
+  private getRendererStateForEmit(label: string): WorkbenchState {
+    const startedAt = performance.now();
+    const state = this.getRendererState();
+    if (this.debugWorkflowPerf) {
+      let payloadSize = 0;
+      try {
+        payloadSize = JSON.stringify(state).length;
+      } catch {
+        payloadSize = -1;
+      }
+      this.logWorkflowPerf(`${label}: renderer payload ${payloadSize} bytes in ${Math.round(performance.now() - startedAt)}ms`);
+    }
+    return state;
+  }
+
+  private emitStateNow(label = "state emit"): void {
+    if (this.pendingStateEmitTimer) {
+      clearTimeout(this.pendingStateEmitTimer);
+      this.pendingStateEmitTimer = undefined;
+    }
+    this.recordWorkflowPerfCounter("state emits");
+    this.emit("stateChanged", this.getRendererStateForEmit(label));
+  }
+
   private emitState(): void {
     if (this.pendingStateEmitTimer) {
       return;
@@ -289,13 +419,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     this.pendingStateEmitTimer = setTimeout(() => {
       this.pendingStateEmitTimer = undefined;
-      this.emit("stateChanged", this.getRendererState());
+      this.recordWorkflowPerfCounter("state emits");
+      this.emit("stateChanged", this.getRendererStateForEmit("coalesced state emit"));
     }, STATE_EMIT_THROTTLE_MS);
     this.pendingStateEmitTimer.unref?.();
   }
 
   private scheduleProjectSave(project: LoadedProject): void {
     const projectId = project.record.id;
+    this.recordWorkflowPerfCounter("project save schedules", project.record.identity.projectName);
     if (this.pendingProjectSaveTimers.has(projectId)) {
       return;
     }
@@ -310,6 +442,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }, LIVE_PROJECT_SAVE_THROTTLE_MS);
     timer.unref?.();
     this.pendingProjectSaveTimers.set(projectId, timer);
+  }
+
+  private flushProjectSaveNow(project: LoadedProject, reason: string): void {
+    const projectId = project.record.id;
+    const timer = this.pendingProjectSaveTimers.get(projectId);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingProjectSaveTimers.delete(projectId);
+    }
+    const startedAt = performance.now();
+    void this.saveProject(project)
+      .then(() => {
+        this.logWorkflowPerf(`${reason}: saved ${project.record.identity.projectName} in ${Math.round(performance.now() - startedAt)}ms`);
+      })
+      .catch((error) => {
+        this.diagnostics.unshift(
+          `Failed to save project checkpoint for ${project.record.identity.projectName}. ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
   }
 
   private async flushScheduledProjectSaves(): Promise<void> {
@@ -387,6 +538,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ...defaultProjectWorkflowState(),
         ...record.workflow
       },
+      localState: {
+        ...defaultLocalState(),
+        ...record.localState
+      },
       userInputRequests: record.userInputRequests ?? [],
       credentials: {
         ...defaultProjectCredentialsState(),
@@ -422,6 +577,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ...defaults.workflowBudgets,
       ...workflow.workflowBudgets
     };
+    workflow.workflowMode = workflow.workflowMode === "fast" ? "fast" : defaults.workflowMode;
+    workflow.previewRequest = normalizeWorkflowPreviewRequest(workflow.previewRequest ?? defaults.previewRequest);
+    workflow.autopilotPolicy = validateAutopilotPolicy({
+      ...workflow.autopilotPolicy,
+      enabled: Boolean(workflow.autopilotPolicy?.enabled || record.localState.autopilotEnabled)
+    }, record.localState.autopilotEnabled);
+    record.localState.autopilotEnabled = workflow.autopilotPolicy.enabled;
     workflow.memory = {
       ...defaults.memory,
       ...workflow.memory,
@@ -446,6 +608,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ? buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, workflow.goalChecklist ?? [])
       : workflow.goalChecklist ?? [];
     workflow.taskMap ??= defaults.taskMap;
+    workflow.workPackages ??= defaults.workPackages;
     record.userInputRequests ??= [];
     record.credentials = {
       ...defaultProjectCredentialsState(),
@@ -478,7 +641,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (this.settings.considerPaidServices) {
       return [
         "External service policy: free/no-card APIs and API keys are allowed when they materially improve required functionality.",
-        "When a credential is needed, implement the provider adapter plus demo/mock and missing-credential states, then request the credential through the user-input/API Keys flow with the secret field marked secret.",
+        "When a credential is needed, implement the provider adapter plus demo/mock and missing-credential states, then request the credential through the user-input/Credentials flow with the secret field marked secret.",
         "Paid services may be considered, but mark them clearly and keep a free/demo/mock path available when practical. Never create billing commitments automatically. Any paid account, billing, or credit-card step must become an explicit user-visible request."
       ].join(" ");
     }
@@ -486,7 +649,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return [
       "External service policy: free/no-card APIs and API keys are allowed when they materially improve required functionality.",
       "Prefer no-key, unauthenticated, open-data, demo, or free-tier providers when they fit, but do not avoid a real API solely because it needs a free/no-card key.",
-      "If a free/no-card credential is needed, implement the provider adapter plus demo/mock and missing-credential states, then request the credential through the user-input/API Keys flow with the secret field marked secret.",
+      "If a free/no-card credential is needed, implement the provider adapter plus demo/mock and missing-credential states, then request the credential through the user-input/Credentials flow with the secret field marked secret.",
       "Do not require paid API services, subscription plans, billing setup, or credit-card-backed keys."
     ].join(" ");
   }
@@ -522,15 +685,107 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow: ProjectWorkflowState,
     entry: Omit<ProjectWorkflowState["activityLog"][number], "id" | "timestamp">
   ): void {
+    const timestamp = nowIso();
+    const detail = entry.detail ? compactText(entry.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : entry.detail;
+    const previous = workflow.activityLog[0];
+    if (
+      previous?.source === entry.source &&
+      previous.status === entry.status &&
+      previous.title === entry.title &&
+      previous.detail === detail &&
+      previous.stepId === entry.stepId &&
+      previous.agentId === entry.agentId &&
+      previous.agentCategory === entry.agentCategory
+    ) {
+      previous.timestamp = timestamp;
+      return;
+    }
+
     workflow.activityLog.unshift({
       id: nanoid(),
-      timestamp: nowIso(),
+      timestamp,
       ...entry,
-      detail: entry.detail ? compactText(entry.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : entry.detail
+      detail
     });
     if (workflow.activityLog.length > 400) {
       workflow.activityLog.length = 400;
     }
+  }
+
+  private updateAutopilotRuntimeStatus(
+    project: LoadedProject,
+    patch: {
+      nextPlannedAction?: string;
+      lastCompletedAction?: string;
+      recommendation?: ProjectWorkflowState["recommendations"][number];
+      pause?: {
+        reason?: AutopilotPauseReason;
+        detail?: string;
+        highRiskPackageRequiresApproval: boolean;
+      };
+    } = {}
+  ): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    const policy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    const recommendation = patch.recommendation ?? workflow.approvedRecommendation;
+    const recommendationId = recommendation
+      ? "recommendationId" in recommendation && typeof recommendation.recommendationId === "string"
+        ? recommendation.recommendationId
+        : recommendation.id
+      : undefined;
+    const nextStatus = {
+      enabled: policy.enabled,
+      profile: policy.profile,
+      workflowMode: workflow.workflowMode,
+      stage: workflow.workflowStage,
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      currentRecommendationId: recommendationId,
+      currentRecommendationTitle: recommendation?.title,
+      lastCompletedAction: patch.lastCompletedAction ?? workflow.autopilotStatus?.lastCompletedAction,
+      nextPlannedAction: patch.nextPlannedAction,
+      pausedReason: patch.pause?.reason,
+      pausedDetail: patch.pause?.detail,
+      highRiskPackageRequiresApproval: patch.pause?.highRiskPackageRequiresApproval ?? false,
+      updatedAt: workflow.autopilotStatus?.updatedAt ?? nowIso()
+    } satisfies NonNullable<ProjectWorkflowState["autopilotStatus"]>;
+    const previousComparable = workflow.autopilotStatus ? {
+      ...workflow.autopilotStatus,
+      updatedAt: ""
+    } : undefined;
+    const nextComparable = {
+      ...nextStatus,
+      updatedAt: ""
+    };
+    if (JSON.stringify(previousComparable) === JSON.stringify(nextComparable)) {
+      return false;
+    }
+    workflow.autopilotStatus = {
+      ...nextStatus,
+      updatedAt: nowIso()
+    };
+    return true;
+  }
+
+  private recordAutopilotPause(
+    workflow: ProjectWorkflowState,
+    reason: AutopilotPauseReason | undefined,
+    detail?: string
+  ): void {
+    if (!reason || reason === "disabled" || reason === "manual_pause_requested") {
+      return;
+    }
+    const previous = workflow.activityLog[0];
+    const title = "Autopilot paused";
+    if (previous?.title === title && previous.detail === detail) {
+      return;
+    }
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title,
+      detail: detail ?? reason.replace(/_/g, " "),
+      stepId: getWorkflowActiveStepId(workflow)
+    });
   }
 
   private mirrorLatestAgentEventToWorkflow(workflow: ProjectWorkflowState, agent: AgentState): void {
@@ -540,6 +795,26 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const previous = workflow.activityLog[0];
+    if (latestEvent.type === "message" && latestEvent.status === "running") {
+      const existingIndex = workflow.activityLog.findIndex((entry) =>
+        entry.source === "agent" &&
+        entry.agentId === agent.id &&
+        entry.title === latestEvent.title &&
+        entry.status === latestEvent.status
+      );
+      if (existingIndex >= 0) {
+        const [existing] = workflow.activityLog.splice(existingIndex, 1);
+        workflow.activityLog.unshift({
+          ...existing,
+          timestamp: latestEvent.timestamp,
+          detail: latestEvent.detail ? compactText(latestEvent.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : latestEvent.detail,
+          stepId: latestEvent.stepId,
+          agentCategory: agent.category
+        });
+        return;
+      }
+    }
+
     if (
       previous?.agentId === agent.id &&
       previous.title === latestEvent.title &&
@@ -749,6 +1024,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const timestamp = nowIso();
     const nextStatus = options?.status ?? patch.status ?? step.status;
     const enteringRunning = nextStatus === "running" && step.status !== "running";
+    const enteringStartup =
+      (nextStatus === "recovering" || nextStatus === "starting") &&
+      step.status !== "recovering" &&
+      step.status !== "starting";
 
     Object.assign(step, patch);
     step.status = nextStatus;
@@ -762,6 +1041,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         step.runCount += 1;
       }
       if (enteringRunning && options?.incrementAttemptCount) {
+        step.attemptCount += 1;
+      }
+    }
+
+    if (nextStatus === "recovering" || nextStatus === "starting") {
+      step.startedAt ??= timestamp;
+      step.completedAt = undefined;
+      if (enteringStartup && options?.incrementAttemptCount) {
         step.attemptCount += 1;
       }
     }
@@ -882,14 +1169,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     relatedPaths: string[] = []
   ): string {
     const workflow = this.ensureWorkflowState(project.record);
+    const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
     const selections = selectRelevantWorkflowContext(workflow.memory.contextDescriptors, {
       workflow,
       agentCategory,
       taskText,
       relatedPaths
     }, {
-      maxEntries: 5,
-      maxChars: 2600
+      maxEntries: modeConfig.contextEntries,
+      maxChars: modeConfig.contextCharBudget
     });
     workflow.memory.lastRelevantContext = selections;
     return formatRelevantContextForPrompt(selections);
@@ -1014,6 +1302,42 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         message: intervention?.title ?? "Human action is required before the workflow can continue."
       }, { status: "blocked" });
     }
+    const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    const nextAutopilotAction = getNextWorkflowAutomationAction(
+      workflow,
+      project.record.agents,
+      project.scan.kind,
+      autopilotPolicy,
+      project.record.localState.workflowPauseRequested,
+      project.record.localState.workflowObjective
+    );
+    const autopilotRecommendation = nextAutopilotAction === "approve_recommendation"
+      ? pickAutopilotRecommendation(workflow.recommendations, workflow)
+      : undefined;
+    const autopilotPause = shouldAutopilotPause({
+      workflow,
+      agents: project.record.agents,
+      projectKind: project.scan.kind,
+      workflowObjective: project.record.localState.workflowObjective,
+      workflowPauseRequested: project.record.localState.workflowPauseRequested,
+      projectAccessStatus: project.record.validation.projectAccess?.status ?? "unknown",
+      nextAction: nextAutopilotAction,
+      recommendation: autopilotRecommendation,
+      previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
+    }, autopilotPolicy);
+    this.updateAutopilotRuntimeStatus(project, {
+      nextPlannedAction: nextAutopilotAction ?? undefined,
+      recommendation: autopilotRecommendation,
+      pause: autopilotPause.shouldPause
+        ? {
+          reason: autopilotPause.reason,
+          detail: autopilotPause.detail,
+          highRiskPackageRequiresApproval: autopilotPause.highRiskPackageRequiresApproval
+        }
+        : {
+          highRiskPackageRequiresApproval: autopilotPause.highRiskPackageRequiresApproval
+        }
+    });
     this.refreshWorkflowMemory(workflow);
   }
 
@@ -1215,6 +1539,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private markCompletedCycleGoalCheckEvidence(project: LoadedProject, timestamp: string): void {
     const workflow = this.ensureWorkflowState(project.record);
+    if (getWorkflowPreviewRequest(workflow).status === "active" && isPreviewRecommendation(workflow.approvedRecommendation)) {
+      return;
+    }
     const targetCheck = this.findCompletedCycleTargetGoalCheck(project, timestamp);
     if (!targetCheck) {
       return;
@@ -1237,7 +1564,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         evidence,
         relatedPaths: workflow.approvedRecommendation?.relatedPaths ?? []
       }],
-      { timestamp }
+      { timestamp, ultimateGoal: workflow.ultimateGoal, cycleNumber: workflow.workflowCycle.cycleNumber }
     );
     this.refreshWorkflowTaskMap(project, timestamp);
     this.recordWorkflowActivity(workflow, {
@@ -1251,7 +1578,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private refreshWorkflowTaskMap(project: LoadedProject, timestamp = nowIso()): void {
     const workflow = this.ensureWorkflowState(project.record);
-    workflow.taskMap = buildChecklistTaskMap(this.buildWorkflowRecommendationContext(project), timestamp);
+    const context = this.buildWorkflowRecommendationContext(project);
+    workflow.taskMap = buildChecklistTaskMap(context, timestamp);
+    workflow.workPackages = buildChecklistWorkPackages(context);
   }
 
   private refreshUltimateGoalAssessment(project: LoadedProject, timestamp = nowIso()): void {
@@ -1376,7 +1705,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       stepId: WorkflowStepId,
       patch: Partial<ProjectWorkflowState["stepProgress"][WorkflowStepId]>
     ): void => {
-      if (workflow.stepProgress[stepId].status !== "running" || this.hasActiveWorkflowAgentForStep(project, stepId)) {
+      const status = workflow.stepProgress[stepId].status;
+      if (
+        (status !== "running" && status !== "recovering" && status !== "starting") ||
+        this.hasActiveWorkflowAgentForStep(project, stepId)
+      ) {
         return;
       }
       this.resetWorkflowStepProgress(workflow, stepId, {
@@ -1512,6 +1845,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
     this.markCompletedCycleGoalCheckEvidence(project, completedAt);
     this.refreshUltimateGoalAssessment(project, completedAt);
+    this.markWorkflowPreviewReady(project, completedAt);
     this.updateWorkflowStepProgress(workflow, "merge", {
       requiresUserInput: false,
       currentActivity: "Cycle complete",
@@ -1530,20 +1864,140 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private async persistProjectUpdate(project: LoadedProject, automate = false): Promise<void> {
     await this.saveProject(project);
     this.emitState();
-    if (automate) {
+    if (automate && !this.workflowAutomationInFlight.has(project.record.id)) {
       this.scheduleWorkflowAutomation(project.record.id);
     }
   }
 
   private scheduleWorkflowAutomation(projectId: string): void {
-    if (this.workflowAutomationInFlight.has(projectId)) {
+    if (this.workflowAutomationInFlight.has(projectId) || this.workflowAutomationInFlight.size > 0) {
       this.workflowAutomationQueued.add(projectId);
       return;
     }
+    if (this.workflowAutomationTimers.has(projectId)) {
+      return;
+    }
 
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      this.workflowAutomationTimers.delete(projectId);
       void this.runWorkflowAutomation(projectId);
-    }, 0);
+    }, WORKFLOW_AUTOMATION_SCHEDULE_DELAY_MS);
+    this.workflowAutomationTimers.set(projectId, timer);
+    timer.unref?.();
+  }
+
+  private cancelScheduledWorkflowAutomation(projectId: string): void {
+    const timer = this.workflowAutomationTimers.get(projectId);
+    if (timer) {
+      clearTimeout(timer);
+      this.workflowAutomationTimers.delete(projectId);
+    }
+    this.workflowAutomationQueued.delete(projectId);
+  }
+
+  private getNextAutomationActionForProject(project: LoadedProject): ReturnType<typeof getNextWorkflowAutomationAction> {
+    const workflow = this.ensureWorkflowState(project.record);
+    return getNextWorkflowAutomationAction(
+      workflow,
+      project.record.agents,
+      project.scan.kind,
+      resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled),
+      project.record.localState.workflowPauseRequested,
+      project.record.localState.workflowObjective
+    );
+  }
+
+  private getWorkflowStepIdForAutomationAction(action: ReturnType<typeof getNextWorkflowAutomationAction>): WorkflowStepId | undefined {
+    switch (action) {
+      case "generate_recommendations":
+      case "approve_recommendation":
+        return "recommendation";
+      case "create_scoped_goal":
+        return "goal_plan";
+      case "start_coding":
+      case "repair_coding":
+        return "coding";
+      case "run_integrity":
+        return "integrity";
+      case "run_merge":
+      case "finalize_cycle":
+        return "merge";
+      default:
+        return undefined;
+    }
+  }
+
+  private workflowStartupMessageForAction(action: ReturnType<typeof getNextWorkflowAutomationAction>): string {
+    switch (action) {
+      case "generate_recommendations":
+        return "Preparing the recommendation agent.";
+      case "approve_recommendation":
+        return "Preparing the saved recommendation decision.";
+      case "create_scoped_goal":
+        return "Preparing the goal planning agent.";
+      case "start_coding":
+        return "Preparing the coding agent and worktree.";
+      case "repair_coding":
+        return "Preparing the repair coding agent and worktree.";
+      case "run_integrity":
+        return "Preparing deterministic validation.";
+      case "run_merge":
+        return "Preparing merge and integration.";
+      case "finalize_cycle":
+        return "Preparing cycle finalization.";
+      default:
+        return "Preparing the next workflow step.";
+    }
+  }
+
+  private markWorkflowStartupProgress(
+    project: LoadedProject,
+    status: "recovering" | "starting",
+    message: string,
+    stepIdOverride?: WorkflowStepId
+  ): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    const action = this.getNextAutomationActionForProject(project);
+    const stepId = stepIdOverride ?? this.getWorkflowStepIdForAutomationAction(action) ?? getWorkflowActiveStepId(workflow);
+    if (status === "starting") {
+      for (const [candidateStepId, progress] of Object.entries(workflow.stepProgress) as Array<[WorkflowStepId, ProjectWorkflowState["stepProgress"][WorkflowStepId]]>) {
+        if (progress.status === "recovering") {
+          this.updateWorkflowStepProgress(workflow, candidateStepId, {
+            currentActivity: "Recovery complete",
+            message: "The next workflow step is starting.",
+            warning: undefined
+          }, { status: "waiting" });
+        }
+      }
+    }
+    this.updateWorkflowStepProgress(workflow, stepId, {
+      requiresUserInput: false,
+      currentActivity: status === "recovering" ? "Recovering workflow state" : "Starting workflow agent",
+      currentSubstep: this.workflowStartupMessageForAction(action),
+      message,
+      warning: undefined
+    }, { status });
+  }
+
+  private isWindowsMountedWslProject(project: LoadedProject): boolean {
+    return this.settings.executionMode === "wsl" && WSL_WINDOWS_MOUNT_PATH.test(project.record.projectRoot);
+  }
+
+  private recordWindowsMountWarningIfNeeded(project: LoadedProject): void {
+    if (!this.isWindowsMountedWslProject(project)) {
+      return;
+    }
+    const workflow = this.ensureWorkflowState(project.record);
+    if (workflow.activityLog.some((event) => event.title === "Windows-mounted WSL project path detected")) {
+      return;
+    }
+    this.recordWorkflowActivity(workflow, {
+      source: "system",
+      status: "waiting",
+      title: "Windows-mounted WSL project path detected",
+      detail: "This workflow is running from /mnt/*. WSL Git and file IO can be much slower there; startup may take longer.",
+      stepId: getWorkflowActiveStepId(workflow)
+    });
   }
 
   private async runWorkflowAutomation(projectId: string): Promise<void> {
@@ -1554,22 +2008,84 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     this.workflowAutomationInFlight.add(projectId);
     try {
-      for (let guard = 0; guard < 12; guard += 1) {
+      let automaticActionsThisPass = 0;
+      let completedCyclesThisPass = 0;
+      for (;;) {
         const project = this.projects.get(projectId);
         if (!project) {
           return;
         }
 
         this.syncWorkflowState(project);
+        if (this.prepareQueuedWorkflowPreviewForRecommendation(project)) {
+          await this.saveProject(project);
+          this.emitState();
+        }
         const workflow = this.ensureWorkflowState(project.record);
+        const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+        if (automaticActionsThisPass >= autopilotPolicy.maxAutomaticActionsPerPass) {
+          this.updateAutopilotRuntimeStatus(project);
+          await this.saveProject(project);
+          this.emitState();
+          break;
+        }
+        if (
+          autopilotPolicy.maxConsecutiveCycles !== undefined &&
+          completedCyclesThisPass >= autopilotPolicy.maxConsecutiveCycles
+        ) {
+          project.record.localState.workflowPauseRequested = true;
+          const pause = {
+            reason: "max_consecutive_cycles" as const,
+            detail: `Autopilot reached the ${autopilotPolicy.maxConsecutiveCycles} cycle policy checkpoint.`,
+            highRiskPackageRequiresApproval: false
+          };
+          this.updateAutopilotRuntimeStatus(project, { pause });
+          this.recordAutopilotPause(workflow, pause.reason, pause.detail);
+          await this.saveProject(project);
+          this.emitState();
+          break;
+        }
         const action = getNextWorkflowAutomationAction(
           workflow,
           project.record.agents,
           project.scan.kind,
-          project.record.localState.autopilotEnabled,
+          autopilotPolicy,
           project.record.localState.workflowPauseRequested,
           project.record.localState.workflowObjective
         );
+        const recommendation = action === "approve_recommendation"
+          ? pickAutopilotRecommendation(workflow.recommendations, workflow)
+          : undefined;
+        const pauseDecision = shouldAutopilotPause({
+          workflow,
+          agents: project.record.agents,
+          projectKind: project.scan.kind,
+          workflowObjective: project.record.localState.workflowObjective,
+          workflowPauseRequested: project.record.localState.workflowPauseRequested,
+          projectAccessStatus: project.record.validation.projectAccess?.status ?? "unknown",
+          nextAction: action,
+          recommendation,
+          previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
+        }, autopilotPolicy);
+        this.updateAutopilotRuntimeStatus(project, {
+          nextPlannedAction: action ?? undefined,
+          recommendation,
+          pause: pauseDecision.shouldPause
+            ? {
+              reason: pauseDecision.reason,
+              detail: pauseDecision.detail,
+              highRiskPackageRequiresApproval: pauseDecision.highRiskPackageRequiresApproval
+            }
+            : {
+              highRiskPackageRequiresApproval: pauseDecision.highRiskPackageRequiresApproval
+            }
+        });
+        if (pauseDecision.shouldPause) {
+          this.recordAutopilotPause(workflow, pauseDecision.reason, pauseDecision.detail);
+          await this.saveProject(project);
+          this.emitState();
+          break;
+        }
         if (!action) {
           break;
         }
@@ -1579,7 +2095,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             await this.runRecommendation(projectId, true);
             break;
           case "approve_recommendation": {
-            const recommendation = pickAutopilotRecommendation(workflow.recommendations, workflow);
             if (!recommendation) {
               break;
             }
@@ -1605,6 +2120,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             break;
           }
         }
+        automaticActionsThisPass += 1;
+        if (action === "finalize_cycle") {
+          completedCyclesThisPass += 1;
+        }
+        const updatedProject = this.projects.get(projectId);
+        if (updatedProject) {
+          this.updateAutopilotRuntimeStatus(updatedProject, { lastCompletedAction: action });
+          await this.saveProject(updatedProject);
+          this.emitState();
+        }
 
         // Yield between automatic steps so UI state transitions remain observable
         // and pause requests can take effect before the next step starts.
@@ -1618,8 +2143,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.emitState();
     } finally {
       this.workflowAutomationInFlight.delete(projectId);
-      if (this.workflowAutomationQueued.delete(projectId)) {
-        this.scheduleWorkflowAutomation(projectId);
+      const rerunCurrentProject = this.workflowAutomationQueued.delete(projectId);
+      const nextQueuedProjectId = rerunCurrentProject
+        ? projectId
+        : this.workflowAutomationQueued.values().next().value;
+      if (nextQueuedProjectId) {
+        this.workflowAutomationQueued.delete(nextQueuedProjectId);
+        this.scheduleWorkflowAutomation(nextQueuedProjectId);
       }
     }
   }
@@ -2158,13 +2688,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
-  private compactRendererAgent(agent: AgentState, options?: { detail?: boolean }): AgentState {
-    const eventLimit = options?.detail ? RENDERER_AGENT_DETAIL_EVENT_LIMIT : RENDERER_AGENT_EVENT_PREVIEW_LIMIT;
-    const commandLimit = options?.detail ? RENDERER_AGENT_DETAIL_COMMAND_LIMIT : RENDERER_AGENT_COMMAND_PREVIEW_LIMIT;
+  private compactRendererAgent(agent: AgentState, options?: { detail?: boolean; summaryOnly?: boolean }): AgentState {
+    const eventLimit = options?.summaryOnly
+      ? 0
+      : options?.detail
+        ? RENDERER_AGENT_DETAIL_EVENT_LIMIT
+        : RENDERER_AGENT_EVENT_PREVIEW_LIMIT;
+    const commandLimit = options?.summaryOnly
+      ? 0
+      : options?.detail
+        ? RENDERER_AGENT_DETAIL_COMMAND_LIMIT
+        : RENDERER_AGENT_COMMAND_PREVIEW_LIMIT;
 
     return {
       ...agent,
-      taskPrompt: options?.detail ? compactText(agent.taskPrompt, 12_000) : compactText(agent.taskPrompt, 1_200),
+      taskPrompt: options?.summaryOnly
+        ? compactText(agent.taskPrompt, 240)
+        : options?.detail
+          ? compactText(agent.taskPrompt, 12_000)
+          : compactText(agent.taskPrompt, 1_200),
       commandLog: agent.commandLog.slice(0, commandLimit).map((command) => ({
         ...command,
         command: command.command.length > RENDERER_COMMAND_TEXT_LIMIT
@@ -2177,31 +2719,74 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       events: agent.events.slice(0, eventLimit).map((event) => ({
         ...event,
         detail: event.detail ? compactText(event.detail, options?.detail ? 8_000 : 800) : event.detail,
-        raw: options?.detail ? event.raw : undefined
+        raw: options?.detail ? compactRawForRenderer(event.raw) : undefined
       }))
     };
   }
 
-  private compactRendererProjectRecord(record: LocalProjectRecord): LocalProjectRecord {
+  private compactRendererProjectRecord(record: LocalProjectRecord, options?: { inactive?: boolean }): LocalProjectRecord {
+    if (options?.inactive) {
+      const workflow = sanitizeWorkflowState(record.workflow, undefined, { renderer: true });
+      return {
+        ...record,
+        agents: [],
+        summaryCache: [],
+        dependencies: [],
+        credentials: {
+          ...record.credentials,
+          entries: [],
+          requests: record.credentials.requests.filter((request) => request.status === "pending").slice(0, 3)
+        },
+        userInputRequests: record.userInputRequests.filter((request) => request.status === "pending").slice(0, 3),
+        workflow: {
+          ...workflow,
+          recommendations: [],
+          goalChecklist: [],
+          activityLog: [],
+          memory: {
+            ...record.workflow.memory,
+            perCycleSummaries: [],
+            lastAcceptedDecisions: [],
+            knownOpenIssues: [],
+            contextDescriptors: [],
+            lastRelevantContext: []
+          }
+        }
+      };
+    }
+
+    const previewAgents = this.sortAgentsForHistory(record.agents)
+      .filter((agent, index) =>
+        index < RENDERER_RECENT_AGENT_PREVIEW_LIMIT ||
+        isAgentActive(agent) ||
+        agent.approvals.some((approval) => approval.status === "pending")
+      );
+    const previewAgentIds = new Set(previewAgents.map((agent) => agent.id));
+
     return {
       ...record,
-      agents: record.agents.map((agent) => this.compactRendererAgent(agent)),
-      workflow: {
+      dependencies: record.dependencies.slice(0, 80),
+      summaryCache: record.summaryCache.slice(0, 80),
+      agents: previewAgents.map((agent) => this.compactRendererAgent(agent, {
+        summaryOnly: !previewAgentIds.has(agent.id)
+      })),
+      workflow: sanitizeWorkflowState({
         ...record.workflow,
-        activityLog: record.workflow.activityLog.slice(0, 120).map((event) => ({
+        activityLog: record.workflow.activityLog.slice(0, 80).map((event) => ({
           ...event,
           detail: event.detail ? compactText(event.detail, MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH) : event.detail
         }))
-      }
+      }, undefined, { renderer: true })
     };
   }
 
   private toRendererLoadedProjectView(project: LoadedProject): LoadedProjectView {
+    const inactive = project.record.id !== this.activeProjectId;
     return {
-      record: this.compactRendererProjectRecord(project.record),
-      tree: project.tree,
+      record: this.compactRendererProjectRecord(project.record, { inactive }),
+      tree: compactRepoTreePreview(project.tree),
       validationStatus: project.record.validation.lastValidatedAt ? "exact" : "unvalidated",
-      candidates: project.candidates
+      candidates: []
     };
   }
 
@@ -2254,8 +2839,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     await this.refreshGitHubStatus(false);
-    await this.updateCodexCliOnStartup();
-    await this.initializeTransport();
+    if (this.settings.mockMode) {
+      await this.initializeTransport();
+    } else {
+      this.codexAvailability = {
+        source: "unavailable",
+        message: "Codex app-server will start when an agent-backed action runs."
+      };
+    }
 
     const records = await this.storage.loadAllProjects();
     for (const storedRecord of records) {
@@ -2338,11 +2929,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   async dispose(): Promise<void> {
     this.threadToAgent.clear();
     this.interfaceCreationRepairAttempts.clear();
+    this.workflowRecoveryInFlight.clear();
     if (this.pendingStateEmitTimer) {
       clearTimeout(this.pendingStateEmitTimer);
       this.pendingStateEmitTimer = undefined;
     }
     await this.flushScheduledProjectSaves();
+    for (const project of this.projects.values()) {
+      await this.saveProject(project);
+    }
     if (!this.transport) {
       return;
     }
@@ -2360,6 +2955,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private async initializeTransport(): Promise<void> {
+    if (this.transport && this.codexAvailability.source !== "unavailable") {
+      return;
+    }
+    if (this.transportInitialization) {
+      await this.transportInitialization;
+      return;
+    }
+
+    this.transportInitialization = this.initializeTransportNow();
+    try {
+      await this.transportInitialization;
+    } finally {
+      this.transportInitialization = undefined;
+    }
+  }
+
+  private async initializeTransportNow(): Promise<void> {
     if (this.settings.mockMode) {
       this.transport = new MockCodexTransport();
       this.attachTransportListeners(this.transport);
@@ -2712,12 +3324,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     project.gitMetadata = scannedProject.gitMetadata;
   }
 
-  private toLoadedProjectView(project: LoadedProject): LoadedProjectView {
+  getRepositoryView(projectId: string): ProjectRepositoryView {
+    const project = this.findProject(projectId);
     return {
-      record: project.record,
+      projectId,
       tree: project.tree,
-      validationStatus: project.record.validation.lastValidatedAt ? "exact" : "unvalidated",
-      candidates: project.candidates
+      dependencies: project.record.dependencies,
+      summaryCache: project.record.summaryCache
     };
   }
 
@@ -2896,7 +3509,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       gitMetadata
     };
 
-    return result;
+    return {
+      ...result,
+      dependencies: result.dependencies.slice(0, 80),
+      tree: compactRepoTreePreview(result.tree)
+    };
   }
 
   showLauncher(): void {
@@ -2977,9 +3594,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.activeProjectId = projectId;
     await this.resumeSavedAgents(project);
     this.emitState();
-    void this.runBootstrapIfNeeded(project);
-    this.scheduleWorkflowAutomation(projectId);
-    return this.toLoadedProjectView(project);
+    return this.toRendererLoadedProjectView(project);
   }
 
   private hasMeaningfulInterfaceContent(record: Pick<LocalProjectRecord, "overview" | "summaryCache" | "workflow">): boolean {
@@ -3117,7 +3732,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.settings.maxRepairCycles <= previousMaxRepairCycles ||
       workflow.repair.status !== "exhausted" ||
       workflow.repair.attemptCount >= workflow.repair.maxAttempts ||
-      (workflow.workflowStopReason !== "repair_budget_exhausted" && workflow.manualHandoff?.reason !== "repair_exhausted") ||
+      (
+        workflow.workflowStopReason !== "repair_budget_exhausted" &&
+        workflow.workflowStopReason !== "integrity_failed" &&
+        workflow.manualHandoff?.reason !== "repair_exhausted"
+      ) ||
       this.isNonRetryableRepairFailureReason(workflow.manualHandoff?.latestFailureReason ?? workflow.repair.latestFailureReason)
     ) {
       return false;
@@ -3394,18 +4013,31 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     this.emitState();
     void this.runBootstrapIfNeeded(project);
-    this.scheduleWorkflowAutomation(projectId);
-    return this.toLoadedProjectView(project);
+    if (this.getNextAutomationActionForProject(project)) {
+      this.scheduleWorkflowAutomation(projectId);
+    }
+    return this.toRendererLoadedProjectView(project);
   }
 
   private async saveProject(project: LoadedProject): Promise<void> {
+    const startedAt = performance.now();
+    let payloadSize: number | undefined;
     this.compactProjectRuntimeHistory(project);
     for (const agent of project.record.agents) {
       this.recordAgentContextDescriptor(project, agent);
     }
     this.syncWorkflowState(project);
     project.record.summaryCache = project.summaryCache.list();
+    if (this.debugWorkflowPerf) {
+      try {
+        payloadSize = JSON.stringify(project.record).length;
+      } catch {
+        payloadSize = undefined;
+      }
+    }
     await this.storage.saveProject(project.record);
+    this.recordWorkflowPerfCounter("project saves", payloadSize === undefined ? undefined : `${payloadSize} bytes`);
+    this.logWorkflowPerf(`save ${project.record.identity.projectName}: ${payloadSize ?? "unknown"} bytes in ${Math.round(performance.now() - startedAt)}ms`);
     const registry = await this.storage.loadRegistry();
     if (!registry.includes(project.record.id)) {
       registry.push(project.record.id);
@@ -3633,14 +4265,225 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return summary;
   }
 
-  async updateLayout(projectId: string, partial: Partial<LocalProjectRecord["layout"]>): Promise<void> {
+  updateLayout(projectId: string, partial: Partial<LocalProjectRecord["layout"]>): void {
     const project = this.findProject(projectId);
+    const layoutPatch = {
+      ...partial
+    } as Partial<LocalProjectRecord["layout"]> & { projectId?: string };
+    delete layoutPatch.projectId;
     project.record.layout = {
       ...project.record.layout,
-      ...partial
+      ...layoutPatch
     };
-    await this.saveProject(project);
-    this.emitState();
+    const layoutKeys = Object.keys(layoutPatch);
+    const tabOnly = layoutKeys.length === 1 && layoutKeys[0] === "activeCenterTab";
+    if (!tabOnly) {
+      this.scheduleProjectSave(project);
+      this.emitState();
+    }
+  }
+
+  private hasActiveWorkflowAgent(project: LoadedProject, categories?: AgentCategory[]): boolean {
+    const categorySet = categories ? new Set<AgentCategory>(categories) : undefined;
+    return project.record.agents.some((agent) =>
+      agent.category !== "manual" &&
+      (!categorySet || categorySet.has(agent.category)) &&
+      isAgentActive(agent)
+    );
+  }
+
+  private prepareQueuedWorkflowPreviewForRecommendation(project: LoadedProject): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    if (previewRequest.status !== "queued" || this.hasActiveWorkflowAgent(project)) {
+      return false;
+    }
+
+    const safeRecommendationBoundary = workflow.workflowCycle.status === "completed" || !workflow.approvedRecommendation;
+    if (safeRecommendationBoundary && workflow.recommendations.length > 0) {
+      workflow.recommendations = [];
+      workflow.recommendationsGeneratedAt = undefined;
+      this.resetWorkflowStepProgress(workflow, "recommendation", {
+        status: "waiting",
+        requiresUserInput: false,
+        currentActivity: "Queued to generate preview recommendations",
+        message: "The next recommendation set will focus on a visible/runnable preview checkpoint."
+      });
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: "Preview request replaced pending recommendations",
+        detail: "Existing unapproved recommendations were cleared so the next safe recommendation pass can focus on preview generation.",
+        stepId: "recommendation"
+      });
+      this.syncWorkflowState(project);
+      return true;
+    }
+
+    return false;
+  }
+
+  private activateWorkflowPreviewRequest(project: LoadedProject): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    if (previewRequest.status !== "queued") {
+      return;
+    }
+
+    workflow.previewRequest = {
+      ...previewRequest,
+      status: "active",
+      startedAt: previewRequest.startedAt ?? nowIso(),
+      remainingCycles: Math.max(1, previewRequest.remainingCycles ?? 1)
+    };
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "running",
+      title: "Preview generation started",
+      detail: "The next bounded cycle is steering toward a visible/runnable inspection checkpoint.",
+      stepId: "recommendation"
+    });
+  }
+
+  private markWorkflowPreviewReady(project: LoadedProject, completedAt = nowIso()): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    if (previewRequest.status !== "active") {
+      return;
+    }
+
+    const evidence = [
+      `Cycle ${workflow.workflowCycle.cycleNumber} completed after deterministic validation and integration.`,
+      workflow.scopedGoal?.summary ? `Preview scoped goal: ${workflow.scopedGoal.summary}.` : undefined,
+      workflow.approvedRecommendation?.relatedPaths.length
+        ? `Preview paths: ${workflow.approvedRecommendation.relatedPaths.slice(0, 5).join(", ")}.`
+        : undefined
+    ].filter((entry): entry is string => Boolean(entry));
+    workflow.previewRequest = {
+      ...previewRequest,
+      status: "ready",
+      completedAt,
+      remainingCycles: 0,
+      evidence
+    };
+    const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    if (autopilotPolicy.enabled && autopilotPolicy.pauseOnPreviewReady) {
+      project.record.localState.workflowPauseRequested = true;
+    }
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: "Preview is ready for inspection",
+      detail: evidence.join(" "),
+      stepId: "merge"
+    });
+  }
+
+  private completeWorkflowPreviewCheckpoint(project: LoadedProject, detail = "Preview checkpoint dismissed."): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    if (previewRequest.status !== "ready") {
+      return false;
+    }
+
+    workflow.previewRequest = {
+      ...previewRequest,
+      status: "completed",
+      completedAt: nowIso()
+    };
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "completed",
+      title: "Preview checkpoint completed",
+      detail,
+      stepId: getWorkflowActiveStepId(workflow)
+    });
+    return true;
+  }
+
+  async requestWorkflowPreview(projectId: string, reason?: string, remainingCycles = 1): Promise<ProjectWorkflowState> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    if (!hasConfirmedUltimateGoal(workflow.ultimateGoal)) {
+      throw new Error("Confirm the Ultimate Goal before generating a preview.");
+    }
+
+    const existing = getWorkflowPreviewRequest(workflow);
+    if (existing.status === "queued" || existing.status === "active" || existing.status === "ready") {
+      return workflow;
+    }
+
+    const requestedAt = nowIso();
+    const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    workflow.previewRequest = {
+      status: "queued",
+      requestedAt,
+      remainingCycles: Math.max(1, Math.min(3, Math.round(remainingCycles))),
+      modeBeforePreview: workflow.workflowMode,
+      autopilotWasEnabled: autopilotPolicy.enabled,
+      reason: reason?.trim() || "Operator requested a visible/runnable preview checkpoint.",
+      evidence: []
+    };
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: this.hasActiveWorkflowAgent(project, ["coding", "integrity", "merge"]) ? "waiting" : "running",
+      title: "Preview generation queued",
+      detail: this.hasActiveWorkflowAgent(project, ["coding", "integrity", "merge"])
+        ? "The current coding, integrity, or merge step will finish before preview generation starts."
+        : "The next safe workflow transition will steer toward a visible/runnable preview checkpoint.",
+      stepId: getWorkflowActiveStepId(workflow)
+    });
+    this.prepareQueuedWorkflowPreviewForRecommendation(project);
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, !this.hasActiveWorkflowAgent(project));
+    return project.record.workflow;
+  }
+
+  async cancelWorkflowPreview(projectId: string): Promise<ProjectWorkflowState> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    const canCancel =
+      previewRequest.status === "queued" ||
+      (
+        previewRequest.status === "active" &&
+        !workflow.approvedRecommendation &&
+        !workflow.scopedGoal &&
+        !this.hasActiveWorkflowAgent(project)
+      );
+    if (!canCancel) {
+      throw new Error("Preview can only be cancelled before preview implementation starts.");
+    }
+
+    workflow.previewRequest = {
+      ...previewRequest,
+      status: "cancelled",
+      completedAt: nowIso()
+    };
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "completed",
+      title: "Preview request cancelled",
+      detail: "The workflow will continue with normal recommendation selection.",
+      stepId: getWorkflowActiveStepId(workflow)
+    });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, project.record.localState.autopilotEnabled && !project.record.localState.workflowPauseRequested);
+    return project.record.workflow;
+  }
+
+  async completeWorkflowPreview(projectId: string): Promise<ProjectWorkflowState> {
+    const project = this.findProject(projectId);
+    const completed = this.completeWorkflowPreviewCheckpoint(project, "The operator dismissed the preview checkpoint and resumed normal workflow progression.");
+    if (!completed) {
+      return project.record.workflow;
+    }
+
+    project.record.localState.workflowPauseRequested = false;
+    this.reconcileWorkflowResumeState(project);
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, project.record.localState.autopilotEnabled);
+    return project.record.workflow;
   }
 
   async updateUiState(projectId: string, partial: Partial<LocalProjectRecord["localState"]>): Promise<void> {
@@ -3649,18 +4492,34 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ...partial
     } as Partial<LocalProjectRecord["localState"]> & { projectId?: string };
     delete localStatePatch.projectId;
+    if (Object.keys(localStatePatch).length === 0) {
+      await this.saveProject(project);
+      return;
+    }
+    const projectMutation =
+      partial.autopilotEnabled !== undefined ||
+      partial.workflowObjective !== undefined ||
+      partial.workflowPauseRequested !== undefined;
     const previousPauseRequested = project.record.localState.workflowPauseRequested;
     project.record.localState = {
       ...project.record.localState,
       ...localStatePatch,
-      lastOpenedAt: nowIso()
+      lastOpenedAt: projectMutation ? nowIso() : project.record.localState.lastOpenedAt
     };
+    const workflow = this.ensureWorkflowState(project.record);
+    if (partial.autopilotEnabled !== undefined) {
+      workflow.autopilotPolicy = validateAutopilotPolicy({
+        ...workflow.autopilotPolicy,
+        enabled: partial.autopilotEnabled
+      }, partial.autopilotEnabled);
+      project.record.localState.autopilotEnabled = workflow.autopilotPolicy.enabled;
+    }
     const nextPauseRequested = project.record.localState.workflowPauseRequested;
     if (partial.workflowPauseRequested !== undefined && previousPauseRequested !== nextPauseRequested) {
       if (!nextPauseRequested) {
+        this.completeWorkflowPreviewCheckpoint(project, "Workflow resumed after preview inspection");
         this.reconcileWorkflowResumeState(project);
       }
-      const workflow = this.ensureWorkflowState(project.record);
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
         status: nextPauseRequested ? "waiting" : "running",
@@ -3671,15 +4530,84 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         stepId: getWorkflowActiveStepId(workflow)
       });
     }
+    if (!projectMutation) {
+      return;
+    }
+
     await this.saveProject(project);
     this.emitState();
     if (
-      partial.autopilotEnabled ||
+      partial.autopilotEnabled !== undefined ||
       partial.workflowObjective !== undefined ||
       (partial.workflowPauseRequested !== undefined && !nextPauseRequested)
     ) {
       this.scheduleWorkflowAutomation(projectId);
     }
+  }
+
+  async setWorkflowMode(projectId: string, workflowMode: WorkflowMode): Promise<ProjectWorkflowState> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const nextMode: WorkflowMode = workflowMode === "fast" ? "fast" : "normal";
+    const previousMode = workflow.workflowMode;
+    workflow.workflowMode = nextMode;
+
+    if (previousMode !== nextMode) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: project.record.agents.some((agent) => agent.category !== "manual" && isAgentActive(agent))
+          ? "waiting"
+          : "completed",
+        title: nextMode === "fast" ? "Fast Mode enabled" : "Normal Mode enabled",
+        detail: nextMode === "fast"
+          ? "Future safe workflow transitions will prefer larger coherent work packages and deterministic scoping when clear."
+          : "Future safe workflow transitions will use the normal review-oriented recommendation policy.",
+        stepId: getWorkflowActiveStepId(workflow)
+      });
+    }
+
+    this.syncWorkflowState(project);
+    const hasActiveWorkflowAgent = project.record.agents.some((agent) => agent.category !== "manual" && isAgentActive(agent));
+    const shouldContinueAutomation =
+      !hasActiveWorkflowAgent &&
+      project.record.localState.autopilotEnabled &&
+      !project.record.localState.workflowPauseRequested;
+    await this.persistProjectUpdate(project, shouldContinueAutomation);
+    return project.record.workflow;
+  }
+
+  async setAutopilotPolicy(projectId: string, policyPatch: Partial<AutopilotPolicy>): Promise<ProjectWorkflowState> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const previousPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    workflow.autopilotPolicy = validateAutopilotPolicy({
+      ...previousPolicy,
+      ...policyPatch
+    }, project.record.localState.autopilotEnabled);
+    project.record.localState.autopilotEnabled = workflow.autopilotPolicy.enabled;
+
+    if (
+      previousPolicy.enabled !== workflow.autopilotPolicy.enabled ||
+      previousPolicy.profile !== workflow.autopilotPolicy.profile ||
+      JSON.stringify(previousPolicy) !== JSON.stringify(workflow.autopilotPolicy)
+    ) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: workflow.autopilotPolicy.enabled ? "running" : "waiting",
+        title: "Autopilot policy updated",
+        detail: `${workflow.autopilotPolicy.profile} profile is ${workflow.autopilotPolicy.enabled ? "enabled" : "disabled"}.`,
+        stepId: getWorkflowActiveStepId(workflow)
+      });
+    }
+
+    this.syncWorkflowState(project);
+    const hasActiveWorkflowAgent = project.record.agents.some((agent) => agent.category !== "manual" && isAgentActive(agent));
+    const shouldContinueAutomation =
+      !hasActiveWorkflowAgent &&
+      workflow.autopilotPolicy.enabled &&
+      !project.record.localState.workflowPauseRequested;
+    await this.persistProjectUpdate(project, shouldContinueAutomation);
+    return project.record.workflow;
   }
 
   async openProjectShell(projectId: string): Promise<OpenProjectShellResult> {
@@ -3960,6 +4888,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               "title",
               "description",
               "required",
+              "itemKind",
               "status",
               "confidence",
               "evidence",
@@ -3971,9 +4900,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               title: { type: "string", maxLength: 180 },
               description: { type: ["string", "null"], maxLength: 240 },
               required: { type: ["boolean", "null"] },
+              itemKind: { type: ["string", "null"], enum: ["required", "backlog", "observation", null] },
               status: { type: "string", enum: ["unknown", "unmet", "met", "not_applicable"] },
               confidence: { type: ["number", "null"], minimum: 0, maximum: 1 },
               evidence: { type: "string", maxLength: 260 },
+              promotionReason: { type: ["string", "null"], maxLength: 220 },
               relatedPaths: {
                 type: "array",
                 maxItems: 5,
@@ -4006,7 +4937,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     context: WorkflowRecommendationContext,
     goalCompletion: Pick<NonNullable<ProjectWorkflowState["ultimateGoalCompletion"]>, "state">
   ): boolean {
+    const modeConfig = getWorkflowModeConfig(context.workflow.workflowMode, resolveEffectiveAutopilotPolicy(context.workflow));
     return context.objective === "deliver" &&
+      modeConfig.finalAppealEnabled &&
       goalCompletion.state === "goal_satisfied" &&
       context.workflow.appeal.status !== "completed" &&
       context.workflow.appeal.status !== "not_applicable" &&
@@ -4042,9 +4975,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private buildRecommendationPrompt(project: LoadedProject, customFocus?: string): string {
+    this.refreshUltimateGoalAssessmentIfChanged(project);
     const workflow = this.ensureWorkflowState(project.record);
     const workflowObjective = project.record.localState.workflowObjective;
     const recommendationContext = this.buildWorkflowRecommendationContext(project, customFocus);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    const previewMode = !customFocus && (previewRequest.status === "queued" || previewRequest.status === "active");
     const appealPassPending =
       workflowObjective === "deliver" &&
       workflow.ultimateGoalCompletion?.state === "goal_satisfied" &&
@@ -4096,16 +5032,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return [
       workflowObjective === "optimize"
         ? "Inspect the active project and recommend the next bounded optimization tasks for the workflow."
+        : previewMode
+          ? "Inspect the active project and recommend the next bounded preview checkpoint for the workflow."
         : appealPassPending
           ? "Inspect the active project and recommend the final bounded appeal pass for the workflow."
         : "Inspect the active project and recommend the next bounded tasks for the workflow.",
       workflowObjective === "optimize"
         ? "The project is in optimize mode. Treat the current product as a working baseline and look for the next small improvement in correctness, UX, aesthetics for visual surfaces, performance/resource use, maintainability, or test coverage."
+        : previewMode
+          ? "Preview mode is active. Recommend work that makes the current app/project structure visible or runnable for inspection, then stops at a checkpoint. This is not final completion."
         : appealPassPending
           ? "The base Ultimate Goal appears satisfied and this looks like an app, website, platform, or other visual experience. Return one to three small recommendations focused on visual appeal, user-facing polish, clarity, responsive behavior, or interaction quality. This is a final appeal pass before deliver-goal mode stops."
         : "First decide whether the Ultimate Goal is already satisfied strongly enough that the workflow should stop opening new cycles. If it is, mark the goal as satisfied and return zero recommendations.",
       workflowObjective === "optimize"
         ? "Return 1 to 5 recommendations."
+        : previewMode
+          ? "Return 1 to 3 preview-oriented recommendations. Prefer the generated runnable preview checkpoint if it fits the repo."
         : appealPassPending
           ? "Return 1 to 3 recommendations for the final appeal pass."
         : "Return 0 to 5 recommendations.",
@@ -4114,10 +5056,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Recommendations must be concrete single-cycle tasks. Use medium scope for cohesive batches, small only for isolated checks, and split unrelated or umbrella work.",
       "If required checks are unmet/unknown, rank the next coherent required-check group ahead of generic stabilization unless a real blocker exists. Do not claim met without repository evidence or validation output.",
       "For live-data, trading, brokerage, market-data, analytics, or finance interfaces, prefer a provider abstraction with offline demo/mock mode, credentialed live adapter mode, and loading/error/empty states. Paid credentials require operator choice.",
-      "Checklist governance: return goalCheckUpdates only for changed items. Add required checks only when indispensable, consolidate duplicates, mark redundant/non-goal/user-derived removals as not_applicable, and keep evidence concise.",
+      previewMode
+        ? "Preview behavior: favor UI shell, route/page/screen structure, visible Workflow tab or current product state, explicit empty states, demo/offline states, mock-provider labels, loading/error/missing-credential states, visible integration points, and a buildable preview path. Do not require paid services, add secrets, fake live data, or claim final completion."
+        : "",
+      "Checklist governance: return goalCheckUpdates only for changed items. Add required checks only when indispensable, set itemKind to backlog or observation for suggestions/polish, consolidate duplicates, mark redundant/non-goal/user-derived removals as not_applicable, and keep evidence concise.",
+      "Promotion rule: a new agent-suggested item becomes itemKind required only when it derives from the Ultimate Goal, explicit operator feedback, a hard blocker, a validation/integrity failure that prevents completion, or a security/credential/runtime-safety issue.",
       "Completion: percentComplete is met required checks divided by total required checks. goal_satisfied requires every required check met and no open blocker.",
       workflowObjective === "optimize"
         ? "If the Ultimate Goal already looks satisfied, say so in the goal-completion assessment and still recommend the next bounded improvement instead of stopping."
+        : previewMode
+          ? "Keep preview evidence separate from checklist completion unless repository evidence truly satisfies a required check. Do not set goal_satisfied just because a preview exists."
         : appealPassPending
           ? "Keep the goal-completion assessment set to goal_satisfied, but do not return an empty recommendations array for this appeal pass."
         : "If the Ultimate Goal is satisfied, set the goal-completion assessment to goal_satisfied and leave the recommendations array empty.",
@@ -4226,6 +5174,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
       const action = record.action;
       const normalizedAction = action === "add" || action === "update" || action === "remove" ? action : undefined;
+      const itemKind = record.itemKind === "required" || record.itemKind === "backlog" || record.itemKind === "observation"
+        ? record.itemKind
+        : undefined;
       const id = typeof record.id === "string" && record.id.trim() ? record.id.trim() : undefined;
       let normalizedStatus: NonNullable<GoalCheckUpdateInput["status"]> = status;
       let evidence = typeof record.evidence === "string" ? record.evidence.trim() : "";
@@ -4250,12 +5201,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           title,
           description: typeof record.description === "string" ? record.description.trim() : undefined,
           required: typeof record.required === "boolean" ? record.required : undefined,
+          itemKind,
           status: normalizedStatus,
           confidence: typeof record.confidence === "number" && Number.isFinite(record.confidence)
             ? Math.max(0, Math.min(1, record.confidence))
             : undefined,
           evidence,
-          relatedPaths
+          relatedPaths,
+          promotionReason: typeof record.promotionReason === "string" ? record.promotionReason.trim() : undefined
         }
       ];
     }).slice(0, 30);
@@ -4271,6 +5224,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     goalCheckUpdates: GoalCheckUpdateInput[];
     recommendations: ProjectWorkflowState["recommendations"];
   } | undefined {
+    const workflow = this.ensureWorkflowState(project.record);
+    const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
     for (const parsed of this.extractJsonObjects(rawText).reverse()) {
       if (typeof parsed.summary !== "string" || !Array.isArray(parsed.recommendations)) {
         continue;
@@ -4294,7 +5249,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             estimatedScope: (entry as { estimatedScope?: unknown }).estimatedScope ?? "small",
             relatedPaths: this.sanitizeRelatedPaths(project, (entry as { relatedPaths?: unknown }).relatedPaths)
           }))
-          .map((entry) => sanitizeRecommendationForCycle(entry))
+          .map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
           .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
           .map((entry, index) => ({
             ...entry,
@@ -4318,7 +5273,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private recommendationDeduplicationKey(recommendation: ProjectWorkflowState["recommendations"][number]): string {
-    const explicitGoalCheckTarget = recommendation.title.match(/^Satisfy goal (?:check|batch):\s*(.+)$/i)?.[1]?.trim();
+    const explicitGoalCheckTarget = recommendation.title.match(/^Satisfy (?:goal (?:check|batch)|work package):\s*(.+)$/i)?.[1]?.trim();
     return explicitGoalCheckTarget
       ? `goal:${this.normalizeGoalCheckMatchText(explicitGoalCheckTarget)}`
       : `title:${this.normalizeGoalCheckMatchText(recommendation.title)}`;
@@ -4329,12 +5284,34 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     recommendations: ProjectWorkflowState["recommendations"],
     deterministicRecommendations: ProjectWorkflowState["recommendations"]
   ): ProjectWorkflowState["recommendations"] {
+    const previewRequest = getWorkflowPreviewRequest(context.workflow);
+    if (previewRequest.status === "queued" || previewRequest.status === "active") {
+      const previewRecommendations = [...deterministicRecommendations, ...recommendations].filter(isPreviewRecommendation);
+      if (previewRecommendations.length > 0) {
+        const seen = new Set<string>();
+        return [...previewRecommendations, ...recommendations, ...deterministicRecommendations]
+          .filter((recommendation) => {
+            const key = this.recommendationDeduplicationKey(recommendation);
+            if (seen.has(key)) {
+              return false;
+            }
+            seen.add(key);
+            return true;
+          })
+          .slice(0, Math.max(1, Math.min(context.maxOptions, 5)))
+          .map((recommendation, index) => ({
+            ...recommendation,
+            rank: index + 1
+          }));
+      }
+    }
+
     if (context.customFocus?.trim()) {
       return recommendations.map((recommendation, index) => ({ ...recommendation, rank: index + 1 }));
     }
 
     const checklistRecommendations = deterministicRecommendations.filter((recommendation) =>
-      /^Satisfy goal (?:check|batch):/i.test(recommendation.title)
+      /^Satisfy (?:goal (?:check|batch)|work package):/i.test(recommendation.title)
     );
     if (checklistRecommendations.length === 0) {
       return recommendations.map((recommendation, index) => ({ ...recommendation, rank: index + 1 }));
@@ -4369,6 +5346,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     customFocus?: string
   ): Promise<void> {
     const workflow = this.ensureWorkflowState(project.record);
+    const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
     const generatedAt = nowIso();
     const baseRecommendationContext = this.buildWorkflowRecommendationContext(project);
     workflow.goalChecklist = applyGoalChecklistUpdates(
@@ -4376,7 +5354,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       goalCheckUpdates,
       {
         timestamp: generatedAt,
-        ownerAgentId: agent?.id
+        ownerAgentId: agent?.id,
+        ultimateGoal: workflow.ultimateGoal,
+        cycleNumber: workflow.workflowCycle.cycleNumber,
+        maxNewRequiredChecks: modeConfig.maxNewRequiredChecksPerCycle,
+        operatorFeedback: Boolean(customFocus?.trim())
       }
     );
     this.refreshWorkflowTaskMap(project, generatedAt);
@@ -4395,7 +5377,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       source: progressSource
     };
     const deterministicRecommendations = buildWorkflowRecommendations(recommendationContext)
-      .map((entry) => sanitizeRecommendationForCycle(entry))
+      .map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
       .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
       .map((entry, index) => ({
         ...entry,
@@ -4517,8 +5499,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     automate = false,
     customFocus?: string
   ): Promise<void> {
+    this.refreshUltimateGoalAssessmentIfChanged(project);
     const objective = project.record.localState.workflowObjective;
     const recommendationContext = this.buildWorkflowRecommendationContext(project, customFocus);
+    const modeConfig = getWorkflowModeConfig(recommendationContext.workflow.workflowMode, resolveEffectiveAutopilotPolicy(recommendationContext.workflow, project.record.localState.autopilotEnabled));
     const progressEstimate: Omit<UltimateGoalProgressEstimate, "updatedAt"> = {
       ...estimateUltimateGoalProgress(recommendationContext),
       source: "deterministic"
@@ -4534,7 +5518,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ? buildAppealRecommendations(recommendationContext)
           : []
         : buildWorkflowRecommendations(recommendationContext)
-    ).map((entry) => sanitizeRecommendationForCycle(entry))
+    ).map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
       .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
       .map((entry, index) => ({
         ...entry,
@@ -4677,6 +5661,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private buildScopedGoalPrompt(project: LoadedProject, approvedRecommendation: ApprovedRecommendation): string {
     const workflow = this.ensureWorkflowState(project.record);
+    const previewRecommendation = isPreviewRecommendation(approvedRecommendation);
     const recentOpenIssues = workflow.memory.knownOpenIssues
       .filter((issue) => issue.status === "open")
       .slice(0, 5)
@@ -4714,6 +5699,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Turn the approved recommendation into a scoped goal for the next coding pass.",
       "The output must represent one bounded task for a single cycle, not a broad multi-phase project.",
       "The result must be executable by one coding agent in one pass. If related checks share implementation paths, tests, or evidence, plan the largest coherent reviewable batch instead of narrowing to a tiny evidence-only slice.",
+      previewRecommendation
+        ? "This is a preview checkpoint. Scope the pass toward making the current product structure visible/runnable for inspection, not toward declaring the Ultimate Goal finished."
+        : "",
+      previewRecommendation
+        ? "Preview plans should expose UI shell, routes/screens, explicit empty/loading/error/missing-credential states, demo/offline labels, and build/run instructions when the repo supports them. Do not fake live data, add secrets, or require paid services."
+        : "",
       "Do not scope another coding pass just to re-prove a semantically identical checklist batch that already has direct evidence. If the approved recommendation is about checklist cleanup, focus the brief on the concrete missing evidence or redundant checks named in the recommendation.",
       "`executionBrief` should be a full prompt for the coding agent: what to change, where to focus, what to avoid, and how to know the task is done.",
       "Make acceptanceCriteria concrete and testable.",
@@ -4756,6 +5747,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ...parsed,
           id: nanoid(),
           sourceRecommendationId: approvedRecommendation.recommendationId,
+          sourceWorkPackageId: (parsed as { sourceWorkPackageId?: unknown }).sourceWorkPackageId ?? approvedRecommendation.sourceWorkPackageId,
+          targetedCheckIds: (parsed as { targetedCheckIds?: unknown }).targetedCheckIds ?? approvedRecommendation.targetedCheckIds,
+          likelyPaths: (parsed as { likelyPaths?: unknown }).likelyPaths ?? approvedRecommendation.relatedPaths,
           createdAt: nowIso()
         }));
       } catch {
@@ -4819,6 +5813,65 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.persistProjectUpdate(project, automate);
   }
 
+  private findWorkPackageForApprovedRecommendation(
+    workflow: ProjectWorkflowState,
+    approvedRecommendation: ApprovedRecommendation
+  ): WorkPackage | undefined {
+    const workPackages = workflow.workPackages ?? [];
+    if (approvedRecommendation.sourceWorkPackageId) {
+      const byId = workPackages.find((workPackage) => workPackage.id === approvedRecommendation.sourceWorkPackageId);
+      if (byId) {
+        return byId;
+      }
+    }
+
+    const targetedCheckIds = new Set(approvedRecommendation.targetedCheckIds ?? []);
+    if (targetedCheckIds.size > 0) {
+      const byChecks = workPackages.find((workPackage) =>
+        workPackage.checkIds.length === targetedCheckIds.size &&
+        workPackage.checkIds.every((checkId) => targetedCheckIds.has(checkId))
+      );
+      if (byChecks) {
+        return byChecks;
+      }
+    }
+
+    const titleTopic = approvedRecommendation.title.match(/^Satisfy work package:\s*(.+)$/i)?.[1]?.trim().toLowerCase();
+    if (!titleTopic) {
+      return undefined;
+    }
+
+    return workPackages.find((workPackage) =>
+      workPackage.primaryTopic.toLowerCase() === titleTopic ||
+      workPackage.title.toLowerCase() === titleTopic ||
+      approvedRecommendation.relatedPaths.some((relatedPath) => workPackage.likelyPaths.includes(relatedPath))
+    );
+  }
+
+  private createDeterministicScopedGoalForApprovedRecommendation(
+    project: LoadedProject,
+    approvedRecommendation: ApprovedRecommendation
+  ): ScopedGoal | undefined {
+    const workflow = this.ensureWorkflowState(project.record);
+    const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    const modeConfig = getWorkflowModeConfig(workflow.workflowMode, autopilotPolicy);
+    if (!modeConfig.useDeterministicScopingWhenClear) {
+      return undefined;
+    }
+
+    this.refreshWorkflowTaskMap(project);
+    const workPackage = this.findWorkPackageForApprovedRecommendation(workflow, approvedRecommendation);
+    if (!workPackage || workPackageRequiresModelScoping(workPackage, workflow)) {
+      return undefined;
+    }
+
+    return createScopedGoalFromWorkPackage(workPackage, workflow, {
+      mode: workflow.workflowMode,
+      autopilotPolicy,
+      sourceRecommendationId: approvedRecommendation.recommendationId
+    });
+  }
+
   private async applyFallbackScopedGoal(project: LoadedProject, approvedRecommendation: ApprovedRecommendation, agent?: AgentState, automate = false): Promise<void> {
     const workflow = this.ensureWorkflowState(project.record);
     const recommendation = workflow.recommendations.find((entry) => entry.id === approvedRecommendation.recommendationId) ?? {
@@ -4832,7 +5885,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       confidence: approvedRecommendation.confidence,
       estimatedScope: approvedRecommendation.estimatedScope,
       riskLevel: approvedRecommendation.riskLevel,
-      relatedPaths: approvedRecommendation.relatedPaths
+      relatedPaths: approvedRecommendation.relatedPaths,
+      sourceWorkPackageId: approvedRecommendation.sourceWorkPackageId,
+      targetedCheckIds: approvedRecommendation.targetedCheckIds
     };
     if (agent) {
       agent.currentPhase = "Used fallback scoped plan";
@@ -4927,10 +5982,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       estimatedScope: recommendation.estimatedScope,
       riskLevel: recommendation.riskLevel,
       relatedPaths: recommendation.relatedPaths,
+      sourceWorkPackageId: recommendation.sourceWorkPackageId,
+      targetedCheckIds: recommendation.targetedCheckIds,
       approvedAt: nowIso()
     };
 
     workflow.approvedRecommendation = approvedRecommendation;
+    if (isPreviewRecommendation(recommendation) && getWorkflowPreviewRequest(workflow).status === "queued") {
+      this.activateWorkflowPreviewRequest(project);
+    }
     workflow.scopedGoal = undefined;
     this.resetWorkflowRepairState(workflow);
     if (workflow.appeal.status === "pending") {
@@ -5001,6 +6061,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const approvedRecommendation = workflow.approvedRecommendation;
     if (!approvedRecommendation) {
       throw new Error("Approve a recommendation before creating a scoped goal.");
+    }
+
+    const deterministicScopedGoal = this.createDeterministicScopedGoalForApprovedRecommendation(project, approvedRecommendation);
+    if (deterministicScopedGoal) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "running",
+        title: "Deterministic scoped plan selected",
+        detail: deterministicScopedGoal.summary,
+        stepId: "goal_plan"
+      });
+      await this.applyScopedGoalState(project, deterministicScopedGoal, undefined, automate);
+      return project.record.workflow.scopedGoal;
     }
 
     this.updateWorkflowStepProgress(workflow, "goal_plan", {
@@ -5082,6 +6155,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const project = this.findProject(projectId);
     const workflow = this.ensureWorkflowState(project.record);
 
+    this.cancelScheduledWorkflowAutomation(projectId);
     project.record.localState.workflowPauseRequested = false;
     if (workflow.repair.status === "merge_conflicts" || workflow.manualHandoff?.reason === "merge_conflicts") {
       const latestFailureReason =
@@ -5165,7 +6239,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         stepId: "integrity"
       });
       this.syncWorkflowState(project);
-      await this.persistProjectUpdate(project, true);
+      await this.persistProjectUpdate(project);
+      await this.runIntegrity(projectId, false);
       return;
     }
 
@@ -5742,7 +6817,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     return [
-      `Credential approved from the local API Keys section: ${entry.providerName} (${entry.keyLabel}).`,
+      `Credential approved from the local Credentials section: ${entry.providerName} (${entry.keyLabel}).`,
       "Use it only for this run, do not write it into project files, logs, portable interface data, or prompts, and preserve demo/mock or missing-credential states."
     ].join(" ");
   }
@@ -5785,7 +6860,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     credentialRequest.status = "fulfilled";
     credentialRequest.resolvedAt = nowIso();
     credentialRequest.submittedToAgentAt = credentialRequest.resolvedAt;
-    credentialRequest.notes = "Credential was sent to the waiting agent after explicit user approval from the API Keys section.";
+    credentialRequest.notes = "Credential was sent to the waiting agent after explicit user approval from the Credentials section.";
 
     const agent = project.record.agents.find((candidate) => candidate.id === userInputRequest.agentId);
     if (agent) {
@@ -5822,8 +6897,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return project.record.workflow.workflowStage;
   }
 
-  async recoverWorkflow(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
+  recoverWorkflow(projectId: string): ProjectWorkflowState["workflowStage"] {
     const project = this.findProject(projectId);
+    if (this.workflowRecoveryInFlight.has(projectId)) {
+      return project.record.workflow.workflowStage;
+    }
+
     const workflow = this.ensureWorkflowState(project.record);
     const reason = "Recovery was requested after the previous agent run stopped responding or lost its app-server connection.";
     const disconnectedAgents = project.record.agents.filter((agent) =>
@@ -5838,17 +6917,98 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const interruptedAgents = [...new Map(
       [...disconnectedAgents, ...this.markActiveAgentsDisconnected(project, reason)].map((agent) => [agent.id, agent])
     ).values()];
+    const recoveryStepId = interruptedAgents
+      .map((agent) => this.getWorkflowStepIdForAgent(agent))
+      .find((stepId): stepId is WorkflowStepId => Boolean(stepId));
 
     project.record.localState.workflowPauseRequested = false;
     this.resetWorkflowAfterInterruptedAgents(project, interruptedAgents, { markRecoveryHandled: true });
     this.reconcileWorkflowResumeState(project);
-
-    if (!this.transport || this.codexAvailability.source === "unavailable") {
-      await this.initializeTransport();
-    }
+    this.recordWindowsMountWarningIfNeeded(project);
+    this.markWorkflowStartupProgress(
+      project,
+      "recovering",
+      "Continue was acknowledged. Recovery, Codex startup, and the next workflow step will continue in the background.",
+      recoveryStepId
+    );
 
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, true);
+    this.scheduleProjectSave(project);
+    this.emitStateNow("workflow recovery acknowledged");
+    this.workflowRecoveryInFlight.add(projectId);
+    void this.runWorkflowRecoveryStartup(projectId).catch((error) => {
+      this.diagnostics.unshift(
+        `Workflow recovery failed. ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+    return project.record.workflow.workflowStage;
+  }
+
+  private async runWorkflowRecoveryStartup(projectId: string): Promise<void> {
+    const startedAt = performance.now();
+    try {
+      let project = this.findProject(projectId);
+      this.logWorkflowPerf(`workflow recovery entered for ${project.record.identity.projectName}`);
+      if (!this.transport || this.codexAvailability.source === "unavailable") {
+        const transportStartedAt = performance.now();
+        await this.initializeTransport();
+        this.logWorkflowPerf(`app-server/session startup ${Math.round(performance.now() - transportStartedAt)}ms`);
+      }
+
+      project = this.findProject(projectId);
+      this.markWorkflowStartupProgress(
+        project,
+        "starting",
+        "Recovery is complete. The next workflow step is starting in the background."
+      );
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, true);
+      this.logWorkflowPerf(`workflow recovery scheduled next step in ${Math.round(performance.now() - startedAt)}ms`);
+    } catch (error) {
+      const project = this.projects.get(projectId);
+      if (project) {
+        const workflow = this.ensureWorkflowState(project.record);
+        this.recordWorkflowActivity(workflow, {
+          source: "system",
+          status: "failed",
+          title: "Workflow recovery failed",
+          detail: error instanceof Error ? error.message : String(error),
+          stepId: getWorkflowActiveStepId(workflow)
+        });
+        const stepId = getWorkflowActiveStepId(workflow);
+        this.updateWorkflowStepProgress(workflow, stepId, {
+          message: error instanceof Error ? error.message : String(error),
+          warning: error instanceof Error ? error.message : String(error)
+        }, { status: "failed" });
+        await this.persistProjectUpdate(project);
+      }
+      throw error;
+    } finally {
+      this.workflowRecoveryInFlight.delete(projectId);
+    }
+  }
+
+  async clearStaleWorkflowLock(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const reason = "The stale running lock was cleared by the operator. No active Codex process was attached to this saved run.";
+    const interruptedAgents = this.markActiveAgentsDisconnected(project, reason);
+    this.resetWorkflowAfterInterruptedAgents(project, interruptedAgents, { markRecoveryHandled: true });
+    const requeued = this.requeueStaleRunningWorkflowSteps(project);
+    project.record.localState.workflowPauseRequested = true;
+    if (interruptedAgents.length > 0 || requeued) {
+      this.recordWorkflowActivity(workflow, {
+        source: "system",
+        status: "waiting",
+        title: "Stale workflow lock cleared",
+        detail: "The saved running state was marked interrupted. The current goal, checklist, and stage decisions were preserved.",
+        stepId: getWorkflowActiveStepId(workflow)
+      });
+    }
+    this.reconcileWorkflowResumeState(project);
+    this.syncWorkflowState(project);
+    await this.saveProject(project);
+    this.emitState();
     return project.record.workflow.workflowStage;
   }
 
@@ -5870,11 +7030,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   ): Promise<AgentState> {
     const launchThread = options?.launchThread !== false;
-    if (launchThread && !this.transport) {
-      throw new Error("Codex app-server is unavailable, so agent creation is currently disabled.");
-    }
     if (launchThread) {
       this.assertGitHubLinked();
+    }
+    if (launchThread && (!this.transport || this.codexAvailability.source === "unavailable")) {
+      await this.initializeTransport();
+    }
+    if (launchThread && (!this.transport || this.codexAvailability.source === "unavailable")) {
+      throw new Error("Codex app-server is unavailable, so agent creation is currently disabled.");
     }
 
     const project = this.findProject(projectId);
@@ -5917,6 +7080,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     if (isWriteEnabledAgentCategory(category) && project.scan.kind === "git") {
       const targetBranch = options?.targetBranch ?? (await determineDefaultBranch(project.record.projectRoot, runtimeSettings));
+      const worktreeStartedAt = performance.now();
       agent.worktree = await createWorktreeAssignment(
         project.record.projectRoot,
         this.settings.worktreeBaseDir,
@@ -5933,6 +7097,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         project.record.distroName,
         `${agentRoles[category].name} worktree creation`
       );
+      this.logWorkflowPerf(`worktree setup for ${name}: ${Math.round(performance.now() - worktreeStartedAt)}ms`);
     }
 
     project.record.agents.unshift(agent);
@@ -6056,6 +7221,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     const sandbox = options?.sandbox ?? "read-only";
     const sandboxPolicy = this.buildRestrictedSandboxPolicy(project, sandbox);
+    const threadStartedAt = performance.now();
     const threadResponse = await this.transport.startThread({
       cwd,
       model: agent.model,
@@ -6067,9 +7233,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       experimentalRawEvents: false,
       persistExtendedHistory: true
     });
+    this.logWorkflowPerf(`app-server thread started for ${agent.name}: ${Math.round(performance.now() - threadStartedAt)}ms`);
     agent.threadId = threadResponse.thread.id;
     agent.startedAt ??= nowIso();
     this.threadToAgent.set(agent.threadId, { projectId: project.record.id, agentId: agent.id });
+    const turnStartedAt = performance.now();
     await this.transport.startTurn({
       threadId: threadResponse.thread.id,
       input: [
@@ -6085,6 +7253,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       effort: agent.reasoningEffort ?? null,
       outputSchema: options?.outputSchema ?? null
     });
+    this.logWorkflowPerf(`app-server turn started for ${agent.name}: ${Math.round(performance.now() - turnStartedAt)}ms`);
     await this.saveProject(project);
     this.emitState();
   }
@@ -6122,6 +7291,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private buildWorkflowCodingPrompt(project: LoadedProject, repair = false): string {
     const workflow = this.ensureWorkflowState(project.record);
     const repairStrategy = repair ? buildRepairStrategyContext(workflow, project.record.agents) : undefined;
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    const previewMode = previewRequest.status === "active" && isPreviewRecommendation(workflow.approvedRecommendation);
     const outcomeStrategyBrief = buildOutcomeStrategyBrief(this.buildWorkflowRecommendationContext(project), {
       maxOpenChecks: 4,
       maxFocusPaths: 4
@@ -6174,6 +7345,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ? `Integrity will verify with:\n- ${workflow.scopedGoal.testStrategy.join("\n- ")}`
         : "",
       workflow.ultimateGoal.summary ? `Ultimate Goal: ${workflow.ultimateGoal.summary}` : "",
+      previewMode
+        ? "Generate Preview is active. Make the current product structure visible or runnable for inspection, preserve honest incomplete states, and stop at a preview checkpoint. Do not claim final completion just because the preview exists."
+        : "",
+      previewMode
+        ? "Preview-specific requirements: label demo/mock data clearly, keep offline/demo behavior available, expose missing credentials as explicit UI/state, avoid paid-service requirements, do not embed secrets, and run the repo-supported build/render validation path."
+        : "",
       "If this implementation needs live external data, build a provider layer instead of hardcoding local-only mock data. Include demo/mock mode for offline development, a live adapter mode that activates only when local credentials are configured, and explicit missing-credential/error/loading states.",
       "For trading-style work, keep provider choice generic unless the user selected a provider. Free/no-card APIs are allowed. Use credential requests and explicit user-visible approval/input flow for API keys or secrets; do not embed or infer secrets.",
       "If a free/no-card API credential is required to validate live behavior, request it through the project credential flow rather than downgrading to mock-only behavior, embedding a secret, or inventing one.",
@@ -6314,6 +7491,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (!workflow.scopedGoal) {
       throw new Error("A scoped execution plan is required before coding can begin.");
     }
+    if (repair && (workflow.repair.status === "retrying_validation" || workflow.repair.status === "fixed")) {
+      return;
+    }
+    if (!repair && workflow.repair.status === "retrying_validation") {
+      return;
+    }
+
+    this.markWorkflowStartupProgress(
+      project,
+      "starting",
+      repair ? "Starting the repair coding agent and preparing its worktree." : "Starting the coding agent and preparing its worktree."
+    );
+    this.scheduleProjectSave(project);
+    this.emitState();
 
     const passNumber = workflow.stepProgress.coding.runCount + 1;
     const agentName = repair ? `Repair Coding Pass ${passNumber}` : `Coding Pass ${passNumber}`;
@@ -6437,6 +7628,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const integrityModel = this.getDefaultAgentModel();
     const workflow = this.ensureWorkflowState(project.record);
     const retryingAfterRepair = workflow.repair.status === "repairing" || workflow.repair.status === "retrying_validation";
+    const retryingExternalEnvironmentValidation =
+      workflow.repair.status === "retrying_validation" &&
+      this.isEnvironmentRepairFailureReason(workflow.repair.latestFailureReason);
     if (retryingAfterRepair) {
       this.updateWorkflowRepairState(workflow, {
         status: "retrying_validation"
@@ -6657,7 +7851,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
     }
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, automate || passed || workflow.repair.status === "repairing");
+    await this.persistProjectUpdate(project, automate || (passed && !retryingExternalEnvironmentValidation) || workflow.repair.status === "repairing");
   }
 
   private async detectVerificationCommands(
@@ -7026,6 +8220,28 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.persistProjectUpdate(project, automate || mergeResult.conflicts.length === 0);
   }
 
+  private findHighConfidenceDeterministicWorkPackage(context: WorkflowRecommendationContext): WorkPackage | undefined {
+    const modeConfig = getWorkflowModeConfig(context.workflow.workflowMode, resolveEffectiveAutopilotPolicy(context.workflow));
+    const preferredMinimum = Math.min(
+      Math.max(2, context.workflow.taskMap.openRequiredChecks || 2),
+      modeConfig.preferredMinChecksPerPackage
+    );
+    const packages = buildChecklistWorkPackages(context, {
+      maxChecksPerPackage: modeConfig.maxChecksPerPackage
+    });
+    return packages.find((workPackage) =>
+      workPackage.checkIds.length >= preferredMinimum &&
+      workPackage.confidence >= modeConfig.highConfidencePackageThreshold &&
+      workPackage.acceptanceHints.length > 0 &&
+      workPackage.estimatedBreadth !== "large"
+    ) ?? packages.find((workPackage) =>
+      workPackage.checkIds.length >= 2 &&
+      workPackage.confidence >= modeConfig.highConfidencePackageThreshold + 0.05 &&
+      workPackage.acceptanceHints.length > 0 &&
+      workPackage.estimatedBreadth !== "large"
+    );
+  }
+
   async runRecommendation(projectId: string, automate = false, customFocus?: string): Promise<void> {
     const project = this.findProject(projectId);
     const workflow = this.ensureWorkflowState(project.record);
@@ -7037,24 +8253,51 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (workflow.approvedRecommendation && workflow.workflowCycle.status !== "completed" && workflow.workflowCycle.status !== "merged") {
       throw new Error("This cycle already has an approved recommendation. Create a scoped goal or finish the cycle before re-running recommendations.");
     }
-    if (
-      project.record.agents.some((agent) =>
+    const activeRecommendationAgents = project.record.agents.filter((agent) =>
         agent.category === "recommendation" &&
         isAgentActive(agent) &&
         (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
-      )
+    );
+    if (normalizedCustomFocus) {
+      if (activeRecommendationAgents.some((agent) => this.extractCustomRecommendationFocus(agent) === normalizedCustomFocus)) {
+        return;
+      }
+      for (const agent of activeRecommendationAgents) {
+        agent.status = "disconnected";
+        agent.currentPhase = "Superseded by custom recommendation focus";
+        agent.disconnectedReason = `Superseded by custom recommendation focus: ${normalizedCustomFocus}`;
+        agent.completedAt ??= nowIso();
+        if (agent.threadId) {
+          this.threadToAgent.delete(agent.threadId);
+        }
+      }
+    }
+    if (
+      !normalizedCustomFocus &&
+      activeRecommendationAgents.some((agent) => isAgentActive(agent))
     ) {
       return;
     }
     if (automate && !normalizedCustomFocus && workflow.recommendations.length > 0 && !workflow.approvedRecommendation) {
       return;
     }
+    if (normalizedCustomFocus && !workflow.approvedRecommendation && workflow.recommendations.length > 0) {
+      workflow.recommendations = [];
+    }
+    const previewMode = !normalizedCustomFocus && getWorkflowPreviewRequest(workflow).status === "queued";
+    if (previewMode) {
+      this.activateWorkflowPreviewRequest(project);
+    }
     const cycleAim = this.buildRecommendationCycleAim(this.buildWorkflowRecommendationContext(project, normalizedCustomFocus));
     this.recordWorkflowActivity(workflow, {
       source: "workflow",
       status: "running",
-      title: objective === "optimize" ? "Optimization recommendation generation started" : "Recommendation generation started",
-      detail: normalizedCustomFocus
+      title: previewMode
+        ? "Preview recommendation generation started"
+        : objective === "optimize" ? "Optimization recommendation generation started" : "Recommendation generation started",
+      detail: previewMode
+        ? "Inspecting repo state for the smallest visible/runnable checkpoint that keeps incomplete areas explicit."
+        : normalizedCustomFocus
         ? `Inspecting repo state, workflow memory, recent activity, and the custom focus "${normalizedCustomFocus}".`
         : objective === "optimize"
           ? "Inspecting repo state, workflow memory, and recent activity for the next bounded improvement."
@@ -7063,20 +8306,49 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
     this.updateWorkflowStepProgress(workflow, "recommendation", {
       requiresUserInput: false,
-      currentActivity: objective === "optimize" ? "Generating optimization candidates" : "Generating recommendation candidates",
+      currentActivity: previewMode
+        ? "Generating preview checkpoint candidates"
+        : objective === "optimize" ? "Generating optimization candidates" : "Generating recommendation candidates",
       currentSubstep: cycleAim.currentSubstep,
       latestProgressNote: normalizedCustomFocus
         ? `Centering recommendations around: ${normalizedCustomFocus}`
+        : previewMode
+          ? "Preview mode is prioritizing visible/runnable inspection paths"
         : objective === "optimize"
           ? "Inspecting project state for the next improvement opportunity"
           : cycleAim.latestProgressNote,
-      message: objective === "optimize"
+      message: previewMode
+        ? `Preview recommendation generation is running. ${cycleAim.currentSubstep}`
+        : objective === "optimize"
         ? `Optimization recommendation generation is running. ${cycleAim.currentSubstep}`
         : `Recommendation generation is running. ${cycleAim.currentSubstep}`,
       agentCategory: "recommendation"
     }, { status: "running", incrementRunCount: true, incrementAttemptCount: true });
     this.syncWorkflowState(project);
     await this.persistProjectUpdate(project);
+
+    const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
+    if (
+      !previewMode &&
+      !normalizedCustomFocus &&
+      modeConfig.deterministicRecommendationFirst &&
+      modeConfig.useRecommendationAgent === "when_no_high_confidence_package"
+    ) {
+      this.refreshUltimateGoalAssessmentIfChanged(project);
+      const deterministicContext = this.buildWorkflowRecommendationContext(project);
+      const deterministicPackage = this.findHighConfidenceDeterministicWorkPackage(deterministicContext);
+      if (deterministicPackage) {
+        this.recordWorkflowActivity(workflow, {
+          source: "workflow",
+          status: "running",
+          title: "Fast Mode selected a deterministic work package",
+          detail: `${deterministicPackage.title}: ${deterministicPackage.checkIds.length} required checks.`,
+          stepId: "recommendation"
+        });
+        await this.applyFallbackRecommendations(project, undefined, automate, normalizedCustomFocus);
+        return;
+      }
+    }
 
     if (!this.transport || this.codexAvailability.source === "unavailable") {
       await this.applyFallbackRecommendations(project, undefined, automate, normalizedCustomFocus);
@@ -7153,6 +8425,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     project.record.interfaceCreation.message = "Deterministic scan data is ready. Preparing agent input.";
     await this.saveProject(project);
     this.emitState();
+
+    if (!this.transport || this.codexAvailability.source === "unavailable") {
+      await this.initializeTransport();
+    }
 
     if (!this.transport || !bootstrapAgent.model || this.availableModels.length === 0 || this.codexAvailability.source === "unavailable") {
       bootstrapAgent.status = "failed";
@@ -7713,21 +8989,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         continue;
       }
 
-      if (!this.transport) {
-        this.markAgentDisconnected(project, agent, "Codex app-server is unavailable, so the saved thread could not be resumed in this session.");
-        interruptedAgents.push(agent);
-        continue;
-      }
-
-      try {
-        await this.transport.resumeThread(agent.threadId);
-        this.threadToAgent.set(agent.threadId, { projectId: project.record.id, agentId: agent.id });
-        agent.disconnectedReason = undefined;
-        agent.recoveryHandledAt = undefined;
-      } catch {
-        this.markAgentDisconnected(project, agent, "The saved Codex thread could not be resumed in this session.");
-        interruptedAgents.push(agent);
-      }
+      this.markAgentDisconnected(
+        project,
+        agent,
+        "Saved Codex threads are not resumed automatically on project open. Continue from the saved workflow state to restart the interrupted step."
+      );
+      interruptedAgents.push(agent);
     }
 
     let changed = false;
@@ -8052,8 +9319,34 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       agent.completedAt = previousLifecycle.completedAt;
       agent.lastMessageSnippet = previousLifecycle.lastMessageSnippet;
     };
+    this.recordWorkflowPerfCounter(`app-server event ${notification.method}`, project.record.identity.projectName);
+    const shouldMirrorWorkflowActivity = !workflowActivitySuppressedTransportMethods.has(notification.method);
+    const shouldPersistProject = !ignoredRendererUpdateMethods.has(notification.method);
+    const shouldEmitRendererUpdate = !ignoredRendererUpdateMethods.has(notification.method);
 
     switch (notification.method) {
+      case "thread/tokenUsage/updated":
+        agent.lastActivityAt = nowIso();
+        break;
+      case "turn/plan/updated": {
+        const detail = [
+          notification.params.explanation ?? undefined,
+          ...notification.params.plan.map((step) => `${step.status}: ${step.step}`)
+        ].filter((entry): entry is string => Boolean(entry)).join("\n");
+        reduceAgentRuntimeEvent(agent, {
+          kind: "raw",
+          title: "Plan updated",
+          detail: compactText(detail, 1_200),
+          raw: {
+            turnId: notification.params.turnId,
+            plan: notification.params.plan.slice(0, 12)
+          }
+        });
+        break;
+      }
+      case "item/reasoning/summaryPartAdded":
+        agent.lastActivityAt = nowIso();
+        break;
       case "thread/status/changed":
         reduceAgentRuntimeEvent(agent, {
           kind: "thread-status",
@@ -8350,10 +9643,26 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (writeAgentFinalizationAlreadyStarted) {
       restoreWriteAgentLifecycle();
     }
-    this.syncWorkflowStepProgressFromAgent(project, agent);
-    this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-    this.scheduleProjectSave(project);
-    this.emitState();
+    if (shouldPersistProject || shouldEmitRendererUpdate || shouldMirrorWorkflowActivity) {
+      this.syncWorkflowStepProgressFromAgent(project, agent);
+      if (shouldMirrorWorkflowActivity) {
+        this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+      }
+    }
+    if (shouldPersistProject) {
+      if (immediateTransportFlushMethods.has(notification.method)) {
+        this.flushProjectSaveNow(project, notification.method);
+      } else {
+        this.scheduleProjectSave(project);
+      }
+    }
+    if (shouldEmitRendererUpdate) {
+      if (immediateTransportFlushMethods.has(notification.method)) {
+        this.emitStateNow(notification.method);
+      } else {
+        this.emitState();
+      }
+    }
     if (!liveTransportUpdateMethods.has(notification.method)) {
       this.scheduleWorkflowAutomation(project.record.id);
     }
@@ -8447,7 +9756,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         description: userInputRequest.description,
         reason: isCredentialRequest
           ? this.settings.considerPaidServices
-            ? "The agent paused for an API credential. Store it in API Keys, then explicitly send it to the waiting agent if you want it used."
+            ? "The agent paused for an API credential. Store it in Credentials, then explicitly send it to the waiting agent if you want it used."
             : "The agent paused for an API credential. Only provide a free/no-card key; otherwise dismiss it and let the agent use a free provider or demo mode."
           : "The agent paused and needs your external setup or answers before it can continue.",
         requestedByAgentCategory: agent.category,

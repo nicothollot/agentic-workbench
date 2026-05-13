@@ -25,6 +25,50 @@ export type UltimateGoalSource = "user" | "detected";
 export type RecommendationRiskLevel = "low" | "medium" | "high";
 export type UltimateGoalProgressSource = "recommendation" | "deterministic";
 export type WorkflowObjective = "deliver" | "optimize";
+export type WorkflowMode = "normal" | "fast";
+export type WorkflowPreviewStatus = "none" | "queued" | "active" | "ready" | "completed" | "cancelled";
+export type AutopilotProfile = "balanced" | "conservative" | "aggressive" | "custom";
+export type AutopilotIntegrityFailurePolicy = "repair" | "pause" | "policy";
+export type AutopilotPauseReason =
+  | "disabled"
+  | "manual_pause_requested"
+  | "preview_ready"
+  | "human_blocker"
+  | "approval_required"
+  | "integrity_failure"
+  | "repair_budget_exhausted"
+  | "merge_conflict"
+  | "ultimate_goal_satisfied"
+  | "no_safe_recommendation"
+  | "project_access_validation_failed"
+  | "repeated_failure"
+  | "high_risk_package_requires_approval"
+  | "unsafe_scope_broadening"
+  | "required_check_promotion_cap"
+  | "max_consecutive_cycles";
+export interface AutopilotPolicy {
+  enabled: boolean;
+  profile: AutopilotProfile;
+  maxAutomaticActionsPerPass: number;
+  maxConsecutiveCycles?: number;
+  pauseOnPreviewReady: boolean;
+  pauseOnHumanBlocker: boolean;
+  pauseOnApprovalRequired: boolean;
+  pauseOnIntegrityFailure: AutopilotIntegrityFailurePolicy;
+  pauseOnMergeConflict: boolean;
+  allowDeterministicScoping: boolean;
+  allowAgentRecommendationWhenDeterministicPackageExists: boolean;
+  allowBacklogPromotion: boolean;
+  maxNewRequiredChecksPerCycle: number;
+  preferGroupedChecklistPackages: boolean;
+  maxChecksPerWorkPackageNormal: number;
+  maxChecksPerWorkPackageFast: number;
+  allowFastModeBatching: boolean;
+  requireExplicitApprovalForHighRiskPackages: boolean;
+  highRiskAreas: string[];
+  stopWhenGoalSatisfied: boolean;
+  stopWhenNoSafeRecommendation: boolean;
+}
 export type UltimateGoalCompletionState = "needs_more_work" | "goal_satisfied";
 export type WorkflowAppealStatus = "not_started" | "not_applicable" | "pending" | "running" | "completed";
 export type WorkflowRepairStatus = "idle" | "repairing" | "retrying_validation" | "fixed" | "exhausted" | "merge_conflicts";
@@ -59,7 +103,7 @@ export type WorkflowStopReason =
   | "ultimate_goal_satisfied"
   | "cycle_completed";
 export type WorkflowStepId = "ultimate_goal" | "recommendation" | "goal_plan" | "coding" | "integrity" | "merge";
-export type WorkflowStepStatus = "not_started" | "waiting" | "running" | "blocked" | "completed" | "failed";
+export type WorkflowStepStatus = "not_started" | "waiting" | "recovering" | "starting" | "running" | "blocked" | "completed" | "failed";
 export type WorkflowCycleStatus =
   | "idle"
   | "recommendation_approved"
@@ -87,7 +131,39 @@ export type WorkflowDecisionKind = "ultimate_goal" | "recommendation" | "scoped_
 export type UserInputRequestStatus = "pending" | "submitted";
 export type CredentialEntryStatus = "active" | "needs_attention" | "disabled";
 export type CredentialRequestStatus = "pending" | "fulfilled" | "dismissed";
-export type WorkspaceCenterTab = "overview" | "workflow" | "logs" | "agents" | "credentials" | "file" | "diff" | "reports";
+export type WorkspaceCenterTab =
+  | "overview"
+  | "workflow"
+  | "runs"
+  | "logs"
+  | "repository"
+  | "credentials"
+  | "settings"
+  | "agents"
+  | "file"
+  | "diff"
+  | "reports";
+export type WorkspaceVisualTabId = Extract<WorkspaceCenterTab, "overview" | "workflow" | "runs" | "logs" | "repository" | "credentials" | "settings">;
+
+export interface VisualExportTab {
+  id: WorkspaceVisualTabId;
+  label: string;
+}
+
+export interface VisualExportCaptureTarget {
+  tab: VisualExportTab;
+  pageIndex: number;
+  pageCount: number;
+  scrollY: number;
+  cropTop: number;
+  sliceHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
+}
+
+export interface VisualExportSessionStart {
+  exportId: string;
+}
 
 export interface AppSettings {
   executionMode: ExecutionMode;
@@ -185,6 +261,8 @@ export interface WorkflowRecommendationOption {
   estimatedScope: "small" | "medium" | "large";
   riskLevel: RecommendationRiskLevel;
   relatedPaths: string[];
+  sourceWorkPackageId?: string;
+  targetedCheckIds?: string[];
 }
 
 export interface ApprovedRecommendation {
@@ -200,21 +278,36 @@ export interface ApprovedRecommendation {
   estimatedScope: "small" | "medium" | "large";
   riskLevel: RecommendationRiskLevel;
   relatedPaths: string[];
+  sourceWorkPackageId?: string;
+  targetedCheckIds?: string[];
   approvedAt: string;
 }
 
 export interface ScopedGoal {
   id: string;
   sourceRecommendationId: string;
+  sourceWorkPackageId?: string;
   summary: string;
   executionBrief: string;
   acceptanceCriteria: string[];
   constraints: string[];
   testStrategy: string[];
+  targetedCheckIds?: string[];
+  likelyPaths?: string[];
   createdAt: string;
 }
 
 export type GoalCheckStatus = "unknown" | "unmet" | "met" | "not_applicable";
+export type GoalCheckItemKind = "required" | "backlog" | "observation";
+export type GoalCheckAuditFlag =
+  | "vague"
+  | "not_observable"
+  | "too_broad"
+  | "duplicate"
+  | "not_tied_to_goal"
+  | "task_not_requirement"
+  | "polish_not_required"
+  | "impossible_to_validate";
 
 export type GoalCheckSource =
   | "success_criterion"
@@ -223,14 +316,37 @@ export type GoalCheckSource =
   | "agent"
   | "deterministic";
 
+export interface GoalCheckEvidenceHistoryEntry {
+  checkId: string;
+  title: string;
+  source: GoalCheckSource;
+  status: GoalCheckStatus;
+  evidence: string;
+  ownerAgentId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface GoalAttainmentCheck {
   id: string;
   title: string;
   description: string;
   required: boolean;
+  itemKind: GoalCheckItemKind;
+  canonicalKey?: string;
+  groupId?: string;
+  mergedInto?: string;
+  sourceCheckIds?: string[];
+  relatedCheckIds?: string[];
+  auditFlags?: GoalCheckAuditFlag[];
+  needsRefinement?: boolean;
+  classificationReason?: string;
+  promotionReason?: string;
+  introducedCycleNumber?: number;
   status: GoalCheckStatus;
   confidence?: number;
   evidence: string;
+  evidenceHistory?: GoalCheckEvidenceHistoryEntry[];
   source: GoalCheckSource;
   relatedPaths: string[];
   ownerAgentId?: string;
@@ -258,6 +374,22 @@ export interface WorkflowTaskMap {
   updatedAt: string;
 }
 
+export interface WorkPackage {
+  id: string;
+  title: string;
+  summary: string;
+  checkIds: string[];
+  primaryTopic: string;
+  likelyPaths: string[];
+  estimatedBreadth: "small" | "medium" | "large";
+  estimatedImpact: "low" | "medium" | "high";
+  confidence: number;
+  riskLevel: RecommendationRiskLevel;
+  reason: string;
+  acceptanceHints: string[];
+  score: number;
+}
+
 export interface WorkflowCycle {
   cycleNumber: number;
   approvedRecommendationId?: string;
@@ -267,6 +399,18 @@ export interface WorkflowCycle {
   status: WorkflowCycleStatus;
   startedAt?: string;
   completedAt?: string;
+}
+
+export interface WorkflowPreviewRequest {
+  status: WorkflowPreviewStatus;
+  requestedAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+  remainingCycles?: number;
+  modeBeforePreview?: WorkflowMode;
+  autopilotWasEnabled?: boolean;
+  reason?: string;
+  evidence?: string[];
 }
 
 export interface WorkflowBudgets {
@@ -462,6 +606,22 @@ export interface WorkflowActivityEvent {
   agentCategory?: AgentCategory;
 }
 
+export interface AutopilotRuntimeStatus {
+  enabled: boolean;
+  profile: AutopilotProfile;
+  workflowMode: WorkflowMode;
+  stage: WorkflowStage;
+  cycleNumber: number;
+  currentRecommendationId?: string;
+  currentRecommendationTitle?: string;
+  lastCompletedAction?: string;
+  nextPlannedAction?: string;
+  pausedReason?: AutopilotPauseReason;
+  pausedDetail?: string;
+  highRiskPackageRequiresApproval: boolean;
+  updatedAt: string;
+}
+
 export interface WorkflowManualHandoff {
   reason: "repair_exhausted" | "repair_stopped_early" | "merge_conflicts";
   title: string;
@@ -528,10 +688,15 @@ export interface UltimateGoalCompletionAssessment {
 export interface ProjectWorkflowState {
   ultimateGoal: UltimateGoal;
   ultimateGoalDraft?: UltimateGoal;
+  workflowMode: WorkflowMode;
+  previewRequest?: WorkflowPreviewRequest;
+  autopilotPolicy: AutopilotPolicy;
+  autopilotStatus?: AutopilotRuntimeStatus;
   ultimateGoalProgress?: UltimateGoalProgressEstimate;
   ultimateGoalCompletion?: UltimateGoalCompletionAssessment;
   goalChecklist: GoalAttainmentCheck[];
   taskMap: WorkflowTaskMap;
+  workPackages: WorkPackage[];
   workflowCycle: WorkflowCycle;
   approvedRecommendation?: ApprovedRecommendation;
   scopedGoal?: ScopedGoal;
@@ -1020,6 +1185,13 @@ export interface LoadedProjectView {
   tree: RepoTreeNode[];
   validationStatus: ValidationStatus;
   candidates: InterfaceCandidate[];
+}
+
+export interface ProjectRepositoryView {
+  projectId: string;
+  tree: RepoTreeNode[];
+  dependencies: DependencyRecord[];
+  summaryCache: FileSummary[];
 }
 
 export interface OpenProjectShellResult {

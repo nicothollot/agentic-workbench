@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, REVIEW_LOG_BUNDLE_VERSION } from "@shared/constants";
 import { createPortableInterface } from "@shared/defaults";
@@ -17,6 +17,7 @@ import type {
 import { nowIso, stableStringify, unique } from "@shared/utils";
 import { sha256 } from "./hashUtils";
 import { assertHostPathWithinProjectRoot } from "./projectBoundary";
+import { sanitizeProjectRecord, STATE_SANITIZER_VERSION, type StateSanitizerReport } from "./stateSanitizer";
 
 type PathReplacement = {
   from: string;
@@ -200,7 +201,19 @@ const redactString = (value: string, replacements: PathReplacement[]): string =>
   for (const replacement of replacements) {
     next = next.split(replacement.from).join(replacement.to);
   }
-  return next;
+  return next
+    .replace(/AGENT_WORKBENCH_CREDENTIAL\s+({[^\r\n]+})/g, "AGENT_WORKBENCH_CREDENTIAL [redacted]")
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b/g, "[redacted-secret]")
+    .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_]{16,}\b/g, "[redacted-token]")
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[redacted-access-key]")
+    .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[redacted-token]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]")
+    .replace(
+      /\b(api[_\s-]?key|secret(?:[_\s-]?key)?|token|access[_\s-]?token|refresh[_\s-]?token|client[_\s-]?secret|authorization|password)\b(\s*[:=]\s*["']?)([A-Za-z0-9_./+=~:-]{12,})(["']?)/gi,
+      "$1$2[redacted]$4"
+    )
+    .replace(/(--(?:api-key|token|secret|password)\s+)(\S{8,})/gi, "$1[redacted]")
+    .replace(/([?&](?:api[_-]?key|key|token|secret|access_token|client_secret)=)([^&\s]+)/gi, "$1[redacted]");
 };
 
 const sanitizeReviewValue = (value: unknown, replacements: PathReplacement[]): unknown => {
@@ -224,6 +237,7 @@ const sanitizeReviewValue = (value: unknown, replacements: PathReplacement[]): u
 const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
   const notes = ["Project root paths were replaced with <project-root>."];
   notes.push("Local credential metadata and secret values were excluded.");
+  notes.push("Common API key, token, bearer credential, and password-looking values were masked.");
 
   if (record.agents.some((agent) => agent.worktree)) {
     notes.push("Managed worktree paths were replaced with <managed-worktrees> and <agent-worktree>.");
@@ -237,6 +251,9 @@ const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
 };
 
 export class WorkbenchStorage {
+  private readonly writeQueues = new Map<string, Promise<void>>();
+  private readonly debugState = process.env.AWB_DEBUG_STATE === "1";
+
   constructor(
     private readonly appDataDir: string,
     private readonly secretCodec?: SecretStorageCodec
@@ -271,7 +288,7 @@ export class WorkbenchStorage {
       summary: buildReviewLogSummary(record),
       redactions: buildRedactionNotes(record),
       warnings: [
-        "Project and worktree paths were redacted, but repository content and tool output may still contain sensitive information.",
+        "Project/worktree paths and common secret-looking values were redacted, but repository content may still contain project-sensitive information.",
         "The bundle only includes the workflow, events, and command output currently retained by the app."
       ],
       project: {
@@ -319,6 +336,64 @@ export class WorkbenchStorage {
     await mkdir(path.join(this.appDataDir, "projects"), { recursive: true });
   }
 
+  private isRetryableAtomicWriteError(error: unknown): boolean {
+    return Boolean(
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error.code === "EPERM" || error.code === "EACCES" || error.code === "EBUSY")
+    );
+  }
+
+  private stringifyForStorage(filePath: string, value: unknown): string {
+    const startedAt = performance.now();
+    const compact = JSON.stringify(value);
+    const output = compact.length > 512_000 ? compact : JSON.stringify(value, null, 2);
+    if (this.debugState) {
+      console.info(
+        `[storage] stringify ${path.basename(filePath)}: ${compact.length} bytes compact, ${Math.round(performance.now() - startedAt)}ms`
+      );
+    }
+    return output;
+  }
+
+  private async writeJsonAtomicallyNow(filePath: string, value: unknown): Promise<void> {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}.tmp`;
+    await writeFile(temporaryPath, this.stringifyForStorage(filePath, value));
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      try {
+        await rename(temporaryPath, filePath);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (!this.isRetryableAtomicWriteError(error) || attempt === 6) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+      }
+    }
+
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private async writeJsonAtomically(filePath: string, value: unknown): Promise<void> {
+    const previousWrite = this.writeQueues.get(filePath) ?? Promise.resolve();
+    const nextWrite = previousWrite
+      .catch(() => undefined)
+      .then(async () => await this.writeJsonAtomicallyNow(filePath, value));
+    this.writeQueues.set(filePath, nextWrite);
+    try {
+      await nextWrite;
+    } finally {
+      if (this.writeQueues.get(filePath) === nextWrite) {
+        this.writeQueues.delete(filePath);
+      }
+    }
+  }
+
   async loadRegistry(): Promise<string[]> {
     try {
       const raw = await readFile(this.registryPath(), "utf8");
@@ -330,7 +405,7 @@ export class WorkbenchStorage {
 
   async saveRegistry(projectIds: string[]): Promise<void> {
     await this.ensureBaseDirs();
-    await writeFile(this.registryPath(), JSON.stringify(projectIds, null, 2));
+    await this.writeJsonAtomically(this.registryPath(), projectIds);
   }
 
   async loadSettings(): Promise<Record<string, unknown> | null> {
@@ -343,13 +418,14 @@ export class WorkbenchStorage {
 
   async saveSettings(settings: Record<string, unknown>): Promise<void> {
     await this.ensureBaseDirs();
-    await writeFile(this.settingsPath(), JSON.stringify(settings, null, 2));
+    await this.writeJsonAtomically(this.settingsPath(), settings);
   }
 
   async saveProject(record: LocalProjectRecord): Promise<void> {
     await this.ensureBaseDirs();
     await mkdir(this.projectDir(record.id), { recursive: true });
-    await writeFile(this.projectStatePath(record.id), JSON.stringify(record, null, 2));
+    const sanitized = sanitizeProjectRecord(record);
+    await this.writeJsonAtomically(this.projectStatePath(record.id), sanitized.record);
   }
 
   private encodeSecretValue(value: string): StoredSecretValue {
@@ -393,7 +469,7 @@ export class WorkbenchStorage {
   private async saveCredentialSecretStore(projectId: string, store: CredentialSecretStore): Promise<void> {
     await this.ensureBaseDirs();
     await mkdir(this.projectDir(projectId), { recursive: true });
-    await writeFile(this.projectCredentialSecretPath(projectId), JSON.stringify(store, null, 2));
+    await this.writeJsonAtomically(this.projectCredentialSecretPath(projectId), store);
   }
 
   async saveCredentialSecret(projectId: string, entryId: string, secrets: CredentialSecretInput): Promise<void> {
@@ -436,11 +512,48 @@ export class WorkbenchStorage {
 
   async loadProject(projectId: string): Promise<LocalProjectRecord | null> {
     try {
-      const raw = await readFile(this.projectStatePath(projectId), "utf8");
-      return localProjectRecordSchema.parse(JSON.parse(raw)) as LocalProjectRecord;
+      const statePath = this.projectStatePath(projectId);
+      const raw = await readFile(statePath, "utf8");
+      const parsedJson = JSON.parse(raw) as LocalProjectRecord;
+      const sanitized = sanitizeProjectRecord(parsedJson);
+      const record = localProjectRecordSchema.parse(sanitized.record) as LocalProjectRecord;
+      if (sanitized.report.changed) {
+        await this.backupProjectStateBeforeMigration(projectId, statePath);
+        await this.writeJsonAtomically(statePath, record);
+        this.logSanitizerReport(projectId, raw.length, JSON.stringify(record).length, sanitized.report);
+      }
+      return record;
     } catch {
       return null;
     }
+  }
+
+  private async backupProjectStateBeforeMigration(projectId: string, statePath: string): Promise<void> {
+    const projectDir = this.projectDir(projectId);
+    const backupPrefix = `state.json.backup.sanitizer-v${STATE_SANITIZER_VERSION}.`;
+    const existingBackups = await readdir(projectDir).catch(() => []);
+    if (existingBackups.some((entry) => entry.startsWith(backupPrefix))) {
+      return;
+    }
+    const timestamp = nowIso().replace(/[:.]/g, "-");
+    await copyFile(statePath, path.join(projectDir, `${backupPrefix}${timestamp}.json`));
+  }
+
+  private logSanitizerReport(projectId: string, beforeBytes: number, afterBytes: number, report: StateSanitizerReport): void {
+    if (!this.debugState) {
+      return;
+    }
+    console.info(
+      [
+        `[storage] sanitized project ${projectId}: ${beforeBytes} -> ${afterBytes} bytes`,
+        `checklist=${report.checklistItemsSanitized}`,
+        `evidenceTruncated=${report.evidenceFieldsTruncated}`,
+        `historyRemoved=${report.evidenceHistoryEntriesRemoved}`,
+        `eventsRemoved=${report.activityEventsRemoved + report.agentEventsRemoved}`,
+        `commandsRemoved=${report.commandRecordsRemoved}`,
+        `agentsCompacted=${report.agentsCompacted}`
+      ].join(" ")
+    );
   }
 
   async loadAllProjects(): Promise<LocalProjectRecord[]> {

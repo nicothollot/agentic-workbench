@@ -174,11 +174,13 @@ const estimateRecommendationBreadth = (
 };
 
 export const isBoundedRecommendation = (
-  recommendation: Pick<WorkflowRecommendationOption, "title" | "summary" | "estimatedScope" | "relatedPaths">
-): boolean => estimateRecommendationBreadth(recommendation) < 2;
+  recommendation: Pick<WorkflowRecommendationOption, "title" | "summary" | "estimatedScope" | "relatedPaths">,
+  breadthLimit = 2
+): boolean => estimateRecommendationBreadth(recommendation) < breadthLimit;
 
 export const sanitizeRecommendationForCycle = (
-  recommendation: WorkflowRecommendationOption
+  recommendation: WorkflowRecommendationOption,
+  options: { breadthLimit?: number } = {}
 ): WorkflowRecommendationOption | undefined => {
   const normalized: WorkflowRecommendationOption = {
     ...recommendation,
@@ -190,7 +192,7 @@ export const sanitizeRecommendationForCycle = (
     relatedPaths: unique(recommendation.relatedPaths.map((entry) => normalizeWhitespace(entry)).filter((entry) => entry.length > 0)).slice(0, 4)
   };
 
-  return isBoundedRecommendation(normalized) ? normalized : undefined;
+  return isBoundedRecommendation(normalized, options.breadthLimit) ? normalized : undefined;
 };
 
 const normalizeScopedList = (values: string[], limit: number): string[] =>

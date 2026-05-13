@@ -354,34 +354,10 @@ export const scanRepository = async (
       };
     }
 
-    let entries;
-    try {
-      entries = await readdir(absolutePath, { withFileTypes: true });
-    } catch (error) {
-      if (isSkippableScanError(error)) {
-        return {
-          fileCount: 0,
-          folderCount: 1,
-          totalSizeBytes: 0
-        };
-      }
-      throw error;
-    }
-    let fileCount = 0;
-    let folderCount = 1;
-    let totalSizeBytes = 0;
-
-    for (const entry of entries) {
-      const childSummary = await summarizeExcludedPath(path.join(absolutePath, entry.name));
-      fileCount += childSummary.fileCount;
-      folderCount += childSummary.folderCount;
-      totalSizeBytes += childSummary.totalSizeBytes;
-    }
-
     return {
-      fileCount,
-      folderCount,
-      totalSizeBytes
+      fileCount: 0,
+      folderCount: 1,
+      totalSizeBytes: 0
     };
   };
 
@@ -395,67 +371,65 @@ export const scanRepository = async (
       }
       throw error;
     }
-    await Promise.all(
-      entries.map(async (entry) => {
-        const absolutePath = path.join(currentDir, entry.name);
-        const relativePath = path.relative(projectRootHostPath, absolutePath).split(path.sep).join("/");
-        if (!relativePath) {
-          return;
-        }
+    for (const entry of entries) {
+      const absolutePath = path.join(currentDir, entry.name);
+      const relativePath = path.relative(projectRootHostPath, absolutePath).split(path.sep).join("/");
+      if (!relativePath) {
+        continue;
+      }
 
-        const exclusionRule = matcher.match(relativePath);
-        if (exclusionRule) {
-          const summary = await summarizeExcludedPath(absolutePath);
-          excludedFiles += summary.fileCount;
-          excludedFolders += summary.folderCount;
-          excludedSizeBytes += summary.totalSizeBytes;
-          excludedPaths.push({
-            path: relativePath,
-            kind: entry.isDirectory() ? "directory" : "file",
-            rule: exclusionRule,
-            fileCount: summary.fileCount,
-            totalSizeBytes: summary.totalSizeBytes
-          });
-          return;
-        }
-
-        if (entry.isDirectory()) {
-          folders.add(relativePath);
-          await walk(absolutePath);
-          return;
-        }
-
-        if (!entry.isFile()) {
-          return;
-        }
-
-        let fileStats;
-        try {
-          fileStats = await stat(absolutePath);
-        } catch (error) {
-          if (isSkippableScanError(error)) {
-            return;
-          }
-          throw error;
-        }
-        const language = guessLanguage(relativePath);
-        files.push({
-          absolutePath,
-          relativePath,
-          size: fileStats.size,
-          language
+      const exclusionRule = matcher.match(relativePath);
+      if (exclusionRule) {
+        const summary = await summarizeExcludedPath(absolutePath);
+        excludedFiles += summary.fileCount;
+        excludedFolders += summary.folderCount;
+        excludedSizeBytes += summary.totalSizeBytes;
+        excludedPaths.push({
+          path: relativePath,
+          kind: entry.isDirectory() ? "directory" : "file",
+          rule: exclusionRule,
+          fileCount: summary.fileCount,
+          totalSizeBytes: summary.totalSizeBytes
         });
-        includedSizeBytes += fileStats.size;
-        fileTypeBreakdown[language] = (fileTypeBreakdown[language] ?? 0) + 1;
-        languageBreakdown[language] = (languageBreakdown[language] ?? 0) + fileStats.size;
+        continue;
+      }
 
-        const baseName = path.basename(relativePath);
-        if (manifestCandidates.has(baseName)) {
-          manifestFiles.add(relativePath);
-          dependencies.push(...(await parseManifestFile(projectRootHostPath, relativePath)));
+      if (entry.isDirectory()) {
+        folders.add(relativePath);
+        await walk(absolutePath);
+        continue;
+      }
+
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      let fileStats;
+      try {
+        fileStats = await stat(absolutePath);
+      } catch (error) {
+        if (isSkippableScanError(error)) {
+          continue;
         }
-      })
-    );
+        throw error;
+      }
+      const language = guessLanguage(relativePath);
+      files.push({
+        absolutePath,
+        relativePath,
+        size: fileStats.size,
+        language
+      });
+      includedSizeBytes += fileStats.size;
+      fileTypeBreakdown[language] = (fileTypeBreakdown[language] ?? 0) + 1;
+      languageBreakdown[language] = (languageBreakdown[language] ?? 0) + fileStats.size;
+
+      const baseName = path.basename(relativePath);
+      if (manifestCandidates.has(baseName)) {
+        manifestFiles.add(relativePath);
+        dependencies.push(...(await parseManifestFile(projectRootHostPath, relativePath)));
+      }
+    }
   };
 
   await walk(projectRootHostPath);

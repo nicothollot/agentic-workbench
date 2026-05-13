@@ -27,20 +27,40 @@ import {
   projectLogFeedRequestSchema,
   projectLoadRequestSchema,
   projectOpenRequestSchema,
-  refreshOverviewRequestSchema
+  refreshOverviewRequestSchema,
+  requestWorkflowPreviewRequestSchema,
+  setAutopilotPolicyRequestSchema,
+  setWorkflowModeRequestSchema,
+  workflowPreviewCheckpointRequestSchema,
+  visualExportCaptureRequestSchema,
+  visualExportSessionRequestSchema,
+  visualExportStartRequestSchema
 } from "@shared/ipc";
-import { createAgentSkeleton, defaultLayout, defaultLocalState, defaultProjectWorkflowState, defaultWorkflowStepProgressState, emptyUltimateGoal } from "@shared/defaults";
-import type { AgentState, ApprovedRecommendation, DiscoveredModel, ProjectOverview, ProjectStats, WorkflowRecommendationOption, WorkflowStage } from "@shared/types";
+import { createAgentSkeleton, createLocalProjectRecord, defaultLayout, defaultLocalState, defaultProjectWorkflowState, defaultWorkflowStepProgressState, emptyUltimateGoal } from "@shared/defaults";
+import type { AgentState, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
 import {
+  createScopedGoalFromWorkPackage,
   createScopedGoalFromRecommendation,
   deriveWorkflowProjection,
   ensureWorkflowStepProgressState,
+  getAutopilotMaxChecksPerWorkPackage,
+  getAutopilotMaxNewRequiredChecksPerCycle,
+  getAutopilotPolicyConfig,
+  getWorkflowModeConfig,
+  getWorkflowPreviewRequest,
   getNextWorkflowAutomationAction,
-  pickAutopilotRecommendation
+  isHighRiskAutopilotRecommendation,
+  isPreviewRecommendation,
+  pickAutopilotRecommendation,
+  resolveEffectiveAutopilotPolicy,
+  shouldAutopilotPause,
+  validateAutopilotPolicy,
+  workPackageRequiresModelScoping
 } from "@shared/workflow";
 import {
   buildWorkflowGoalView,
   buildWorkflowTimelineSteps,
+  deriveWorkflowRuntimeStatus,
   getWorkflowRecoveryCandidate,
   getWorkflowRepairCounterView,
   workflowActionGuide,
@@ -85,9 +105,12 @@ import { executionPathToHostPath, resolveProjectPath, windowsPathToWslPath } fro
 import {
   applyGoalChecklistUpdates,
   assessUltimateGoalCompletion,
+  auditGoalChecklist,
   buildAppealRecommendations,
+  buildChecklistWorkPackages,
   buildChecklistTaskMap,
   buildChecklistTaskMapBrief,
+  consolidateGoalChecklist,
   buildGoalChecklistForAssessment,
   buildGoalChecklistFromUltimateGoal,
   buildOutcomeStrategyBrief,
@@ -96,6 +119,13 @@ import {
   isVisualProject,
   type WorkflowRecommendationContext
 } from "@runtime/workflowRecommendations";
+import {
+  CHECKLIST_EVIDENCE_HISTORY_MAX_ENTRIES,
+  CHECKLIST_RENDERER_EVIDENCE_MAX_CHARS,
+  CHECKLIST_EVIDENCE_MAX_CHARS,
+  sanitizeGoalAttainmentCheck,
+  sanitizeProjectRecord
+} from "@runtime/stateSanitizer";
 import {
   assessIntegrityFailure,
   sanitizeRecommendationForCycle,
@@ -143,7 +173,9 @@ const makeRecommendation = (overrides: Partial<WorkflowRecommendationOption> = {
   confidence: overrides.confidence ?? 0.9,
   estimatedScope: overrides.estimatedScope ?? "small",
   riskLevel: overrides.riskLevel ?? "medium",
-  relatedPaths: overrides.relatedPaths ?? ["src/index.ts"]
+  relatedPaths: overrides.relatedPaths ?? ["src/index.ts"],
+  sourceWorkPackageId: overrides.sourceWorkPackageId,
+  targetedCheckIds: overrides.targetedCheckIds
 });
 
 const approveRecommendation = (
@@ -162,6 +194,8 @@ const approveRecommendation = (
   estimatedScope: overrides.estimatedScope ?? recommendation.estimatedScope,
   riskLevel: overrides.riskLevel ?? recommendation.riskLevel,
   relatedPaths: overrides.relatedPaths ?? recommendation.relatedPaths,
+  sourceWorkPackageId: overrides.sourceWorkPackageId ?? recommendation.sourceWorkPackageId,
+  targetedCheckIds: overrides.targetedCheckIds ?? recommendation.targetedCheckIds,
   approvedAt: overrides.approvedAt ?? "2026-04-07T00:00:00.000Z"
 });
 
@@ -182,6 +216,73 @@ const makePassedIntegrityAgent = (): AgentState => ({
     risks: [],
     generatedAt: "2026-04-07T00:02:00.000Z"
   }
+});
+
+const makeWorkflowRecommendationContext = (
+  workflow = defaultProjectWorkflowState(),
+  files: WorkflowRecommendationContext["scan"]["files"] = [
+    { absolutePath: "/repo/src/runtime/workflowRecommendations.ts", relativePath: "src/runtime/workflowRecommendations.ts", size: 4_096, language: "TypeScript" },
+    { absolutePath: "/repo/src/shared/workflow.ts", relativePath: "src/shared/workflow.ts", size: 2_048, language: "TypeScript" },
+    { absolutePath: "/repo/src/tests/unit.spec.ts", relativePath: "src/tests/unit.spec.ts", size: 2_048, language: "TypeScript" }
+  ]
+): WorkflowRecommendationContext => ({
+  workflow,
+  agents: [],
+  scan: {
+    kind: "git",
+    files,
+    stats: {
+      projectRoot: "/repo",
+      kind: "git",
+      totalFiles: files.length,
+      totalFolders: 3,
+      totalSizeBytes: files.reduce((sum, file) => sum + file.size, 0),
+      includedFiles: files.length,
+      includedFolders: 3,
+      includedSizeBytes: files.reduce((sum, file) => sum + file.size, 0),
+      excludedFiles: 0,
+      excludedFolders: 0,
+      excludedSizeBytes: 0,
+      excludedPaths: [],
+      fileTypeBreakdown: { TypeScript: files.length },
+      languageBreakdown: { TypeScript: files.length },
+      entryPoints: ["src/runtime/workflowRecommendations.ts"],
+      manifestFiles: ["package.json"],
+      testsPresent: true,
+      primaryManagers: ["npm"],
+      explanation: "Workflow test repo"
+    },
+    dependencies: []
+  },
+  overview: undefined,
+  objective: "deliver",
+  maxOptions: 5
+});
+
+const makeGoalCheck = (overrides: Partial<GoalAttainmentCheck> = {}): GoalAttainmentCheck => ({
+  id: overrides.id ?? "check-1",
+  title: overrides.title ?? "Workflow checklist requirement is observable",
+  description: overrides.description ?? "",
+  required: overrides.required ?? true,
+  itemKind: overrides.itemKind ?? (overrides.required === false ? "backlog" : "required"),
+  canonicalKey: overrides.canonicalKey,
+  groupId: overrides.groupId,
+  sourceCheckIds: overrides.sourceCheckIds,
+  relatedCheckIds: overrides.relatedCheckIds,
+  auditFlags: overrides.auditFlags,
+  needsRefinement: overrides.needsRefinement,
+  classificationReason: overrides.classificationReason,
+  promotionReason: overrides.promotionReason,
+  introducedCycleNumber: overrides.introducedCycleNumber,
+  status: overrides.status ?? "unknown",
+  confidence: overrides.confidence,
+  evidence: overrides.evidence ?? "",
+  evidenceHistory: overrides.evidenceHistory,
+  source: overrides.source ?? "agent",
+  relatedPaths: overrides.relatedPaths ?? [],
+  ownerAgentId: overrides.ownerAgentId,
+  createdAt: overrides.createdAt ?? "2026-04-07T00:00:00.000Z",
+  updatedAt: overrides.updatedAt ?? "2026-04-07T00:00:00.000Z"
 });
 
 describe("path utils", () => {
@@ -464,7 +565,7 @@ describe("repo stats", () => {
 
     expect(scan.stats.totalFiles).toBeGreaterThan(scan.stats.includedFiles);
     expect(scan.stats.includedFiles).toBeGreaterThanOrEqual(3);
-    expect(scan.stats.excludedFiles).toBeGreaterThanOrEqual(2);
+    expect(scan.stats.excludedFiles).toBeGreaterThanOrEqual(1);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === ".git" && entry.kind === "directory")).toBe(true);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === "node_modules" && entry.rule === "default")).toBe(true);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === "ignored.log" && entry.rule === "gitignore")).toBe(true);
@@ -645,6 +746,24 @@ describe("schema validation and IPC", () => {
     expect(approvalDecisionRequestSchema.parse({ projectId: "p", agentId: "a", approvalId: "x", decision: "accept" }).decision).toBe("accept");
     expect(downloadInterfaceRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(downloadLogsRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
+    expect(visualExportStartRequestSchema.parse({
+      projectId: "p",
+      tabs: [{ id: "overview", label: "Overview" }]
+    }).tabs[0].id).toBe("overview");
+    expect(visualExportCaptureRequestSchema.parse({
+      exportId: "export-1",
+      target: {
+        tab: { id: "logs", label: "Logs" },
+        pageIndex: 1,
+        pageCount: 3,
+        scrollY: 900,
+        cropTop: 0,
+        sliceHeight: 900,
+        viewportWidth: 1440,
+        viewportHeight: 900
+      }
+    }).target.tab.id).toBe("logs");
+    expect(visualExportSessionRequestSchema.parse({ exportId: "export-1" }).exportId).toBe("export-1");
     expect(refreshOverviewRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(agentListRequestSchema.parse({ projectId: "p", scope: "workflow" }).limit).toBe(20);
     expect(agentDetailRequestSchema.parse({ projectId: "p", agentId: "a" }).agentId).toBe("a");
@@ -1098,6 +1217,59 @@ describe("workflow state", () => {
     expect(intervention.blocking).toBe(true);
   });
 
+  it("defaults missing preview requests to none and validates preview IPC payloads", () => {
+    const workflow = projectWorkflowStateSchema.parse({});
+
+    expect(workflow.previewRequest).toMatchObject({ status: "none", remainingCycles: 1 });
+    expect(getWorkflowPreviewRequest({}).status).toBe("none");
+    expect(projectWorkflowStateSchema.parse({
+      previewRequest: {
+        status: "queued",
+        remainingCycles: 3,
+        requestedAt: "2026-04-07T00:00:00.000Z"
+      }
+    }).previewRequest?.remainingCycles).toBe(3);
+    expect(getWorkflowPreviewRequest({
+      previewRequest: {
+        status: "queued",
+        remainingCycles: 9
+      }
+    }).remainingCycles).toBe(3);
+    expect(requestWorkflowPreviewRequestSchema.parse({
+      projectId: "project-1",
+      reason: "Need to inspect the app shell.",
+      remainingCycles: 3
+    }).remainingCycles).toBe(3);
+    expect(() => requestWorkflowPreviewRequestSchema.parse({
+      projectId: "project-1",
+      remainingCycles: 4
+    })).toThrow();
+    expect(workflowPreviewCheckpointRequestSchema.parse({ projectId: "project-1" }).projectId).toBe("project-1");
+  });
+
+  it("defaults missing workflow mode to normal and exposes inspectable mode configs", () => {
+    const workflow = projectWorkflowStateSchema.parse({});
+
+    expect(defaultProjectWorkflowState().workflowMode).toBe("normal");
+    expect(workflow.workflowMode).toBe("normal");
+    expect(projectWorkflowStateSchema.parse({ workflowMode: undefined }).workflowMode).toBe("normal");
+    expect(getWorkflowModeConfig("normal")).toMatchObject({
+      mode: "normal",
+      maxChecksPerPackage: 4,
+      useRecommendationAgent: "always",
+      finalAppealEnabled: true
+    });
+    expect(getWorkflowModeConfig("fast")).toMatchObject({
+      mode: "fast",
+      maxChecksPerPackage: 8,
+      deterministicRecommendationFirst: true,
+      useRecommendationAgent: "when_no_high_confidence_package",
+      maxNewRequiredChecksPerCycle: 0,
+      finalAppealEnabled: false
+    });
+    expect(setWorkflowModeRequestSchema.parse({ projectId: "project-1", workflowMode: "fast" }).workflowMode).toBe("fast");
+  });
+
   it("derives blocked-human and recommendation-approved workflow stages", () => {
     const baseWorkflow = {
       ...defaultProjectWorkflowState(),
@@ -1291,6 +1463,102 @@ describe("workflow state", () => {
     expect(scopedGoal.constraints).toContain("Do not spend this cycle on non-goal: Do not rebuild the transport layer.");
   });
 
+  it("creates deterministic scoped goals from clear work packages", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowMode = "fast";
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Ship deterministic workflow package completion.",
+      constraints: ["Keep typed IPC intact."],
+      nonGoals: ["Do not rebuild the renderer shell."],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = [
+      makeGoalCheck({
+        id: "check-a",
+        title: "Workflow package ranking groups required checks",
+        status: "unmet",
+        source: "success_criterion",
+        relatedPaths: ["src/runtime/workflowRecommendations.ts"]
+      }),
+      makeGoalCheck({
+        id: "check-b",
+        title: "Workflow package scoped goal preserves targeted check IDs",
+        status: "unknown",
+        source: "success_criterion",
+        relatedPaths: ["src/shared/workflow.ts"]
+      })
+    ];
+    const workPackage: WorkPackage = {
+      id: "work-package:clear",
+      title: "Workflow package completion work package",
+      summary: "Close related workflow package checks.",
+      checkIds: ["check-a", "check-b"],
+      primaryTopic: "Workflow package completion",
+      likelyPaths: ["src/runtime/workflowRecommendations.ts", "src/shared/workflow.ts"],
+      estimatedBreadth: "medium",
+      estimatedImpact: "high",
+      confidence: 0.86,
+      riskLevel: "medium",
+      reason: "Grouped by shared checklist semantics and workflow package paths.",
+      acceptanceHints: [
+        "Show repository evidence that package ranking groups required checks.",
+        "Verify targeted check IDs are carried into the scoped goal."
+      ],
+      score: 320
+    };
+
+    const scopedGoal = createScopedGoalFromWorkPackage(workPackage, workflow, {
+      sourceRecommendationId: "rec-package",
+      now: "2026-04-07T00:00:00.000Z"
+    });
+
+    expect(scopedGoal).toBeTruthy();
+    expect(scopedGoal?.sourceRecommendationId).toBe("rec-package");
+    expect(scopedGoal?.sourceWorkPackageId).toBe(workPackage.id);
+    expect(scopedGoal?.targetedCheckIds).toEqual(["check-a", "check-b"]);
+    expect(scopedGoal?.likelyPaths).toEqual(workPackage.likelyPaths);
+    expect(scopedGoal?.acceptanceCriteria.join(" ")).toContain("targeted required checks");
+    expect(scopedGoal?.constraints).toContain("Keep typed IPC intact.");
+    expect(scopedGoal?.testStrategy.join(" ")).toContain("targeted checks");
+  });
+
+  it("requires model scoping for high-risk work packages", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowMode = "fast";
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Protect credential and approval handling.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = [
+      makeGoalCheck({
+        id: "check-secret",
+        title: "Credential handling preserves local secret storage",
+        status: "unmet",
+        relatedPaths: ["src/runtime/storage.ts"]
+      })
+    ];
+    const workPackage: WorkPackage = {
+      id: "work-package:risk",
+      title: "Credential approval policy work package",
+      summary: "Adjust credential approval and local secret storage behavior.",
+      checkIds: ["check-secret"],
+      primaryTopic: "Credential handling",
+      likelyPaths: ["src/runtime/storage.ts", "src/runtime/approvalPolicy.ts"],
+      estimatedBreadth: "medium",
+      estimatedImpact: "high",
+      confidence: 0.92,
+      riskLevel: "high",
+      reason: "Touches secrets and approval policy.",
+      acceptanceHints: ["Credential storage remains local-only."],
+      score: 280
+    };
+
+    expect(workPackageRequiresModelScoping(workPackage, workflow)).toBe(true);
+    expect(createScopedGoalFromWorkPackage(workPackage, workflow)).toBeUndefined();
+  });
+
   it("normalizes workflow step progress defaults and clears stale blocked states", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {
@@ -1393,6 +1661,383 @@ describe("workflow state", () => {
         id: startingAgent.id
       }
     });
+  });
+
+  it("derives one workflow runtime status for running, stale, paused, and approval states", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Recover workflow state consistently.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "goal-1",
+      sourceRecommendationId: "rec-1",
+      summary: "Implement recovery controls",
+      executionBrief: "Fix stale running state.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.workflowStage = "coding_running";
+    workflow.stepProgress.coding.status = "running";
+    workflow.stepProgress.coding.startedAt = "2026-04-07T00:00:00.000Z";
+    workflow.stepProgress.coding.updatedAt = "2026-04-07T00:00:00.000Z";
+    const runningAgent: AgentState = {
+      ...createAgentSkeleton("coding", "Coding Pass", "Prompt", "gpt-5.4-mini"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "running",
+      startedAt: "2026-04-07T00:00:00.000Z",
+      lastActivityAt: "2026-04-07T00:09:00.000Z"
+    };
+
+    expect(deriveWorkflowRuntimeStatus(workflow, [runningAgent], {
+      nowMs: new Date("2026-04-07T00:10:00.000Z").getTime(),
+      staleMs: 10 * 60 * 1000
+    })).toMatchObject({
+      status: "running",
+      canContinue: false,
+      label: "Running"
+    });
+
+    expect(deriveWorkflowRuntimeStatus(workflow, [], {
+      nowMs: new Date("2026-04-07T00:10:00.000Z").getTime(),
+      staleMs: 10 * 60 * 1000
+    })).toMatchObject({
+      status: "stale-running",
+      canContinue: true,
+      label: "Needs recovery"
+    });
+
+    const recoveringWorkflow = {
+      ...workflow,
+      stepProgress: {
+        ...workflow.stepProgress,
+        coding: {
+          ...workflow.stepProgress.coding,
+          status: "recovering" as const,
+          updatedAt: "2026-04-07T00:09:55.000Z"
+        }
+      }
+    };
+    expect(deriveWorkflowRuntimeStatus(recoveringWorkflow, [], {
+      nowMs: new Date("2026-04-07T00:10:00.000Z").getTime(),
+      staleMs: 10 * 60 * 1000
+    })).toMatchObject({
+      status: "recovering",
+      canContinue: false,
+      label: "Recovering"
+    });
+
+    const startingWorkflow = {
+      ...workflow,
+      stepProgress: {
+        ...workflow.stepProgress,
+        coding: {
+          ...workflow.stepProgress.coding,
+          status: "starting" as const,
+          updatedAt: "2026-04-07T00:09:55.000Z"
+        }
+      }
+    };
+    expect(deriveWorkflowRuntimeStatus(startingWorkflow, [], {
+      nowMs: new Date("2026-04-07T00:10:00.000Z").getTime(),
+      staleMs: 10 * 60 * 1000
+    })).toMatchObject({
+      status: "starting-agent",
+      canContinue: false,
+      label: "Starting agent"
+    });
+
+    const pausedWorkflow = {
+      ...workflow,
+      stepProgress: {
+        ...workflow.stepProgress,
+        coding: {
+          ...workflow.stepProgress.coding,
+          status: "waiting" as const
+        }
+      }
+    };
+    expect(deriveWorkflowRuntimeStatus(pausedWorkflow, [], {
+      workflowPauseRequested: true
+    })).toMatchObject({
+      status: "paused",
+      canContinue: true
+    });
+
+    const approvalAgent: AgentState = {
+      ...runningAgent,
+      status: "waiting_approval",
+      approvals: [{
+        id: "approval-1",
+        agentId: runningAgent.id,
+        kind: "command",
+        summary: "Run validation",
+        filePaths: [],
+        createdAt: "2026-04-07T00:00:00.000Z",
+        status: "pending",
+        availableDecisions: ["accept", "decline"]
+      }]
+    };
+    expect(deriveWorkflowRuntimeStatus(pausedWorkflow, [approvalAgent])).toMatchObject({
+      status: "awaiting-approval",
+      canContinue: false,
+      continueDisabledReason: "Resolve the pending approval before continuing."
+    });
+  });
+
+  it("resolves durable autopilot policy defaults and clamps unsafe custom values", () => {
+    const parsedWorkflow = projectWorkflowStateSchema.parse({});
+    expect(parsedWorkflow.autopilotPolicy).toMatchObject({
+      enabled: false,
+      profile: "balanced",
+      maxAutomaticActionsPerPass: 5,
+      pauseOnApprovalRequired: true,
+      requireExplicitApprovalForHighRiskPackages: true
+    });
+
+    expect(resolveEffectiveAutopilotPolicy({}, true)).toMatchObject({
+      enabled: true,
+      profile: "balanced"
+    });
+    expect(getAutopilotPolicyConfig("conservative")).toMatchObject({
+      profile: "conservative",
+      maxChecksPerWorkPackageNormal: 2,
+      maxConsecutiveCycles: 1
+    });
+    expect(getAutopilotPolicyConfig("aggressive").maxChecksPerWorkPackageFast)
+      .toBeGreaterThan(getAutopilotPolicyConfig("conservative").maxChecksPerWorkPackageFast);
+
+    const custom = validateAutopilotPolicy({
+      enabled: true,
+      profile: "custom",
+      maxAutomaticActionsPerPass: 999,
+      maxNewRequiredChecksPerCycle: -10,
+      maxChecksPerWorkPackageNormal: 99,
+      maxChecksPerWorkPackageFast: 1,
+      highRiskAreas: []
+    });
+    expect(custom.maxAutomaticActionsPerPass).toBe(12);
+    expect(custom.maxNewRequiredChecksPerCycle).toBe(0);
+    expect(custom.maxChecksPerWorkPackageNormal).toBe(8);
+    expect(custom.maxChecksPerWorkPackageFast).toBe(8);
+    expect(custom.highRiskAreas).toContain("approval policy");
+    expect(setAutopilotPolicyRequestSchema.parse({
+      projectId: "project-1",
+      policy: { profile: "aggressive" }
+    }).policy.profile).toBe("aggressive");
+  });
+
+  it("pauses autopilot at background-safe checkpoints", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Ship safe background automation.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    const policy = validateAutopilotPolicy({ enabled: true });
+    const approvalAgent: AgentState = {
+      ...createAgentSkeleton("coding", "Coding", "Prompt", "gpt-5.4-mini"),
+      approvals: [{
+        id: "approval-1",
+        agentId: "agent-1",
+        kind: "command",
+        summary: "Run command",
+        filePaths: [],
+        createdAt: "2026-04-07T00:00:00.000Z",
+        status: "pending",
+        availableDecisions: ["accept", "decline"]
+      }]
+    };
+    expect(shouldAutopilotPause({ workflow, agents: [approvalAgent] }, policy)).toMatchObject({
+      shouldPause: true,
+      reason: "approval_required"
+    });
+
+    expect(shouldAutopilotPause({
+      workflow,
+      agents: [approvalAgent],
+      previewReady: true,
+      workflowPauseRequested: true
+    }, policy)).toMatchObject({
+      shouldPause: true,
+      reason: "preview_ready"
+    });
+
+    workflow.humanInterventions = [{
+      id: "human-1",
+      kind: "credentials",
+      title: "Add credential",
+      description: "A local credential is required.",
+      reason: "The agent cannot safely invent credentials.",
+      requestedByAgentCategory: "coding",
+      severity: "high",
+      blocking: true,
+      status: "pending",
+      createdAt: "2026-04-07T00:00:00.000Z"
+    }];
+    expect(shouldAutopilotPause({ workflow }, policy).reason).toBe("human_blocker");
+    workflow.humanInterventions = [];
+
+    workflow.workflowStopReason = "merge_conflicts";
+    workflow.repair.status = "merge_conflicts";
+    expect(shouldAutopilotPause({ workflow }, policy).reason).toBe("merge_conflict");
+    workflow.workflowStopReason = "repair_budget_exhausted";
+    workflow.repair.status = "exhausted";
+    expect(shouldAutopilotPause({ workflow }, policy).reason).toBe("repair_budget_exhausted");
+
+    workflow.workflowStopReason = "none";
+    workflow.repair.status = "idle";
+    workflow.ultimateGoalCompletion = {
+      state: "goal_satisfied",
+      rationale: "All required checks are met.",
+      source: "deterministic",
+      updatedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.appeal.status = "not_applicable";
+    expect(shouldAutopilotPause({ workflow, workflowObjective: "deliver" }, policy).reason).toBe("ultimate_goal_satisfied");
+
+    workflow.ultimateGoalCompletion = undefined;
+    expect(shouldAutopilotPause({ workflow, nextAction: "approve_recommendation" }, policy).reason).toBe("no_safe_recommendation");
+    expect(shouldAutopilotPause({
+      workflow,
+      nextAction: "approve_recommendation",
+      recommendation: makeRecommendation({
+        title: "Change approval policy automation",
+        riskLevel: "medium",
+        relatedPaths: ["src/runtime/approvalPolicy.ts"]
+      })
+    }, policy)).toMatchObject({
+      reason: "high_risk_package_requires_approval",
+      highRiskPackageRequiresApproval: true
+    });
+    expect(shouldAutopilotPause({ workflow, projectAccessStatus: "failed" }, policy).reason).toBe("project_access_validation_failed");
+  });
+
+  it("applies autopilot policy to work-package selection, Fast Mode, and deterministic scoping", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowMode = "fast";
+    workflow.autopilotPolicy = validateAutopilotPolicy({ enabled: true, profile: "balanced" });
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a market analytics dashboard.",
+      successCriteria: [
+        "App includes drawdown visualization and recovery analysis",
+        "App includes rolling volatility and rolling Sharpe metrics"
+      ],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z");
+    const checkIds = workflow.goalChecklist.map((check) => check.id);
+    const recommendations = [
+      makeRecommendation({
+        id: "package",
+        title: "Satisfy work package: performance analytics",
+        summary: "Close 2 related required checks with shared implementation and evidence.",
+        targetedCheckIds: checkIds,
+        sourceWorkPackageId: "work-package:analytics",
+        confidence: 0.82,
+        estimatedScope: "medium"
+      }),
+      makeRecommendation({
+        id: "polish",
+        title: "Polish dashboard spacing",
+        summary: "Backlog polish while required checks remain open.",
+        confidence: 0.99
+      })
+    ];
+
+    expect(pickAutopilotRecommendation(recommendations, workflow)?.id).toBe("package");
+    expect(pickAutopilotRecommendation([recommendations[1]], workflow)).toBeUndefined();
+
+    const balancedNormal = getWorkflowModeConfig("normal", workflow.autopilotPolicy);
+    const balancedFast = getWorkflowModeConfig("fast", workflow.autopilotPolicy);
+    expect(balancedFast.maxChecksPerPackage).toBeGreaterThan(balancedNormal.maxChecksPerPackage);
+    expect(getAutopilotMaxNewRequiredChecksPerCycle(workflow.autopilotPolicy, "fast")).toBe(0);
+    expect(getAutopilotMaxChecksPerWorkPackage(getAutopilotPolicyConfig("aggressive"), "fast"))
+      .toBeGreaterThan(getAutopilotMaxChecksPerWorkPackage(getAutopilotPolicyConfig("conservative"), "fast"));
+
+    const workPackage: WorkPackage = {
+      id: "work-package:analytics",
+      title: "analytics work package",
+      summary: "Close analytics checks.",
+      checkIds,
+      primaryTopic: "performance analytics",
+      likelyPaths: ["src/analytics.ts"],
+      estimatedBreadth: "medium",
+      estimatedImpact: "high",
+      confidence: 0.86,
+      riskLevel: "medium",
+      reason: "Related analytics checks.",
+      acceptanceHints: ["Verify analytics output."],
+      score: 250
+    };
+    expect(createScopedGoalFromWorkPackage(workPackage, workflow, {
+      mode: "fast",
+      autopilotPolicy: workflow.autopilotPolicy
+    })).toBeDefined();
+    expect(createScopedGoalFromWorkPackage(workPackage, workflow, {
+      mode: "fast",
+      autopilotPolicy: validateAutopilotPolicy({
+        enabled: true,
+        profile: "custom",
+        allowDeterministicScoping: false
+      })
+    })).toBeUndefined();
+    expect(isHighRiskAutopilotRecommendation(makeRecommendation({
+      title: "Adjust runtime command execution",
+      riskLevel: "medium"
+    }), getAutopilotPolicyConfig("aggressive"))).toBe(true);
+  });
+
+  it("keeps autopilot behind approval and repair safety boundaries", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Keep automation bounded.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    const approvalAgent: AgentState = {
+      ...createAgentSkeleton("coding", "Coding", "Prompt", "gpt-5.4-mini"),
+      status: "waiting_approval",
+      approvals: [{
+        id: "approval-1",
+        agentId: "agent-1",
+        kind: "command",
+        command: "git push origin main",
+        summary: "Push changes",
+        filePaths: [],
+        createdAt: "2026-04-07T00:00:00.000Z",
+        status: "pending",
+        availableDecisions: ["accept", "decline"]
+      }]
+    };
+    expect(getNextWorkflowAutomationAction(
+      workflow,
+      [approvalAgent],
+      "git",
+      validateAutopilotPolicy({ enabled: true })
+    )).toBeNull();
+    expect(shouldAutoApproveApproval(approvalAgent.approvals[0], {
+      autoApproveCommands: true,
+      autoApproveGitCommits: false,
+      autoApproveGitPushes: false
+    })).toBe(false);
+
+    workflow.workflowStopReason = "integrity_failed";
+    workflow.repair.latestFailureReason = "npm test failed";
+    expect(shouldAutopilotPause({
+      workflow
+    }, validateAutopilotPolicy({ enabled: true, profile: "balanced" })).shouldPause).toBe(false);
+    expect(shouldAutopilotPause({
+      workflow
+    }, validateAutopilotPolicy({ enabled: true, profile: "conservative" })).reason).toBe("integrity_failure");
+    expect(shouldAutopilotPause({
+      workflow,
+      promotedRequiredCheckCount: 3
+    }, validateAutopilotPolicy({ enabled: true, profile: "balanced", maxNewRequiredChecksPerCycle: 2 })).reason).toBe("required_check_promotion_cap");
   });
 
   it("selects the next automation action conservatively from workflow state", () => {
@@ -2874,10 +3519,10 @@ describe("workflow recommendations", () => {
       maxOptions: 5
     });
 
-    expect(recommendations[0]?.title).toContain("Satisfy goal batch:");
+    expect(recommendations[0]?.title).toContain("Satisfy work package:");
     expect(recommendations[0]?.summary).toContain("related required checks");
     expect(recommendations[0]?.estimatedScope).toBe("medium");
-    expect(recommendations.slice(0, 2).every((entry) => /^Satisfy goal (?:batch|check):/.test(entry.title))).toBe(true);
+    expect(recommendations.slice(0, 2).every((entry) => /^Satisfy (?:work package|goal check):/.test(entry.title))).toBe(true);
     const stabilizeIndex = recommendations.findIndex((entry) => entry.title.startsWith("Stabilize recent work"));
     expect(stabilizeIndex === -1 || stabilizeIndex > 1).toBe(true);
   });
@@ -2921,15 +3566,17 @@ describe("workflow recommendations", () => {
           relatedPaths: ["src/architecture/layerSeparation.test.ts"]
         }
       ],
-      { timestamp: "2026-04-07T00:03:00.000Z" }
+      { timestamp: "2026-04-07T00:03:00.000Z", ultimateGoal: workflow.ultimateGoal, cycleNumber: 1 }
     );
 
     const separationChecks = workflow.goalChecklist.filter((check) =>
       `${check.title} ${check.description}`.toLowerCase().includes("separation")
     );
     expect(separationChecks).toHaveLength(1);
-    expect(separationChecks[0]?.status).toBe("met");
+    expect(separationChecks[0]?.status).toBe("unmet");
     expect(separationChecks[0]?.evidence).toContain("Consolidated");
+    expect(separationChecks[0]?.sourceCheckIds).toContain("constraint-architecture-separation");
+    expect(separationChecks[0]?.evidenceHistory?.some((entry) => entry.evidence.includes("layerSeparation.test.ts"))).toBe(true);
 
     const reconsolidated = buildGoalChecklistFromUltimateGoal(
       workflow.ultimateGoal,
@@ -2976,7 +3623,565 @@ describe("workflow recommendations", () => {
       maxOptions: 5
     });
 
+    expect(progress.percentComplete).toBeLessThan(100);
+  });
+
+  it("keeps backlog and observations out of Ultimate Goal completion math", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Ship a stable workflow checklist ledger.",
+      successCriteria: ["Required ledger checks are persisted and evidenced"],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z"),
+      [
+        {
+          title: "Required ledger checks are persisted and evidenced",
+          status: "met",
+          evidence: "src/runtime/workflowRecommendations.ts persists required checklist metadata."
+        },
+        {
+          action: "add",
+          title: "Polish the checklist labels later",
+          itemKind: "backlog",
+          required: false,
+          status: "unmet",
+          evidence: "Non-blocking label polish."
+        },
+        {
+          action: "add",
+          title: "Observe whether future grouping copy can be nicer",
+          itemKind: "observation",
+          required: false,
+          status: "unknown",
+          evidence: "Observation only."
+        }
+      ],
+      { timestamp: "2026-04-07T00:01:00.000Z", ultimateGoal: workflow.ultimateGoal, cycleNumber: 1 }
+    );
+    workflow.workflowCycle.status = "completed";
+
+    const progress = estimateUltimateGoalProgress({
+      ...makeWorkflowRecommendationContext(workflow),
+      agents: [makePassedIntegrityAgent()]
+    });
+
+    expect(workflow.goalChecklist.filter((check) => check.itemKind !== "required")).toHaveLength(2);
     expect(progress.percentComplete).toBe(100);
+  });
+
+  it("defaults agent-suggested checks to backlog and caps normal required promotions per cycle", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Stabilize workflow checklist grouping and requirement ledger promotion.",
+      successCriteria: ["Checklist grouping closes related requirements"],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    const baseChecklist = buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z");
+    const checklist = applyGoalChecklistUpdates(
+      baseChecklist,
+      [
+        { action: "add", title: "Improve the workflow copy someday", status: "unknown", required: true },
+        { action: "add", title: "Checklist grouping closes related requirement evidence", status: "unmet", required: true },
+        { action: "add", title: "Requirement ledger promotion remains stable", status: "unmet", required: true },
+        { action: "add", title: "Workflow checklist promotion includes extra ledger diagnostics", status: "unmet", required: true },
+        { action: "add", title: "Validation failed and blocks checklist completion", status: "unmet", required: true }
+      ],
+      {
+        timestamp: "2026-04-07T00:02:00.000Z",
+        ultimateGoal: workflow.ultimateGoal,
+        cycleNumber: 2,
+        maxNewRequiredChecks: 2
+      }
+    );
+    const newAgentChecks = checklist.filter((check) => check.source === "agent");
+    const backlog = newAgentChecks.filter((check) => check.itemKind !== "required");
+
+    expect(backlog.some((check) => check.title === "Improve the workflow copy someday")).toBe(true);
+    expect(checklist.filter((check) =>
+      check.itemKind === "required" &&
+      (
+        check.title.includes("Checklist grouping closes") ||
+        check.title.includes("Requirement ledger promotion")
+      )
+    )).toHaveLength(2);
+    expect(checklist.find((check) => check.title.includes("extra ledger diagnostics"))?.classificationReason).toContain("normal cap");
+    expect(checklist.find((check) => check.title.includes("Validation failed"))?.promotionReason).toContain("normal cap");
+  });
+
+  it("consolidates exact and near duplicate checks without merging unrelated requirements", () => {
+    const checks = consolidateGoalChecklist([
+      makeGoalCheck({
+        id: "a",
+        title: "Workflow checklist stores canonical keys",
+        description: "Required checks keep a canonical key for deduplication.",
+        status: "met",
+        evidence: "src/runtime/workflowRecommendations.ts stores canonicalKey.",
+        relatedPaths: ["src/runtime/workflowRecommendations.ts"],
+        source: "deterministic"
+      }),
+      makeGoalCheck({
+        id: "b",
+        title: "Workflow checklist stores canonical keys",
+        description: "Duplicate exact title.",
+        status: "unknown",
+        evidence: "A duplicate was observed.",
+        source: "agent"
+      }),
+      makeGoalCheck({
+        id: "c",
+        title: "Canonical checklist keys are persisted for workflow deduplication",
+        description: "Near duplicate with the same acceptance phrase.",
+        status: "unmet",
+        evidence: "src/runtime/workflowRecommendations.ts still needs canonicalKey evidence.",
+        relatedPaths: ["src/runtime/workflowRecommendations.ts"],
+        source: "agent"
+      }),
+      makeGoalCheck({
+        id: "d",
+        title: "Renderer keyboard shortcuts remain visible",
+        description: "Unrelated renderer behavior.",
+        status: "unknown",
+        relatedPaths: ["src/renderer/App.tsx"],
+        source: "success_criterion"
+      })
+    ]);
+    const canonical = checks.find((check) => check.sourceCheckIds?.includes("c"));
+
+    expect(checks).toHaveLength(2);
+    expect(canonical?.status).toBe("unmet");
+    expect(canonical?.relatedCheckIds).toEqual(expect.arrayContaining(["a", "b"]));
+    expect(canonical?.evidenceHistory?.map((entry) => entry.checkId)).toEqual(expect.arrayContaining(["a", "b", "c"]));
+    expect(checks.some((check) => check.title.includes("Renderer keyboard"))).toBe(true);
+  });
+
+  it("sanitizes checklist evidence, consolidation notes, and history idempotently", () => {
+    const repeatedNote = "Consolidated 4 semantically equivalent checklist entries.";
+    const hugeEvidence = [
+      "src/runtime/stateSanitizer.ts caps persisted checklist evidence.",
+      ...Array.from({ length: 80 }, () => repeatedNote),
+      "src/runtime/stateSanitizer.ts caps persisted checklist evidence.",
+      "x".repeat(5_000)
+    ].join("\n");
+    const check = makeGoalCheck({
+      id: "bloated-check",
+      title: "Essential status fields stay stable",
+      status: "unmet",
+      evidence: hugeEvidence,
+      evidenceHistory: Array.from({ length: 8 }, (_, index) => ({
+        checkId: `history-${index}`,
+        title: "Historical evidence",
+        source: "agent" as const,
+        status: "unknown" as const,
+        evidence: `${"history ".repeat(200)}${index}`,
+        createdAt: `2026-04-07T00:0${index}:00.000Z`,
+        updatedAt: `2026-04-07T00:0${index}:30.000Z`
+      }))
+    });
+
+    const sanitized = sanitizeGoalAttainmentCheck(check);
+    const sanitizedAgain = sanitizeGoalAttainmentCheck(sanitized);
+
+    expect(sanitized).toEqual(sanitizedAgain);
+    expect(sanitized.id).toBe("bloated-check");
+    expect(sanitized.title).toBe("Essential status fields stay stable");
+    expect(sanitized.status).toBe("unmet");
+    expect(sanitized.evidence.length).toBeLessThanOrEqual(CHECKLIST_EVIDENCE_MAX_CHARS);
+    expect(sanitized.evidence.match(/Consolidated/g)).toHaveLength(1);
+    expect(sanitized.evidenceHistory).toHaveLength(CHECKLIST_EVIDENCE_HISTORY_MAX_ENTRIES);
+    expect(sanitized.evidenceHistory?.every((entry) => entry.evidence.length <= 750)).toBe(true);
+  });
+
+  it("sanitizes single-entry checklist consolidation paths", () => {
+    const repeatedNote = "Consolidated 3 semantically equivalent checklist entries.";
+    const [check] = consolidateGoalChecklist([
+      makeGoalCheck({
+        id: "single-bloated",
+        title: "Single checklist entry gets compacted",
+        status: "unknown",
+        evidence: `${repeatedNote}\n${repeatedNote}\n${"large evidence ".repeat(600)}`,
+        evidenceHistory: Array.from({ length: 7 }, (_, index) => ({
+          checkId: `single-history-${index}`,
+          title: "Single history",
+          source: "agent" as const,
+          status: "unknown" as const,
+          evidence: "raw output ".repeat(200),
+          updatedAt: `2026-04-07T00:1${index}:00.000Z`
+        }))
+      })
+    ]);
+
+    expect(check?.evidence.length).toBeLessThanOrEqual(CHECKLIST_EVIDENCE_MAX_CHARS);
+    expect(check?.evidence.match(/Consolidated/g)).toHaveLength(1);
+    expect(check?.evidenceHistory).toHaveLength(CHECKLIST_EVIDENCE_HISTORY_MAX_ENTRIES);
+    expect(check?.id).toBe("single-bloated");
+  });
+
+  it("compacts persisted and renderer project state to bounded workflow payloads", () => {
+    const identity = createProjectIdentity({
+      kind: "git",
+      projectRoot: "/repo",
+      projectName: "repo",
+      repositoryName: "repo",
+      normalizedRemotes: ["git@github.com:awb-tests/repo.git"],
+      manifestSignature: "manifest",
+      treeSignature: "tree"
+    });
+    const record = createLocalProjectRecord(
+      "project-1",
+      "/repo",
+      "/repo",
+      "/repo",
+      "/repo",
+      identity,
+      {
+        interfaceSchemaVersion: 1,
+        appMinVersion: "0.1.0",
+        projectKind: "git"
+      }
+    );
+    record.workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Keep renderer state bounded.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    record.workflow.goalChecklist = [
+      makeGoalCheck({
+        id: "heavy-check",
+        title: "Renderer payload keeps checklist evidence short",
+        status: "unmet",
+        evidence: "evidence ".repeat(400_000)
+      })
+    ];
+    const agent = createAgentSkeleton("coding", "Heavy history agent", "prompt ".repeat(2_000), "gpt-5.4-mini");
+    agent.events = Array.from({ length: 1_400 }, (_, index) => ({
+      id: `event-${index}`,
+      agentId: agent.id,
+      timestamp: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      type: "raw" as const,
+      title: `Event ${index}`,
+      detail: "detail ".repeat(500),
+      raw: { output: "raw ".repeat(500) }
+    }));
+    agent.commandLog = Array.from({ length: 700 }, (_, index) => ({
+      itemId: `cmd-${index}`,
+      command: `npm test -- --run ${index} ${"x".repeat(100)}`,
+      output: "output ".repeat(2_000),
+      status: "completed",
+      startedAt: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:10.000Z`,
+      completedAt: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:20.000Z`,
+      exitCode: 0
+    }));
+    record.agents = [agent];
+
+    const persisted = sanitizeProjectRecord(record).record;
+    const renderer = sanitizeProjectRecord(record, { renderer: true }).record;
+
+    expect(persisted.agents.reduce((count, entry) => count + entry.events.length, 0)).toBeLessThanOrEqual(1_000);
+    expect(persisted.agents.reduce((count, entry) => count + entry.commandLog.length, 0)).toBeLessThanOrEqual(450);
+    expect(renderer.workflow.goalChecklist[0]?.evidence.length).toBeLessThanOrEqual(CHECKLIST_RENDERER_EVIDENCE_MAX_CHARS);
+    expect(JSON.stringify(renderer.workflow.goalChecklist).length).toBeLessThan(2_000);
+    expect(JSON.stringify(renderer.workflow).length).toBeLessThan(25_000);
+  });
+
+  it("flags vague checklist items without turning concrete acceptance criteria into vague work", () => {
+    const vague = auditGoalChecklist([
+      makeGoalCheck({
+        id: "vague",
+        title: "Improve workflow robustness",
+        description: "Make it better and cleaner.",
+        source: "agent"
+      }),
+      makeGoalCheck({
+        id: "concrete",
+        title: "Improve validation handling when npm test fails",
+        description: "tests/unit.spec.ts asserts failed validation keeps the required check unmet.",
+        relatedPaths: ["src/tests/unit.spec.ts"],
+        source: "agent"
+      })
+    ]);
+
+    expect(vague).toHaveLength(2);
+    expect(vague.find((check) => check.id === "vague")?.auditFlags).toEqual(expect.arrayContaining(["vague", "not_observable"]));
+    expect(vague.find((check) => check.id === "vague")?.needsRefinement).toBe(true);
+    expect(vague.find((check) => check.id === "concrete")?.auditFlags ?? []).not.toContain("vague");
+  });
+
+  it("builds deterministic work packages from related required checks", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Stabilize workflow checklist grouping.",
+      successCriteria: [
+        "Workflow checklist classifies required ledger items",
+        "Workflow checklist groups related ledger items",
+        "Renderer exposes keyboard shortcut hints"
+      ],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z"),
+      [
+        {
+          title: "Workflow checklist classifies required ledger items",
+          status: "unmet",
+          evidence: "Runtime checklist classification is still open.",
+          relatedPaths: ["src/runtime/workflowRecommendations.ts"]
+        },
+        {
+          title: "Workflow checklist groups related ledger items",
+          status: "unmet",
+          evidence: "Runtime work-package grouping is still open.",
+          relatedPaths: ["src/runtime/workflowRecommendations.ts"]
+        },
+        {
+          title: "Renderer exposes keyboard shortcut hints",
+          status: "unknown",
+          relatedPaths: ["src/renderer/App.tsx"]
+        },
+        {
+          action: "add",
+          title: "Polish renderer badge colors",
+          itemKind: "backlog",
+          required: false,
+          status: "unmet",
+          relatedPaths: ["src/renderer/App.tsx"]
+        }
+      ],
+      { timestamp: "2026-04-07T00:01:00.000Z", ultimateGoal: workflow.ultimateGoal, cycleNumber: 1 }
+    );
+
+    const packages = buildChecklistWorkPackages(makeWorkflowRecommendationContext(workflow));
+    const checklistPackage = packages.find((workPackage) => workPackage.checkIds.length >= 2);
+    const singlePackage = packages.find((workPackage) => workPackage.checkIds.length === 1);
+
+    expect(checklistPackage?.likelyPaths).toContain("src/runtime/workflowRecommendations.ts");
+    expect(checklistPackage?.acceptanceHints.length).toBeGreaterThan(0);
+    expect(singlePackage).toBeTruthy();
+    expect((checklistPackage?.score ?? 0)).toBeGreaterThan(singlePackage?.score ?? 0);
+    expect(packages.every((workPackage) => !workPackage.title.toLowerCase().includes("polish renderer badge"))).toBe(true);
+
+    const recommendations = buildWorkflowRecommendations(makeWorkflowRecommendationContext(workflow));
+    expect(recommendations[0]?.title).toMatch(/^Satisfy work package:/);
+    expect(recommendations[0]?.summary).toContain("related required checks");
+  });
+
+  it("prioritizes preview-oriented recommendations without satisfying the goal by itself", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build an inspectable workflow dashboard.",
+      successCriteria: ["Workflow tab exposes the current project structure"],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.previewRequest = {
+      status: "active",
+      requestedAt: "2026-04-07T00:00:00.000Z",
+      startedAt: "2026-04-07T00:00:01.000Z",
+      remainingCycles: 1
+    };
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z"),
+      [{
+        title: "Workflow tab exposes the current project structure",
+        status: "unknown",
+        relatedPaths: ["src/renderer/App.tsx"]
+      }],
+      { timestamp: "2026-04-07T00:01:00.000Z", ultimateGoal: workflow.ultimateGoal, cycleNumber: 1 }
+    );
+
+    const recommendations = buildWorkflowRecommendations(makeWorkflowRecommendationContext(workflow, [
+      { absolutePath: "/repo/src/renderer/App.tsx", relativePath: "src/renderer/App.tsx", size: 8_192, language: "TypeScript" },
+      { absolutePath: "/repo/src/main.tsx", relativePath: "src/main.tsx", size: 512, language: "TypeScript" }
+    ]));
+
+    expect(recommendations[0]?.title).toBe("Generate runnable preview checkpoint");
+    expect(isPreviewRecommendation(recommendations[0])).toBe(true);
+    expect(recommendations[0]?.relatedPaths).toContain("src/renderer/App.tsx");
+    expect(pickAutopilotRecommendation(recommendations, workflow)?.id).toBe(recommendations[0]?.id);
+    expect(assessUltimateGoalCompletion(makeWorkflowRecommendationContext(workflow)).state).toBe("needs_more_work");
+  });
+
+  it("lets fast mode build larger coherent work packages than normal mode", () => {
+    const criteria = [
+      "Recommendation ranking retires multiple unmet required checks",
+      "Scoped goal metadata carries targeted check IDs",
+      "Acceptance evidence names grouped workflow package paths",
+      "Checklist consolidation keeps required package items distinct",
+      "Recommendation fallback avoids generic stabilization churn",
+      "Workflow task map exposes grouped package progress"
+    ];
+    const buildWorkflow = (mode: "normal" | "fast") => {
+      const workflow = defaultProjectWorkflowState();
+      workflow.workflowMode = mode;
+      workflow.ultimateGoal = {
+        ...emptyUltimateGoal("user"),
+        summary: "Close workflow package convergence requirements.",
+        successCriteria: criteria,
+        confirmedAt: "2026-04-07T00:00:00.000Z"
+      };
+      workflow.goalChecklist = applyGoalChecklistUpdates(
+        buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z"),
+        criteria.map((title) => ({
+          title,
+          description: "The related workflow package work should be implemented together.",
+          status: "unmet" as const,
+          relatedPaths: ["src/runtime/workflowRecommendations.ts"]
+        })),
+        { timestamp: "2026-04-07T00:01:00.000Z", ultimateGoal: workflow.ultimateGoal, cycleNumber: 1 }
+      );
+      return workflow;
+    };
+
+    const normalPackages = buildChecklistWorkPackages(makeWorkflowRecommendationContext(buildWorkflow("normal")));
+    const fastPackages = buildChecklistWorkPackages(makeWorkflowRecommendationContext(buildWorkflow("fast")));
+
+    const normalMax = Math.max(...normalPackages.map((workPackage) => workPackage.checkIds.length));
+    const fastMax = Math.max(...fastPackages.map((workPackage) => workPackage.checkIds.length));
+    expect(normalMax).toBeLessThanOrEqual(4);
+    expect(fastMax).toBeGreaterThan(normalMax);
+    expect(fastMax).toBeGreaterThanOrEqual(5);
+  });
+
+  it("makes fast mode prefer grouped required-check completion over generic stabilization", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowMode = "fast";
+    const criteria = [
+      "Recommendation ranking retires multiple unmet required checks",
+      "Scoped goal metadata carries targeted check IDs",
+      "Acceptance evidence names grouped workflow package paths",
+      "Checklist consolidation keeps required package items distinct",
+      "Workflow task map exposes grouped package progress"
+    ];
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Finish workflow package convergence.",
+      successCriteria: criteria,
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z"),
+      criteria.map((title) => ({
+        title,
+        description: "The requirement should close through the same workflow recommendation module.",
+        status: "unmet" as const,
+        relatedPaths: ["src/runtime/workflowRecommendations.ts"]
+      })),
+      { timestamp: "2026-04-07T00:01:00.000Z", ultimateGoal: workflow.ultimateGoal, cycleNumber: 1 }
+    );
+
+    const recommendations = buildWorkflowRecommendations({
+      ...makeWorkflowRecommendationContext(workflow),
+      agents: [
+        {
+          ...createAgentSkeleton("coding", "Coding Pass", "Touch package metadata.", "gpt-5.4"),
+          changedFiles: ["package.json"]
+        }
+      ]
+    });
+
+    expect(recommendations[0]?.title).toMatch(/^Satisfy work package:/);
+    expect(recommendations[0]?.targetedCheckIds?.length).toBeGreaterThanOrEqual(4);
+    expect(recommendations[0]?.sourceWorkPackageId).toMatch(/^work-package:/);
+    expect(recommendations[0]?.summary).toContain("related required checks");
+    const stabilizeIndex = recommendations.findIndex((entry) => entry.title.startsWith("Stabilize recent work"));
+    expect(stabilizeIndex === -1 || stabilizeIndex > 1).toBe(true);
+  });
+
+  it("keeps fast-mode new required checks capped except hard blockers and safety issues", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowMode = "fast";
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Ship workflow package convergence.",
+      successCriteria: ["Workflow packages retire required checks"],
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    const checklist = applyGoalChecklistUpdates(
+      buildGoalChecklistFromUltimateGoal(workflow.ultimateGoal, [], "2026-04-07T00:00:00.000Z"),
+      [
+        {
+          action: "add",
+          title: "Workflow package copy can be polished later",
+          status: "unknown",
+          required: true
+        },
+        {
+          action: "add",
+          title: "Credential secret handling blocks completion",
+          status: "unmet",
+          required: true,
+          evidence: "A credential safety issue blocks completion until fixed."
+        }
+      ],
+      {
+        timestamp: "2026-04-07T00:01:00.000Z",
+        ultimateGoal: workflow.ultimateGoal,
+        cycleNumber: 2,
+        maxNewRequiredChecks: getWorkflowModeConfig("fast").maxNewRequiredChecksPerCycle
+      }
+    );
+
+    expect(checklist.find((check) => check.title === "Workflow package copy can be polished later")?.itemKind).toBe("backlog");
+    const safetyCheck = checklist.find((check) => check.title === "Credential secret handling blocks completion");
+    expect(safetyCheck?.itemKind).toBe("required");
+    expect(safetyCheck?.promotionReason).toContain("Promoted outside the normal cap");
+  });
+
+  it("does not downweight fast-mode security work behind polish", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowMode = "fast";
+    const criteria = [
+      "Credential handling keeps secrets local-only",
+      "Approval policy stays explicit before privileged operations",
+      "Runtime command execution preserves sandbox safety"
+    ];
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Protect workflow credential and approval safety.",
+      successCriteria: criteria,
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.goalChecklist = [
+      makeGoalCheck({
+        id: "security-check-1",
+        title: "Credential handling keeps secrets local-only",
+        status: "unmet",
+        source: "success_criterion",
+        relatedPaths: ["src/runtime/storage.ts"]
+      }),
+      makeGoalCheck({
+        id: "security-check-2",
+        title: "Approval policy stays explicit before privileged operations",
+        status: "unmet",
+        source: "success_criterion",
+        relatedPaths: ["src/runtime/approvalPolicy.ts"]
+      }),
+      makeGoalCheck({
+        id: "security-check-3",
+        title: "Runtime command execution preserves sandbox safety",
+        status: "unknown",
+        source: "constraint",
+        relatedPaths: ["src/runtime/execution.ts"]
+      })
+    ];
+
+    const recommendations = buildWorkflowRecommendations({
+      ...makeWorkflowRecommendationContext(workflow),
+      agents: [
+        {
+          ...createAgentSkeleton("coding", "Coding Pass", "Polish workflow labels.", "gpt-5.4"),
+          changedFiles: ["src/renderer/App.tsx"]
+        }
+      ]
+    });
+
+    expect(recommendations[0]?.title).toMatch(/^Satisfy work package:/);
+    expect(recommendations[0]?.targetedCheckIds?.length).toBeGreaterThanOrEqual(2);
+    expect(recommendations[0]?.title.toLowerCase()).not.toContain("polish");
   });
 
   it("turns redundant checklist removals into non-blocking not-applicable checks", () => {
@@ -3168,7 +4373,7 @@ describe("workflow recommendations", () => {
     });
 
     expect(recommendations.length).toBeGreaterThan(0);
-    expect(recommendations[0]?.title).toMatch(/^Satisfy goal (?:batch|check):/);
+    expect(recommendations[0]?.title).toMatch(/^Satisfy (?:work package|goal check):/);
     expect(recommendations[0]?.title).not.toContain("operator feedback");
   });
 

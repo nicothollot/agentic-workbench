@@ -1,6 +1,10 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell } from "electron";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { APP_ID, APP_NAME } from "@shared/constants";
 import { getPreloadEntryPath, getRendererEntryPath } from "@shared/electronAppPaths";
 import {
@@ -27,24 +31,49 @@ import {
   projectLoadRequestSchema,
   projectLogFeedRequestSchema,
   projectOpenRequestSchema,
+  projectRepositoryViewRequestSchema,
   projectSelectionDecisionSchema,
   refreshOverviewRequestSchema,
   manageUserInputRequestAttachmentsSchema,
+  requestWorkflowPreviewRequestSchema,
   retryWorkflowGoalRequestSchema,
   runRecommendationRequestSchema,
+  setAutopilotPolicyRequestSchema,
+  setWorkflowModeRequestSchema,
   submitUserInputRequestResponseSchema,
   requestHumanInterventionRequestSchema,
   resolveHumanInterventionRequestSchema,
   updateUltimateGoalRequestSchema,
-  uiStateUpdateRequestSchema
+  uiStateUpdateRequestSchema,
+  workflowPreviewCheckpointRequestSchema,
+  visualExportCaptureRequestSchema,
+  visualExportSessionRequestSchema,
+  visualExportStartRequestSchema
 } from "@shared/ipc";
-import type { WorkbenchState } from "@shared/types";
+import type { VisualExportCaptureTarget, VisualExportTab, WorkbenchState } from "@shared/types";
 import { appSettingsSchema } from "@shared/schemas";
 import { AppService } from "@runtime/appService";
 
 let mainWindow: BrowserWindow | undefined;
 let appService: AppService | undefined;
 let quitRequested = false;
+
+type VisualExportCapture = {
+  target: VisualExportCaptureTarget;
+  png: Buffer;
+  width: number;
+  height: number;
+  capturedAt: string;
+};
+
+type VisualExportSession = {
+  projectId: string;
+  destinationPath: string;
+  tabs: VisualExportTab[];
+  captures: VisualExportCapture[];
+};
+
+const visualExportSessions = new Map<string, VisualExportSession>();
 
 const interfaceIconPath = (): string =>
   path.join(app.getAppPath(), "assets", "branding", "interface_icon.png");
@@ -57,6 +86,139 @@ const windowIconPath = (): string =>
 const toSafeFileStem = (value: string): string => {
   const normalized = value.trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "");
   return normalized || "project";
+};
+
+const ensurePdfExtension = (filePath: string): string =>
+  path.extname(filePath).toLowerCase() === ".pdf" ? filePath : `${filePath}.pdf`;
+
+const escapeHtml = (value: string): string =>
+  value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+
+const visualExportPageSize = (capture: VisualExportCapture): Electron.Size => ({
+  width: Math.min(20, Math.max(6, capture.target.viewportWidth / 100)),
+  height: Math.min(20, Math.max(4, capture.target.viewportHeight / 100))
+});
+
+const buildVisualExportHtml = (
+  pages: Array<VisualExportCapture & { imageUrl: string }>,
+  pageSize: Electron.Size
+): string => {
+  const pageWidth = `${pageSize.width}in`;
+  const pageHeight = `${pageSize.height}in`;
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    @page { size: ${pageWidth} ${pageHeight}; margin: 0; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: ${pageWidth};
+      background: #ffffff;
+    }
+    .visual-page {
+      width: ${pageWidth};
+      height: ${pageHeight};
+      page-break-after: always;
+      overflow: hidden;
+      background: #f0e7da;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+    }
+    .visual-page:last-child {
+      page-break-after: auto;
+    }
+    .visual-page img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+${pages.map((page) => `  <section class="visual-page" aria-label="${escapeHtml(page.target.tab.label)} ${page.target.pageIndex + 1} of ${page.target.pageCount}">
+    <img src="${page.imageUrl}" alt="${escapeHtml(page.target.tab.label)} ${page.target.pageIndex + 1} of ${page.target.pageCount}" />
+  </section>`).join("\n")}
+</body>
+</html>
+`;
+};
+
+const waitForCapturedPaint = async (window: BrowserWindow): Promise<void> => {
+  await window.webContents.executeJavaScript(
+    "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 80));
+};
+
+const writeVisualExportPdf = async (captures: VisualExportCapture[], destinationPath: string): Promise<void> => {
+  if (captures.length === 0) {
+    throw new Error("No interface visuals were captured.");
+  }
+
+  const tempDir = await mkdtemp(path.join(tmpdir(), "awb-visual-export-"));
+  const pdfWindow = new BrowserWindow({
+    width: captures[0].target.viewportWidth,
+    height: captures[0].target.viewportHeight,
+    show: false,
+    backgroundColor: "#ffffff",
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false
+    }
+  });
+
+  try {
+    const pages: Array<VisualExportCapture & { imageUrl: string }> = [];
+    for (const [index, capture] of captures.entries()) {
+      const imagePath = path.join(tempDir, `visual-${index}.png`);
+      await writeFile(imagePath, capture.png);
+      pages.push({
+        ...capture,
+        imageUrl: pathToFileURL(imagePath).href
+      });
+    }
+
+    const pageSize = visualExportPageSize(captures[0]);
+    const htmlPath = path.join(tempDir, "visual-export.html");
+    await writeFile(htmlPath, buildVisualExportHtml(pages, pageSize), "utf8");
+    await pdfWindow.loadFile(htmlPath);
+    await pdfWindow.webContents.executeJavaScript(`
+      Promise.all(Array.from(document.images).map((image) => {
+        if (image.complete) {
+          return true;
+        }
+        return new Promise((resolve) => {
+          image.addEventListener("load", () => resolve(true), { once: true });
+          image.addEventListener("error", () => resolve(false), { once: true });
+        });
+      })).then(() => true);
+    `);
+    await waitForCapturedPaint(pdfWindow);
+
+    const pdf = await pdfWindow.webContents.printToPDF({
+      printBackground: true,
+      displayHeaderFooter: false,
+      pageSize,
+      margins: {
+        marginType: "none"
+      }
+    });
+    await writeFile(destinationPath, pdf);
+  } finally {
+    if (!pdfWindow.isDestroyed()) {
+      pdfWindow.destroy();
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
 };
 
 const dockIcon = () => {
@@ -243,6 +405,102 @@ const registerIpc = (): void => {
 
     return await appService?.downloadLogs(parsed.projectId, fileResult.filePath);
   });
+  ipcMain.handle("project:startVisualExport", async (_event, payload) => {
+    const parsed = visualExportStartRequestSchema.parse(payload);
+    if (!mainWindow) {
+      throw new Error("The workbench window is not available.");
+    }
+    const project = appService?.getState().projects.find((entry) => entry.record.id === parsed.projectId);
+    if (!project) {
+      throw new Error("Unknown project for visual export.");
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const suggestedName = `${toSafeFileStem(project.record.identity.projectName)}-interface-visuals-${timestamp}.pdf`;
+    const fileResult = await dialog.showSaveDialog(mainWindow, {
+      title: "Save interface visuals as PDF",
+      defaultPath: path.join(app.getPath("downloads"), suggestedName),
+      filters: [
+        {
+          name: "PDF",
+          extensions: ["pdf"]
+        }
+      ]
+    });
+    if (fileResult.canceled || !fileResult.filePath) {
+      return null;
+    }
+
+    const exportId = randomUUID();
+    visualExportSessions.set(exportId, {
+      projectId: parsed.projectId,
+      destinationPath: ensurePdfExtension(fileResult.filePath),
+      tabs: parsed.tabs,
+      captures: []
+    });
+    return { exportId };
+  });
+  ipcMain.handle("project:captureVisualExportPage", async (_event, payload) => {
+    const parsed = visualExportCaptureRequestSchema.parse(payload);
+    const session = visualExportSessions.get(parsed.exportId);
+    if (!session) {
+      throw new Error("Visual export session is no longer available.");
+    }
+    if (!mainWindow) {
+      throw new Error("The workbench window is not available.");
+    }
+
+    await waitForCapturedPaint(mainWindow);
+    const image = await mainWindow.webContents.capturePage();
+    const size = image.getSize();
+    const scaleY = size.height / parsed.target.viewportHeight;
+    const cropTop = Math.max(0, Math.round(parsed.target.cropTop * scaleY));
+    const cropHeight = Math.min(size.height - cropTop, Math.max(1, Math.round(parsed.target.sliceHeight * scaleY)));
+    if (cropHeight <= 0) {
+      throw new Error(`Could not crop ${parsed.target.tab.label} visual slice ${parsed.target.pageIndex + 1}.`);
+    }
+    const croppedImage = cropTop > 0 || cropHeight < size.height
+      ? image.crop({
+        x: 0,
+        y: cropTop,
+        width: size.width,
+        height: cropHeight
+      })
+      : image;
+    const croppedSize = croppedImage.getSize();
+    const capture: VisualExportCapture = {
+      target: parsed.target,
+      png: croppedImage.toPNG(),
+      width: croppedSize.width,
+      height: croppedSize.height,
+      capturedAt: new Date().toISOString()
+    };
+    session.captures = [...session.captures, capture];
+  });
+  ipcMain.handle("project:finishVisualExport", async (_event, payload) => {
+    const parsed = visualExportSessionRequestSchema.parse(payload);
+    const session = visualExportSessions.get(parsed.exportId);
+    if (!session) {
+      throw new Error("Visual export session is no longer available.");
+    }
+
+    const orderedCaptures = session.tabs.flatMap((tab) => {
+      const captures = session.captures
+        .filter((capture) => capture.target.tab.id === tab.id)
+        .sort((left, right) => left.target.pageIndex - right.target.pageIndex);
+      if (captures.length === 0) {
+        throw new Error(`The ${tab.label} tab was not captured.`);
+      }
+      return captures;
+    });
+    await writeVisualExportPdf(orderedCaptures, session.destinationPath);
+    visualExportSessions.delete(parsed.exportId);
+    return session.destinationPath;
+  });
+  ipcMain.handle("project:cancelVisualExport", (_event, payload) => {
+    const parsed = visualExportSessionRequestSchema.parse(payload);
+    visualExportSessions.delete(parsed.exportId);
+  });
   ipcMain.handle("project:importInterface", async (_event, payload) => {
     const parsed = importInterfaceRequestSchema.parse(payload);
     return await appService?.importInterface(parsed.projectRootPath, parsed.importPath, parsed.allowMismatch);
@@ -254,6 +512,10 @@ const registerIpc = (): void => {
   ipcMain.handle("project:getFileSummary", async (_event, payload) => {
     const parsed = fileSummaryRequestSchema.parse(payload);
     return await appService?.getFileSummary(parsed.projectId, parsed.relativePath);
+  });
+  ipcMain.handle("project:getRepositoryView", (_event, payload) => {
+    const parsed = projectRepositoryViewRequestSchema.parse(payload);
+    return appService?.getRepositoryView(parsed.projectId);
   });
   ipcMain.handle("project:listAgents", (_event, payload) => {
     const parsed = agentListRequestSchema.parse(payload);
@@ -267,9 +529,9 @@ const registerIpc = (): void => {
     const parsed = projectLogFeedRequestSchema.parse(payload);
     return appService?.getProjectLogFeed(parsed.projectId, parsed);
   });
-  ipcMain.handle("project:updateLayout", async (_event, payload) => {
+  ipcMain.handle("project:updateLayout", (_event, payload) => {
     const parsed = layoutUpdateRequestSchema.parse(payload);
-    await appService?.updateLayout(parsed.projectId, parsed);
+    appService?.updateLayout(parsed.projectId, parsed);
   });
   ipcMain.handle("project:updateUiState", async (_event, payload) => {
     const parsed = uiStateUpdateRequestSchema.parse(payload);
@@ -332,13 +594,37 @@ const registerIpc = (): void => {
     const parsed = retryWorkflowGoalRequestSchema.parse(payload);
     return await appService?.retryWorkflowGoal(parsed.projectId);
   });
+  ipcMain.handle("workflow:setMode", async (_event, payload) => {
+    const parsed = setWorkflowModeRequestSchema.parse(payload);
+    return await appService?.setWorkflowMode(parsed.projectId, parsed.workflowMode);
+  });
+  ipcMain.handle("workflow:requestPreview", async (_event, payload) => {
+    const parsed = requestWorkflowPreviewRequestSchema.parse(payload);
+    return await appService?.requestWorkflowPreview(parsed.projectId, parsed.reason, parsed.remainingCycles);
+  });
+  ipcMain.handle("workflow:cancelPreview", async (_event, payload) => {
+    const parsed = workflowPreviewCheckpointRequestSchema.parse(payload);
+    return await appService?.cancelWorkflowPreview(parsed.projectId);
+  });
+  ipcMain.handle("workflow:completePreview", async (_event, payload) => {
+    const parsed = workflowPreviewCheckpointRequestSchema.parse(payload);
+    return await appService?.completeWorkflowPreview(parsed.projectId);
+  });
+  ipcMain.handle("workflow:setAutopilotPolicy", async (_event, payload) => {
+    const parsed = setAutopilotPolicyRequestSchema.parse(payload);
+    return await appService?.setAutopilotPolicy(parsed.projectId, parsed.policy);
+  });
   ipcMain.handle("workflow:advanceStage", async (_event, payload) => {
     const parsed = advanceWorkflowStageRequestSchema.parse(payload);
     return await appService?.advanceWorkflowStage(parsed.projectId);
   });
-  ipcMain.handle("workflow:recover", async (_event, payload) => {
+  ipcMain.handle("workflow:recover", (_event, payload) => {
     const parsed = advanceWorkflowStageRequestSchema.parse(payload);
-    return await appService?.recoverWorkflow(parsed.projectId);
+    return appService?.recoverWorkflow(parsed.projectId);
+  });
+  ipcMain.handle("workflow:clearStaleLock", async (_event, payload) => {
+    const parsed = advanceWorkflowStageRequestSchema.parse(payload);
+    return await appService?.clearStaleWorkflowLock(parsed.projectId);
   });
   ipcMain.handle("workflow:requestHumanIntervention", async (_event, payload) => {
     const parsed = requestHumanInterventionRequestSchema.parse(payload);

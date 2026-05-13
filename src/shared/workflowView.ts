@@ -13,8 +13,10 @@ import {
   getLatestPendingHumanIntervention,
   getNextWorkflowAutomationAction,
   getWorkflowActiveStepId,
+  getWorkflowPreviewRequest,
   hasBlockingHumanIntervention,
   hasConfirmedUltimateGoal,
+  hasPendingAgentApprovals,
   hasUnfinishedWorkflowAppeal,
   isWorkflowAppealFinished
 } from "./workflow";
@@ -82,6 +84,27 @@ export interface WorkflowRepairCounterView {
 export interface WorkflowRecoveryCandidate {
   kind: "disconnected" | "stale" | "startup_stalled";
   agent: AgentState;
+}
+
+export type WorkflowRuntimeStatus =
+  | "running"
+  | "recovering"
+  | "starting-agent"
+  | "paused"
+  | "idle"
+  | "blocked"
+  | "awaiting-approval"
+  | "stale-running"
+  | "completed"
+  | "error";
+
+export interface WorkflowRuntimeStatusView {
+  status: WorkflowRuntimeStatus;
+  label: string;
+  tone: "idle" | "running" | "paused" | "blocked" | "completed";
+  canContinue: boolean;
+  continueDisabledReason?: string;
+  recoveryCandidate?: WorkflowRecoveryCandidate;
 }
 
 const stepMetadata: Record<WorkflowStepId, { title: string; description: string }> = {
@@ -194,6 +217,196 @@ export const getWorkflowRecoveryCandidate = (
     : null;
 };
 
+const hasCurrentCycleActiveAgentForStep = (
+  workflow: ProjectWorkflowState,
+  agents: AgentState[],
+  stepId: WorkflowStepId
+): boolean =>
+  agents.some((agent) =>
+    agent.category !== "manual" &&
+    isAgentActive(agent) &&
+    workflowStepIdForRecoveryAgent(agent) === stepId &&
+    (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+  );
+
+const getStaleRunningStepId = (
+  workflow: ProjectWorkflowState,
+  agents: AgentState[],
+  nowMs: number,
+  staleMs: number
+): WorkflowStepId | undefined => {
+  const stepProgress = ensureWorkflowStepProgressState(workflow);
+  return (Object.keys(stepProgress) as WorkflowStepId[]).find((stepId) => {
+    const progress = stepProgress[stepId];
+    if (hasCurrentCycleActiveAgentForStep(workflow, agents, stepId)) {
+      return false;
+    }
+    if (progress.status === "running") {
+      return true;
+    }
+    if (progress.status !== "recovering" && progress.status !== "starting") {
+      return false;
+    }
+    const updatedAt = new Date(progress.updatedAt ?? progress.startedAt ?? 0).getTime();
+    return Number.isFinite(updatedAt) && nowMs - updatedAt >= staleMs;
+  });
+};
+
+export const deriveWorkflowRuntimeStatus = (
+  workflow: ProjectWorkflowState,
+  agents: AgentState[],
+  options: {
+    projectKind?: ProjectKind;
+    nowMs?: number;
+    staleMs?: number;
+    workflowPauseRequested?: boolean;
+    autopilotEnabled?: boolean;
+    workflowObjective?: WorkflowObjective;
+  } = {}
+): WorkflowRuntimeStatusView => {
+  const projectKind = options.projectKind ?? "folder";
+  const workflowObjective = options.workflowObjective ?? "deliver";
+  const nowMs = options.nowMs ?? Date.now();
+  const staleMs = options.staleMs ?? 10 * 60 * 1000;
+  const workflowPauseRequested = options.workflowPauseRequested ?? false;
+  const recoveryCandidate = getWorkflowRecoveryCandidate(workflow, agents, nowMs, staleMs);
+  const stepProgress = ensureWorkflowStepProgressState(workflow);
+  const staleRunningStepId = getStaleRunningStepId(workflow, agents, nowMs, staleMs);
+  const pendingApproval = hasPendingAgentApprovals(agents);
+  const blockingHuman = hasBlockingHumanIntervention(workflow);
+  const activeAgent = agents.some((agent) =>
+    agent.category !== "manual" &&
+    isAgentActive(agent) &&
+    (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+  );
+
+  if (pendingApproval) {
+    return {
+      status: "awaiting-approval",
+      label: "Awaiting approval",
+      tone: "blocked",
+      canContinue: false,
+      continueDisabledReason: "Resolve the pending approval before continuing."
+    };
+  }
+
+  if (blockingHuman || workflow.workflowStage === "blocked_human") {
+    return {
+      status: "blocked",
+      label: "Blocked",
+      tone: "blocked",
+      canContinue: false,
+      continueDisabledReason: "Resolve the human intervention blocker before continuing."
+    };
+  }
+
+  if (recoveryCandidate || staleRunningStepId) {
+    return {
+      status: "stale-running",
+      label: "Needs recovery",
+      tone: "blocked",
+      canContinue: true,
+      recoveryCandidate: recoveryCandidate ?? undefined
+    };
+  }
+
+  if (Object.values(stepProgress).some((progress) => progress.status === "recovering")) {
+    return {
+      status: "recovering",
+      label: "Recovering",
+      tone: "running",
+      canContinue: false,
+      continueDisabledReason: "Workflow recovery is already in progress."
+    };
+  }
+
+  if (Object.values(stepProgress).some((progress) => progress.status === "starting")) {
+    return {
+      status: "starting-agent",
+      label: "Starting agent",
+      tone: "running",
+      canContinue: false,
+      continueDisabledReason: "A workflow agent is already starting."
+    };
+  }
+
+  if (activeAgent) {
+    return {
+      status: "running",
+      label: "Running",
+      tone: "running",
+      canContinue: false,
+      continueDisabledReason: "A live workflow agent is currently running."
+    };
+  }
+
+  if (
+    workflow.repair.status === "exhausted" ||
+    workflow.repair.status === "merge_conflicts" ||
+    workflow.workflowStopReason === "merge_conflicts"
+  ) {
+    return {
+      status: "blocked",
+      label: "Blocked",
+      tone: "blocked",
+      canContinue: false,
+      continueDisabledReason: "Use the manual recovery controls for the current workflow blocker."
+    };
+  }
+
+  if (
+    workflowPauseRequested ||
+    workflow.autopilotStatus?.pausedReason ||
+    getWorkflowPreviewRequest(workflow).status === "ready"
+  ) {
+    return {
+      status: "paused",
+      label: "Paused",
+      tone: "paused",
+      canContinue: true
+    };
+  }
+
+  if (
+    workflow.workflowStopReason === "ultimate_goal_satisfied" &&
+    workflowObjective === "deliver" &&
+    isWorkflowAppealFinished(workflow)
+  ) {
+    return {
+      status: "completed",
+      label: "Completed",
+      tone: "completed",
+      canContinue: false,
+      continueDisabledReason: "The Ultimate Goal is satisfied. Enable Optimize to continue looking for improvements."
+    };
+  }
+
+  const nextAction = getNextWorkflowAutomationAction(
+    workflow,
+    agents,
+    projectKind,
+    options.autopilotEnabled ?? false,
+    false,
+    workflowObjective
+  );
+  if (nextAction) {
+    return {
+      status: "idle",
+      label: "Idle",
+      tone: "idle",
+      canContinue: true
+    };
+  }
+
+  return {
+    status: "idle",
+    label: "Idle",
+    tone: "idle",
+    canContinue: false,
+    continueDisabledReason: "No runnable workflow step is available from the current state."
+  };
+};
+
 export const workflowStageLabel = (stage: WorkflowStage): string =>
   ({
     charter_needed: "Ultimate Goal Needed",
@@ -214,6 +427,8 @@ export const workflowStepStatusLabel = (status: WorkflowStepStatus): string =>
   ({
     not_started: "Not started",
     waiting: "Waiting",
+    recovering: "Recovering",
+    starting: "Starting",
     running: "Running",
     blocked: "Blocked",
     completed: "Completed",
@@ -224,6 +439,8 @@ export const workflowDisplayStatusLabel = (status: WorkflowTimelineDisplayState)
   ({
     not_started: "Not started",
     waiting: "Waiting",
+    recovering: "Recovering",
+    starting: "Starting",
     running: "Running",
     blocked: "Blocked",
     completed: "Completed",

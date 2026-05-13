@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   agentCategorySchema,
   agentReasoningModeSchema,
+  autopilotPolicySchema,
   appSettingsSchema,
   gitHubStatusSchema,
   humanInterventionKindSchema,
@@ -10,7 +11,8 @@ import {
   localProjectRecordSchema,
   portableInterfaceSchema,
   ultimateGoalSchema,
-  validationStatusSchema
+  validationStatusSchema,
+  workflowModeSchema
 } from "./schemas";
 
 export const credentialEntrySaveRequestSchema = z.object({
@@ -88,6 +90,34 @@ export const downloadLogsRequestSchema = z.object({
   projectId: z.string().min(1)
 });
 
+export const visualExportTabSchema = z.object({
+  id: z.enum(["overview", "workflow", "runs", "logs", "repository", "credentials", "settings"]),
+  label: z.string().min(1).max(80)
+});
+
+export const visualExportStartRequestSchema = z.object({
+  projectId: z.string().min(1),
+  tabs: z.array(visualExportTabSchema).min(1).max(8)
+});
+
+export const visualExportCaptureRequestSchema = z.object({
+  exportId: z.string().min(1),
+  target: z.object({
+    tab: visualExportTabSchema,
+    pageIndex: z.number().int().min(0),
+    pageCount: z.number().int().min(1).max(250),
+    scrollY: z.number().nonnegative(),
+    cropTop: z.number().nonnegative(),
+    sliceHeight: z.number().positive(),
+    viewportWidth: z.number().positive(),
+    viewportHeight: z.number().positive()
+  })
+});
+
+export const visualExportSessionRequestSchema = z.object({
+  exportId: z.string().min(1)
+});
+
 export const importInterfaceRequestSchema = z.object({
   projectRootPath: z.string().min(1),
   importPath: z.string().min(1),
@@ -101,6 +131,10 @@ export const refreshOverviewRequestSchema = z.object({
 export const fileSummaryRequestSchema = z.object({
   projectId: z.string().min(1),
   relativePath: z.string().min(1)
+});
+
+export const projectRepositoryViewRequestSchema = z.object({
+  projectId: z.string().min(1)
 });
 
 export const agentListRequestSchema = z.object({
@@ -128,7 +162,7 @@ export const layoutUpdateRequestSchema = z.object({
   leftPanelWidth: z.number().int().positive().optional(),
   rightPanelWidth: z.number().int().positive().optional(),
   bottomPanelHeight: z.number().int().positive().optional(),
-  activeCenterTab: z.enum(["overview", "workflow", "logs", "agents", "credentials", "file", "diff", "reports"]).optional()
+  activeCenterTab: z.enum(["overview", "workflow", "runs", "logs", "repository", "credentials", "settings", "agents", "file", "diff", "reports"]).optional()
 });
 
 export const uiStateUpdateRequestSchema = z.object({
@@ -173,6 +207,26 @@ export const createScopedGoalRequestSchema = z.object({
 
 export const retryWorkflowGoalRequestSchema = z.object({
   projectId: z.string().min(1)
+});
+
+export const setWorkflowModeRequestSchema = z.object({
+  projectId: z.string().min(1),
+  workflowMode: workflowModeSchema
+});
+
+export const requestWorkflowPreviewRequestSchema = z.object({
+  projectId: z.string().min(1),
+  reason: z.string().max(240).optional(),
+  remainingCycles: z.number().int().min(1).max(3).default(1)
+});
+
+export const workflowPreviewCheckpointRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
+export const setAutopilotPolicyRequestSchema = z.object({
+  projectId: z.string().min(1),
+  policy: autopilotPolicySchema.partial()
 });
 
 export const runRecommendationRequestSchema = z.object({
@@ -265,8 +319,13 @@ export type IpcChannel =
   | "project:exportInterface"
   | "project:downloadInterface"
   | "project:downloadLogs"
+  | "project:startVisualExport"
+  | "project:captureVisualExportPage"
+  | "project:finishVisualExport"
+  | "project:cancelVisualExport"
   | "project:importInterface"
   | "project:getFileSummary"
+  | "project:getRepositoryView"
   | "project:listAgents"
   | "project:getAgent"
   | "project:getLogFeed"
@@ -283,8 +342,13 @@ export type IpcChannel =
   | "workflow:approveRecommendation"
   | "workflow:createScopedGoal"
   | "workflow:retryGoal"
+  | "workflow:setMode"
+  | "workflow:requestPreview"
+  | "workflow:cancelPreview"
+  | "workflow:completePreview"
   | "workflow:advanceStage"
   | "workflow:recover"
+  | "workflow:clearStaleLock"
   | "workflow:requestHumanIntervention"
   | "workflow:resolveHumanIntervention"
   | "workflow:submitUserInputRequest"

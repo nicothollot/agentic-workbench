@@ -13,7 +13,8 @@ import {
 import type { GoalCheckUpdateInput } from "@runtime/workflowRecommendations";
 import { createAgentSkeleton, createLocalProjectRecord } from "@shared/defaults";
 import { projectReviewLogBundleSchema } from "@shared/schemas";
-import type { UltimateGoal } from "@shared/types";
+import type { AgentState, UltimateGoal } from "@shared/types";
+import { nowIso } from "@shared/utils";
 import { createTempDir, initGitRepo, commitAll, writeMockSettings } from "./helpers";
 
 const execFileAsync = promisify(execFile);
@@ -578,7 +579,7 @@ describe("integration flows", () => {
       source: "agent",
       status: "failed",
       title: "Integrity failed",
-      detail: `Validation failed while checking ${root}/src/index.ts`,
+      detail: `Validation failed while checking ${root}/src/index.ts with token=secret-token-value-12345`,
       stepId: "integrity",
       agentId: "agent-1",
       agentCategory: "integrity"
@@ -605,7 +606,7 @@ describe("integration flows", () => {
     agent.commandLog.push({
       command: `npm test -- ${root}/src/index.ts`,
       cwd: root,
-      output: `FAIL ${root}/src/index.ts\nWorktree: ${agent.worktree.worktreePath}`,
+      output: `FAIL ${root}/src/index.ts\nWorktree: ${agent.worktree.worktreePath}\nAuthorization: Bearer secret-token-value-12345\napiKey=sk-proj-secretvalue1234567890`,
       status: "failed",
       startedAt: "2026-04-07T00:00:01.000Z",
       completedAt: "2026-04-07T00:00:02.000Z",
@@ -646,7 +647,10 @@ describe("integration flows", () => {
     const bundle = projectReviewLogBundleSchema.parse(JSON.parse(raw));
 
     expect(raw).not.toContain(root);
+    expect(raw).not.toContain("secret-token-value-12345");
+    expect(raw).not.toContain("sk-proj-secretvalue1234567890");
     expect(raw).toContain("<project-root>");
+    expect(raw).toContain("[redacted]");
     expect(raw).toContain("<agent-worktree>");
     expect(raw).toContain("<user-input-inbox>");
     expect(bundle.summary.totalAgents).toBe(1);
@@ -715,7 +719,7 @@ describe("integration flows", () => {
     expect(developerInstructions).toContain("Project boundary rules");
     expect(developerInstructions).toContain("External service policy");
     expect(developerInstructions).toContain("free/no-card APIs and API keys are allowed");
-    expect(developerInstructions).toContain("request the credential through the user-input/API Keys flow");
+    expect(developerInstructions).toContain("request the credential through the user-input/Credentials flow");
     expect(turnText).toContain(taskPrompt);
     expect(turnText).not.toContain("Make the largest coherent, reviewable change");
   });
@@ -1357,6 +1361,198 @@ describe("integration flows", () => {
     expect(codingStarted.record.agents.some((agent) => agent.category === "coding")).toBe(true);
   });
 
+  it("persists workflow mode changes without interrupting active workflow agents", async () => {
+    const root = await createSampleRepo("workflow-mode-persistence");
+    const appData = await createTempDir("appdata-workflow-mode-persistence");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    const fastWorkflow = await service.setWorkflowMode(selected.record.id, "fast");
+    const storage = new WorkbenchStorage(appData);
+    const storedFastRecord = (await storage.loadAllProjects()).find((record) => record.id === selected.record.id);
+    expect(fastWorkflow.workflowMode).toBe("fast");
+    expect(storedFastRecord?.workflow.workflowMode).toBe("fast");
+
+    const project = (service as any).projects.get(selected.record.id);
+    const activeAgent: any = {
+      ...createAgentSkeleton("coding", "Coding Pass", "Keep running.", "gpt-5.4"),
+      status: "running" as const
+    };
+    project.record.agents.unshift(activeAgent);
+
+    const normalWorkflow = await service.setWorkflowMode(selected.record.id, "normal");
+    expect(normalWorkflow.workflowMode).toBe("normal");
+    expect(project.record.agents.find((agent: any) => agent.id === activeAgent.id)?.status).toBe("running");
+  });
+
+  it("queues Generate Preview safely, reaches preview ready, and resumes autopilot afterward", async () => {
+    const root = await createSampleRepo("workflow-preview-cycle");
+    const appData = await createTempDir("appdata-workflow-preview-cycle");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    (service as any).transport = undefined;
+    (service as any).codexAvailability = { source: "unavailable" };
+
+    await service.updateUltimateGoal(selected.record.id, {
+      summary: "Build an inspectable workflow preview.",
+      detailedIntent: "The operator needs to inspect the app structure before normal workflow continues.",
+      successCriteria: ["The preview surface is visible and honest about incomplete areas."],
+      constraints: ["Keep typed IPC intact.", "Do not claim final completion from a preview alone."],
+      nonGoals: ["Do not add secrets."],
+      targetAudience: "Workbench operators",
+      qualityBar: "Preview state is durable and resumable.",
+      source: "user"
+    }, true);
+
+    const project = (service as any).projects.get(selected.record.id);
+    const activeAgent: any = {
+      ...createAgentSkeleton("coding", "Coding Pass", "Keep running.", "gpt-5.4"),
+      status: "running" as const
+    };
+    project.record.agents.unshift(activeAgent);
+
+    const queued = await service.requestWorkflowPreview(selected.record.id, "Inspect the current app shell.");
+    expect(queued.previewRequest?.status).toBe("queued");
+    expect(project.record.agents.find((agent: any) => agent.id === activeAgent.id)?.status).toBe("running");
+
+    activeAgent.status = "completed";
+    await service.runRecommendation(selected.record.id, false);
+    const previewRecommendation = getProjectRecord(service, selected.record.id)?.workflow.recommendations[0];
+    expect(previewRecommendation?.title).toBe("Generate runnable preview checkpoint");
+    expect(getProjectRecord(service, selected.record.id)?.workflow.previewRequest?.status).toBe("active");
+
+    await service.approveRecommendation(selected.record.id, previewRecommendation?.id ?? "");
+    await service.createScopedGoal(selected.record.id, false);
+    const scopedPreview = getProjectRecord(service, selected.record.id)?.workflow.scopedGoal;
+    expect(scopedPreview?.acceptanceCriteria.some((criterion) => criterion.includes("visible/runnable preview"))).toBe(true);
+
+    await service.setAutopilotPolicy(selected.record.id, { enabled: true, pauseOnPreviewReady: true });
+    const liveProject = (service as any).projects.get(selected.record.id);
+    liveProject.record.workflow.workflowCycle.status = "merged";
+    (service as any).finalizeWorkflowCycle(liveProject);
+    await (service as any).persistProjectUpdate(liveProject);
+
+    const ready = getProjectRecord(service, selected.record.id)?.workflow;
+    expect(ready?.previewRequest?.status).toBe("ready");
+    expect(ready?.previewRequest?.evidence?.[0]).toContain("deterministic validation and integration");
+    expect(ready?.ultimateGoalCompletion?.state).toBe("needs_more_work");
+    expect(getProjectRecord(service, selected.record.id)?.localState.workflowPauseRequested).toBe(true);
+    expect(getProjectRecord(service, selected.record.id)?.workflow.autopilotPolicy.enabled).toBe(true);
+
+    const completed = await service.completeWorkflowPreview(selected.record.id);
+    expect(completed.previewRequest?.status).toBe("completed");
+    expect(getProjectRecord(service, selected.record.id)?.localState.workflowPauseRequested).toBe(false);
+    expect(getProjectRecord(service, selected.record.id)?.workflow.autopilotPolicy.enabled).toBe(true);
+  });
+
+  it("uses deterministic fast-mode packages before launching a recommendation agent", async () => {
+    const root = await createSampleRepo("fast-deterministic-recommendation");
+    const appData = await createTempDir("appdata-fast-deterministic-recommendation");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    const transport = new CapturingPromptTransport();
+    (service as unknown as { transport: MockCodexTransport }).transport = transport;
+
+    await service.updateUltimateGoal(selected.record.id, {
+      summary: "Close coherent workflow package requirements.",
+      detailedIntent: "The workflow should batch related required checks when Fast Mode can do so safely.",
+      successCriteria: [
+        "Recommendation ranking retires multiple unmet required checks",
+        "Scoped goal metadata carries targeted check IDs",
+        "Acceptance evidence names grouped workflow package paths",
+        "Checklist consolidation keeps required package items distinct",
+        "Workflow task map exposes grouped package progress"
+      ],
+      constraints: ["Keep changes local to workflow package fixtures."],
+      nonGoals: ["Do not build Generate Preview."],
+      targetAudience: "Workbench operators",
+      qualityBar: "Deterministic, bounded, and test-backed.",
+      source: "user"
+    }, false);
+
+    const record = getProjectRecord(service, selected.record.id);
+    expect(record).toBeTruthy();
+    if (!record) {
+      return;
+    }
+    const workflow = record.workflow;
+    workflow.ultimateGoal.confirmedAt = "2026-04-12T00:00:00.000Z";
+    workflow.goalChecklist = applyGoalChecklistUpdates(
+      workflow.goalChecklist,
+      workflow.ultimateGoal.successCriteria.map((criterion: string) => ({
+        title: criterion,
+        status: "unmet" as const,
+        evidence: "Fast Mode should retire this through the shared workflow package implementation.",
+        relatedPaths: ["src/index.ts"]
+      })),
+      {
+        timestamp: "2026-04-12T00:00:00.000Z",
+        ultimateGoal: workflow.ultimateGoal,
+        cycleNumber: workflow.workflowCycle.cycleNumber
+      }
+    );
+    await service.setWorkflowMode(selected.record.id, "fast");
+    const previousRecommendationAgentCount = record.agents.filter((agent) => agent.category === "recommendation").length;
+
+    await service.runRecommendation(selected.record.id, false);
+
+    const recommendation = await waitFor(() => getProjectRecord(service, selected.record.id)?.workflow.recommendations[0]);
+    expect(recommendation.sourceWorkPackageId).toMatch(/^work-package:/);
+    expect(recommendation.targetedCheckIds?.length).toBeGreaterThanOrEqual(4);
+    const recommendationAgentsAfter = getProjectRecord(service, selected.record.id)?.agents.filter((agent) => agent.category === "recommendation") ?? [];
+    expect(recommendationAgentsAfter).toHaveLength(previousRecommendationAgentCount);
+    expect(transport.threadStarts).toHaveLength(0);
+
+    const beforeGoalAgentCount = (getProjectRecord(service, selected.record.id)?.agents ?? []).filter((agent) => agent.category === "goal").length;
+    await service.approveRecommendation(selected.record.id, recommendation.id);
+    await service.createScopedGoal(selected.record.id, false);
+    const scopedGoal = getProjectRecord(service, selected.record.id)?.workflow.scopedGoal;
+    expect(scopedGoal?.sourceWorkPackageId).toBe(recommendation.sourceWorkPackageId);
+    expect(scopedGoal?.targetedCheckIds?.length).toBeGreaterThanOrEqual(4);
+    const goalAgentsAfter = getProjectRecord(service, selected.record.id)?.agents.filter((agent) => agent.category === "goal") ?? [];
+    expect(goalAgentsAfter).toHaveLength(beforeGoalAgentCount);
+  });
+
+  it("falls back to the recommendation agent when fast-mode deterministic packages are insufficient", async () => {
+    const root = await createSampleRepo("fast-recommendation-agent-fallback");
+    const appData = await createTempDir("appdata-fast-recommendation-agent-fallback");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    const transport = new CapturingPromptTransport();
+    (service as unknown as { transport: MockCodexTransport }).transport = transport;
+
+    await service.updateUltimateGoal(selected.record.id, {
+      summary: "Close one small workflow requirement.",
+      detailedIntent: "Only one requirement is available, so Fast Mode should not invent a package.",
+      successCriteria: ["Single workflow requirement is evidenced"],
+      constraints: ["Keep typed IPC intact."],
+      nonGoals: [],
+      targetAudience: "Workbench operators",
+      qualityBar: "Small and verified.",
+      source: "user"
+    }, false);
+    const record = getProjectRecord(service, selected.record.id);
+    expect(record).toBeTruthy();
+    if (!record) {
+      return;
+    }
+    record.workflow.ultimateGoal.confirmedAt = "2026-04-12T00:00:00.000Z";
+    await service.setWorkflowMode(selected.record.id, "fast");
+
+    await service.runRecommendation(selected.record.id, false);
+
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.agents.find((agent) => agent.category === "recommendation"));
+    expect(transport.threadStarts.length).toBeGreaterThan(0);
+  });
+
   it("blocks the workflow on a pending human intervention and clears the block when resolved", async () => {
     const root = await createSampleRepo("blocked-human");
     const appData = await createTempDir("appdata-blocked-human");
@@ -1490,7 +1686,7 @@ describe("integration flows", () => {
     ).toBe("resolved");
   });
 
-  it("routes mid-run credential requests to API Keys and sends stored secrets only after explicit approval", async () => {
+  it("routes mid-run credential requests to Credentials and sends stored secrets only after explicit approval", async () => {
     const root = await createSampleRepo("credential-request-flow");
     const appData = await createTempDir("appdata-credential-request-flow");
     const service = await createService(appData);
@@ -1571,7 +1767,7 @@ describe("integration flows", () => {
     expect(respond).toHaveBeenCalledWith("request-credential-flow", {
       answers: [
         "free-polygon-key",
-        expect.stringContaining("Credential approved from the local API Keys section")
+        expect.stringContaining("Credential approved from the local Credentials section")
       ]
     });
     const afterSubmit = getProjectRecord(service, selected.record.id);
@@ -1923,9 +2119,9 @@ describe("integration flows", () => {
     await service.updateUltimateGoal(
       selected.record.id,
       {
-        summary: "Let the workflow run unattended until the next recommendation decision.",
-        detailedIntent: "Autopilot should pick the most checklist-aligned next step, but turning it off should only affect the next recommendation boundary.",
-        successCriteria: ["Autopilot picks a recommendation automatically.", "Turning it off does not interrupt the active cycle."],
+        summary: "Let the checklist runner continue until the next recommendation decision.",
+        detailedIntent: "The runner should pick the most checklist-aligned next step, but turning it off should only affect the next recommendation boundary.",
+        successCriteria: ["A recommendation is picked automatically.", "Turning the runner off does not interrupt the active cycle."],
         constraints: ["Keep the behavior persisted in project state."],
         nonGoals: ["Do not cancel work that is already running."],
         targetAudience: "Operators who want to switch between unattended and supervised execution.",
@@ -1941,7 +2137,7 @@ describe("integration flows", () => {
     }, 6_000);
 
     const checklistRecommendations = autopilotApproved.recommendations.filter((entry) =>
-      entry.title.startsWith("Satisfy goal check:")
+      /^Satisfy (?:work package|goal check):/.test(entry.title)
     );
     if (checklistRecommendations.length > 0) {
       expect(autopilotApproved.approvedRecommendation?.recommendationId).toBe(checklistRecommendations[0]?.id);
@@ -2349,7 +2545,7 @@ describe("integration flows", () => {
       };
     }
 
-    await service.recoverWorkflow(selected.record.id);
+    service.recoverWorkflow(selected.record.id);
 
     const recovered = await waitFor(() => {
       const nextRecord = getProjectRecord(service, selected.record.id);
@@ -2794,6 +2990,7 @@ describe("integration flows", () => {
       const workflow = getProjectRecord(service, selected.record.id)?.workflow;
       return workflow?.repair.status === "exhausted" && workflow.repair.attemptCount === 1 ? workflow : null;
     }, 8_000);
+    await service.updateUiState(selected.record.id, {});
 
     const reopenedService = new AppService(appData);
     await reopenedService.initialize();
@@ -3060,6 +3257,248 @@ describe("integration flows", () => {
     expect(streamingRows[0].detail).toContain("second");
   });
 
+  it("acknowledges stale workflow recovery before slow transport startup completes", async () => {
+    const root = await createSampleFolder("recovery-ack-before-startup");
+    const appData = await createTempDir("appdata-recovery-ack-before-startup");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      summary: "Recover without blocking the UI.",
+      detailedIntent: "Recovery should acknowledge immediately and continue startup in the background.",
+      successCriteria: ["Continue returns quickly."],
+      constraints: ["Keep local state durable."],
+      nonGoals: ["Do not redesign the UI."],
+      targetAudience: "Workbench operators",
+      qualityBar: "Responsive and explicit.",
+      source: "user",
+      confirmedAt: nowIso()
+    };
+    workflow.scopedGoal = {
+      id: "scoped-recovery",
+      sourceRecommendationId: "rec-recovery",
+      summary: "Restart the saved coding step.",
+      executionBrief: "Continue from the saved scoped goal.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: nowIso()
+    };
+    workflow.workflowStage = "coding_running";
+    workflow.workflowStopReason = "none";
+    workflow.workflowCycle.status = "coding";
+    workflow.stepProgress.coding = {
+      ...workflow.stepProgress.coding,
+      status: "running",
+      startedAt: nowIso(),
+      updatedAt: nowIso(),
+      currentActivity: "Interrupted coding run",
+      agentCategory: "coding"
+    };
+    project.record.localState.autopilotEnabled = true;
+    workflow.autopilotPolicy = {
+      ...workflow.autopilotPolicy,
+      enabled: true
+    };
+    const interruptedAgent: AgentState = {
+      ...createAgentSkeleton("coding", "Interrupted Coding Pass", "Implement the saved scoped goal.", "gpt-5.4-mini"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "running",
+      startedAt: nowIso(),
+      threadId: "lost-coding-thread",
+      currentPhase: "Turn running"
+    };
+    project.record.agents.unshift(interruptedAgent);
+
+    let releaseStartup!: () => void;
+    const startupGate = new Promise<void>((resolve) => {
+      releaseStartup = resolve;
+    });
+    const initializeTransport = vi.fn(async () => {
+      await startupGate;
+      (service as any).transport = new MockCodexTransport();
+      (service as any).codexAvailability = { source: "mock", message: "Mock transport ready." };
+    });
+    (service as any).transport = undefined;
+    (service as any).codexAvailability = { source: "unavailable", message: "Starting test transport." };
+    (service as any).initializeTransport = initializeTransport;
+
+    const startedAt = performance.now();
+    const stage = service.recoverWorkflow(selected.record.id);
+    const elapsed = performance.now() - startedAt;
+
+    expect(stage).toBe("goal_ready");
+    expect(elapsed).toBeLessThan(100);
+    expect(initializeTransport).toHaveBeenCalled();
+    expect(getProjectRecord(service, selected.record.id)?.workflow.stepProgress.coding.status).toBe("recovering");
+
+    releaseStartup();
+    await waitFor(() => !(service as any).workflowRecoveryInFlight.has(selected.record.id));
+  });
+
+  it("ignores token usage storms for renderer emits and project saves", async () => {
+    const root = await createSampleFolder("token-usage-storm");
+    const appData = await createTempDir("appdata-token-usage-storm");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    const agent = await service.createAgent(selected.record.id, "integrity", "Token Usage Agent", "Inspect.", "gpt-5.4");
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const originalSaveProject = (service as any).saveProject.bind(service);
+    let saveCount = 0;
+    let emitCount = 0;
+    (service as any).saveProject = async (...args: unknown[]) => {
+      saveCount += 1;
+      return await originalSaveProject(...args);
+    };
+    service.on("stateChanged", () => {
+      emitCount += 1;
+    });
+
+    for (let index = 0; index < 50; index += 1) {
+      (service as any).handleTransportNotification({
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: agent.threadId,
+          turnId: "turn-token",
+          tokenUsage: {
+            total: { inputTokens: index, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: index },
+            last: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1 },
+            modelContextWindow: null
+          }
+        }
+      });
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(saveCount).toBe(0);
+    expect(emitCount).toBe(0);
+  });
+
+  it("deduplicates repeated command status activity rows", async () => {
+    const root = await createSampleFolder("command-activity-dedupe");
+    const appData = await createTempDir("appdata-command-activity-dedupe");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    const agent = await service.createAgent(selected.record.id, "integrity", "Command Agent", "Run a command.", "gpt-5.4");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const startedNotification = {
+      method: "item/started",
+      params: {
+        threadId: agent.threadId,
+        turnId: "turn-command",
+        item: {
+          type: "commandExecution",
+          id: "cmd-1",
+          command: "npm test",
+          cwd: root
+        }
+      }
+    };
+    const completedNotification = {
+      method: "item/completed",
+      params: {
+        threadId: agent.threadId,
+        turnId: "turn-command",
+        item: {
+          type: "commandExecution",
+          id: "cmd-1",
+          command: "npm test",
+          cwd: root,
+          status: "completed",
+          exitCode: 0
+        }
+      }
+    };
+
+    (service as any).handleTransportNotification(startedNotification);
+    (service as any).handleTransportNotification(startedNotification);
+    (service as any).handleTransportNotification(completedNotification);
+    (service as any).handleTransportNotification(completedNotification);
+
+    const activity = getProjectRecord(service, selected.record.id)?.workflow.activityLog ?? [];
+    expect(activity.filter((event) => event.agentId === agent.id && event.title === "Command started")).toHaveLength(1);
+    expect(activity.filter((event) => event.agentId === agent.id && event.title === "Command completed")).toHaveLength(1);
+  });
+
+  it("flushes final transport states promptly", async () => {
+    const root = await createSampleFolder("final-state-flush");
+    const appData = await createTempDir("appdata-final-state-flush");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    const agent = await service.createAgent(selected.record.id, "integrity", "Final Flush Agent", "Inspect.", "gpt-5.4");
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    let saveCount = 0;
+    (service as any).saveProject = async () => {
+      saveCount += 1;
+    };
+
+    (service as any).handleTransportNotification({
+      method: "turn/completed",
+      params: {
+        threadId: agent.threadId,
+        turn: {
+          id: "turn-final",
+          items: [],
+          status: "completed",
+          error: null,
+          startedAt: Math.floor(Date.now() / 1000),
+          completedAt: Math.floor(Date.now() / 1000),
+          durationMs: 1
+        }
+      }
+    });
+
+    await waitFor(() => saveCount > 0);
+  });
+
+  it("keeps normal renderer state compact for raw events and command output", async () => {
+    const root = await createSampleFolder("renderer-compact-state");
+    const appData = await createTempDir("appdata-renderer-compact-state");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    const agent = await service.createAgent(selected.record.id, "integrity", "Compact Agent", "Inspect.", "gpt-5.4");
+    const project = (service as any).projects.get(selected.record.id);
+    const storedAgent = project.record.agents.find((entry: AgentState) => entry.id === agent.id) as AgentState;
+    storedAgent.commandLog.unshift({
+      itemId: "huge-command",
+      command: "npm test",
+      output: "x".repeat(50_000),
+      status: "running",
+      startedAt: nowIso()
+    });
+    storedAgent.events.unshift({
+      id: "huge-event",
+      agentId: storedAgent.id,
+      timestamp: nowIso(),
+      type: "raw",
+      status: "info",
+      title: "Huge raw event",
+      detail: "d".repeat(20_000),
+      raw: { payload: "r".repeat(20_000) }
+    });
+
+    const rendererRecord = service.getRendererState().projects.find((entry) => entry.record.id === selected.record.id)?.record;
+    const rendererAgent = rendererRecord?.agents.find((entry) => entry.id === agent.id);
+    expect(rendererAgent?.commandLog[0]?.output).toBe("");
+    expect(rendererAgent?.events[0]?.raw).toBeUndefined();
+    expect(rendererAgent?.events[0]?.detail?.length ?? 0).toBeLessThanOrEqual(820);
+  });
+
   it("creates manual agents separately from the workflow cycle while preserving git worktree isolation", async () => {
     const root = await createSampleRepo("manual-agent");
     const appData = await createTempDir("appdata-manual-agent");
@@ -3128,6 +3567,7 @@ describe("integration flows", () => {
     await service.loadProject(root);
     const selected = await service.selectPendingInterface("fresh");
     await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
+    await service.updateUiState(selected.record.id, { workflowPauseRequested: true });
 
     await service.updateUltimateGoal(selected.record.id, {
       summary: "Improve operator ergonomics.",

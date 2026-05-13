@@ -43,6 +43,7 @@ const MAX_EVENT_RAW_ARRAY_LENGTH = 20;
 const MAX_EVENT_RAW_OBJECT_KEYS = 40;
 const MAX_EVENT_RAW_DEPTH = 4;
 const STRUCTURED_STREAM_PLACEHOLDER = "Receiving structured agent output...";
+const LATEST_ONLY_EVENT_TITLES = new Set(["Plan updated"]);
 
 const ANSI_ESCAPE_PATTERN = new RegExp(
   String.raw`(?:\u001B\][\s\S]*?(?:\u0007|\u001B\\))|(?:[\u001B\u009B][[\]()#;?]*(?:[0-?]*[ -/]*[@-~]))`,
@@ -240,7 +241,12 @@ const pushEvent = (
   options?: Pick<RuntimeEventRecord, "status" | "itemId">
 ): void => {
   const timestamp = nowIso();
-  agent.events.unshift({
+  const existingIndex = options?.itemId
+    ? agent.events.findIndex((entry) => entry.itemId === options.itemId && entry.type === type && entry.title === title)
+    : LATEST_ONLY_EVENT_TITLES.has(title)
+      ? agent.events.findIndex((entry) => entry.type === type && entry.title === title)
+      : -1;
+  const nextEvent = {
     id: nanoid(),
     agentId: agent.id,
     timestamp,
@@ -252,7 +258,17 @@ const pushEvent = (
     title,
     detail: detail ? capDetail(detail) : detail,
     raw: compactRawPayload(raw)
-  });
+  };
+  if (existingIndex >= 0) {
+    const [existing] = agent.events.splice(existingIndex, 1);
+    agent.events.unshift({
+      ...existing,
+      ...nextEvent,
+      id: existing.id
+    });
+  } else {
+    agent.events.unshift(nextEvent);
+  }
   agent.lastActivityAt = timestamp;
   if (agent.events.length > 250) {
     agent.events.length = 250;
@@ -353,14 +369,21 @@ export const reduceAgentRuntimeEvent = (agent: AgentState, event: WorkbenchTrans
       agent.startedAt ??= nowIso();
       agent.currentSubtask = event.detail ?? event.command ?? event.title;
       if (event.command) {
-        agent.commandLog.unshift({
-          itemId: event.itemId,
-          command: event.command,
-          cwd: event.cwd,
-          output: "",
-          status: "running",
-          startedAt: nowIso()
-        });
+        const existingCommand = agent.commandLog.find((entry) => entry.itemId === event.itemId);
+        if (existingCommand) {
+          existingCommand.command = event.command;
+          existingCommand.cwd = event.cwd;
+          existingCommand.status = "running";
+        } else {
+          agent.commandLog.unshift({
+            itemId: event.itemId,
+            command: event.command,
+            cwd: event.cwd,
+            output: "",
+            status: "running",
+            startedAt: nowIso()
+          });
+        }
       }
       pushEvent(agent, "item", event.title, event.detail ?? event.command, event, {
         status: "running",

@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 import { APP_NAME, PROJECT_SHELL_LAUNCHER_CMD_PATH, PROJECT_SHELL_LAUNCH_LOG_PATH } from "@shared/constants";
 import {
   DEFAULT_AGENT_REASONING_EFFORTS,
@@ -11,8 +11,8 @@ import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/
 import {
   buildWorkflowGoalView,
   buildWorkflowTimelineSteps,
+  deriveWorkflowRuntimeStatus,
   getWorkflowRecoveryCandidate,
-  getWorkflowRepairCounterView,
   workflowActionGuide,
   workflowRunStateLabel,
   workflowSectionProminence,
@@ -26,7 +26,10 @@ import type {
   AgentReasoningEfforts,
   AgentReasoningMode,
   AgentState,
+  AutopilotPolicy,
+  AutopilotProfile,
   ApprovalRequestRecord,
+  CredentialRequestRecord,
   CredentialEntryMetadata,
   DiscoveredModel,
   ExecutionMode,
@@ -37,8 +40,11 @@ import type {
   InterfaceCandidate,
   LoadedProjectView,
   ProjectLoadResult,
+  ProjectCommandLogEntry,
   ProjectLogFeedResponse,
+  ProjectRepositoryView,
   ProjectWorkflowState,
+  RepoTreeNode,
   RuntimeEventRecord,
   SummarySource,
   UserInputRequestQuestion,
@@ -46,9 +52,11 @@ import type {
   UltimateGoalImportPreview,
   UltimateGoalProgressEstimate,
   UltimateGoal,
+  VisualExportCaptureTarget,
+  VisualExportTab,
   ValidationStatus,
   WorkflowActivityEvent,
-  WorkspaceCenterTab,
+  WorkspaceVisualTabId,
   WorkflowRecommendationOption,
   WorkbenchState
 } from "@shared/types";
@@ -66,6 +74,10 @@ type LogFeedView = ProjectLogFeedResponse & {
   loading: boolean;
 };
 
+type RepositoryDataView = ProjectRepositoryView & {
+  loading: boolean;
+};
+
 type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
   kind: "resume_workflow";
   title: string;
@@ -78,11 +90,193 @@ type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
   actionLabel: string;
 };
 
+type SettingsDraftState = {
+  executionMode: ExecutionMode;
+  distroName: string;
+  codexBinaryPath: string;
+  codexHome: string;
+  worktreeBaseDir: string;
+  warnOnMntMount: boolean;
+  maxRepairCycles: number;
+  interfaceCreationModel: string;
+  interfaceCreationReasoningEffort: InterfaceReasoningEffort;
+  agentReasoningMode: AgentReasoningMode;
+  agentReasoningEfforts: Record<AgentCategory, InterfaceReasoningEffort>;
+  autoApproveCommands: boolean;
+  autoApproveGitCommits: boolean;
+  autoApproveGitPushes: boolean;
+  considerPaidServices: boolean;
+};
+
+type SettingsDraftUpdate = {
+  executionMode?: ExecutionMode;
+  distroName?: string;
+  codexBinaryPath?: string;
+  codexHome?: string;
+  worktreeBaseDir?: string;
+  warnOnMntMount?: boolean;
+  maxRepairCycles?: number;
+  interfaceCreationModel?: string;
+  interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
+  agentReasoningMode?: AgentReasoningMode;
+  agentReasoningEfforts?: AgentReasoningEfforts;
+  autoApproveCommands?: boolean;
+  autoApproveGitCommits?: boolean;
+  autoApproveGitPushes?: boolean;
+  considerPaidServices?: boolean;
+};
+
+type StatusChipTone =
+  | "running"
+  | "paused"
+  | "idle"
+  | "blocked"
+  | "completed"
+  | "not-started"
+  | "pending"
+  | "error"
+  | "warning"
+  | "success";
+
+type ShellStatusTone = Extract<StatusChipTone, "idle" | "running" | "paused" | "blocked" | "completed">;
+
+type ShellAction = {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+};
+
 const interfaceIconUrl = new URL("../../assets/branding/interface_icon.png", import.meta.url).href;
 const WORKFLOW_AGENT_STALE_MS = 10 * 60 * 1000;
 const AGENT_HISTORY_PAGE_SIZE = 20;
 const LOG_ACTIVITY_PAGE_SIZE = 80;
 const LOG_COMMAND_PAGE_SIZE = 50;
+const RUN_DETAIL_PREVIEW_TEXT_LIMIT = 4_000;
+const WORKSPACE_VISUAL_TABS: VisualExportTab[] = [
+  { id: "overview", label: "Overview" },
+  { id: "workflow", label: "Workflow" },
+  { id: "runs", label: "Runs" },
+  { id: "logs", label: "Logs" },
+  { id: "repository", label: "Repository" },
+  { id: "credentials", label: "Credentials" },
+  { id: "settings", label: "Settings" }
+];
+const WORKSPACE_TAB_IDS = new Set<WorkspaceVisualTabId>(WORKSPACE_VISUAL_TABS.map((tab) => tab.id));
+const VISUAL_EXPORT_READY_TIMEOUT_MS = 5_000;
+
+type VisualExportReadiness = {
+  activeProjectId?: string;
+  activeWorkspaceTab: WorkspaceVisualTabId;
+  logFeedProjectId: string;
+  logFeedLoading: boolean;
+  repositoryProjectId: string;
+  repositoryLoading: boolean;
+  workflowAgentPageLoading: boolean;
+  manualAgentPageLoading: boolean;
+};
+
+type VisualExportScrollMetrics = {
+  totalHeight: number;
+  maxScrollY: number;
+  viewportWidth: number;
+  viewportHeight: number;
+};
+
+const delay = async (durationMs: number): Promise<void> =>
+  await new Promise((resolve) => window.setTimeout(resolve, durationMs));
+
+const waitForVisualRender = async (): Promise<void> => {
+  await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)));
+  await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)));
+  await delay(80);
+};
+
+const waitForVisualCondition = async (
+  condition: () => boolean,
+  description: string,
+  timeoutMs = VISUAL_EXPORT_READY_TIMEOUT_MS
+): Promise<void> => {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    if (condition()) {
+      return;
+    }
+    await delay(80);
+  }
+  throw new Error(`Timed out waiting for ${description}.`);
+};
+
+const getVisualExportScrollMetrics = (): VisualExportScrollMetrics => {
+  const scrollingElement = document.scrollingElement ?? document.documentElement;
+  const viewportWidth = Math.ceil(window.innerWidth);
+  const viewportHeight = Math.ceil(window.innerHeight);
+  const totalHeight = Math.ceil(Math.max(
+    scrollingElement.scrollHeight,
+    document.documentElement.scrollHeight,
+    document.body.scrollHeight,
+    viewportHeight
+  ));
+
+  return {
+    totalHeight,
+    maxScrollY: Math.max(0, totalHeight - viewportHeight),
+    viewportWidth,
+    viewportHeight
+  };
+};
+
+const buildVisualExportCaptureTargets = (
+  tab: VisualExportTab,
+  metrics: VisualExportScrollMetrics
+): VisualExportCaptureTarget[] => {
+  const targets: VisualExportCaptureTarget[] = [];
+  let nextStartY = 0;
+
+  while (nextStartY < metrics.totalHeight) {
+    const scrollY = Math.min(nextStartY, metrics.maxScrollY);
+    const cropTop = nextStartY - scrollY;
+    const sliceHeight = Math.min(metrics.viewportHeight - cropTop, metrics.totalHeight - nextStartY);
+    if (sliceHeight <= 0) {
+      break;
+    }
+
+    targets.push({
+      tab,
+      pageIndex: targets.length,
+      pageCount: 1,
+      scrollY,
+      cropTop,
+      sliceHeight,
+      viewportWidth: metrics.viewportWidth,
+      viewportHeight: metrics.viewportHeight
+    });
+    nextStartY += sliceHeight;
+  }
+
+  const pageCount = Math.max(1, targets.length);
+  return targets.length
+    ? targets.map((target) => ({ ...target, pageCount }))
+    : [{
+      tab,
+      pageIndex: 0,
+      pageCount,
+      scrollY: 0,
+      cropTop: 0,
+      sliceHeight: metrics.viewportHeight,
+      viewportWidth: metrics.viewportWidth,
+      viewportHeight: metrics.viewportHeight
+    }];
+};
+
+const normalizeWorkspaceTab = (tab?: string): WorkspaceVisualTabId => {
+  if (tab === "reports") {
+    return "workflow";
+  }
+  if (tab === "file" || tab === "diff" || tab === "agents") {
+    return tab === "agents" ? "runs" : "repository";
+  }
+  return WORKSPACE_TAB_IDS.has(tab as WorkspaceVisualTabId) ? tab as WorkspaceVisualTabId : "overview";
+};
 
 const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "Ultimate Goal authoring format for Codex Agent Workbench",
@@ -406,6 +600,56 @@ const ultimateGoalProgressSourceLabel = (source: UltimateGoalProgressEstimate["s
 const workflowObjectiveLabel = (objective: LoadedProjectView["record"]["localState"]["workflowObjective"]): string =>
   objective === "optimize" ? "Optimize project" : "Deliver goal";
 
+const workflowModeLabel = (mode: ProjectWorkflowState["workflowMode"]): string =>
+  mode === "fast" ? "Fast mode" : "Normal mode";
+
+const previewStatusLabel = (status?: NonNullable<ProjectWorkflowState["previewRequest"]>["status"]): string => {
+  switch (status) {
+    case "queued":
+      return "Preview queued";
+    case "active":
+      return "Generating preview";
+    case "ready":
+      return "Preview ready";
+    case "completed":
+      return "Preview completed";
+    case "cancelled":
+      return "Preview cancelled";
+    case "none":
+    default:
+      return "No preview";
+  }
+};
+
+const previewButtonLabel = (status?: NonNullable<ProjectWorkflowState["previewRequest"]>["status"]): string => {
+  switch (status) {
+    case "queued":
+      return "Preview Queued";
+    case "active":
+      return "Generating Preview";
+    case "ready":
+      return "Preview Ready";
+    default:
+      return "Generate Preview";
+  }
+};
+
+const autopilotProfileLabel = (profile: AutopilotProfile): string => {
+  switch (profile) {
+    case "conservative":
+      return "Conservative";
+    case "aggressive":
+      return "Aggressive";
+    case "custom":
+      return "Custom";
+    case "balanced":
+      return "Balanced";
+  }
+};
+
+const autopilotPauseReasonLabel = (reason?: NonNullable<ProjectWorkflowState["autopilotStatus"]>["pausedReason"]): string =>
+  reason ? reason.replace(/_/g, " ") : "None";
+
 const ultimateGoalCompletionStateLabel = (
   state: NonNullable<ProjectWorkflowState["ultimateGoalCompletion"]>["state"]
 ): string => state === "goal_satisfied" ? "Goal satisfied" : "More work needed";
@@ -432,6 +676,686 @@ const goalCheckSourceLabel = (source: ProjectWorkflowState["goalChecklist"][numb
     agent: "Agent",
     deterministic: "Deterministic"
   })[source];
+
+type WorkflowChecklistGroupSummary = {
+  id: string;
+  title: string;
+  openCount: number;
+  metCount: number;
+  unknownCount: number;
+  blockedCount: number;
+  totalCount: number;
+  representative?: string;
+  relatedPaths: string[];
+};
+
+type WorkflowChecklistOverview = {
+  percentComplete?: number;
+  requiredMet: number;
+  requiredTotal: number;
+  openRequired: number;
+  unknownCount: number;
+  groups: WorkflowChecklistGroupSummary[];
+  topOpenGroups: WorkflowChecklistGroupSummary[];
+  topMetGroups: WorkflowChecklistGroupSummary[];
+  topUnknownGroups: WorkflowChecklistGroupSummary[];
+};
+
+type WorkflowAttentionItem = {
+  id: string;
+  kind: "approval" | "blocker" | "credential" | "integrity" | "warning";
+  title: string;
+  detail: string;
+  tone: "neutral" | "warning" | "danger";
+  createdAt?: string;
+  approval?: ApprovalRequestRecord;
+  target?: "credentials" | "user-input" | "blocker";
+};
+
+const summarizeText = (value?: string, fallback = "Not available", maxLength = 180): string => {
+  const normalized = (value ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return fallback;
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  const prefix = normalized.slice(0, maxLength);
+  const sentenceEnd = prefix.lastIndexOf(". ");
+  const cutIndex = sentenceEnd > 80 ? sentenceEnd + 1 : prefix.lastIndexOf(" ");
+  const safeCut = cutIndex > 80 ? cutIndex : maxLength;
+  return `${prefix.slice(0, safeCut).trim().replace(/[.,;:]+$/, "")}...`;
+};
+
+const redactSensitiveText = (value?: string): string => {
+  if (!value) {
+    return "";
+  }
+
+  return value
+    .replace(/AGENT_WORKBENCH_CREDENTIAL\s+({[^\r\n]+})/g, "AGENT_WORKBENCH_CREDENTIAL [redacted]")
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b/g, "[redacted-secret]")
+    .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_]{16,}\b/g, "[redacted-token]")
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[redacted-access-key]")
+    .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[redacted-token]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]")
+    .replace(
+      /\b(api[_\s-]?key|secret(?:[_\s-]?key)?|token|access[_\s-]?token|refresh[_\s-]?token|client[_\s-]?secret|authorization|password)\b(\s*[:=]\s*["']?)([A-Za-z0-9_./+=~:-]{12,})(["']?)/gi,
+      "$1$2[redacted]$4"
+    )
+    .replace(/(--(?:api-key|token|secret|password)\s+)(\S{8,})/gi, "$1[redacted]")
+    .replace(/([?&](?:api[_-]?key|key|token|secret|access_token|client_secret)=)([^&\s]+)/gi, "$1[redacted]");
+};
+
+const summarizeSafeText = (value?: string, fallback = "Not available", maxLength = 180): string =>
+  summarizeText(redactSensitiveText(value), fallback, maxLength);
+
+const pluralize = (count: number, singular: string, plural = `${singular}s`): string =>
+  `${count} ${count === 1 ? singular : plural}`;
+
+const uniqueSortedStrings = (values: string[]): string[] =>
+  [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))].sort((left, right) => left.localeCompare(right));
+
+const getWorkflowLastUpdatedAt = (workflow?: ProjectWorkflowState, agents: AgentState[] = []): string | undefined => {
+  const timestamps = [
+    workflow?.workflowCycle.completedAt,
+    workflow?.workflowCycle.startedAt,
+    workflow?.recommendationsGeneratedAt,
+    workflow?.ultimateGoal.lastUpdatedAt,
+    workflow?.ultimateGoal.confirmedAt,
+    workflow?.ultimateGoalProgress?.updatedAt,
+    workflow?.ultimateGoalCompletion?.updatedAt,
+    workflow?.taskMap.updatedAt,
+    workflow?.repair.lastUpdatedAt,
+    workflow?.manualHandoff?.createdAt,
+    ...(workflow ? Object.values(workflow.stepProgress).flatMap((step) => [
+      step.updatedAt,
+      step.lastEventAt,
+      step.completedAt,
+      step.startedAt
+    ]) : []),
+    ...(workflow?.activityLog.map((event) => event.timestamp) ?? []),
+    ...agents.flatMap((agent) => [
+      agent.lastActivityAt,
+      agent.completedAt,
+      agent.startedAt,
+      agent.createdAt
+    ])
+  ]
+    .map(toTime)
+    .filter((time) => time > 0);
+
+  return timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : undefined;
+};
+
+const inferWorkflowChecklistGroupTitle = (check: ProjectWorkflowState["goalChecklist"][number]): string => {
+  const text = `${check.title} ${check.description} ${check.evidence} ${check.relatedPaths.join(" ")}`.toLowerCase();
+  if (/\bcompany|companies|employer|firm|profile page|company page\b/.test(text)) {
+    return "Company pages";
+  }
+  if (/\bquestion bank|questions|practice problem|prompt|answer key\b/.test(text)) {
+    return "Question bank";
+  }
+  if (/\bcompensation|salary|pay band|source context|offer|level\b/.test(text)) {
+    return "Compensation/source context";
+  }
+  if (/\bprovenance|citation|citations|source|sources|reference|attribution\b/.test(text)) {
+    return "Source provenance";
+  }
+  if (/\bmental math|arithmetic|estimation|calculation|calculate\b/.test(text)) {
+    return "Mental math";
+  }
+  if (/\blocal data|persistence|persist|storage|database|cache|indexeddb|sqlite\b/.test(text)) {
+    return "Local data/persistence";
+  }
+  if (/\btest|tests|validation|validate|integrity|lint|typecheck|build\b/.test(text)) {
+    return "Testing/validation";
+  }
+  if (/\bworkflow|agent|cycle|approval|autopilot|blocker\b/.test(text)) {
+    return "Workflow operations";
+  }
+  if (/\bui|ux|layout|screen|responsive|visual|navigation\b/.test(text)) {
+    return "Interface";
+  }
+  return goalCheckSourceLabel(check.source);
+};
+
+const buildWorkflowChecklistGroups = (
+  checklist: ProjectWorkflowState["goalChecklist"],
+  taskMap?: ProjectWorkflowState["taskMap"]
+): WorkflowChecklistGroupSummary[] => {
+  const checksById = new Map(checklist.map((check) => [check.id, check]));
+
+  if (taskMap?.groups.length) {
+    return taskMap.groups.map((group) => {
+      const checks = group.checkIds.map((id) => checksById.get(id)).filter((check): check is ProjectWorkflowState["goalChecklist"][number] => Boolean(check));
+      const unknownCount = checks.filter((check) => check.status === "unknown").length;
+      const blockedCount = checks.filter((check) =>
+        check.status !== "met" &&
+        check.status !== "not_applicable" &&
+        /\b(block|blocked|fail|failed|missing|required)\b/i.test(`${check.title} ${check.description} ${check.evidence}`)
+      ).length;
+
+      return {
+        id: group.id,
+        title: group.title,
+        openCount: group.openCheckCount,
+        metCount: group.metCheckCount,
+        unknownCount,
+        blockedCount,
+        totalCount: Math.max(group.checkIds.length, group.openCheckCount + group.metCheckCount),
+        representative: group.representativeChecks[0] ?? checks[0]?.title,
+        relatedPaths: uniqueSortedStrings([...group.relatedPaths, ...checks.flatMap((check) => check.relatedPaths)]).slice(0, 5)
+      };
+    });
+  }
+
+  const groups = new Map<string, WorkflowChecklistGroupSummary>();
+  for (const check of checklist) {
+    const title = inferWorkflowChecklistGroupTitle(check);
+    const existing = groups.get(title) ?? {
+      id: title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+      title,
+      openCount: 0,
+      metCount: 0,
+      unknownCount: 0,
+      blockedCount: 0,
+      totalCount: 0,
+      representative: check.title,
+      relatedPaths: []
+    };
+
+    const isOpen = check.required && check.status !== "met" && check.status !== "not_applicable";
+    existing.totalCount += 1;
+    existing.openCount += isOpen ? 1 : 0;
+    existing.metCount += check.status === "met" ? 1 : 0;
+    existing.unknownCount += check.status === "unknown" ? 1 : 0;
+    existing.blockedCount += isOpen && /\b(block|blocked|fail|failed|missing|required)\b/i.test(`${check.title} ${check.description} ${check.evidence}`) ? 1 : 0;
+    existing.relatedPaths = uniqueSortedStrings([...existing.relatedPaths, ...check.relatedPaths]).slice(0, 5);
+    groups.set(title, existing);
+  }
+
+  return [...groups.values()];
+};
+
+const buildWorkflowChecklistOverview = (
+  workflow?: ProjectWorkflowState
+): WorkflowChecklistOverview => {
+  const checklist = workflow?.goalChecklist ?? [];
+  const requiredChecks = checklist.filter((check) => check.required && check.status !== "not_applicable");
+  const requiredMet = requiredChecks.filter((check) => check.status === "met").length;
+  const requiredTotal = requiredChecks.length;
+  const openRequired = requiredChecks.length - requiredMet;
+  const groups = buildWorkflowChecklistGroups(checklist, workflow?.taskMap);
+  const byOpen = [...groups].sort((left, right) =>
+    right.openCount - left.openCount ||
+    right.blockedCount - left.blockedCount ||
+    left.title.localeCompare(right.title)
+  );
+  const byMet = [...groups].sort((left, right) =>
+    right.metCount - left.metCount ||
+    left.title.localeCompare(right.title)
+  );
+  const byUnknown = [...groups].sort((left, right) =>
+    right.unknownCount - left.unknownCount ||
+    right.blockedCount - left.blockedCount ||
+    left.title.localeCompare(right.title)
+  );
+
+  return {
+    percentComplete: workflow?.ultimateGoalProgress?.percentComplete ??
+      (requiredTotal > 0 ? Math.round((requiredMet / requiredTotal) * 100) : undefined),
+    requiredMet,
+    requiredTotal,
+    openRequired,
+    unknownCount: requiredChecks.filter((check) => check.status === "unknown").length,
+    groups,
+    topOpenGroups: byOpen.filter((group) => group.openCount > 0).slice(0, 5),
+    topMetGroups: byMet.filter((group) => group.metCount > 0).slice(0, 4),
+    topUnknownGroups: byUnknown.filter((group) => group.unknownCount > 0 || group.blockedCount > 0).slice(0, 4)
+  };
+};
+
+const getCurrentCycleChangedFiles = (workflow: ProjectWorkflowState | undefined, agents: AgentState[]): string[] => {
+  if (!workflow) {
+    return [];
+  }
+  const currentCycleAgents = agents.filter((agent) =>
+    agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
+  );
+  return uniqueSortedStrings(currentCycleAgents.flatMap((agent) => agent.changedFiles));
+};
+
+const summarizeWorkflowChecksStatus = (
+  agent?: AgentState,
+  workflow?: ProjectWorkflowState,
+  activeStep?: ReturnType<typeof buildWorkflowTimelineSteps>[number]
+): string => {
+  const integrityReport = agent?.integrityReport;
+  if (integrityReport) {
+    const failed = integrityReport.checks.filter((check) => check.status === "failed").length;
+    const passed = integrityReport.checks.filter((check) => check.status === "passed").length;
+    if (failed > 0) {
+      return `${failed} failed, ${passed} passed`;
+    }
+    return integrityReport.checks.length ? `${passed}/${integrityReport.checks.length} checks passed` : "Integrity report recorded";
+  }
+  if (workflow?.stepProgress.integrity.status === "failed" || workflow?.workflowStopReason === "integrity_failed") {
+    return "Integrity needs repair";
+  }
+  if (workflow?.stepProgress.integrity.status === "completed") {
+    return "Integrity completed";
+  }
+  if (activeStep?.id === "integrity") {
+    return activeStep.displayStatusLabel;
+  }
+  return workflow?.scopedGoal?.testStrategy.length ? `${workflow.scopedGoal.testStrategy.length} validations planned` : "No validation result yet";
+};
+
+const buildWorkflowAttentionItems = ({
+  workflow,
+  approvals,
+  userInputRequests,
+  humanInterventions,
+  credentialRequests,
+  timeline,
+  agents
+}: {
+  workflow?: ProjectWorkflowState;
+  approvals: ApprovalRequestRecord[];
+  userInputRequests: UserInputRequestRecord[];
+  humanInterventions: HumanInterventionRecord[];
+  credentialRequests: CredentialRequestRecord[];
+  timeline: ReturnType<typeof buildWorkflowTimelineSteps>;
+  agents: AgentState[];
+}): WorkflowAttentionItem[] => {
+  const items: WorkflowAttentionItem[] = [];
+
+  for (const approval of approvals) {
+    items.push({
+      id: `approval:${approval.id}`,
+      kind: "approval",
+      title: approval.summary,
+      detail: summarizeText(approval.reason ?? approval.command ?? "Approval required before the workflow can continue.", "Approval required.", 130),
+      tone: "warning",
+      createdAt: approval.createdAt,
+      approval
+    });
+  }
+
+  for (const intervention of humanInterventions) {
+    items.push({
+      id: `intervention:${intervention.id}`,
+      kind: "blocker",
+      title: intervention.title,
+      detail: summarizeText(intervention.description || intervention.reason, "Human intervention is required.", 140),
+      tone: intervention.blocking ? "danger" : "warning",
+      createdAt: intervention.createdAt,
+      target: "blocker"
+    });
+  }
+
+  for (const request of userInputRequests) {
+    items.push({
+      id: `user-input:${request.id}`,
+      kind: "blocker",
+      title: request.title,
+      detail: summarizeText(request.description, "External action is required.", 140),
+      tone: "danger",
+      createdAt: request.createdAt,
+      target: "user-input"
+    });
+  }
+
+  for (const request of credentialRequests) {
+    items.push({
+      id: `credential:${request.id}`,
+      kind: "credential",
+      title: `${request.providerName} ${request.keyLabel}`,
+      detail: summarizeText(request.description, "Credential is required.", 140),
+      tone: "warning",
+      createdAt: request.createdAt,
+      target: "credentials"
+    });
+  }
+
+  if (workflow?.manualHandoff) {
+    items.push({
+      id: `manual-handoff:${workflow.manualHandoff.reason}`,
+      kind: "blocker",
+      title: workflow.manualHandoff.title,
+      detail: summarizeText(workflow.manualHandoff.latestFailureReason, "Manual handoff is required.", 150),
+      tone: "danger",
+      createdAt: workflow.manualHandoff.createdAt,
+      target: "blocker"
+    });
+  } else if (workflow?.workflowStage === "blocked_human" && humanInterventions.length === 0 && userInputRequests.length === 0) {
+    items.push({
+      id: "workflow:blocker",
+      kind: "blocker",
+      title: "Workflow is blocked",
+      detail: workflowStopReasonLabel(workflow.workflowStopReason),
+      tone: "danger"
+    });
+  }
+
+  const failedIntegrityAgent = agents.find((agent) => agent.integrityReport?.checks.some((check) => check.status === "failed"));
+  if (failedIntegrityAgent?.integrityReport) {
+    const failedCount = failedIntegrityAgent.integrityReport.checks.filter((check) => check.status === "failed").length;
+    items.push({
+      id: `integrity-agent:${failedIntegrityAgent.id}`,
+      kind: "integrity",
+      title: `${pluralize(failedCount, "integrity check")} failed`,
+      detail: summarizeText(failedIntegrityAgent.integrityReport.summary, "Integrity validation failed.", 150),
+      tone: "danger",
+      createdAt: failedIntegrityAgent.completedAt ?? failedIntegrityAgent.lastActivityAt
+    });
+  } else if (workflow?.stepProgress.integrity.status === "failed" || workflow?.workflowStopReason === "integrity_failed") {
+    items.push({
+      id: "integrity:failed",
+      kind: "integrity",
+      title: "Integrity needs repair",
+      detail: summarizeText(workflow.repair.latestFailureReason ?? workflow.repair.latestIssueSummary, workflowStopReasonLabel(workflow.workflowStopReason), 150),
+      tone: "warning",
+      createdAt: workflow.repair.lastUpdatedAt
+    });
+  }
+
+  for (const step of timeline.filter((step) => step.warning).slice(0, 3)) {
+    items.push({
+      id: `warning:${step.id}`,
+      kind: "warning",
+      title: `${step.title} warning`,
+      detail: summarizeText(step.warning, "Workflow warning.", 150),
+      tone: "warning",
+      createdAt: step.updatedAt ?? step.lastEventAt
+    });
+  }
+
+  return items.sort((left, right) => {
+    const toneScore = { danger: 0, warning: 1, neutral: 2 } as const;
+    const toneDelta = toneScore[left.tone] - toneScore[right.tone];
+    return toneDelta !== 0 ? toneDelta : toTime(right.createdAt) - toTime(left.createdAt);
+  });
+};
+
+const workflowAttentionKindLabel = (kind: WorkflowAttentionItem["kind"]): string =>
+  ({
+    approval: "Approval",
+    blocker: "Blocker",
+    credential: "Credential",
+    integrity: "Integrity",
+    warning: "Warning"
+  })[kind];
+
+type RunFilterId =
+  | "all"
+  | "recommendation"
+  | "planning"
+  | "coding"
+  | "integrity"
+  | "merge"
+  | "errors"
+  | "completed";
+
+type RunEvidenceItem = {
+  id: string;
+  title: string;
+  detail: string;
+  meta?: string;
+  tone?: "neutral" | "warning" | "danger";
+};
+
+const RUN_FILTERS: Array<{ id: RunFilterId; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "recommendation", label: "Recommendation" },
+  { id: "planning", label: "Planning" },
+  { id: "coding", label: "Coding" },
+  { id: "integrity", label: "Integrity" },
+  { id: "merge", label: "Merge" },
+  { id: "errors", label: "Errors/blocked" },
+  { id: "completed", label: "Completed" }
+];
+
+const agentRunTimestamp = (agent: AgentState): string =>
+  agent.completedAt ?? agent.lastActivityAt ?? agent.startedAt ?? agent.createdAt;
+
+const runFilterMatches = (agent: AgentState, filter: RunFilterId): boolean => {
+  switch (filter) {
+    case "recommendation":
+      return agent.category === "recommendation";
+    case "planning":
+      return agent.category === "bootstrap" || agent.category === "goal";
+    case "coding":
+      return agent.category === "coding";
+    case "integrity":
+      return agent.category === "integrity";
+    case "merge":
+      return agent.category === "merge";
+    case "errors":
+      return agent.status === "failed" ||
+        agent.status === "conflicted" ||
+        agent.status === "disconnected" ||
+        agent.status === "waiting_approval" ||
+        agent.approvals.some((approval) => approval.status === "pending");
+    case "completed":
+      return agent.status === "completed";
+    case "all":
+    default:
+      return true;
+  }
+};
+
+const runSearchText = (agent: AgentState, workflow?: ProjectWorkflowState): string => [
+  agent.name,
+  agent.category,
+  agent.status,
+  agent.model,
+  agent.currentPhase,
+  agent.currentSubtask,
+  agent.taskPrompt,
+  agentPreviewText(agent, workflow),
+  agent.recommendationReport?.summary,
+  agent.integrityReport?.summary,
+  agent.mergeReport?.summary,
+  agent.changedFiles.join(" "),
+  agent.worktree?.branch
+].filter(Boolean).join(" ").toLowerCase();
+
+const runMatchesSearch = (agent: AgentState, search: string, workflow?: ProjectWorkflowState): boolean => {
+  const query = search.trim().toLowerCase();
+  return !query || runSearchText(agent, workflow).includes(query);
+};
+
+const runStageName = (agent: AgentState): string => {
+  if (agent.category === "bootstrap" || agent.category === "goal") {
+    return "Planning";
+  }
+  return agentCategoryLabel(agent.category);
+};
+
+const runModelSummary = (agent: AgentState): string =>
+  `${agent.model}${agent.reasoningEffort ? ` / ${reasoningEffortLabel(agent.reasoningEffort)}${agent.reasoningEffortSource ? ` ${agent.reasoningEffortSource}` : ""}` : ""}`;
+
+const runResultSummary = (agent: AgentState, workflow?: ProjectWorkflowState): string => {
+  if (agent.status === "waiting_approval") {
+    return "Waiting for an explicit approval before continuing.";
+  }
+  if (agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected") {
+    return summarizeText(agent.disconnectedReason ?? agent.currentPhase ?? latestMeaningfulAgentDetail(agent), "Run needs review.", 170);
+  }
+  if (agent.recommendationReport?.summary) {
+    return summarizeText(agent.recommendationReport.summary, "Recommendation report captured.", 170);
+  }
+  if (agent.integrityReport?.summary) {
+    return summarizeText(agent.integrityReport.summary, "Integrity report captured.", 170);
+  }
+  if (agent.mergeReport?.summary) {
+    return summarizeText(agent.mergeReport.summary, "Merge report captured.", 170);
+  }
+  return summarizeText(agentPreviewText(agent, workflow), "No result summary captured yet.", 170);
+};
+
+const runNextAction = (agent: AgentState): string => {
+  if (agent.approvals.some((approval) => approval.status === "pending") || agent.status === "waiting_approval") {
+    return "Review pending approvals.";
+  }
+  if (agent.mergeReport?.conflicts.length || agent.status === "conflicted") {
+    return "Review conflicts and continue from Workflow.";
+  }
+  if (agent.integrityReport?.checks.some((check) => check.status === "failed") || agent.status === "failed") {
+    return "Review failures and use Workflow for repair or recovery.";
+  }
+  if (agent.status === "disconnected") {
+    return "Recover the workflow from the saved state.";
+  }
+  if (agent.status === "running" || agent.status === "starting") {
+    return "Monitor current output.";
+  }
+  if (agent.category === "recommendation" && agent.recommendationReport?.nextSteps.length) {
+    return "Open Workflow to choose the next bounded task.";
+  }
+  return "No immediate action recorded.";
+};
+
+const runChecksSummary = (agent: AgentState): string => {
+  if (agent.integrityReport?.checks.length) {
+    const passed = agent.integrityReport.checks.filter((check) => check.status === "passed").length;
+    const failed = agent.integrityReport.checks.filter((check) => check.status === "failed").length;
+    const skipped = agent.integrityReport.checks.filter((check) => check.status === "skipped").length;
+    return `${passed}/${agent.integrityReport.checks.length} checks passed${failed ? `, ${failed} failed` : ""}${skipped ? `, ${skipped} skipped` : ""}`;
+  }
+
+  if (agent.commandLog.length) {
+    const failedCommands = agent.commandLog.filter((command) =>
+      command.exitCode !== undefined && command.exitCode !== null && command.exitCode !== 0
+    ).length;
+    return `${agent.commandLog.length} command${agent.commandLog.length === 1 ? "" : "s"} recorded${failedCommands ? `, ${failedCommands} failed` : ""}`;
+  }
+
+  return "No tests/checks captured";
+};
+
+const runApprovalSummary = (agent: AgentState): string => {
+  const pending = agent.approvals.filter((approval) => approval.status === "pending").length;
+  if (!agent.approvals.length) {
+    return "No approvals";
+  }
+  return `${pending} pending / ${agent.approvals.length} total`;
+};
+
+const runRiskItems = (agent: AgentState): string[] => {
+  const failedChecks = agent.integrityReport?.checks
+    .filter((check) => check.status === "failed")
+    .map((check) => `${check.name} failed`) ?? [];
+  return [
+    ...(agent.disconnectedReason ? [agent.disconnectedReason] : []),
+    ...(agent.mergeReport?.conflicts.map((conflict) => `Merge conflict: ${conflict}`) ?? []),
+    ...(agent.integrityReport?.risks ?? []),
+    ...failedChecks,
+    ...agent.approvals.filter((approval) => approval.status === "pending").map((approval) => `Approval pending: ${approval.summary}`)
+  ];
+};
+
+const runEvidenceItems = (agent: AgentState, workflow?: ProjectWorkflowState): RunEvidenceItem[] => {
+  const items: RunEvidenceItem[] = [];
+
+  if (agent.recommendationReport) {
+    for (const step of agent.recommendationReport.nextSteps.slice(0, 4)) {
+      items.push({
+        id: `recommendation:${step.rank}:${step.title}`,
+        title: step.title,
+        detail: summarizeText(step.summary || step.rationale, "Recommendation captured.", 180),
+        meta: `Rank ${step.rank} · ${step.priority} priority · ${Math.round(step.confidence * 100)}% confidence`,
+        tone: step.riskLevel === "high" ? "warning" : "neutral"
+      });
+    }
+  }
+
+  if (agent.integrityReport) {
+    for (const check of agent.integrityReport.checks.slice(0, 6)) {
+      items.push({
+        id: `check:${check.name}`,
+        title: check.name,
+        detail: summarizeText(check.outputSnippet || check.command, "Check recorded.", 180),
+        meta: `${check.status}${check.command ? ` · ${check.command}` : ""}`,
+        tone: check.status === "failed" ? "danger" : check.status === "skipped" ? "warning" : "neutral"
+      });
+    }
+  }
+
+  if (agent.mergeReport) {
+    items.push({
+      id: "merge-summary",
+      title: "Merge result",
+      detail: summarizeText(agent.mergeReport.summary, "Merge report captured.", 180),
+      meta: agent.mergeReport.conflicts.length
+        ? `${agent.mergeReport.conflicts.length} conflicts`
+        : `${agent.mergeReport.mergedBranches.length} branches merged`,
+      tone: agent.mergeReport.conflicts.length ? "danger" : "neutral"
+    });
+  }
+
+  if (agent.category === "goal" && workflow?.scopedGoal && agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber) {
+    items.push({
+      id: "scoped-goal",
+      title: "Scoped goal",
+      detail: summarizeText(workflow.scopedGoal.executionBrief || workflow.scopedGoal.summary, "Scoped goal captured.", 180),
+      meta: `${workflow.scopedGoal.acceptanceCriteria.length} acceptance criteria`
+    });
+  }
+
+  for (const event of sortEventsByAge(agent.events).slice(0, 4)) {
+    items.push({
+      id: `event:${event.id}`,
+      title: event.title,
+      detail: summarizeText(event.detail, "Runtime event recorded.", 160),
+      meta: `${workflowEventStatusLabel(event.status)} · ${formatDateTime(event.timestamp)}`,
+      tone: event.status === "failed" ? "danger" : event.status === "waiting" ? "warning" : "neutral"
+    });
+  }
+
+  if (agent.changedFiles.length) {
+    items.push({
+      id: "changed-files",
+      title: "Files/areas affected",
+      detail: agent.changedFiles.slice(0, 8).join(", "),
+      meta: `${agent.changedFiles.length} changed file${agent.changedFiles.length === 1 ? "" : "s"}`
+    });
+  }
+
+  return items;
+};
+
+const stringifyRawValue = (value: unknown): string => {
+  const toPreview = (text: string): string => {
+    const clipped = text.length > RUN_DETAIL_PREVIEW_TEXT_LIMIT
+      ? `${text.slice(0, RUN_DETAIL_PREVIEW_TEXT_LIMIT)}\n...[truncated for UI performance]`
+      : text;
+    return redactSensitiveText(clipped);
+  };
+
+  if (typeof value === "string") {
+    return toPreview(value);
+  }
+
+  try {
+    return toPreview(JSON.stringify(value, null, 2));
+  } catch {
+    return toPreview(String(value));
+  }
+};
+
+const renderOutputPreview = (value?: string): string => {
+  if (!value) {
+    return "";
+  }
+  const clipped = value.length > RUN_DETAIL_PREVIEW_TEXT_LIMIT
+    ? `${value.slice(0, RUN_DETAIL_PREVIEW_TEXT_LIMIT)}\n...[truncated for UI performance]`
+    : value;
+  return redactSensitiveText(clipped);
+};
 
 const toLineList = (value: string): string[] =>
   value
@@ -547,12 +1471,6 @@ const agentDetailedExplanation = (agent: AgentState, workflow?: ProjectWorkflowS
     .filter((entry) => entry && entry.trim().length > 0)
     .join("\n\n") || "No detailed explanation is available yet.";
 };
-
-const splitAgentExplanation = (value: string): string[] =>
-  value
-    .split(/\n{2,}/)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
 
 const ValidationBadge = ({ status }: { status: ValidationStatus }) => (
   <span className={`badge ${validationClass(status)}`}>{status}</span>
@@ -756,122 +1674,25 @@ const AgentCard = ({
   workflow?: ProjectWorkflowState;
   selected?: boolean;
   onSelect?: (agentId: string) => void;
-}) => (
-  <button className={`agent-card ${selected ? "agent-card--selected" : ""}`} onClick={() => onSelect?.(agent.id)} type="button">
-    <div className="agent-card__header">
-      <div>
-        <strong>{agent.name}</strong>
-        <div className="agent-card__subtle">{agentCategoryLabel(agent.category)}</div>
-      </div>
-      <div className={`status-pill status-${agent.status}`}>{agent.status}</div>
-    </div>
-    <div className="agent-card__meta">
-      <span>{agent.lastActivityAt ? `Updated ${formatDateTime(agent.lastActivityAt)}` : "Waiting to start"}</span>
-      <span>{agent.reasoningEffort ? `${reasoningEffortLabel(agent.reasoningEffort)}${agent.reasoningEffortSource === "auto" ? " auto" : agent.reasoningEffortSource === "manual" ? " manual" : ""}` : "Default reasoning"}</span>
-      <span>{agent.approvals.filter((approval) => approval.status === "pending").length} approvals</span>
-      <span>{agent.changedFiles.length} changed files</span>
-    </div>
-    <p>{agentPreviewText(agent, workflow)}</p>
-  </button>
-);
-
-const PagedAgentList = ({
-  agents,
-  workflow,
-  selectedAgentId,
-  emptyCopy,
-  onSelect,
-  totalAgents,
-  pageIndex,
-  onPageChange,
-  pageSize = AGENT_HISTORY_PAGE_SIZE
-}: {
-  agents: AgentState[];
-  workflow?: ProjectWorkflowState;
-  selectedAgentId?: string;
-  emptyCopy: string;
-  onSelect: (agentId: string) => void;
-  totalAgents?: number;
-  pageIndex?: number;
-  onPageChange?: (pageIndex: number) => void;
-  pageSize?: number;
 }) => {
-  const [localPageIndex, setLocalPageIndex] = useState(0);
-  const previousSelectedAgentId = useRef<string | undefined>(undefined);
-  const isControlled = typeof totalAgents === "number" && typeof pageIndex === "number" && onPageChange;
-  const total = totalAgents ?? agents.length;
-  const currentPageIndex = pageIndex ?? localPageIndex;
-  const setCurrentPageIndex = onPageChange ?? setLocalPageIndex;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const boundedPageIndex = Math.min(currentPageIndex, totalPages - 1);
-  const pageStart = boundedPageIndex * pageSize;
-  const visibleAgents = isControlled ? agents : agents.slice(pageStart, pageStart + pageSize);
-  const pageEnd = Math.min(pageStart + visibleAgents.length, total);
-
-  useEffect(() => {
-    setCurrentPageIndex(Math.min(currentPageIndex, totalPages - 1));
-  }, [currentPageIndex, setCurrentPageIndex, totalPages]);
-
-  useEffect(() => {
-    if (isControlled) {
-      return;
-    }
-    if (previousSelectedAgentId.current === selectedAgentId) {
-      return;
-    }
-    previousSelectedAgentId.current = selectedAgentId;
-
-    if (!selectedAgentId) {
-      return;
-    }
-
-    const selectedIndex = agents.findIndex((agent) => agent.id === selectedAgentId);
-    if (selectedIndex >= 0) {
-      setLocalPageIndex(Math.floor(selectedIndex / pageSize));
-    }
-  }, [agents, isControlled, pageSize, selectedAgentId]);
-
-  if (!total) {
-    return <div className="empty-copy">{emptyCopy}</div>;
-  }
-
+  const status = agentLifecycleStatusChip(agent.status);
   return (
-    <>
-      <div className="workflow-agent-list__pager">
-        <span>
-          Showing {pageStart + 1}-{pageEnd} of {total}
-        </span>
-        <div className="workflow-agent-list__pager-actions">
-          <button
-            className="secondary-button"
-            disabled={boundedPageIndex === 0}
-            onClick={() => setCurrentPageIndex(Math.max(0, boundedPageIndex - 1))}
-            type="button"
-          >
-            Previous {pageSize}
-          </button>
-          <button
-            className="secondary-button"
-            disabled={boundedPageIndex >= totalPages - 1}
-            onClick={() => setCurrentPageIndex(Math.min(totalPages - 1, boundedPageIndex + 1))}
-            type="button"
-          >
-            Next {pageSize}
-          </button>
+    <button className={`agent-card ${selected ? "agent-card--selected" : ""}`} onClick={() => onSelect?.(agent.id)} type="button">
+      <div className="agent-card__header">
+        <div>
+          <strong>{agent.name}</strong>
+          <div className="agent-card__subtle">{agentCategoryLabel(agent.category)}</div>
         </div>
+        <StatusChip label={status.label} tone={status.tone} />
       </div>
-      <div className="workflow-agent-list workflow-agent-list--paged">
-        {visibleAgents.map((agent) => (
-          <AgentCard
-            key={agent.id}
-            agent={agent}
-            workflow={workflow}
-            selected={selectedAgentId === agent.id}
-            onSelect={onSelect}
-          />
-        ))}
+      <div className="agent-card__meta">
+        <span>{agent.lastActivityAt ? `Updated ${formatDateTime(agent.lastActivityAt)}` : "Waiting to start"}</span>
+        <span>{agent.reasoningEffort ? `${reasoningEffortLabel(agent.reasoningEffort)}${agent.reasoningEffortSource === "auto" ? " auto" : agent.reasoningEffortSource === "manual" ? " manual" : ""}` : "Default reasoning"}</span>
+        <span>{agent.approvals.filter((approval) => approval.status === "pending").length} approvals</span>
+        <span>{agent.changedFiles.length} changed files</span>
       </div>
-    </>
+      <p>{redactSensitiveText(agentPreviewText(agent, workflow))}</p>
+    </button>
   );
 };
 
@@ -923,6 +1744,263 @@ const FeedPager = ({
   );
 };
 
+type LogFilterId = "all" | "workflow" | "agent" | "commands" | "approvals" | "errors" | "warnings";
+type LogEventKind = "workflow" | "agent" | "command" | "approval";
+
+type LogEventView = {
+  id: string;
+  timestamp: string;
+  kind: LogEventKind;
+  typeLabel: string;
+  title: string;
+  summary: string;
+  detail?: string;
+  actor?: string;
+  statusLabel: string;
+  statusTone: StatusChipTone;
+};
+
+const LOG_FILTERS: Array<{ id: LogFilterId; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "workflow", label: "Workflow" },
+  { id: "agent", label: "Agent messages" },
+  { id: "commands", label: "Commands" },
+  { id: "approvals", label: "Approvals" },
+  { id: "errors", label: "Errors" },
+  { id: "warnings", label: "Warnings" }
+];
+
+const textLooksWarning = (value?: string): boolean =>
+  /\b(warn|warning|caution|attention|degraded|stale)\b/i.test(value ?? "");
+
+const runtimeStatusChip = (status?: RuntimeEventRecord["status"]): { label: string; tone: StatusChipTone } => {
+  if (status === "running") {
+    return { label: "Running", tone: "running" };
+  }
+  if (status === "waiting") {
+    return { label: "Pending", tone: "pending" };
+  }
+  if (status === "completed") {
+    return { label: "Completed", tone: "completed" };
+  }
+  if (status === "failed") {
+    return { label: "Error", tone: "error" };
+  }
+  return { label: "Idle", tone: "idle" };
+};
+
+const commandStatusChip = (command: Pick<ProjectCommandLogEntry, "status" | "exitCode" | "completedAt">): { label: string; tone: StatusChipTone } => {
+  const status = command.status.toLowerCase();
+  if (command.exitCode !== undefined && command.exitCode !== null && command.exitCode !== 0) {
+    return { label: "Error", tone: "error" };
+  }
+  if (/\b(fail|error|cancel|reject)\b/.test(status)) {
+    return { label: "Error", tone: "error" };
+  }
+  if (/\b(run|start|progress)\b/.test(status) && !command.completedAt) {
+    return { label: "Running", tone: "running" };
+  }
+  if (/\b(skip|warn)\b/.test(status)) {
+    return { label: "Warning", tone: "warning" };
+  }
+  return { label: command.completedAt ? "Completed" : "Pending", tone: command.completedAt ? "completed" : "pending" };
+};
+
+const agentLifecycleStatusChip = (status: AgentState["status"]): { label: string; tone: StatusChipTone } =>
+  ({
+    idle: { label: "Idle", tone: "idle" },
+    starting: { label: "Running", tone: "running" },
+    running: { label: "Running", tone: "running" },
+    waiting_approval: { label: "Pending", tone: "pending" },
+    completed: { label: "Completed", tone: "completed" },
+    failed: { label: "Error", tone: "error" },
+    conflicted: { label: "Blocked", tone: "blocked" },
+    disconnected: { label: "Warning", tone: "warning" }
+  })[status] as { label: string; tone: StatusChipTone };
+
+const credentialStatusChip = (status: CredentialEntryMetadata["status"]): { label: string; tone: StatusChipTone } =>
+  ({
+    active: { label: "Success", tone: "success" },
+    needs_attention: { label: "Warning", tone: "warning" },
+    disabled: { label: "Idle", tone: "idle" }
+  })[status] as { label: string; tone: StatusChipTone };
+
+const validationStatusChip = (status: ValidationStatus): { label: string; tone: StatusChipTone } =>
+  ({
+    exact: { label: "Success", tone: "success" },
+    stale: { label: "Warning", tone: "warning" },
+    incompatible: { label: "Error", tone: "error" },
+    unvalidated: { label: "Pending", tone: "pending" }
+  })[status] as { label: string; tone: StatusChipTone };
+
+const buildLogEvents = ({
+  activity,
+  commands,
+  agents,
+  approvals
+}: {
+  activity: WorkflowActivityEvent[];
+  commands: ProjectCommandLogEntry[];
+  agents: AgentState[];
+  approvals: ApprovalRequestRecord[];
+}): LogEventView[] => {
+  const activityEvents: LogEventView[] = activity.map((event) => {
+    const status = runtimeStatusChip(event.status);
+    const warning = textLooksWarning(`${event.title} ${event.detail ?? ""}`);
+    const kind: LogEventKind = event.source === "approval" ? "approval" : event.source === "agent" ? "agent" : "workflow";
+    return {
+      id: `workflow:${event.id}`,
+      timestamp: event.timestamp,
+      kind,
+      typeLabel: workflowActivitySourceLabel(event.source),
+      title: redactSensitiveText(event.title),
+      summary: summarizeSafeText(event.detail ?? event.title, event.title, 150),
+      detail: event.detail ? redactSensitiveText(event.detail) : undefined,
+      actor: event.agentCategory ? agentCategoryLabel(event.agentCategory) : undefined,
+      statusLabel: warning && status.tone !== "error" ? "Warning" : status.label,
+      statusTone: warning && status.tone !== "error" ? "warning" : status.tone
+    };
+  });
+
+  const commandEvents: LogEventView[] = commands.map((command) => {
+    const status = commandStatusChip(command);
+    const safeCommand = redactSensitiveText(command.command);
+    return {
+      id: `command:${command.id}`,
+      timestamp: command.completedAt ?? command.startedAt,
+      kind: "command",
+      typeLabel: "Command",
+      title: command.agentName,
+      summary: summarizeSafeText(safeCommand, "Command recorded.", 150),
+      detail: safeCommand,
+      actor: agentCategoryLabel(command.agentCategory),
+      statusLabel: status.label,
+      statusTone: status.tone
+    };
+  });
+
+  const runtimeEvents: LogEventView[] = agents.flatMap((agent) =>
+    agent.events
+      .filter((event) => event.type !== "command")
+      .map((event) => {
+        const status = runtimeStatusChip(event.status);
+        const warning = textLooksWarning(`${event.title} ${event.detail ?? ""}`);
+        const kind: LogEventKind = event.type === "approval" ? "approval" : "agent";
+        return {
+          id: `agent:${agent.id}:${event.id}`,
+          timestamp: event.timestamp,
+          kind,
+          typeLabel: event.type === "message" ? "Agent message" : event.type.replace("-", " "),
+          title: redactSensitiveText(event.title),
+          summary: summarizeSafeText(event.detail ?? event.title, event.title, 150),
+          detail: event.detail ? redactSensitiveText(event.detail) : undefined,
+          actor: agent.name,
+          statusLabel: warning && status.tone !== "error" ? "Warning" : status.label,
+          statusTone: warning && status.tone !== "error" ? "warning" : status.tone
+        };
+      })
+  );
+
+  const approvalEvents: LogEventView[] = approvals.map((approval) => ({
+    id: `approval:${approval.agentId}:${approval.id}`,
+    timestamp: approval.createdAt,
+    kind: "approval",
+    typeLabel: "Approval",
+    title: redactSensitiveText(approval.summary),
+    summary: summarizeSafeText(approval.reason ?? approval.command, "Approval required before work can continue.", 150),
+    detail: redactSensitiveText(approval.reason ?? approval.command ?? "Approval required before work can continue."),
+    statusLabel: "Pending",
+    statusTone: "pending"
+  }));
+
+  const byId = new Map<string, LogEventView>();
+  for (const event of [...approvalEvents, ...activityEvents, ...commandEvents, ...runtimeEvents]) {
+    byId.set(event.id, event);
+  }
+
+  return [...byId.values()].sort((left, right) => toTime(right.timestamp) - toTime(left.timestamp));
+};
+
+const logEventMatchesFilter = (event: LogEventView, filter: LogFilterId): boolean => {
+  if (filter === "all") {
+    return true;
+  }
+  if (filter === "errors") {
+    return event.statusTone === "error";
+  }
+  if (filter === "warnings") {
+    return event.statusTone === "warning";
+  }
+  if (filter === "commands") {
+    return event.kind === "command";
+  }
+  if (filter === "approvals") {
+    return event.kind === "approval";
+  }
+  return event.kind === filter;
+};
+
+const logTextMatchesSearch = (event: LogEventView, search: string): boolean => {
+  const needle = search.trim().toLowerCase();
+  if (!needle) {
+    return true;
+  }
+  return [event.typeLabel, event.title, event.summary, event.detail, event.actor]
+    .filter(Boolean)
+    .some((value) => value!.toLowerCase().includes(needle));
+};
+
+const CopyButton = ({ value, label = "Copy" }: { value: string; label?: string }) => {
+  const [copied, setCopied] = useState(false);
+
+  const copyValue = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <button className="secondary-button secondary-button--compact" type="button" onClick={() => void copyValue()}>
+      {copied ? "Copied" : label}
+    </button>
+  );
+};
+
+const LongTextDisclosure = ({
+  title = "View details",
+  value,
+  code = false
+}: {
+  title?: string;
+  value?: string;
+  code?: boolean;
+}) => {
+  const safeValue = redactSensitiveText(value);
+  if (!safeValue) {
+    return null;
+  }
+
+  const isLong = safeValue.split(/\r?\n/).length > 6 || safeValue.length > 520;
+  if (!isLong) {
+    return code ? <pre className="long-text-block">{safeValue}</pre> : <p className="long-text-inline">{safeValue}</p>;
+  }
+
+  return (
+    <details className="long-text-disclosure">
+      <summary>{title}</summary>
+      <pre className="long-text-block">{safeValue}</pre>
+    </details>
+  );
+};
+
+const CompactEmptyState = ({ children }: { children: ReactNode }) => (
+  <div className="compact-empty-state">{children}</div>
+);
+
 const AgentLane = ({
   eyebrow,
   title,
@@ -967,136 +2045,785 @@ const AgentLane = ({
   </section>
 );
 
-const AgentFocusPanel = ({ agent, workflow }: { agent?: AgentState; workflow?: ProjectWorkflowState }) => {
+const OverviewMetricCard = ({
+  label,
+  value,
+  detail,
+  tone
+}: {
+  label: string;
+  value: string | number;
+  detail: string;
+  tone?: "good" | "warning" | "danger";
+}) => (
+  <article className={`overview-metric-card ${tone ? `overview-metric-card--${tone}` : ""}`}>
+    <span>{label}</span>
+    <strong>{value}</strong>
+    <p>{detail}</p>
+  </article>
+);
+
+const OverviewAttentionSummary = ({
+  items,
+  onOpenWorkflow,
+  onOpenLogs,
+  onOpenCredentials
+}: {
+  items: WorkflowAttentionItem[];
+  onOpenWorkflow: () => void;
+  onOpenLogs: () => void;
+  onOpenCredentials: () => void;
+}) => {
+  const visibleItems = items.slice(0, 5);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+
+  return (
+    <article className={`overview-attention-card ${items.length === 0 ? "overview-attention-card--empty" : ""}`}>
+      <SectionTitle
+        eyebrow="Attention"
+        title="What needs attention"
+        meta={<span className={`badge ${items.some((item) => item.tone === "danger") ? "badge-incompatible" : "badge-exact"}`}>{items.length}</span>}
+      />
+      {items.length === 0 ? (
+        <p className="overview-attention-card__empty">No urgent attention needed.</p>
+      ) : (
+        <div className="overview-attention-list">
+          {visibleItems.map((item) => {
+            const action = item.target === "credentials"
+              ? { label: "Credentials", onClick: onOpenCredentials }
+              : item.kind === "approval"
+                ? { label: "Logs", onClick: onOpenLogs }
+                : { label: "Workflow", onClick: onOpenWorkflow };
+            return (
+              <div key={item.id} className={`overview-attention-item overview-attention-item--${item.tone}`}>
+                <div>
+                  <div className="candidate-card__title-row">
+                    <strong>{item.title}</strong>
+                    <span className="badge">{workflowAttentionKindLabel(item.kind)}</span>
+                  </div>
+                  <p>{item.detail}</p>
+                </div>
+                <button className="secondary-button" type="button" onClick={action.onClick}>{action.label}</button>
+              </div>
+            );
+          })}
+          {hiddenCount > 0 ? <p className="agent-card__subtle">{hiddenCount} more item{hiddenCount === 1 ? "" : "s"} in Workflow.</p> : null}
+        </div>
+      )}
+    </article>
+  );
+};
+
+const OverviewActivitySnapshot = ({ events }: { events: WorkflowActivityEvent[] }) => (
+  <article className="overview-activity-card">
+    <SectionTitle eyebrow="Recent" title="Recent activity" meta={<span className="badge">{events.length}</span>} />
+    {events.length ? (
+      <div className="overview-activity-list">
+        {events.slice(0, 6).map((event) => (
+          <div key={event.id} className="overview-activity-row">
+            <span>{formatClockTime(event.timestamp)}</span>
+            <strong>{workflowActivitySourceLabel(event.source)}</strong>
+            <p>{event.title}{event.detail ? ` - ${summarizeText(event.detail, "", 105)}` : ""}</p>
+            <span className={`badge workflow-transcript__badge workflow-transcript__badge--${event.status}`}>{workflowEventStatusLabel(event.status)}</span>
+          </div>
+        ))}
+      </div>
+    ) : (
+      <p className="overview-attention-card__empty">Workflow activity will appear once work starts.</p>
+    )}
+  </article>
+);
+
+const QuickNavigationCard = ({
+  title,
+  detail,
+  meta,
+  onClick
+}: {
+  title: string;
+  detail: string;
+  meta?: string;
+  onClick: () => void;
+}) => (
+  <button className="quick-nav-card" type="button" onClick={onClick}>
+    <div>
+      <strong>{title}</strong>
+      <p>{detail}</p>
+    </div>
+    {meta ? <span className="badge">{meta}</span> : null}
+  </button>
+);
+
+const RunRow = ({
+  agent,
+  workflow,
+  selected,
+  onSelect
+}: {
+  agent: AgentState;
+  workflow?: ProjectWorkflowState;
+  selected: boolean;
+  onSelect: (agentId: string) => void;
+}) => {
+  const pendingApprovalCount = agent.approvals.filter((approval) => approval.status === "pending").length;
+  const status = agentLifecycleStatusChip(agent.status);
+
+  return (
+    <button className={`run-row ${selected ? "run-row--selected" : ""}`} type="button" onClick={() => onSelect(agent.id)}>
+      <div className="run-row__main">
+        <div className="candidate-card__title-row">
+          <strong>{agent.name}</strong>
+          <StatusChip label={status.label} tone={status.tone} />
+        </div>
+        <p>{runResultSummary(agent, workflow)}</p>
+      </div>
+      <div className="run-row__meta">
+        <span>{runStageName(agent)}</span>
+        <span>{formatDateTime(agentRunTimestamp(agent))}</span>
+        <span>{agent.changedFiles.length} files</span>
+        <span>{pendingApprovalCount} approvals</span>
+        <span>{agent.reasoningEffort ? reasoningEffortLabel(agent.reasoningEffort) : "Default reasoning"}</span>
+      </div>
+    </button>
+  );
+};
+
+const RunDetailField = ({
+  label,
+  value
+}: {
+  label: string;
+  value: string | number;
+}) => (
+  <div>
+    <span>{label}</span>
+    <strong>{value}</strong>
+  </div>
+);
+
+const RunDetailDisclosure = ({
+  title,
+  count,
+  renderBody
+}: {
+  title: string;
+  count?: string | number;
+  renderBody: () => ReactNode;
+}) => {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <details className="run-detail-disclosure" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <span>{title}</span>
+        {count !== undefined ? <span className="badge">{count}</span> : null}
+      </summary>
+      {open ? <div className="run-detail-disclosure__body">{renderBody()}</div> : null}
+    </details>
+  );
+};
+
+const RunDetailPanel = ({
+  agent,
+  workflow,
+  onOpenWorkflow,
+  onOpenLogs
+}: {
+  agent?: AgentState;
+  workflow?: ProjectWorkflowState;
+  onOpenWorkflow: () => void;
+  onOpenLogs: () => void;
+}) => {
   if (!agent) {
     return (
-      <aside className="agent-focus card-surface">
-        <div className="eyebrow">Focused agent</div>
-        <h3>Agent details</h3>
-        <div className="empty-copy">
-          <p>Select an agent card to inspect its prompt, runtime details, and latest output.</p>
-        </div>
-      </aside>
+      <article className="runs-detail-card">
+        <SectionTitle eyebrow="Selected run" title="Run details" />
+        <p className="overview-attention-card__empty">No runs yet. Start from Workflow or run a recommendation.</p>
+      </article>
     );
   }
 
-  const recentEvents = sortEventsByAge(agent.events).slice(0, 6);
-  const explanation = splitAgentExplanation(agentDetailedExplanation(agent, workflow));
+  const evidence = runEvidenceItems(agent, workflow);
+  const risks = runRiskItems(agent);
+  const recentEvents = sortEventsByAge(agent.events).slice(0, 8);
+  const pendingApprovalsForAgent = agent.approvals.filter((approval) => approval.status === "pending");
+  const visibleApprovals = agent.approvals.slice(0, 12);
+  const visibleCommands = agent.commandLog.slice(0, 12);
+  const visibleChangedFiles = agent.changedFiles.slice(0, 48);
+  const rawEvents = agent.events.filter((event) => event.raw !== undefined).slice(0, 8);
+  const status = agentLifecycleStatusChip(agent.status);
 
   return (
-    <aside className="agent-focus card-surface">
-      <div className="agent-focus__header">
+    <article className="runs-detail-card">
+      <div className="runs-detail-card__header">
         <div>
-          <div className="eyebrow">Focused agent</div>
+          <div className="eyebrow">Selected run</div>
           <h3>{agent.name}</h3>
-          <div className="agent-card__subtle">{agentCategoryLabel(agent.category)}</div>
+          <p>{runResultSummary(agent, workflow)}</p>
         </div>
-        <div className={`status-pill status-${agent.status}`}>{agent.status}</div>
-      </div>
-      <div className="agent-focus__meta">
-        <span>{agent.model}</span>
-        <span>{agent.reasoningEffort ? `${reasoningEffortLabel(agent.reasoningEffort)} reasoning${agent.reasoningEffortSource ? ` (${agent.reasoningEffortSource})` : ""}` : "Default reasoning"}</span>
-        <span>{agent.threadId ?? "No thread yet"}</span>
-        <span>{agent.worktree?.branch ?? "No worktree"}</span>
-      </div>
-      <section className="agent-focus__section">
-        <div className="agent-focus__label">Full explanation</div>
-        <div className="agent-focus__copy">
-          {explanation.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}
+        <div className="runs-detail-card__header-actions">
+          <StatusChip label={status.label} tone={status.tone} />
+          <button className="secondary-button" type="button" onClick={onOpenWorkflow}>Open Workflow</button>
+          <button className="secondary-button" type="button" onClick={onOpenLogs}>View Logs</button>
         </div>
+      </div>
+
+      <div className="runs-detail-grid">
+        <RunDetailField label="Agent" value={agent.name} />
+        <RunDetailField label="Stage" value={runStageName(agent)} />
+        <RunDetailField label="Timestamp" value={formatDateTime(agentRunTimestamp(agent))} />
+        <RunDetailField label="Model/reasoning" value={runModelSummary(agent)} />
+        <RunDetailField label="Decision/result" value={runResultSummary(agent, workflow)} />
+        <RunDetailField label="Next action" value={runNextAction(agent)} />
+        <RunDetailField label="Changed files" value={agent.changedFiles.length} />
+        <RunDetailField label="Tests/checks" value={runChecksSummary(agent)} />
+        <RunDetailField label="Approvals" value={runApprovalSummary(agent)} />
+        <RunDetailField label="Risks/blockers" value={risks.length ? `${risks.length} noted` : "None noted"} />
+      </div>
+
+      {agent.recommendationReport?.nextSteps.length ? (
+        <section className="runs-detail-section">
+          <SectionTitle eyebrow="Recommendations" title="Key recommendations" meta={<span className="badge">{agent.recommendationReport.nextSteps.length}</span>} />
+          <div className="run-evidence-grid">
+            {agent.recommendationReport.nextSteps.slice(0, 4).map((step) => (
+              <article key={`${agent.id}:recommendation:${step.rank}`} className="run-evidence-card">
+                <div className="candidate-card__title-row">
+                  <strong>{step.title}</strong>
+                  <span className="badge">{step.priority}</span>
+                </div>
+                <p>{summarizeText(step.summary, "No summary captured.", 170)}</p>
+                <span>{step.relatedPaths.slice(0, 3).join(", ") || "No files listed"}</span>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <section className="runs-detail-section">
+        <SectionTitle eyebrow="Evidence" title="Evidence and affected areas" meta={<span className="badge">{evidence.length}</span>} />
+        {evidence.length ? (
+          <div className="run-evidence-list">
+            {evidence.slice(0, 10).map((item) => (
+              <div key={item.id} className={`run-evidence-row ${item.tone ? `run-evidence-row--${item.tone}` : ""}`}>
+                <div>
+                  <strong>{item.title}</strong>
+                  <p>{item.detail}</p>
+                </div>
+                {item.meta ? <span>{item.meta}</span> : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="overview-attention-card__empty">No structured evidence has been captured for this run yet.</p>
+        )}
       </section>
-      <section className="agent-focus__section">
-        <div className="agent-focus__label">Objective</div>
-        <p>{agent.taskPrompt}</p>
+
+      <section className="runs-detail-section">
+        <SectionTitle eyebrow="Risks" title="Risks and blockers" meta={<span className={`badge ${risks.length ? "badge-incompatible" : "badge-exact"}`}>{risks.length}</span>} />
+        {risks.length ? (
+          <ul className="workflow-compact-list">
+            {risks.slice(0, 8).map((risk) => <li key={risk}>{risk}</li>)}
+          </ul>
+        ) : (
+          <p className="overview-attention-card__empty">No blockers or risks were captured in the run summary.</p>
+        )}
       </section>
-      {agent.currentPhase ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Current phase</div>
-          <p>{agent.currentPhase}</p>
-        </section>
-      ) : null}
-      {agent.lastMessageSnippet ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Latest output</div>
-          <p>{agent.lastMessageSnippet}</p>
-        </section>
-      ) : null}
-      {agent.integrityReport ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Integrity report</div>
-          <p>{agent.integrityReport.summary}</p>
-          <div className="tag-row">
-            {agent.integrityReport.checks.map((check) => (
-              <span key={check.name} className="tag">{check.name}: {check.status}</span>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {agent.recommendationReport ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Recommendations</div>
-          <p>{agent.recommendationReport.summary}</p>
-          {agent.recommendationReport.ultimateGoalProgress ? (
-            <p>
-              Estimated Ultimate Goal completion: {agent.recommendationReport.ultimateGoalProgress.percentComplete}%.
-              {" "}
-              {agent.recommendationReport.ultimateGoalProgress.rationale}
-            </p>
-          ) : null}
-          <div className="tag-row">
-            {agent.recommendationReport.nextSteps.map((step) => (
-              <span key={step.title} className="tag">{step.priority}: {step.title}</span>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {agent.mergeReport ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Merge status</div>
-          <p>{agent.mergeReport.summary}</p>
-          <div className="tag-row">
-            {agent.mergeReport.mergedBranches.map((branch) => <span key={branch} className="tag">{branch}</span>)}
-            {agent.mergeReport.conflicts.length ? <span className="tag">{agent.mergeReport.conflicts.length} conflicts</span> : null}
-          </div>
-        </section>
-      ) : null}
-      {agent.category === "goal" && workflow?.scopedGoal && agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Scoped plan</div>
-          <div className="tag-row">
-            {workflow.scopedGoal.acceptanceCriteria.map((criterion) => (
-              <span key={criterion} className="tag">{criterion}</span>
-            ))}
-          </div>
-          {workflow.scopedGoal.testStrategy.length ? (
+
+      <div className="run-detail-raw">
+        <RunDetailDisclosure
+          title="Full explanation"
+          renderBody={() => <p>{redactSensitiveText(agentDetailedExplanation(agent, workflow))}</p>}
+        />
+        <RunDetailDisclosure
+          title="Objective"
+          renderBody={() => <p>{redactSensitiveText(agent.taskPrompt)}</p>}
+        />
+        {agent.lastMessageSnippet ? (
+          <RunDetailDisclosure
+            title="Latest output"
+            renderBody={() => <p>{redactSensitiveText(agent.lastMessageSnippet)}</p>}
+          />
+        ) : null}
+        <RunDetailDisclosure
+          title="Changed files"
+          count={agent.changedFiles.length}
+          renderBody={() => agent.changedFiles.length ? (
             <div className="tag-row">
-              {workflow.scopedGoal.testStrategy.map((strategy) => (
-                <span key={strategy} className="tag">{strategy}</span>
-              ))}
+              {visibleChangedFiles.map((file) => <span key={file} className="tag">{file}</span>)}
+              {agent.changedFiles.length > visibleChangedFiles.length ? <span className="tag">+{agent.changedFiles.length - visibleChangedFiles.length} more</span> : null}
             </div>
-          ) : null}
-        </section>
-      ) : null}
-      {agent.changedFiles.length ? (
-        <section className="agent-focus__section">
-          <div className="agent-focus__label">Changed files</div>
-          <div className="tag-row">
-            {agent.changedFiles.map((file) => <span key={file} className="tag">{file}</span>)}
-          </div>
-        </section>
-      ) : null}
-      <section className="agent-focus__section">
-        <div className="agent-focus__label">Recent events</div>
-        <div className="activity-list activity-list--compact">
-          {recentEvents.length ? recentEvents.map((event) => (
-            <div key={event.id} className="activity-row">
-              <strong>{event.title}</strong>
-              <span>{event.detail ?? "No detail"}</span>
+          ) : <p>No changed files were recorded for this run.</p>}
+        />
+        <RunDetailDisclosure
+          title="Approvals"
+          count={agent.approvals.length}
+          renderBody={() => (
+            <>
+              {visibleApprovals.length ? visibleApprovals.map((approval) => (
+                <div key={approval.id} className="run-raw-row">
+                  <strong>{redactSensitiveText(approval.summary)}</strong>
+                  <span>{approval.status} · {approval.kind} · {formatDateTime(approval.createdAt)}</span>
+                  <p>{redactSensitiveText(approval.reason ?? approval.command ?? "Approval request recorded.")}</p>
+                </div>
+              )) : <p>No approvals were recorded for this run.</p>}
+              {agent.approvals.length > visibleApprovals.length ? <p className="agent-card__subtle">Showing the latest {visibleApprovals.length} approvals. Open Logs for older entries.</p> : null}
+              {pendingApprovalsForAgent.length ? <p className="agent-card__subtle">{pendingApprovalsForAgent.length} approval{pendingApprovalsForAgent.length === 1 ? "" : "s"} still pending.</p> : null}
+            </>
+          )}
+        />
+        <RunDetailDisclosure
+          title="Commands"
+          count={agent.commandLog.length}
+          renderBody={() => (
+            <>
+              {visibleCommands.length ? visibleCommands.map((command) => (
+                <div key={`${command.itemId ?? command.startedAt}:${command.command}`} className="run-raw-row">
+                  <strong>{redactSensitiveText(command.command)}</strong>
+                  <span>{command.status} · {command.cwd ?? "No cwd"} · {formatDateTime(command.startedAt)}</span>
+                  {command.output ? <pre>{renderOutputPreview(command.output)}</pre> : <p>No command output included in this preview.</p>}
+                </div>
+              )) : <p>No commands were recorded for this run.</p>}
+              {agent.commandLog.length > visibleCommands.length ? <p className="agent-card__subtle">Showing the latest {visibleCommands.length} command snippets. Open Logs for older entries.</p> : null}
+            </>
+          )}
+        />
+        <RunDetailDisclosure
+          title="Logs and events"
+          count={recentEvents.length}
+          renderBody={() => recentEvents.length ? recentEvents.map((event) => (
+            <div key={event.id} className="run-raw-row">
+              <strong>{redactSensitiveText(event.title)}</strong>
+              <span>{workflowEventStatusLabel(event.status)} · {event.type} · {formatDateTime(event.timestamp)}</span>
+              {event.detail ? <p>{redactSensitiveText(event.detail)}</p> : null}
             </div>
-          )) : <div className="empty-copy">No agent events have been recorded yet.</div>}
+          )) : <p>No events were recorded for this run.</p>}
+        />
+        <RunDetailDisclosure
+          title="Raw output / JSON"
+          count={rawEvents.length}
+          renderBody={() => rawEvents.length ? rawEvents.map((event) => (
+            <div key={`raw:${event.id}`} className="run-raw-row">
+              <strong>{redactSensitiveText(event.title)}</strong>
+              <pre>{stringifyRawValue(event.raw)}</pre>
+            </div>
+          )) : <p>No raw event JSON is available for this run.</p>}
+        />
+      </div>
+    </article>
+  );
+};
+
+const RunsReviewPage = ({
+  agents,
+  totalAgents,
+  workflowPage,
+  manualPage,
+  workflowPageIndex,
+  manualPageIndex,
+  workflow,
+  selectedAgent,
+  loading,
+  manualAgentPrompt,
+  manualAgentModel,
+  manualAgentReasoningMode,
+  manualAgentReasoningEffort,
+  availableModels,
+  modelOptionsByName,
+  manualPendingApprovalCount,
+  onSelectAgent,
+  onWorkflowPageChange,
+  onManualPageChange,
+  onOpenWorkflow,
+  onOpenLogs,
+  onManualPromptChange,
+  onManualModelChange,
+  onManualReasoningModeChange,
+  onManualReasoningEffortChange,
+  onCreateManualAgent
+}: {
+  agents: AgentState[];
+  totalAgents: number;
+  workflowPage: AgentPageView;
+  manualPage: AgentPageView;
+  workflowPageIndex: number;
+  manualPageIndex: number;
+  workflow?: ProjectWorkflowState;
+  selectedAgent?: AgentState;
+  loading: boolean;
+  manualAgentPrompt: string;
+  manualAgentModel: string;
+  manualAgentReasoningMode: AgentReasoningMode;
+  manualAgentReasoningEffort: InterfaceReasoningEffort;
+  availableModels: DiscoveredModel[];
+  modelOptionsByName: Map<string, DiscoveredModel>;
+  manualPendingApprovalCount: number;
+  onSelectAgent: (agentId: string) => void;
+  onWorkflowPageChange: (pageIndex: number) => void;
+  onManualPageChange: (pageIndex: number) => void;
+  onOpenWorkflow: () => void;
+  onOpenLogs: () => void;
+  onManualPromptChange: (value: string) => void;
+  onManualModelChange: (value: string) => void;
+  onManualReasoningModeChange: (value: AgentReasoningMode) => void;
+  onManualReasoningEffortChange: (value: InterfaceReasoningEffort) => void;
+  onCreateManualAgent: () => void;
+}) => {
+  const [filter, setFilter] = useState<RunFilterId>("all");
+  const [search, setSearch] = useState("");
+  const latestRun = agents[0];
+  const selectedRun = selectedAgent ?? latestRun;
+  const filteredRuns = useMemo(
+    () => agents.filter((agent) => runFilterMatches(agent, filter) && runMatchesSearch(agent, search, workflow)),
+    [agents, filter, search, workflow]
+  );
+  const completedCount = agents.filter((agent) => agent.status === "completed").length;
+  const blockedCount = agents.filter((agent) => runFilterMatches(agent, "errors")).length;
+
+  return (
+    <section className="runs-page">
+      <header className="runs-page-header">
+        <div>
+          <div className="eyebrow">Run history</div>
+          <h2>Runs</h2>
+          <p>Review agent runs from structured summaries first. Full prompts, logs, commands, and raw event data stay collapsed below each selected run.</p>
         </div>
+        <div className="runs-page-header__stats">
+          <RunDetailField label="Total runs" value={totalAgents} />
+          <RunDetailField label="Most recent" value={latestRun ? latestRun.status : "None"} />
+          <RunDetailField label="Selected" value={selectedRun ? selectedRun.name : "No run"} />
+          <RunDetailField label="Loaded completed" value={completedCount} />
+          <RunDetailField label="Loaded blocked" value={blockedCount} />
+        </div>
+      </header>
+
+      <div className="runs-toolbar">
+        <div className="runs-filter-tabs" role="tablist" aria-label="Run filters">
+          {RUN_FILTERS.map((option) => (
+            <button
+              key={option.id}
+              className={filter === option.id ? "runs-filter-tab runs-filter-tab--active" : "runs-filter-tab"}
+              type="button"
+              onClick={() => setFilter(option.id)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <input
+          className="input runs-search"
+          placeholder="Search runs, files, output summaries"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+        />
+      </div>
+
+      <article className="runs-list-card">
+        <div className="candidate-card__title-row">
+          <strong>{loading ? "Loading runs" : `${filteredRuns.length} loaded run${filteredRuns.length === 1 ? "" : "s"}`}</strong>
+          <span className="badge">{filter === "all" ? "All stages" : RUN_FILTERS.find((option) => option.id === filter)?.label}</span>
+        </div>
+        <div className="runs-pager-grid">
+          <FeedPager
+            label="Workflow runs"
+            pageIndex={workflowPageIndex}
+            pageSize={AGENT_HISTORY_PAGE_SIZE}
+            total={workflowPage.total}
+            visibleCount={workflowPage.agents.length}
+            onPageChange={onWorkflowPageChange}
+          />
+          <FeedPager
+            label="Manual runs"
+            pageIndex={manualPageIndex}
+            pageSize={AGENT_HISTORY_PAGE_SIZE}
+            total={manualPage.total}
+            visibleCount={manualPage.agents.length}
+            onPageChange={onManualPageChange}
+          />
+        </div>
+        <div className="runs-list">
+          {filteredRuns.length ? filteredRuns.map((agent) => (
+            <RunRow
+              key={agent.id}
+              agent={agent}
+              workflow={workflow}
+              selected={selectedRun?.id === agent.id}
+              onSelect={onSelectAgent}
+            />
+          )) : (
+            <p className="overview-attention-card__empty">
+              {agents.length ? "No runs match the current filter or search." : "No runs yet. Start from Workflow or run a recommendation."}
+            </p>
+          )}
+        </div>
+      </article>
+
+      <RunDetailPanel agent={selectedRun} workflow={workflow} onOpenWorkflow={onOpenWorkflow} onOpenLogs={onOpenLogs} />
+
+      <details className="runs-manual-panel">
+        <summary>
+          <span>Manual / independent run</span>
+          <span className="badge">{manualPendingApprovalCount} approvals pending</span>
+        </summary>
+        <div className="agent-form card-surface">
+          <textarea
+            className="textarea"
+            placeholder="Ask a question about the repo or describe a change outside the workflow cycle."
+            value={manualAgentPrompt}
+            onChange={(event) => onManualPromptChange(event.target.value)}
+          />
+          <select className="input" value={manualAgentModel} onChange={(event) => onManualModelChange(event.target.value)}>
+            {availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
+          </select>
+          <AgentReasoningPicker
+            category="manual"
+            model={modelOptionsByName.get(manualAgentModel)}
+            taskPrompt={manualAgentPrompt}
+            mode={manualAgentReasoningMode}
+            effort={manualAgentReasoningEffort}
+            onModeChange={onManualReasoningModeChange}
+            onEffortChange={onManualReasoningEffortChange}
+          />
+          <div className="actions-row">
+            <button className="primary-button" disabled={!manualAgentPrompt.trim() || !manualAgentModel} onClick={onCreateManualAgent}>
+              Run manual agent
+            </button>
+            <span className="agent-card__subtle">Manual runs stay outside the workflow cycle.</span>
+          </div>
+        </div>
+      </details>
+    </section>
+  );
+};
+
+const LogsPanel = ({
+  logFeed,
+  agents,
+  pendingApprovals,
+  activityLogPageIndex,
+  commandLogPageIndex,
+  onActivityPageChange,
+  onCommandPageChange,
+  onApprove,
+  onReject
+}: {
+  logFeed: LogFeedView;
+  agents: AgentState[];
+  pendingApprovals: ApprovalRequestRecord[];
+  activityLogPageIndex: number;
+  commandLogPageIndex: number;
+  onActivityPageChange: (pageIndex: number) => void;
+  onCommandPageChange: (pageIndex: number) => void;
+  onApprove: (approval: ApprovalRequestRecord) => void;
+  onReject: (approval: ApprovalRequestRecord) => void;
+}) => {
+  const [filter, setFilter] = useState<LogFilterId>("all");
+  const [search, setSearch] = useState("");
+  const events = useMemo(
+    () => buildLogEvents({
+      activity: logFeed.activity.entries,
+      commands: logFeed.commands.entries,
+      agents,
+      approvals: pendingApprovals
+    }),
+    [agents, logFeed.activity.entries, logFeed.commands.entries, pendingApprovals]
+  );
+  const visibleEvents = useMemo(
+    () => events
+      .filter((event) => logEventMatchesFilter(event, filter))
+      .filter((event) => logTextMatchesSearch(event, search))
+      .slice(0, 160),
+    [events, filter, search]
+  );
+  const visibleCommands = useMemo(
+    () => logFeed.commands.entries
+      .filter((command) => {
+        const status = commandStatusChip(command);
+        const event: LogEventView = {
+          id: command.id,
+          timestamp: command.completedAt ?? command.startedAt,
+          kind: "command",
+          typeLabel: "Command",
+          title: command.agentName,
+          summary: redactSensitiveText(command.command),
+          detail: redactSensitiveText(command.command),
+          actor: agentCategoryLabel(command.agentCategory),
+          statusLabel: status.label,
+          statusTone: status.tone
+        };
+        return logEventMatchesFilter(event, filter) && logTextMatchesSearch(event, search);
+      })
+      .slice(0, 40),
+    [filter, logFeed.commands.entries, search]
+  );
+  const eventStats = useMemo(() => {
+    const lastEventTime = events.reduce((latest, event) => Math.max(latest, toTime(event.timestamp)), 0);
+    return {
+      total: Math.max(logFeed.activity.total + logFeed.commands.total, events.length),
+      errors: events.filter((event) => event.statusTone === "error").length,
+      warnings: events.filter((event) => event.statusTone === "warning").length,
+      lastEventTime: lastEventTime ? new Date(lastEventTime).toISOString() : undefined
+    };
+  }, [events, logFeed.activity.total, logFeed.commands.total]);
+
+  return (
+    <section className="workflow-control-center panel workflow-log-workspace">
+      <header className="logs-header">
+        <div>
+          <div className="eyebrow">Execution feed</div>
+          <h2>Logs</h2>
+          <p>Recent workflow events, agent messages, command snippets, and approvals with sensitive values redacted before display.</p>
+        </div>
+        <div className="logs-header__stats" aria-label="Log summary">
+          <div>
+            <span>Recent events</span>
+            <strong>{eventStats.total}</strong>
+          </div>
+          <div>
+            <span>Errors / warnings</span>
+            <strong>{eventStats.errors} / {eventStats.warnings}</strong>
+          </div>
+          <div>
+            <span>Pending approvals</span>
+            <strong>{pendingApprovals.length}</strong>
+          </div>
+          <div>
+            <span>Last event</span>
+            <strong>{formatClockTime(eventStats.lastEventTime)}</strong>
+          </div>
+        </div>
+      </header>
+
+      <div className="logs-toolbar">
+        <div className="runs-filter-tabs" aria-label="Log filters">
+          {LOG_FILTERS.map((option) => (
+            <button
+              key={option.id}
+              className={`runs-filter-tab ${filter === option.id ? "runs-filter-tab--active" : ""}`}
+              type="button"
+              onClick={() => setFilter(option.id)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <input
+          className="input logs-search"
+          placeholder="Search logs"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+        />
+      </div>
+
+      <section className={`logs-approval-strip ${pendingApprovals.length === 0 ? "logs-approval-strip--empty" : ""}`}>
+        <div className="candidate-card__title-row">
+          <strong>Pending approvals</strong>
+          <StatusChip label={pendingApprovals.length ? "Pending" : "Idle"} tone={pendingApprovals.length ? "pending" : "idle"} />
+        </div>
+        {pendingApprovals.length ? (
+          <div className="logs-approval-list">
+            {pendingApprovals.slice(0, 6).map((approval) => (
+              <article key={approval.id} className="log-approval-card">
+                <div>
+                  <strong>{redactSensitiveText(approval.summary)}</strong>
+                  <p>{summarizeSafeText(approval.reason ?? approval.command, "Approval required before work can continue.", 180)}</p>
+                  <span>{approval.kind} · Requested {formatDateTime(approval.createdAt)}</span>
+                </div>
+                <div className="actions-row">
+                  <button className="primary-button" type="button" onClick={() => onApprove(approval)}>Accept</button>
+                  <button className="secondary-button" type="button" onClick={() => onReject(approval)}>Reject</button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <CompactEmptyState>No approvals are waiting. The workflow can continue without operator action.</CompactEmptyState>
+        )}
       </section>
-    </aside>
+
+      <section className="logs-main-grid">
+        <article className="logs-feed-panel">
+          <SectionTitle
+            eyebrow="Activity feed"
+            title="Recent execution"
+            meta={logFeed.loading ? <StatusChip label="Running" tone="running" /> : <span className="badge">{visibleEvents.length}</span>}
+          />
+          <FeedPager
+            label="Activity"
+            pageIndex={activityLogPageIndex}
+            pageSize={LOG_ACTIVITY_PAGE_SIZE}
+            total={logFeed.activity.total}
+            visibleCount={logFeed.activity.entries.length}
+            onPageChange={onActivityPageChange}
+          />
+          <div className="log-event-list">
+            {visibleEvents.length ? visibleEvents.map((event) => (
+              <article key={event.id} className={`log-event-row log-event-row--${event.statusTone}`}>
+                <div className="log-event-row__time">{formatClockTime(event.timestamp)}</div>
+                <div className="log-event-row__body">
+                  <div className="log-event-row__title">
+                    <span>{event.typeLabel}</span>
+                    <strong>{event.title}</strong>
+                    {event.actor ? <em>{event.actor}</em> : null}
+                  </div>
+                  <p>{event.summary}</p>
+                  {event.detail ? <LongTextDisclosure value={event.detail} /> : null}
+                </div>
+                <StatusChip label={event.statusLabel} tone={event.statusTone} />
+              </article>
+            )) : (
+              <CompactEmptyState>No log events match the current filter.</CompactEmptyState>
+            )}
+          </div>
+        </article>
+
+        <article className="logs-command-panel">
+          <SectionTitle
+            eyebrow="Commands"
+            title="Command snippets"
+            meta={logFeed.loading ? <StatusChip label="Running" tone="running" /> : <span className="badge">{visibleCommands.length}</span>}
+          />
+          <FeedPager
+            label="Commands"
+            pageIndex={commandLogPageIndex}
+            pageSize={LOG_COMMAND_PAGE_SIZE}
+            total={logFeed.commands.total}
+            visibleCount={logFeed.commands.entries.length}
+            onPageChange={onCommandPageChange}
+          />
+          <div className="log-command-list">
+            {visibleCommands.length ? visibleCommands.map((command) => {
+              const safeCommand = redactSensitiveText(command.command);
+              const status = commandStatusChip(command);
+              return (
+                <article key={command.id} className="log-command-card">
+                  <div className="log-command-card__header">
+                    <div>
+                      <strong>{command.agentName}</strong>
+                      <span>{agentCategoryLabel(command.agentCategory)} · {formatDateTime(command.startedAt)}</span>
+                    </div>
+                    <div className="log-command-card__actions">
+                      <StatusChip label={status.label} tone={status.tone} />
+                      <CopyButton value={safeCommand} />
+                    </div>
+                  </div>
+                  <pre className="log-command-block">{safeCommand}</pre>
+                  <details className="long-text-disclosure">
+                    <summary>Command details</summary>
+                    <div className="log-command-details">
+                      <span>CWD: {redactSensitiveText(command.cwd ?? "Not recorded")}</span>
+                      <span>Exit: {command.exitCode ?? "Not recorded"}</span>
+                      <span>Completed: {formatDateTime(command.completedAt)}</span>
+                    </div>
+                  </details>
+                </article>
+              );
+            }) : (
+              <CompactEmptyState>No command snippets match the current filter.</CompactEmptyState>
+            )}
+          </div>
+        </article>
+      </section>
+    </section>
   );
 };
 
@@ -1240,61 +2967,66 @@ const CredentialsPanel = ({
 
   return (
     <section className="workflow-control-center panel credentials-workspace">
-      <SectionTitle
-        eyebrow="Local credentials"
-        title="API Keys / Credentials"
-        meta={<span className="badge">{credentials.entries.length} stored • {pendingRequests.length} pending</span>}
-      />
-      <div className="notice">
-        Secret values are stored only on this machine and are never added to portable interface files, review logs, or prompts automatically.
-        Send a secret to an agent only through an explicit pending input request.
-      </div>
-      <div className="credentials-grid">
-        <article className="overview-card workflow-panel">
-          <SectionTitle eyebrow="Requests" title="Pending credential requests" meta={<span className="badge">{pendingRequests.length}</span>} />
-          <div className="workflow-option-list credentials-list">
-            {pendingRequests.length ? pendingRequests.map((request) => (
-              <article key={request.id} className="workflow-option workflow-option--blocked">
-                <div className="candidate-card__title-row">
-                  <strong>{request.providerName} {request.keyLabel}</strong>
-                  <span className="badge badge-incompatible">Pending</span>
-                </div>
-                <p>{request.description}</p>
-                <div className="notice notice--compact">
-                  {request.freeOnly ?? true
-                    ? "Free/no-card credential only. If this provider requires payment, dismiss the request and let the agent choose a free provider or demo mode."
-                    : "Paid services may be considered because the setting is enabled, but billing still requires explicit approval."}
-                </div>
-                {entriesByLinkedRequest.get(request.id) ? (
-                  <div className="lane-note">
-                    <strong>Stored credential ready</strong>
-                    <span>Use Send to waiting agent only if you want this secret shared with the current run.</span>
-                  </div>
-                ) : null}
-                <div className="workflow-option__meta">
-                  <span>{request.requestedByAgentCategory ? agentCategoryLabel(request.requestedByAgentCategory) : "Workflow"}</span>
-                  <span>Requested {formatDateTime(request.createdAt)}</span>
-                </div>
-                <div className="actions-row">
-                  <button className="primary-button" type="button" onClick={() => applyRequestToDraft(request.id)}>Use in credential form</button>
-                  {request.userInputRequestId && entriesByLinkedRequest.get(request.id) ? (
-                    <button
-                      className="primary-button"
-                      type="button"
-                      disabled={submitBusyRequestId === request.id}
-                      onClick={() => void submitRequestToAgent(request.id)}
-                    >
-                      {submitBusyRequestId === request.id ? "Sending..." : "Send to waiting agent"}
-                    </button>
-                  ) : null}
-                  <button className="secondary-button" type="button" onClick={() => void dismissRequest(request.id)}>Dismiss</button>
-                </div>
-              </article>
-            )) : <div className="empty-copy">No credential requests are pending.</div>}
-          </div>
-        </article>
+      <header className="credentials-header">
+        <SectionTitle
+          eyebrow="Local credentials"
+          title="Credentials"
+          meta={<span className="badge">{credentials.entries.length} stored • {pendingRequests.length} pending</span>}
+        />
+        <div className="credentials-security-note">
+          Secrets are stored locally for this project and are never added to portable interface files, logs, or prompts automatically.
+        </div>
+      </header>
 
-        <article className="overview-card workflow-panel">
+      <section className={`credential-requests-panel ${pendingRequests.length === 0 ? "credential-requests-panel--empty" : ""}`}>
+        <div className="candidate-card__title-row">
+          <strong>Pending credential requests</strong>
+          <StatusChip label={pendingRequests.length ? "Pending" : "Idle"} tone={pendingRequests.length ? "pending" : "idle"} />
+        </div>
+        {pendingRequests.length ? (
+          <div className="credential-request-list">
+            {pendingRequests.map((request) => {
+              const linkedEntry = entriesByLinkedRequest.get(request.id);
+              return (
+                <article key={request.id} className="credential-request-card">
+                  <div>
+                    <div className="candidate-card__title-row">
+                      <strong>{request.providerName} · {request.keyLabel}</strong>
+                      <StatusChip label="Pending" tone="pending" />
+                    </div>
+                    <p>{redactSensitiveText(request.description)}</p>
+                    <div className="workflow-option__meta">
+                      <span>{request.requestedByAgentCategory ? agentCategoryLabel(request.requestedByAgentCategory) : "Workflow"}</span>
+                      <span>Requested {formatDateTime(request.createdAt)}</span>
+                      <span>{request.freeOnly ?? true ? "Free/no-card only" : "Paid allowed with approval"}</span>
+                      {linkedEntry ? <span>Stored credential ready</span> : null}
+                    </div>
+                  </div>
+                  <div className="actions-row">
+                    <button className="primary-button" type="button" onClick={() => applyRequestToDraft(request.id)}>Use in form</button>
+                    {request.userInputRequestId && linkedEntry ? (
+                      <button
+                        className="primary-button"
+                        type="button"
+                        disabled={submitBusyRequestId === request.id}
+                        onClick={() => void submitRequestToAgent(request.id)}
+                      >
+                        {submitBusyRequestId === request.id ? "Sending..." : "Send to waiting agent"}
+                      </button>
+                    ) : null}
+                    <button className="secondary-button" type="button" onClick={() => void dismissRequest(request.id)}>Dismiss</button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <CompactEmptyState>No credential requests are pending. Agents will pause here when a local secret is needed.</CompactEmptyState>
+        )}
+      </section>
+
+      <div className="credentials-layout">
+        <article className="overview-card workflow-panel credential-form-panel">
           <SectionTitle eyebrow={draft.entryId ? "Replace" : "Add"} title={draft.entryId ? "Replace stored credential" : "Add credential"} />
           <div className="workflow-form">
             <label className="form-field">
@@ -1347,35 +3079,359 @@ const CredentialsPanel = ({
             ) : null}
           </div>
         </article>
-      </div>
 
-      <article className="overview-card workflow-panel">
-        <SectionTitle eyebrow="Stored locally" title="Configured providers" meta={<span className="badge">{credentials.entries.length}</span>} />
-        <div className="credential-entry-grid">
-          {credentials.entries.length ? credentials.entries.map((entry) => (
-            <article key={entry.id} className="workflow-option credential-entry">
-              <div className="candidate-card__title-row">
-                <strong>{entry.providerName}</strong>
-                <span className={`badge ${entry.status === "active" ? "badge-exact" : "badge-source"}`}>{entry.status.replace("_", " ")}</span>
-              </div>
-              <div className="credential-secret-preview">
-                <span>{entry.keyLabel}</span>
-                <code>{entry.hasApiKey ? "••••••••" : "No API key"}</code>
-                <code>{entry.hasSecretKey ? "secret ••••••••" : "No secret key"}</code>
-              </div>
-              {entry.notes ? <p>{entry.notes}</p> : null}
-              <div className="workflow-option__meta">
-                <span>Updated {formatDateTime(entry.updatedAt)}</span>
-                <span>{entry.linkedRequestIds.length} linked requests</span>
-              </div>
-              <div className="actions-row">
-                <button className="secondary-button" type="button" onClick={() => editEntry(entry)}>Replace</button>
-                <button className="secondary-button" type="button" disabled={busy} onClick={() => void deleteCredential(entry.id)}>Remove</button>
-              </div>
-            </article>
-          )) : <div className="empty-copy">No credentials are stored for this project.</div>}
+        <article className="overview-card workflow-panel credential-provider-panel">
+          <SectionTitle eyebrow="Stored locally" title="Configured providers" meta={<span className="badge">{credentials.entries.length}</span>} />
+          <div className="credential-table">
+            {credentials.entries.length ? credentials.entries.map((entry) => {
+              const status = credentialStatusChip(entry.status);
+              return (
+                <article key={entry.id} className="credential-table-row">
+                  <div className="credential-table-row__main">
+                    <strong>{entry.providerName}</strong>
+                    <span>{entry.keyLabel}</span>
+                    <span>{entry.hasSecretKey ? "API key + secret stored" : entry.hasApiKey ? "API key stored" : "No secret stored"}</span>
+                    {entry.notes ? <p>{redactSensitiveText(entry.notes)}</p> : null}
+                  </div>
+                  <StatusChip label={status.label} tone={status.tone} />
+                  <div className="credential-table-row__meta">
+                    <span>Created {formatDateTime(entry.createdAt)}</span>
+                    <span>Updated {formatDateTime(entry.updatedAt)}</span>
+                    <span>{entry.linkedRequestIds.length} linked requests</span>
+                  </div>
+                  <div className="actions-row">
+                    <button className="secondary-button" type="button" onClick={() => editEntry(entry)}>Replace</button>
+                    <button className="secondary-button" type="button" disabled={busy} onClick={() => void deleteCredential(entry.id)}>Remove</button>
+                  </div>
+                </article>
+              );
+            }) : (
+              <CompactEmptyState>No credentials are stored for this project.</CompactEmptyState>
+            )}
+          </div>
+        </article>
+      </div>
+    </section>
+  );
+};
+
+const topLevelDirectories = (nodes: RepoTreeNode[]): RepoTreeNode[] =>
+  nodes.filter((node) => node.type === "directory").slice(0, 10);
+
+const dependencyEcosystemSummary = (dependencies: LoadedProjectView["record"]["dependencies"]): Array<{ ecosystem: string; count: number }> => {
+  const counts = new Map<string, number>();
+  for (const dependency of dependencies) {
+    counts.set(dependency.ecosystem, (counts.get(dependency.ecosystem) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([ecosystem, count]) => ({ ecosystem, count }))
+    .sort((left, right) => right.count - left.count || left.ecosystem.localeCompare(right.ecosystem));
+};
+
+const interfaceCreationStatusChip = (status?: LoadedProjectView["record"]["interfaceCreation"]): { label: string; tone: StatusChipTone } => {
+  if (!status) {
+    return { label: "Pending", tone: "pending" };
+  }
+  if (status.status === "running" || status.status === "queued") {
+    return { label: "Running", tone: "running" };
+  }
+  if (status.status === "completed") {
+    return { label: "Completed", tone: "completed" };
+  }
+  if (status.status === "failed") {
+    return { label: "Error", tone: "error" };
+  }
+  return { label: "Idle", tone: "idle" };
+};
+
+const RepositoryPanel = ({
+  project,
+  repositoryData,
+  treeFilterDraft,
+  deferredTreeFilter,
+  selectedFile,
+  fileSummary,
+  importantPathSummaries,
+  onTreeFilterChange,
+  onSelectFile
+}: {
+  project: LoadedProjectView;
+  repositoryData: RepositoryDataView;
+  treeFilterDraft: string;
+  deferredTreeFilter: string;
+  selectedFile?: string;
+  fileSummary: FileSummary | null;
+  importantPathSummaries: FileSummary[];
+  onTreeFilterChange: (value: string) => void;
+  onSelectFile: (relativePath: string) => void;
+}) => {
+  const { record } = project;
+  const stats = record.stats;
+  const overview = record.overview;
+  const dependencies = repositoryData.projectId === record.id ? repositoryData.dependencies : [];
+  const summaryCache = repositoryData.projectId === record.id ? repositoryData.summaryCache : [];
+  const repositoryTree = repositoryData.projectId === record.id ? repositoryData.tree : [];
+  const scanStatus = interfaceCreationStatusChip(record.interfaceCreation);
+  const validationStatus = validationStatusChip(project.validationStatus);
+  const accessProbe = record.validation.projectAccess;
+  const accessStatus: { label: string; tone: StatusChipTone } = accessProbe
+    ? accessProbe.status === "passed"
+      ? { label: "Success", tone: "success" }
+      : { label: "Error", tone: "error" }
+    : { label: "Pending", tone: "pending" };
+  const deterministicScanReady = record.interfaceCreation?.deterministicScanReady ?? Boolean(stats);
+  const agentAnalysisReady = record.interfaceCreation?.agentAnalysisReady ?? Boolean(overview);
+  const directories = topLevelDirectories(repositoryTree);
+  const dependencySummary = dependencyEcosystemSummary(dependencies);
+  const excludedPathEntries = getExcludedPathEntries(stats?.excludedPaths);
+  const rawRepositoryAnalysis = [
+    overview?.summary,
+    overview?.architecture,
+    overview?.howItIsOrganized,
+    overview?.importantToKnowFirst,
+    overview?.recommendations.length ? `Recommendations:\n${overview.recommendations.map((item) => `- ${item}`).join("\n")}` : undefined
+  ].filter(Boolean).join("\n\n");
+  const scanDetails = [
+    stats?.explanation,
+    `Project kind: ${record.validation.projectKind}`,
+    `Branch: ${record.validation.branch ?? "Not recorded"}`,
+    `Git head: ${record.validation.gitHead ?? "Not recorded"}`,
+    `Manifest files: ${stats?.manifestFiles.join(", ") || "None detected"}`,
+    `Entry points: ${stats?.entryPoints.join(", ") || "None detected"}`
+  ].filter(Boolean).join("\n");
+
+  return (
+    <section className="workspace-summary repository-workspace repository-intelligence-page">
+      <header className="repository-header">
+        <div>
+          <div className="eyebrow">Repository intelligence</div>
+          <h2>{record.identity.projectName}</h2>
+          <p>{redactSensitiveText(overview?.whatProjectDoes ?? overview?.summary ?? "Repository analysis is still in progress.")}</p>
         </div>
-      </article>
+        <div className="repository-header__chips">
+          <StatusChip label={scanStatus.label} tone={scanStatus.tone} />
+          <StatusChip label={validationStatus.label} tone={validationStatus.tone} />
+        </div>
+      </header>
+
+      <section className="repository-summary-grid">
+        <article className="repository-fact-card repository-fact-card--wide">
+          <span>Project intent</span>
+          <strong>{record.identity.repositoryName ?? record.identity.projectName}</strong>
+          <p>{summarizeSafeText(overview?.importantToKnowFirst ?? overview?.whatProjectDoes ?? overview?.summary, "No project intent has been generated yet.", 220)}</p>
+        </article>
+        <article className="repository-fact-card">
+          <span>Files</span>
+          <strong>{stats?.includedFiles ?? 0}</strong>
+          <p>{stats?.totalFiles ?? 0} total · {stats?.excludedFiles ?? 0} excluded</p>
+        </article>
+        <article className="repository-fact-card">
+          <span>Indexed size</span>
+          <strong>{formatBytes(stats?.includedSizeBytes ?? 0)}</strong>
+          <p>{formatBytes(stats?.totalSizeBytes ?? 0)} scanned footprint</p>
+        </article>
+        <article className="repository-fact-card">
+          <span>Dependencies</span>
+          <strong>{dependencies.length}</strong>
+          <p>{stats?.primaryManagers.join(", ") || "Package manager not detected"}</p>
+        </article>
+        <article className="repository-fact-card">
+          <span>Last scan</span>
+          <strong>{formatClockTime(overview?.generatedAt ?? stats?.createdAt ?? record.validation.lastValidatedAt)}</strong>
+          <p>{record.interfaceCreation?.phase || record.interfaceCreation?.message || "Scan state saved locally"}</p>
+        </article>
+      </section>
+
+      <section className="repository-report-layout">
+        <div className="repository-report-main">
+          <article className="repository-section">
+            <SectionTitle eyebrow="Structure" title="Important paths and modules" />
+            <div className="repository-two-column">
+              <div>
+                <span className="workflow-option__label">Important paths</span>
+                <div className="path-summary-list">
+                  {importantPathSummaries.length ? importantPathSummaries.slice(0, 6).map((summary) => (
+                    <div key={summary.relativePath} className="path-summary path-summary--compact">
+                      <div className="candidate-card__title-row">
+                        <strong>{summary.relativePath}</strong>
+                        <SourceBadge source={summary.source} />
+                      </div>
+                      <p>{summarizeSafeText(summary.summary, "No summary available.", 170)}</p>
+                    </div>
+                  )) : <CompactEmptyState>No important path summaries are available yet.</CompactEmptyState>}
+                </div>
+              </div>
+              <div>
+                <span className="workflow-option__label">Main directories</span>
+                <div className="tag-row">
+                  {directories.length ? directories.map((node) => <span key={node.path} className="tag">{node.path}</span>) : <span className="tag">No directories detected</span>}
+                </div>
+                <span className="workflow-option__label">Entry points</span>
+                <div className="tag-row">
+                  {stats?.entryPoints.length ? stats.entryPoints.slice(0, 10).map((entry) => <span key={entry} className="tag">{entry}</span>) : <span className="tag">None detected</span>}
+                </div>
+              </div>
+            </div>
+            <div className="path-summary-list">
+              {overview?.subsystemSummaries.length ? overview.subsystemSummaries.slice(0, 5).map((subsystem) => (
+                <div key={subsystem.name} className="path-summary">
+                  <strong>{subsystem.name}</strong>
+                  <p>{summarizeSafeText(subsystem.summary, "No subsystem summary available.", 180)}</p>
+                  {subsystem.paths.length ? <span className="agent-card__subtle">{subsystem.paths.slice(0, 5).join(", ")}</span> : null}
+                </div>
+              )) : <CompactEmptyState>No subsystem breakdown is available yet.</CompactEmptyState>}
+            </div>
+          </article>
+
+          <article className="repository-section">
+            <SectionTitle eyebrow="Dependencies" title="Runtime and package map" meta={<span className="badge">{dependencies.length}</span>} />
+            <div className="repository-two-column">
+              <div>
+                <span className="workflow-option__label">Package manager</span>
+                <p>{stats?.primaryManagers.join(", ") || "No package manager was detected."}</p>
+                <div className="tag-row">
+                  {dependencySummary.length ? dependencySummary.map((entry) => <span key={entry.ecosystem} className="tag">{entry.ecosystem}: {entry.count}</span>) : <span className="tag">No dependencies</span>}
+                </div>
+              </div>
+              <div>
+                <span className="workflow-option__label">Framework/runtime notes</span>
+                {overview?.dependencyHighlights.length ? (
+                  <ul className="workflow-compact-list">
+                    {overview.dependencyHighlights.slice(0, 5).map((highlight) => <li key={highlight}>{redactSensitiveText(highlight)}</li>)}
+                  </ul>
+                ) : <p>No dependency highlights have been generated yet.</p>}
+              </div>
+            </div>
+            <details className="workflow-inline-details">
+              <summary>View dependency list</summary>
+              <div className="tag-row">
+                {dependencies.length ? dependencies.slice(0, 80).map((dependency) => (
+                  <span key={`${dependency.manifest}:${dependency.name}`} className="tag">
+                    {dependency.name}@{dependency.version}{dependency.dev ? " dev" : ""}
+                  </span>
+                )) : <span className="tag">No dependencies detected</span>}
+              </div>
+            </details>
+          </article>
+
+          <article className="repository-section">
+            <SectionTitle eyebrow="Scan coverage" title="Included, excluded, and analysis status" />
+            <div className="repository-coverage-grid">
+              <div>
+                <span>Included paths</span>
+                <strong>{record.identity.selectedSubpath ?? "."}</strong>
+              </div>
+              <div>
+                <span>Ignored folders/files</span>
+                <strong>{stats?.excludedFiles ?? 0}</strong>
+              </div>
+              <div>
+                <span>Deterministic scan</span>
+                <strong>{deterministicScanReady ? "Ready" : "Pending"}</strong>
+              </div>
+              <div>
+                <span>Agent analysis</span>
+                <strong>{agentAnalysisReady ? "Ready" : "Pending"}</strong>
+              </div>
+            </div>
+            <div className="tag-row">
+              {getTopFileTypes(stats?.fileTypeBreakdown).map(([label, count]) => (
+                <span key={label} className="tag">{label}: {count}</span>
+              ))}
+            </div>
+            <details className="workflow-inline-details">
+              <summary>View excluded paths</summary>
+              <div className="path-summary-list">
+                {excludedPathEntries.length ? excludedPathEntries.slice(0, 18).map((entry) => (
+                  <div key={`${entry.rule}:${entry.path}`} className="path-summary path-summary--compact">
+                    <div className="candidate-card__title-row">
+                      <strong>{entry.path}</strong>
+                      <span className="badge">{entry.kind}</span>
+                    </div>
+                    <p>{exclusionRuleLabel(entry.rule)} · {entry.fileCount} files · {formatBytes(entry.totalSizeBytes)}</p>
+                  </div>
+                )) : <CompactEmptyState>No excluded paths were detected by the scanner.</CompactEmptyState>}
+              </div>
+            </details>
+          </article>
+
+          <article className="repository-section">
+            <SectionTitle eyebrow="Access check" title="Project access" meta={<StatusChip label={accessStatus.label} tone={accessStatus.tone} />} />
+            <div className="repository-access-card">
+              <strong>{accessProbe?.message ?? "No project access validation has been recorded yet."}</strong>
+              <p>{accessProbe?.error ? redactSensitiveText(accessProbe.error) : "Workbench access is checked from the local runtime boundary, not from the renderer."}</p>
+              <div className="workflow-option__meta">
+                <span>Last validation: {formatDateTime(accessProbe?.checkedAt ?? record.validation.lastValidatedAt)}</span>
+                <span>Branch: {record.validation.branch ?? "Not recorded"}</span>
+              </div>
+            </div>
+          </article>
+
+          <article className="repository-section">
+            <SectionTitle eyebrow="Raw details" title="Collapsed analysis" />
+            <LongTextDisclosure title="Raw scan details" value={scanDetails} code />
+            <LongTextDisclosure title="Full repository analysis" value={rawRepositoryAnalysis || "No full repository analysis is available yet."} code />
+            <details className="workflow-inline-details">
+              <summary>File/path details</summary>
+              <div className="path-summary-list">
+                {summaryCache.length ? summaryCache.slice(0, 80).map((summary) => (
+                  <div key={summary.relativePath} className="path-summary path-summary--compact">
+                    <strong>{summary.relativePath}</strong>
+                    <p>{summarizeSafeText(summary.purpose || summary.summary, "No summary available.", 170)}</p>
+                  </div>
+                )) : <CompactEmptyState>No file summaries are available yet.</CompactEmptyState>}
+              </div>
+            </details>
+          </article>
+        </div>
+
+        <aside className="repository-side-panel">
+          <article className="repository-section repository-tree-panel">
+            <SectionTitle
+              eyebrow="Files"
+              title="Repository tree"
+              meta={<span className="badge">{stats?.includedFiles ?? 0} indexed</span>}
+            />
+            <div className="panel-toolbar panel-toolbar--compact">
+              <div className="panel-toolbar__summary">
+                <span>{formatBytes(stats?.includedSizeBytes ?? 0)} indexed</span>
+                <span>{stats?.testsPresent ? "Tests detected" : "No tests detected"}</span>
+              </div>
+              <input
+                className="input"
+                placeholder="Filter files"
+                value={treeFilterDraft}
+                onChange={(event) => onTreeFilterChange(event.target.value)}
+              />
+            </div>
+            {repositoryData.loading ? (
+              <LoadingIndicator label="Loading repository tree" compact />
+            ) : (
+              <RepoTree key={record.id} nodes={repositoryTree} filter={deferredTreeFilter} selected={selectedFile} onSelect={onSelectFile} />
+            )}
+          </article>
+
+          <article className="repository-section repository-file-panel">
+            <div className="candidate-card__title-row">
+              <h3>File details</h3>
+              {fileSummary ? <SourceBadge source={fileSummary.source} /> : null}
+            </div>
+            {fileSummary ? (
+              <>
+                <div className="file-summary__title">{fileSummary.relativePath}</div>
+                <p>{redactSensitiveText(fileSummary.purpose)}</p>
+                <p>{redactSensitiveText(fileSummary.summary)}</p>
+                <div className="tag-row">
+                  {fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>)}
+                </div>
+                <LongTextDisclosure title="Related files" value={fileSummary.relatedFiles.join("\n")} code />
+              </>
+            ) : (
+              <CompactEmptyState>Select a file in the repository tree to load its summary and related symbols.</CompactEmptyState>
+            )}
+          </article>
+        </aside>
+      </section>
     </section>
   );
 };
@@ -1592,82 +3648,833 @@ const WorkflowStepRail = ({
   </div>
 );
 
-const WorkflowAtAGlance = ({
-  goalTitle,
-  currentActivity,
-  recommendationTitle,
-  executionPlan,
-  intendedSteps,
+const WorkflowControlHeader = ({
+  projectName,
+  statusLabel,
+  statusTone,
+  cycleLabel,
   stageLabel,
-  activeStepTitle,
-  agentName,
-  agentStatus,
-  checklistSummary,
-  nextGuidance
+  agentLabel,
+  lastUpdatedAt,
+  approvalsPending,
+  primaryAction,
+  secondaryActions
 }: {
-  goalTitle: string;
-  currentActivity: string;
-  recommendationTitle: string;
-  executionPlan: string;
-  intendedSteps: string[];
+  projectName: string;
+  statusLabel: string;
+  statusTone: ShellStatusTone;
+  cycleLabel: string;
   stageLabel: string;
-  activeStepTitle?: string;
-  agentName?: string;
-  agentStatus?: AgentState["status"];
-  checklistSummary: string;
-  nextGuidance?: string;
+  agentLabel: string;
+  lastUpdatedAt?: string;
+  approvalsPending: number;
+  primaryAction?: ShellAction;
+  secondaryActions: ShellAction[];
 }) => (
-  <article className="workflow-at-glance">
-    <div className="workflow-at-glance__main">
-      <span className="workflow-option__label">Workflow look</span>
-      <h3>{goalTitle}</h3>
-      <div className="workflow-at-glance__brief">
-        <div>
-          <span className="workflow-option__label">Now</span>
-          <p>{currentActivity}</p>
-        </div>
-        <div>
-          <span className="workflow-option__label">Recommendation</span>
-          <p>{recommendationTitle}</p>
-        </div>
-        <div>
-          <span className="workflow-option__label">Plan</span>
-          <p>{executionPlan}</p>
-        </div>
-        <div>
-          <span className="workflow-option__label">Intended steps</span>
-          {intendedSteps.length ? (
-            <ol className="workflow-at-glance__steps">
-              {intendedSteps.map((step) => (
-                <li key={step}>{step}</li>
-              ))}
-            </ol>
-          ) : (
-            <p>Steps will appear when the workflow has a recommendation or scoped goal.</p>
-          )}
-        </div>
+  <header className="workflow-operator-header">
+    <div className="workflow-operator-header__main">
+      <div className="eyebrow">Workflow control</div>
+      <h2>{projectName}</h2>
+      <div className="workflow-operator-header__chips">
+        <span className={`status-chip status-chip--${statusTone}`}>{statusLabel}</span>
+        <span className="badge">{cycleLabel}</span>
+        <span className="badge">{approvalsPending} approvals pending</span>
       </div>
     </div>
-    <div className="workflow-at-glance__facts">
-      <div className="workflow-at-glance__fact">
+    <div className="workflow-operator-header__facts" aria-label="Workflow facts">
+      <div>
         <span>Stage</span>
         <strong>{stageLabel}</strong>
       </div>
-      <div className="workflow-at-glance__fact">
+      <div>
         <span>Agent</span>
-        <strong>{agentName ?? "Waiting for next run"}</strong>
-        {agentStatus ? <em>{agentStatus}</em> : null}
+        <strong>{agentLabel}</strong>
       </div>
-      <div className="workflow-at-glance__fact">
-        <span>Step</span>
-        <strong>{activeStepTitle ?? "No active step yet"}</strong>
-      </div>
-      <div className="workflow-at-glance__fact">
-        <span>Checklist</span>
-        <strong>{checklistSummary}</strong>
+      <div>
+        <span>Updated</span>
+        <strong>{formatClockTime(lastUpdatedAt)}</strong>
       </div>
     </div>
-    {nextGuidance ? <p className="workflow-at-glance__next">{nextGuidance}</p> : null}
+    <div className="workflow-operator-header__actions">
+      {primaryAction ? (
+        <button className="primary-button" disabled={primaryAction.disabled} onClick={primaryAction.onClick} type="button">
+          {primaryAction.label}
+        </button>
+      ) : null}
+      <div className="workflow-control-actions" aria-label="Workflow actions">
+        {secondaryActions.map((action) => (
+          <button key={action.label} className="secondary-button" disabled={action.disabled} onClick={action.onClick} type="button">
+            {action.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  </header>
+);
+
+const WorkflowStageTimeline = ({
+  steps,
+  nowTime
+}: {
+  steps: ReturnType<typeof buildWorkflowTimelineSteps>;
+  nowTime: number;
+}) => {
+  const displayState = (step: ReturnType<typeof buildWorkflowTimelineSteps>[number]): { label: string; tone: string } => {
+    if (step.isBlocked || step.status === "failed" || step.displayStatus === "failed") {
+      return { label: "Blocked", tone: "blocked" };
+    }
+    if (step.isCurrent || step.status === "running" || step.status === "waiting" || step.displayStatus === "repairing" || step.displayStatus === "retrying_validation") {
+      return { label: "Active", tone: "active" };
+    }
+    if (step.status === "completed" || step.displayStatus === "fixed") {
+      return { label: "Completed", tone: "completed" };
+    }
+    return { label: "Not started", tone: "not-started" };
+  };
+
+  return (
+    <section className="workflow-stage-timeline" aria-label="Workflow stage timeline">
+      {steps.map((step, index) => {
+        const state = displayState(step);
+        return (
+          <article key={step.id} className={`workflow-stage-timeline__step workflow-stage-timeline__step--${state.tone} ${step.isCurrent ? "workflow-stage-timeline__step--current" : ""}`}>
+            <div className="workflow-stage-timeline__marker">{index + 1}</div>
+            <div className="workflow-stage-timeline__body">
+              <div className="candidate-card__title-row">
+                <strong>{step.title}</strong>
+                <span className={`badge workflow-stage-timeline__badge workflow-stage-timeline__badge--${state.tone}`}>{state.label}</span>
+              </div>
+              <p>{summarizeText(step.isCurrent ? (step.currentActivity ?? step.description) : step.description, step.description, 105)}</p>
+              <div className="workflow-step-card__meta">
+                {step.updatedAt ? <span>Updated {formatClockTime(step.updatedAt)}</span> : null}
+                {step.startedAt ? <span>{formatElapsedDuration(step.startedAt, step.completedAt, nowTime) ?? "In progress"}</span> : null}
+              </div>
+            </div>
+          </article>
+        );
+      })}
+    </section>
+  );
+};
+
+const WorkflowCurrentActionCard = ({
+  stageLabel,
+  agentName,
+  agentStatus,
+  focus,
+  runSummary,
+  changedFilesCount,
+  checksStatus,
+  approvalsPending,
+  nextAction,
+  phase
+}: {
+  stageLabel: string;
+  agentName: string;
+  agentStatus?: AgentState["status"];
+  focus: string;
+  runSummary: string;
+  changedFilesCount: number;
+  checksStatus: string;
+  approvalsPending: number;
+  nextAction: string;
+  phase: string;
+}) => (
+  <article className="workflow-now-card">
+    <SectionTitle
+      eyebrow="Current action"
+      title="What is happening now"
+      meta={agentStatus ? <StatusChip {...agentLifecycleStatusChip(agentStatus)} /> : <StatusChip label="Idle" tone="idle" />}
+    />
+    <div className="workflow-now-card__focus">
+      <span className="workflow-option__label">Current focus</span>
+      <strong>{focus}</strong>
+      <p>{runSummary}</p>
+    </div>
+    <div className="workflow-now-card__grid">
+      <div>
+        <span>Stage</span>
+        <strong>{stageLabel}</strong>
+      </div>
+      <div>
+        <span>Agent</span>
+        <strong>{agentName}</strong>
+      </div>
+      <div>
+        <span>Phase</span>
+        <strong>{phase}</strong>
+      </div>
+      <div>
+        <span>Changed files</span>
+        <strong>{changedFilesCount}</strong>
+      </div>
+      <div>
+        <span>Checks</span>
+        <strong>{checksStatus}</strong>
+      </div>
+      <div>
+        <span>Approvals</span>
+        <strong>{approvalsPending}</strong>
+      </div>
+    </div>
+    <div className="workflow-now-card__next">
+      <span className="workflow-option__label">Next recommended action</span>
+      <p>{nextAction}</p>
+    </div>
+  </article>
+);
+
+const WorkflowCurrentAgentMessages = ({
+  agent,
+  workflow,
+  recoveryAvailable,
+  onRecover
+}: {
+  agent?: AgentState;
+  workflow?: ProjectWorkflowState;
+  recoveryAvailable: boolean;
+  onRecover: () => void;
+}) => {
+  const status = agent ? agentLifecycleStatusChip(agent.status) : { label: "Idle", tone: "idle" as const };
+  const recentEvents = agent
+    ? sortEventsByAge(agent.events)
+      .filter((event) => Boolean(event.title.trim()) || Boolean(event.detail?.trim()))
+      .slice(0, 5)
+    : [];
+  const active = agent ? isWorkflowAgentActive(agent) : false;
+  const latestMessage = agent
+    ? summarizeSafeText(
+      agent.lastMessageSnippet ?? latestMeaningfulAgentDetail(agent) ?? agent.currentSubtask ?? agent.currentPhase,
+      "No current agent message has been captured yet.",
+      260
+    )
+    : "No workflow agent is selected for the current cycle.";
+  const cycleLabel = agent
+    ? `Cycle ${agent.workflowCycleNumber ?? workflow?.workflowCycle.cycleNumber ?? "unknown"}`
+    : workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No cycle";
+
+  return (
+    <article className="workflow-agent-messages-card">
+      <SectionTitle
+        eyebrow="Current agent"
+        title="Recent messages"
+        meta={<StatusChip label={status.label} tone={status.tone} />}
+      />
+      <div className="workflow-agent-messages-card__summary">
+        <div>
+          <span className="workflow-option__label">{cycleLabel}</span>
+          <strong>{agent?.name ?? "No current workflow agent"}</strong>
+        </div>
+        <p>
+          {agent
+            ? active
+              ? "This is the live workflow agent the app is currently tracking."
+              : agent.status === "disconnected"
+                ? "This is an interrupted saved agent, not a live Codex process."
+                : "This is the most recent workflow agent for this project."
+            : "The workflow is waiting for the next runnable step."}
+        </p>
+      </div>
+      <div className="lane-note">
+        <strong>{agent?.currentSubtask ?? agent?.currentPhase ?? "Latest agent message"}</strong>
+        <span>{latestMessage}</span>
+      </div>
+      {recoveryAvailable ? (
+        <div className="workflow-agent-messages-card__recovery">
+          <div>
+            <strong>Interrupted; recovery available</strong>
+            <span>Continue from saved state restarts the workflow step instead of trusting a stale process label.</span>
+          </div>
+          <button className="primary-button" type="button" onClick={onRecover}>Continue from saved state</button>
+        </div>
+      ) : null}
+      <div className="workflow-agent-messages-card__list">
+        {recentEvents.length ? recentEvents.map((event) => (
+          <div key={event.id} className="workflow-agent-message-row">
+            <div>
+              <strong>{redactSensitiveText(event.title)}</strong>
+              <p>{summarizeSafeText(event.detail, workflowEventStatusLabel(event.status), 180)}</p>
+            </div>
+            <span>{formatClockTime(event.timestamp)}</span>
+          </div>
+        )) : (
+          <p className="agent-card__subtle">Recent agent messages will appear here after the current run reports progress.</p>
+        )}
+      </div>
+    </article>
+  );
+};
+
+const WorkflowNeedsAttentionPanel = ({
+  items,
+  onApprove,
+  onReject,
+  onOpenCredentials,
+  onViewDetails
+}: {
+  items: WorkflowAttentionItem[];
+  onApprove: (approval: ApprovalRequestRecord) => void;
+  onReject: (approval: ApprovalRequestRecord) => void;
+  onOpenCredentials: () => void;
+  onViewDetails: (target?: WorkflowAttentionItem["target"]) => void;
+}) => {
+  const visibleItems = items.slice(0, 8);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+
+  return (
+    <article id="workflow-needs-attention" className={`workflow-attention-panel ${items.length === 0 ? "workflow-attention-panel--empty" : ""}`}>
+      <SectionTitle
+        eyebrow="Needs attention"
+        title="Approvals, blockers, and warnings"
+        meta={<span className={`badge ${items.some((item) => item.tone === "danger") ? "badge-incompatible" : "badge-exact"}`}>{items.length}</span>}
+      />
+      {items.length === 0 ? (
+        <p className="workflow-attention-panel__empty">No approvals, blockers, or credential requests pending.</p>
+      ) : (
+        <div className="workflow-attention-list">
+          {visibleItems.map((item) => {
+            const approval = item.approval;
+            return (
+              <div key={item.id} className={`workflow-attention-item workflow-attention-item--${item.tone}`}>
+                <div className="workflow-attention-item__copy">
+                  <div className="candidate-card__title-row">
+                    <strong>{item.title}</strong>
+                    <span className="badge">{workflowAttentionKindLabel(item.kind)}</span>
+                  </div>
+                  <p>{item.detail}</p>
+                  {item.createdAt ? <span>Requested {formatDateTime(item.createdAt)}</span> : null}
+                </div>
+                {approval ? (
+                  <div className="workflow-attention-item__actions">
+                    <button className="primary-button" onClick={() => onApprove(approval)} type="button">Accept</button>
+                    <button className="secondary-button" onClick={() => onReject(approval)} type="button">Reject</button>
+                  </div>
+                ) : item.target === "credentials" ? (
+                  <button className="secondary-button" onClick={onOpenCredentials} type="button">Open credentials</button>
+                ) : item.target ? (
+                  <button className="secondary-button" onClick={() => onViewDetails(item.target)} type="button">View details</button>
+                ) : null}
+              </div>
+            );
+          })}
+          {hiddenCount > 0 ? <p className="agent-card__subtle">{hiddenCount} more attention item{hiddenCount === 1 ? "" : "s"} hidden from this summary.</p> : null}
+        </div>
+      )}
+    </article>
+  );
+};
+
+const WorkflowStaleRecoveryPanel = ({
+  recoveryCandidate,
+  onContinue,
+  onClearLock
+}: {
+  recoveryCandidate?: ReturnType<typeof getWorkflowRecoveryCandidate>;
+  onContinue: () => void;
+  onClearLock: () => void;
+}) => (
+  <article className="workflow-attention-panel workflow-attention-panel--danger">
+    <SectionTitle
+      eyebrow="Recovery"
+      title="Previous run is detached"
+      meta={<span className="badge badge-incompatible">Needs recovery</span>}
+    />
+    <p>
+      Previous run was marked as running, but no active agent process is attached. You can continue from the saved state or clear the stale running lock.
+    </p>
+    {recoveryCandidate?.agent ? (
+      <div className="lane-note">
+        <strong>{recoveryCandidate.agent.name}</strong>
+        <span>{recoveryCandidate.agent.disconnectedReason ?? recoveryCandidate.agent.currentPhase ?? "Saved agent state is recoverable."}</span>
+      </div>
+    ) : null}
+    <div className="actions-row">
+      <button className="primary-button" type="button" onClick={onContinue}>Continue from saved state</button>
+      <button className="secondary-button" type="button" onClick={onClearLock}>Clear stale running lock</button>
+      <button className="secondary-button" type="button" disabled title="No safe checkpoint rollback is available for this saved state.">
+        Rollback unavailable
+      </button>
+    </div>
+  </article>
+);
+
+const WorkflowPlanSummaryCard = ({
+  goalSummary,
+  recommendationSummary,
+  objective,
+  scope,
+  filesLikelyInvolved,
+  validationRequired,
+  constraints,
+  doneCondition,
+  rawPlan
+}: {
+  goalSummary: string;
+  recommendationSummary: string;
+  objective: string;
+  scope: string;
+  filesLikelyInvolved: string[];
+  validationRequired: string[];
+  constraints: string[];
+  doneCondition: string[];
+  rawPlan: string;
+}) => (
+  <article className="workflow-plan-card">
+    <SectionTitle eyebrow="Goal and scoped plan" title="Current goal" />
+    <p className="workflow-plan-card__goal">{goalSummary}</p>
+    <div className="workflow-plan-card__grid">
+      <div>
+        <span className="workflow-option__label">Recommendation summary</span>
+        <p>{recommendationSummary}</p>
+      </div>
+      <div>
+        <span className="workflow-option__label">Objective</span>
+        <p>{objective}</p>
+      </div>
+      <div>
+        <span className="workflow-option__label">Scope</span>
+        <p>{scope}</p>
+      </div>
+      <div>
+        <span className="workflow-option__label">Files likely involved</span>
+        {filesLikelyInvolved.length ? (
+          <div className="tag-row">
+            {filesLikelyInvolved.slice(0, 8).map((file) => <span key={file} className="tag">{file}</span>)}
+          </div>
+        ) : <p>No likely files identified yet.</p>}
+      </div>
+      <div>
+        <span className="workflow-option__label">Validation required</span>
+        {validationRequired.length ? (
+          <ul className="workflow-compact-list">
+            {validationRequired.slice(0, 4).map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        ) : <p>No validation plan has been scoped yet.</p>}
+      </div>
+      <div>
+        <span className="workflow-option__label">Constraints</span>
+        {constraints.length ? (
+          <ul className="workflow-compact-list">
+            {constraints.slice(0, 4).map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        ) : <p>No additional constraints captured for this plan.</p>}
+      </div>
+      <div className="workflow-plan-card__wide">
+        <span className="workflow-option__label">Done condition</span>
+        {doneCondition.length ? (
+          <ul className="workflow-compact-list">
+            {doneCondition.slice(0, 5).map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        ) : <p>The done condition will appear after the goal is scoped.</p>}
+      </div>
+    </div>
+    <details className="workflow-inline-details">
+      <summary>View full plan</summary>
+      <p>{rawPlan}</p>
+    </details>
+  </article>
+);
+
+const WorkflowChecklistSummaryCard = ({
+  overview,
+  checklist
+}: {
+  overview: WorkflowChecklistOverview;
+  checklist: ProjectWorkflowState["goalChecklist"];
+}) => (
+  <article className="workflow-checklist-card">
+    <SectionTitle
+      eyebrow="Goal progress"
+      title="Checklist summary"
+      meta={<span className="badge">{overview.requiredMet}/{overview.requiredTotal} checks met</span>}
+    />
+    {typeof overview.percentComplete === "number" ? (
+      <div className="workflow-goal-progress__bar" role="progressbar" aria-label="Estimated goal completion" aria-valuemin={0} aria-valuemax={100} aria-valuenow={overview.percentComplete}>
+        <div className="workflow-goal-progress__fill" style={{ width: `${overview.percentComplete}%` }} />
+      </div>
+    ) : null}
+    <div className="workflow-checklist-card__stats">
+      <div>
+        <span>Goal completion</span>
+        <strong>{typeof overview.percentComplete === "number" ? `${overview.percentComplete}%` : "Unknown"}</strong>
+      </div>
+      <div>
+        <span>Open checks</span>
+        <strong>{overview.openRequired}</strong>
+      </div>
+      <div>
+        <span>Unknown</span>
+        <strong>{overview.unknownCount}</strong>
+      </div>
+      <div>
+        <span>Groups</span>
+        <strong>{overview.groups.length}</strong>
+      </div>
+    </div>
+    <div className="workflow-checklist-card__groups">
+      <div>
+        <span className="workflow-option__label">Top open groups</span>
+        {overview.topOpenGroups.length ? overview.topOpenGroups.map((group) => (
+          <div key={group.id} className="workflow-group-row">
+            <strong>{group.title}</strong>
+            <span>{group.openCount} open</span>
+          </div>
+        )) : <p className="agent-card__subtle">No required checks are open.</p>}
+      </div>
+      <div>
+        <span className="workflow-option__label">Top met groups</span>
+        {overview.topMetGroups.length ? overview.topMetGroups.map((group) => (
+          <div key={group.id} className="workflow-group-row">
+            <strong>{group.title}</strong>
+            <span>{group.metCount} met</span>
+          </div>
+        )) : <p className="agent-card__subtle">No checks have been marked met yet.</p>}
+      </div>
+      <div>
+        <span className="workflow-option__label">Blocked/unknown groups</span>
+        {overview.topUnknownGroups.length ? overview.topUnknownGroups.map((group) => (
+          <div key={group.id} className="workflow-group-row">
+            <strong>{group.title}</strong>
+            <span>{group.blockedCount || group.unknownCount} attention</span>
+          </div>
+        )) : <p className="agent-card__subtle">No unknown groups stand out.</p>}
+      </div>
+    </div>
+    <details className="workflow-inline-details">
+      <summary>View full checklist</summary>
+      <div className="goal-checklist-preview">
+        {checklist.length ? checklist.map((check) => (
+          <div key={check.id} className="goal-checklist-preview__item">
+            <span className={`badge goal-check-badge goal-check-badge--${check.status}`}>{goalCheckStatusLabel(check.status)}</span>
+            <div className="goal-checklist-preview__copy">
+              <strong>{check.title}</strong>
+              <span>{check.required ? "Required" : "Optional"} · {goalCheckSourceLabel(check.source)}{check.evidence ? ` · ${check.evidence}` : ""}</span>
+            </div>
+          </div>
+        )) : <div className="empty-copy">No checklist has been generated yet.</div>}
+      </div>
+    </details>
+  </article>
+);
+
+const WorkflowStatusStrip = ({
+  items
+}: {
+  items: Array<{ label: string; value: string; tone?: "normal" | "warning" | "success" }>;
+}) => (
+  <section className="workflow-status-strip" aria-label="Workflow status">
+    {items.map((item) => (
+      <div key={item.label} className={`workflow-status-strip__item workflow-status-strip__item--${item.tone ?? "normal"}`}>
+        <span>{item.label}</span>
+        <strong>{item.value}</strong>
+      </div>
+    ))}
+  </section>
+);
+
+const WorkflowAutopilotPanel = ({
+  autopilotEnabled,
+  autopilotProfile,
+  autopilotPolicy,
+  autopilotPausedReason,
+  highRiskPackageRequiresApproval,
+  currentRecommendationTitle,
+  lastCompletedAction,
+  objectiveLabel,
+  nextAction,
+  workflowPauseRequested,
+  workflowHasActiveAgent,
+  recoveryAvailable,
+  optimizeModeEnabled,
+  workflowMode,
+  previewStatus,
+  previewDisabledReason,
+  onToggleAutopilot,
+  onProfileChange,
+  onPolicyChange,
+  onToggleOptimizeMode,
+  onToggleWorkflowMode,
+  onRequestPreview,
+  onCancelPreview,
+  onCompletePreview,
+  onContinueWorkflow,
+  canContinueWorkflow,
+  continueDisabledReason
+}: {
+  autopilotEnabled: boolean;
+  autopilotProfile: AutopilotProfile;
+  autopilotPolicy?: AutopilotPolicy;
+  autopilotPausedReason?: NonNullable<ProjectWorkflowState["autopilotStatus"]>["pausedReason"];
+  highRiskPackageRequiresApproval: boolean;
+  currentRecommendationTitle?: string;
+  lastCompletedAction?: string;
+  objectiveLabel: string;
+  nextAction: string;
+  workflowPauseRequested: boolean;
+  workflowHasActiveAgent: boolean;
+  recoveryAvailable: boolean;
+  optimizeModeEnabled: boolean;
+  workflowMode: ProjectWorkflowState["workflowMode"];
+  previewStatus: NonNullable<ProjectWorkflowState["previewRequest"]>["status"];
+  previewDisabledReason?: string;
+  onToggleAutopilot: () => void;
+  onProfileChange: (profile: AutopilotProfile) => void;
+  onPolicyChange: (patch: Partial<AutopilotPolicy>) => void;
+  onToggleOptimizeMode: () => void;
+  onToggleWorkflowMode: () => void;
+  onRequestPreview: () => void;
+  onCancelPreview: () => void;
+  onCompletePreview: () => void;
+  onContinueWorkflow: () => void;
+  canContinueWorkflow: boolean;
+  continueDisabledReason?: string;
+}) => {
+  const policy = autopilotPolicy;
+  const previewCanRequest = previewStatus === "none" || previewStatus === "completed" || previewStatus === "cancelled";
+  const previewCanCancel = previewStatus === "queued";
+  const previewCanComplete = previewStatus === "ready";
+  const canContinue = canContinueWorkflow || workflowPauseRequested || previewCanComplete || recoveryAvailable || Boolean(autopilotPausedReason);
+  const numberPatch = (key: "maxChecksPerWorkPackageNormal" | "maxChecksPerWorkPackageFast" | "maxNewRequiredChecksPerCycle", value: string) => {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      onPolicyChange({ profile: "custom", [key]: parsed });
+    }
+  };
+
+  return (
+    <article className="workflow-autopilot-compact">
+      <SectionTitle eyebrow="Workflow controls" title="Fast Mode, preview, and Autopilot" meta={<span className={`badge ${autopilotEnabled ? "badge-exact" : ""}`}>{autopilotEnabled ? "Autopilot on" : "Autopilot off"}</span>} />
+      <div className="workflow-autopilot-compact__grid">
+        <div>
+          <span>Objective</span>
+          <strong>{objectiveLabel}</strong>
+        </div>
+        <div>
+          <span>Workflow mode</span>
+          <strong>{workflowModeLabel(workflowMode)}</strong>
+        </div>
+        <label>
+          <span>Profile</span>
+          <select className="input" value={autopilotProfile} onChange={(event) => onProfileChange(event.target.value as AutopilotProfile)}>
+            <option value="balanced">Balanced</option>
+            <option value="conservative">Conservative</option>
+            <option value="aggressive">Aggressive</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <div>
+          <span>Preview</span>
+          <strong>{previewStatusLabel(previewStatus)}</strong>
+        </div>
+        <div>
+          <span>Current package</span>
+          <strong>{currentRecommendationTitle ?? "No package selected"}</strong>
+        </div>
+        <div>
+          <span>Next planned action</span>
+          <strong>{nextAction}</strong>
+        </div>
+        <div>
+          <span>Last action</span>
+          <strong>{lastCompletedAction ? lastCompletedAction.replace(/_/g, " ") : "None"}</strong>
+        </div>
+        <div>
+          <span>Pause state</span>
+          <strong>{workflowPauseRequested ? (workflowHasActiveAgent ? "Pause pending" : "Paused") : autopilotPauseReasonLabel(autopilotPausedReason)}</strong>
+        </div>
+        <div>
+          <span>Checkpoint</span>
+          <strong>{highRiskPackageRequiresApproval ? "High-risk approval needed" : "Policy clear"}</strong>
+        </div>
+      </div>
+      {previewStatus === "ready" ? (
+        <div className="workflow-preview-callout">
+          <strong>Preview is ready for inspection</strong>
+          <span>Resume workflow when the checkpoint has been reviewed.</span>
+        </div>
+      ) : previewDisabledReason ? (
+        <div className="workflow-preview-callout workflow-preview-callout--muted">
+          <strong>Preview unavailable</strong>
+          <span>{previewDisabledReason}</span>
+        </div>
+      ) : null}
+      <div className="actions-row workflow-control-button-row">
+        <button className={autopilotEnabled ? "primary-button" : "secondary-button"} onClick={onToggleAutopilot} type="button">
+          Turn autopilot {autopilotEnabled ? "off" : "on"}
+        </button>
+        <button className={workflowMode === "fast" ? "primary-button" : "secondary-button"} onClick={onToggleWorkflowMode} type="button">
+          {workflowMode === "fast" ? "Switch to Normal Mode" : "Switch to Fast Mode"}
+        </button>
+        <button className="secondary-button" disabled={!previewCanRequest || Boolean(previewDisabledReason)} onClick={onRequestPreview} type="button">
+          {previewButtonLabel(previewStatus)}
+        </button>
+        {previewCanCancel ? (
+          <button className="secondary-button" onClick={onCancelPreview} type="button">
+            Cancel Preview
+          </button>
+        ) : null}
+        {previewCanComplete ? (
+          <button className="primary-button" onClick={onCompletePreview} type="button">
+            Resume Workflow
+          </button>
+        ) : null}
+        <button className={optimizeModeEnabled ? "primary-button" : "secondary-button"} onClick={onToggleOptimizeMode} type="button">
+          {optimizeModeEnabled ? "Stop optimizing" : "Optimize"}
+        </button>
+        <button className="secondary-button" disabled={!canContinue} onClick={onContinueWorkflow} title={!canContinue ? continueDisabledReason : undefined} type="button">
+          Continue workflow
+        </button>
+      </div>
+      <details className="workflow-autopilot-settings">
+        <summary>
+          <span>Autopilot settings</span>
+          <span className="badge">{autopilotProfileLabel(autopilotProfile)}</span>
+        </summary>
+        <div className="workflow-autopilot-settings__grid">
+          <label className="checkbox-field">
+            <input
+              checked={policy?.preferGroupedChecklistPackages ?? true}
+              type="checkbox"
+              onChange={(event) => onPolicyChange({ profile: "custom", preferGroupedChecklistPackages: event.target.checked })}
+            />
+            <span>Prefer grouped checklist packages</span>
+          </label>
+          <label className="form-field">
+            <span>Max checks per package in normal mode</span>
+            <input
+              className="input"
+              max={8}
+              min={1}
+              type="number"
+              value={policy?.maxChecksPerWorkPackageNormal ?? 4}
+              onChange={(event) => numberPatch("maxChecksPerWorkPackageNormal", event.target.value)}
+            />
+          </label>
+          <label className="form-field">
+            <span>Max checks per package in fast mode</span>
+            <input
+              className="input"
+              max={12}
+              min={1}
+              type="number"
+              value={policy?.maxChecksPerWorkPackageFast ?? 8}
+              onChange={(event) => numberPatch("maxChecksPerWorkPackageFast", event.target.value)}
+            />
+          </label>
+          <label className="checkbox-field">
+            <input
+              checked={policy?.pauseOnPreviewReady ?? true}
+              type="checkbox"
+              onChange={(event) => onPolicyChange({ profile: "custom", pauseOnPreviewReady: event.target.checked })}
+            />
+            <span>Pause on preview ready</span>
+          </label>
+          <label className="checkbox-field">
+            <input
+              checked={policy?.pauseOnApprovalRequired ?? true}
+              type="checkbox"
+              onChange={(event) => onPolicyChange({ profile: "custom", pauseOnApprovalRequired: event.target.checked })}
+            />
+            <span>Pause on required approval</span>
+          </label>
+          <label className="checkbox-field">
+            <input
+              checked={policy?.requireExplicitApprovalForHighRiskPackages ?? true}
+              type="checkbox"
+              onChange={(event) => onPolicyChange({ profile: "custom", requireExplicitApprovalForHighRiskPackages: event.target.checked })}
+            />
+            <span>Pause on high-risk work</span>
+          </label>
+          <label className="form-field">
+            <span>Max new required checks per cycle</span>
+            <input
+              className="input"
+              max={5}
+              min={0}
+              type="number"
+              value={policy?.maxNewRequiredChecksPerCycle ?? 2}
+              onChange={(event) => numberPatch("maxNewRequiredChecksPerCycle", event.target.value)}
+            />
+          </label>
+          <label className="checkbox-field">
+            <input
+              checked={policy?.allowDeterministicScoping ?? true}
+              type="checkbox"
+              onChange={(event) => onPolicyChange({ profile: "custom", allowDeterministicScoping: event.target.checked })}
+            />
+            <span>Allow deterministic scoped goals</span>
+          </label>
+          <label className="checkbox-field">
+            <input
+              checked={policy?.stopWhenNoSafeRecommendation ?? true}
+              type="checkbox"
+              onChange={(event) => onPolicyChange({ profile: "custom", stopWhenNoSafeRecommendation: event.target.checked })}
+            />
+            <span>Stop when no safe recommendation exists</span>
+          </label>
+        </div>
+      </details>
+    </article>
+  );
+};
+
+const WorkflowContextCards = ({
+  selections
+}: {
+  selections: ProjectWorkflowState["memory"]["lastRelevantContext"];
+}) => (
+  <article className="workflow-context-panel">
+    <SectionTitle eyebrow="Prior context" title="Relevant history" meta={<span className="badge">{selections.length}</span>} />
+    {selections.length ? (
+      <div className="workflow-context-list">
+        {selections.slice(0, 5).map((selection) => (
+          <article key={selection.descriptorId} className="workflow-context-card">
+            <div className="candidate-card__title-row">
+              <strong>Cycle {selection.cycleNumber}</strong>
+              <span className="badge">{agentCategoryLabel(selection.agentCategory)}</span>
+            </div>
+            <p>{summarizeText(selection.summary, "No summary available.", 145)}</p>
+            <div className="workflow-step-card__meta">
+              <span>{selection.paths.length} changed/related files</span>
+              <span>{selection.reasons[0] ? summarizeText(selection.reasons[0], "Context selected by relevance.", 90) : "Selected by relevance"}</span>
+            </div>
+            <details className="workflow-inline-details workflow-inline-details--compact">
+              <summary>View details</summary>
+              {selection.paths.length ? <p>Files: {selection.paths.join(", ")}</p> : null}
+              {selection.reasons.length ? <p>Why it matters: {selection.reasons.join("; ")}</p> : null}
+              {selection.decisionIds.length ? <p>Decisions: {selection.decisionIds.join(", ")}</p> : null}
+              {selection.issueIds.length ? <p>Issues: {selection.issueIds.join(", ")}</p> : null}
+            </details>
+          </article>
+        ))}
+      </div>
+    ) : (
+      <p className="workflow-attention-panel__empty">Relevant prior context will appear after workflow memory has enough history.</p>
+    )}
+  </article>
+);
+
+const WorkflowActivityMiniFeed = ({
+  events
+}: {
+  events: WorkflowActivityEvent[];
+}) => (
+  <article className="workflow-activity-mini">
+    <SectionTitle eyebrow="Recent activity" title="Workflow feed" meta={<span className="badge">{events.length}</span>} />
+    {events.length ? (
+      <div className="workflow-activity-mini__list">
+        {events.slice(0, 8).map((event) => (
+          <div key={event.id} className="workflow-activity-mini__row">
+            <span>{formatClockTime(event.timestamp)}</span>
+            <strong>{workflowActivitySourceLabel(event.source)}</strong>
+            <p>{event.title}{event.detail ? ` - ${summarizeText(event.detail, "", 120)}` : ""}</p>
+            <span className={`badge workflow-transcript__badge workflow-transcript__badge--${event.status}`}>{workflowEventStatusLabel(event.status)}</span>
+          </div>
+        ))}
+      </div>
+    ) : (
+      <p className="workflow-attention-panel__empty">Workflow activity will appear once work starts.</p>
+    )}
   </article>
 );
 
@@ -1771,7 +4578,7 @@ const LiveUpdatesPanel = ({
               >
                 <div className="workflow-transcript__run-header">
                   <strong>{agent.name}</strong>
-                  <span className={`status-pill status-${agent.status}`}>{agent.status}</span>
+                  <StatusChip {...agentLifecycleStatusChip(agent.status)} />
                 </div>
                 <div className="workflow-transcript__run-meta">
                   <span>{agentCategoryLabel(agent.category)}</span>
@@ -1886,48 +4693,18 @@ const SettingsDialog = ({
   onSave,
   onClose,
   onOpenDevTools,
-  onRefreshGitHubStatus
+  onRefreshGitHubStatus,
+  mode = "modal"
 }: {
   state: WorkbenchState;
-  settingsDraft: {
-    executionMode: ExecutionMode;
-    distroName: string;
-    codexBinaryPath: string;
-    codexHome: string;
-    worktreeBaseDir: string;
-    warnOnMntMount: boolean;
-    maxRepairCycles: number;
-    interfaceCreationModel: string;
-    interfaceCreationReasoningEffort: InterfaceReasoningEffort;
-    agentReasoningMode: AgentReasoningMode;
-    agentReasoningEfforts: Record<AgentCategory, InterfaceReasoningEffort>;
-    autoApproveCommands: boolean;
-    autoApproveGitCommits: boolean;
-    autoApproveGitPushes: boolean;
-    considerPaidServices: boolean;
-  };
+  settingsDraft: SettingsDraftState;
   github: GitHubStatus;
-  onChange: (next: {
-    executionMode?: ExecutionMode;
-    distroName?: string;
-    codexBinaryPath?: string;
-    codexHome?: string;
-    worktreeBaseDir?: string;
-    warnOnMntMount?: boolean;
-    maxRepairCycles?: number;
-    interfaceCreationModel?: string;
-    interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
-    agentReasoningMode?: AgentReasoningMode;
-    agentReasoningEfforts?: AgentReasoningEfforts;
-    autoApproveCommands?: boolean;
-    autoApproveGitCommits?: boolean;
-    autoApproveGitPushes?: boolean;
-    considerPaidServices?: boolean;
-  }) => void;
+  onChange: (next: SettingsDraftUpdate) => void;
   onSave: () => void;
   onClose: () => void;
   onOpenDevTools: () => void;
   onRefreshGitHubStatus: () => void;
+  mode?: "modal" | "page";
 }) => {
   const selectedModel = state.availableModels.find((model) => model.model === settingsDraft.interfaceCreationModel);
   const supportedReasoningEfforts = selectedModel?.supportedReasoningEfforts.length
@@ -1943,9 +4720,8 @@ const SettingsDialog = ({
     });
   };
 
-  return (
-    <div className="settings-modal">
-      <div className="settings-panel">
+  const panel = (
+      <div className={`settings-panel ${mode === "page" ? "settings-panel--page" : ""}`}>
         <SectionTitle eyebrow="Preferences" title="Settings" meta={<img className="settings-panel__icon" src={interfaceIconUrl} alt="" />} />
         <p className="settings-panel__copy">
           Tune agent run defaults and open diagnostics only when you need them. Developer Tools no longer open automatically on launch.
@@ -2235,8 +5011,9 @@ const SettingsDialog = ({
           <button className="secondary-button" onClick={onClose}>Close</button>
         </div>
       </div>
-    </div>
   );
+
+  return mode === "modal" ? <div className="settings-modal">{panel}</div> : panel;
 };
 
 const AgentReasoningPicker = ({
@@ -2309,6 +5086,65 @@ const BrandHeader = ({
     </div>
     {actions}
   </header>
+);
+
+const StatusChip = ({ label, tone }: { label: string; tone: StatusChipTone }) => (
+  <span className={`status-chip status-chip--${tone}`}>{label}</span>
+);
+
+const TopBar = ({
+  projectName,
+  projectContext,
+  statusLabel,
+  statusTone,
+  primaryAction,
+  utilityActions
+}: {
+  projectName: string;
+  projectContext: string;
+  statusLabel: string;
+  statusTone: ShellStatusTone;
+  primaryAction?: ShellAction;
+  utilityActions: ShellAction[];
+}) => (
+  <header className="top-app-bar">
+    <div className="top-app-bar__identity">
+      <img className="top-app-bar__icon" src={interfaceIconUrl} alt="" />
+      <div className="top-app-bar__titles">
+        <div className="top-app-bar__app">{APP_NAME}</div>
+        <div className="top-app-bar__project">
+          <strong>{projectName}</strong>
+          <span>{projectContext}</span>
+        </div>
+      </div>
+    </div>
+    <div className="top-app-bar__actions">
+      <StatusChip label={statusLabel} tone={statusTone} />
+      {primaryAction ? (
+        <button className="primary-button top-app-bar__primary" disabled={primaryAction.disabled} onClick={primaryAction.onClick}>
+          {primaryAction.label}
+        </button>
+      ) : null}
+      <details className="utility-menu">
+        <summary aria-label="Open utility actions">Utilities</summary>
+        <div className="utility-menu__content">
+          {utilityActions.map((action) => (
+            <button key={action.label} className="utility-menu__item" disabled={action.disabled} onClick={action.onClick} type="button">
+              {action.label}
+            </button>
+          ))}
+        </div>
+      </details>
+    </div>
+  </header>
+);
+
+const ProjectStatusStrip = ({ items }: { items: Array<string | JSX.Element> }) => (
+  <section className="project-status-strip" aria-label="Project status">
+    {items.map((item, index) => (
+      <span key={typeof item === "string" ? item : index} className="project-status-strip__item">{item}</span>
+    ))}
+  </section>
 );
 
 const LauncherActionCard = ({
@@ -2396,6 +5232,7 @@ export const App = () => {
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [shellLaunchBusy, setShellLaunchBusy] = useState(false);
   const [overviewRefreshBusy, setOverviewRefreshBusy] = useState(false);
+  const [visualExtractBusy, setVisualExtractBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
   const [userInputAttachmentBusyId, setUserInputAttachmentBusyId] = useState<string>();
   const [workflowAgentPageIndex, setWorkflowAgentPageIndex] = useState(0);
@@ -2417,6 +5254,16 @@ export const App = () => {
   const [agentDetail, setAgentDetail] = useState<AgentState>();
   const [activityLogPageIndex, setActivityLogPageIndex] = useState(0);
   const [commandLogPageIndex, setCommandLogPageIndex] = useState(0);
+  const [activeWorkspaceTabOverride, setActiveWorkspaceTabOverride] = useState<WorkspaceVisualTabId>();
+  const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
+  const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
+  const [repositoryData, setRepositoryData] = useState<RepositoryDataView>({
+    projectId: "",
+    tree: [],
+    dependencies: [],
+    summaryCache: [],
+    loading: false
+  });
   const [logFeed, setLogFeed] = useState<LogFeedView>({
     projectId: "",
     activity: {
@@ -2433,6 +5280,17 @@ export const App = () => {
     },
     loading: false
   });
+  const [workflowDetailsMounted, setWorkflowDetailsMounted] = useState(false);
+  const visualExportReadinessRef = useRef<VisualExportReadiness>({
+    activeProjectId: undefined,
+    activeWorkspaceTab: "overview",
+    logFeedProjectId: "",
+    logFeedLoading: false,
+    repositoryProjectId: "",
+    repositoryLoading: false,
+    workflowAgentPageLoading: false,
+    manualAgentPageLoading: false
+  });
 
   useEffect(() => {
     void window.workbench.getState()
@@ -2441,6 +5299,12 @@ export const App = () => {
     return window.workbench.onStateUpdated((nextState) => {
       startTransition(() => setState(nextState));
     });
+  }, []);
+
+  useEffect(() => () => {
+    if (tabLayoutPersistTimerRef.current !== undefined) {
+      window.clearTimeout(tabLayoutPersistTimerRef.current);
+    }
   }, []);
 
   useEffect(() => {
@@ -2453,7 +5317,7 @@ export const App = () => {
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       setClockNow(Date.now());
-    }, 1000);
+    }, 10_000);
 
     return () => window.clearInterval(intervalId);
   }, []);
@@ -2489,7 +5353,6 @@ export const App = () => {
   const selectedFileFromState = activeProject?.record.localState.selectedFile;
   const storedTreeFilter = activeProject?.record.localState.treeFilter ?? "";
   const storedActiveAgentId = activeProject?.record.localState.activeAgentId;
-  const autopilotEnabled = activeProject?.record.localState.autopilotEnabled ?? false;
   const workflowObjective = activeProject?.record.localState.workflowObjective ?? "deliver";
   const optimizeModeEnabled = workflowObjective === "optimize";
   const workflowPauseRequested = activeProject?.record.localState.workflowPauseRequested ?? false;
@@ -2500,7 +5363,23 @@ export const App = () => {
   const modelOptionsByName = useMemo(() => new Map(availableModels.map((model) => [model.model, model])), [availableModels]);
   const deferredTreeFilter = useDeferredValue(treeFilterDraft);
   const workflow = activeProject?.record.workflow;
+  const autopilotPolicy = workflow?.autopilotPolicy;
+  const autopilotStatus = workflow?.autopilotStatus;
+  const autopilotEnabled = autopilotPolicy?.enabled ?? activeProject?.record.localState.autopilotEnabled ?? false;
+  const autopilotProfile = autopilotPolicy?.profile ?? "balanced";
+  const workflowMode = workflow?.workflowMode ?? "normal";
+  const previewRequest = workflow?.previewRequest;
+  const previewStatus = previewRequest?.status ?? "none";
+  const previewDisabledReason = workflow && !workflow.ultimateGoal.confirmedAt
+    ? "Confirm the Ultimate Goal first."
+    : undefined;
+  const fastModeEnabled = workflowMode === "fast";
   const allAgents = useMemo(() => activeProject ? sortAgentsByActivity(activeProject.record.agents) : [], [activeProject]);
+  const runsPageAgents = useMemo(
+    () => sortAgentsByActivity([...workflowAgentPage.agents, ...manualAgentPage.agents]),
+    [manualAgentPage.agents, workflowAgentPage.agents]
+  );
+  const totalRunsCount = workflowAgentPage.total + manualAgentPage.total;
   const agentHistoryVersion = useMemo(
     () => allAgents.map((agent) => `${agent.id}:${agent.status}:${agent.lastActivityAt ?? ""}:${agent.approvals.length}:${agent.changedFiles.length}`).join("|"),
     [allAgents]
@@ -2552,6 +5431,19 @@ export const App = () => {
     () => workflow ? getWorkflowRecoveryCandidate(workflow, workflowAgents, clockNow, WORKFLOW_AGENT_STALE_MS) : null,
     [clockNow, workflow, workflowAgents]
   );
+  const workflowRuntimeStatus = useMemo(
+    () => workflow
+      ? deriveWorkflowRuntimeStatus(workflow, workflowAgents, {
+        projectKind: activeProject?.record.identity.kind,
+        nowMs: clockNow,
+        staleMs: WORKFLOW_AGENT_STALE_MS,
+        workflowPauseRequested,
+        autopilotEnabled,
+        workflowObjective
+      })
+      : null,
+    [activeProject?.record.identity.kind, autopilotEnabled, clockNow, workflow, workflowAgents, workflowObjective, workflowPauseRequested]
+  );
   const manualPendingApprovalCount = useMemo(
     () => manualAgents.reduce((count, agent) => count + agent.approvals.filter((approval) => approval.status === "pending").length, 0),
     [manualAgents]
@@ -2564,19 +5456,22 @@ export const App = () => {
     if (!workflow) {
       return null;
     }
-    if (workflowRecoveryCandidate && workflowPendingApprovals.length === 0) {
+    if (workflowRuntimeStatus?.status === "stale-running" && workflowPendingApprovals.length === 0) {
+      const recoveryCandidate = workflowRuntimeStatus.recoveryCandidate ?? workflowRecoveryCandidate;
       return {
         kind: "recover_workflow",
-        title: workflowRecoveryCandidate.kind === "disconnected"
+        title: recoveryCandidate?.kind === "disconnected"
           ? "Workflow was interrupted"
-          : workflowRecoveryCandidate.kind === "startup_stalled"
+          : recoveryCandidate?.kind === "startup_stalled"
             ? "Agent startup may be stalled"
             : "Workflow may be stalled",
-        description: workflowRecoveryCandidate.kind === "disconnected"
-          ? `${workflowRecoveryCandidate.agent.name} lost its Codex connection. Continue from the last saved workflow decision.`
-          : workflowRecoveryCandidate.kind === "startup_stalled"
-            ? `${workflowRecoveryCandidate.agent.name} has not received a Codex thread yet. Continue from the saved workflow state to restart the step.`
-          : `${workflowRecoveryCandidate.agent.name} has not reported progress recently. Continue from the last saved workflow decision if it stopped responding.`,
+        description: recoveryCandidate?.kind === "disconnected"
+          ? `${recoveryCandidate.agent.name} lost its Codex connection. Continue from the last saved workflow decision.`
+          : recoveryCandidate?.kind === "startup_stalled"
+            ? `${recoveryCandidate.agent.name} has not received a Codex thread yet. Continue from the saved workflow state to restart the step.`
+          : recoveryCandidate
+            ? `${recoveryCandidate.agent.name} has not reported progress recently. Continue from the last saved workflow decision if it stopped responding.`
+            : "A saved workflow step is marked running, but no active agent process is attached. Continue from the saved workflow state to restart the step.",
         actionLabel: "Continue from saved state"
       };
     }
@@ -2596,7 +5491,7 @@ export const App = () => {
       };
     }
     return workflowActionGuide(workflow, workflowPendingApprovals.length > 0, autopilotEnabled, workflowObjective);
-  }, [autopilotEnabled, workflow, workflowHasActiveAgent, workflowObjective, workflowPauseRequested, workflowPendingApprovals.length, workflowRecoveryCandidate]);
+  }, [autopilotEnabled, workflow, workflowHasActiveAgent, workflowObjective, workflowPauseRequested, workflowPendingApprovals.length, workflowRecoveryCandidate, workflowRuntimeStatus]);
   const workflowProminence = useMemo(
     () => workflow ? workflowSectionProminence(workflow) : { recommendations: false, humanIntervention: false, manualHandoff: false },
     [workflow]
@@ -2675,10 +5570,6 @@ export const App = () => {
 
     return [];
   }, [workflow]);
-  const workflowRepairCounter = useMemo(
-    () => workflow ? getWorkflowRepairCounterView(workflow) : null,
-    [workflow]
-  );
   const repairAttemptReports = useMemo(
     () => workflow ? collectRepairAttemptReports(workflow, workflowAgents) : [],
     [workflow, workflowAgents]
@@ -2690,26 +5581,80 @@ export const App = () => {
         : [],
     [workflow]
   );
+  const workflowLastUpdatedAt = useMemo(
+    () => getWorkflowLastUpdatedAt(workflow, workflowAgents),
+    [workflow, workflowAgents]
+  );
+  const workflowChecklistOverview = useMemo(
+    () => buildWorkflowChecklistOverview(workflow),
+    [workflow]
+  );
+  const currentWorkflowChangedFiles = useMemo(
+    () => getCurrentCycleChangedFiles(workflow, workflowAgents),
+    [workflow, workflowAgents]
+  );
+  const workflowCredentialRequests = useMemo(
+    () => activeProject?.record.credentials.requests.filter((request) => request.status === "pending") ?? [],
+    [activeProject]
+  );
+  const workflowAttentionItems = useMemo(
+    () => buildWorkflowAttentionItems({
+      workflow,
+      approvals: workflowPendingApprovals,
+      userInputRequests: pendingUserInputRequests,
+      humanInterventions: pendingHumanInterventions,
+      credentialRequests: workflowCredentialRequests,
+      timeline: workflowTimeline,
+      agents: workflowAgents
+    }),
+    [
+      pendingHumanInterventions,
+      pendingUserInputRequests,
+      workflow,
+      workflowAgents,
+      workflowCredentialRequests,
+      workflowPendingApprovals,
+      workflowTimeline
+    ]
+  );
   const activeAgent = useMemo(
     () => allAgents.find((agent) => agent.id === focusedAgentId) ?? allAgents[0],
     [allAgents, focusedAgentId]
   );
   const activeAgentForDetail = agentDetail?.id === activeAgent?.id ? agentDetail : activeAgent;
-  const activeWorkspaceTab: WorkspaceCenterTab = activeProject?.record.layout.activeCenterTab === "reports"
-    ? "workflow"
-    : activeProject?.record.layout.activeCenterTab === "file" || activeProject?.record.layout.activeCenterTab === "diff"
-      ? "overview"
-      : activeProject?.record.layout.activeCenterTab ?? "overview";
+  const selectedRunAgent = agentDetail
+    ?? runsPageAgents.find((agent) => agent.id === focusedAgentId)
+    ?? activeAgentForDetail;
+  const selectedWorkspaceTab: WorkspaceVisualTabId = activeWorkspaceTabOverride ?? normalizeWorkspaceTab(activeProject?.record.layout.activeCenterTab);
+  const activeWorkspaceTab = useDeferredValue(selectedWorkspaceTab);
   const workflowRunState = workflow && activeProject
-    ? workflowPauseRequested
-      ? workflowHasActiveAgent
-        ? "Pausing after current run"
-        : "Paused"
-      : workflowRunStateLabel(workflow, activeProject.record.identity.kind, workflowPendingApprovals.length > 0, autopilotEnabled, workflowObjective)
+    ? workflowRuntimeStatus?.status === "running"
+      ? "Running"
+      : workflowRuntimeStatus?.status === "recovering"
+        ? "Recovering"
+        : workflowRuntimeStatus?.status === "starting-agent"
+          ? "Starting agent"
+      : workflowRuntimeStatus?.status === "stale-running"
+        ? "Needs recovery"
+        : workflowRuntimeStatus?.status === "awaiting-approval"
+          ? "Awaiting approval"
+          : workflowRuntimeStatus?.status === "paused"
+            ? "Paused"
+            : workflowRuntimeStatus?.status === "blocked"
+              ? "Blocked"
+              : workflowRuntimeStatus?.status === "completed"
+                ? "Completed"
+                : workflowRunStateLabel(workflow, activeProject.record.identity.kind, workflowPendingApprovals.length > 0, autopilotEnabled, workflowObjective)
     : "Running automatically";
   const activeStageGuidance = workflow ? workflowStageGuidance(workflow.workflowStage) : null;
   const workflowLead = workflow
-    ? workflowPauseRequested
+    ? workflowRuntimeStatus?.status === "recovering"
+      ? "Workflow recovery is running in the background."
+      : workflowRuntimeStatus?.status === "starting-agent"
+        ? "The next workflow agent is starting in the background."
+      : workflowRuntimeStatus?.status === "stale-running"
+      ? "Previous workflow run is detached. Continue from saved state or clear the stale running lock."
+      : workflowPauseRequested
       ? workflowHasActiveAgent
         ? "Pause requested. The current workflow agent can finish, then automation will stop."
         : "Workflow automation is paused. Continue when you are ready to resume this cycle."
@@ -2727,17 +5672,60 @@ export const App = () => {
   );
   const overviewRefreshRunning = overviewRefreshBusy || activeProject?.record.interfaceCreation?.status === "running";
 
-  const setWorkspaceTab = async (tab: Extract<WorkspaceCenterTab, "overview" | "workflow" | "logs" | "agents" | "credentials">) => {
+  const scheduleWorkspaceTabPersist = (projectId: string, tab: WorkspaceVisualTabId) => {
+    tabLayoutPersistRequestRef.current = { projectId, tab };
+    if (tabLayoutPersistTimerRef.current !== undefined) {
+      window.clearTimeout(tabLayoutPersistTimerRef.current);
+    }
+
+    tabLayoutPersistTimerRef.current = window.setTimeout(() => {
+      tabLayoutPersistTimerRef.current = undefined;
+      const request = tabLayoutPersistRequestRef.current;
+      tabLayoutPersistRequestRef.current = undefined;
+      if (!request) {
+        return;
+      }
+
+      void window.workbench.updateLayout(request.projectId, { activeCenterTab: request.tab }).catch(handleError);
+    }, 750);
+  };
+
+  const setWorkspaceTab = (tab: WorkspaceVisualTabId) => {
     if (!activeProject) {
       return;
     }
 
-    try {
-      await window.workbench.updateLayout(activeProject.record.id, { activeCenterTab: tab });
-    } catch (error) {
-      handleError(error);
-    }
+    setActiveWorkspaceTabOverride(tab);
+    scheduleWorkspaceTabPersist(activeProject.record.id, tab);
   };
+
+  useEffect(() => {
+    visualExportReadinessRef.current = {
+      activeProjectId,
+      activeWorkspaceTab,
+      logFeedProjectId: logFeed.projectId,
+      logFeedLoading: logFeed.loading,
+      repositoryProjectId: repositoryData.projectId,
+      repositoryLoading: repositoryData.loading,
+      workflowAgentPageLoading: workflowAgentPage.loading,
+      manualAgentPageLoading: manualAgentPage.loading
+    };
+  }, [
+    activeProjectId,
+    activeWorkspaceTab,
+    logFeed.loading,
+    logFeed.projectId,
+    repositoryData.loading,
+    repositoryData.projectId,
+    manualAgentPage.loading,
+    workflowAgentPage.loading
+  ]);
+
+  useEffect(() => {
+    if (selectedWorkspaceTab !== "workflow") {
+      setWorkflowDetailsMounted(false);
+    }
+  }, [selectedWorkspaceTab]);
 
   useEffect(() => {
     document.title = activeProject ? `${activeProject.record.identity.projectName} · ${APP_NAME}` : APP_NAME;
@@ -2876,6 +5864,14 @@ export const App = () => {
       setActivityLogPageIndex(0);
       setCommandLogPageIndex(0);
       setAgentDetail(undefined);
+      setActiveWorkspaceTabOverride(undefined);
+      setRepositoryData({
+        projectId: "",
+        tree: [],
+        dependencies: [],
+        summaryCache: [],
+        loading: false
+      });
       return;
     }
 
@@ -2884,15 +5880,28 @@ export const App = () => {
   }, [activeProjectId, storedActiveAgentId, storedTreeFilter]);
 
   useEffect(() => {
+    if (tabLayoutPersistTimerRef.current !== undefined) {
+      window.clearTimeout(tabLayoutPersistTimerRef.current);
+      tabLayoutPersistTimerRef.current = undefined;
+    }
+    tabLayoutPersistRequestRef.current = undefined;
     setWorkflowAgentPageIndex(0);
     setManualAgentPageIndex(0);
     setActivityLogPageIndex(0);
     setCommandLogPageIndex(0);
     setAgentDetail(undefined);
+    setActiveWorkspaceTabOverride(undefined);
+    setRepositoryData({
+      projectId: "",
+      tree: [],
+      dependencies: [],
+      summaryCache: [],
+      loading: false
+    });
   }, [activeProjectId]);
 
   useEffect(() => {
-    if (!activeProjectId || activeWorkspaceTab !== "agents") {
+    if (!activeProjectId || activeWorkspaceTab !== "runs") {
       return;
     }
 
@@ -2915,7 +5924,7 @@ export const App = () => {
   }, [activeProjectId, activeWorkspaceTab, agentHistoryVersion, workflowAgentPageIndex]);
 
   useEffect(() => {
-    if (!activeProjectId || activeWorkspaceTab !== "agents") {
+    if (!activeProjectId || activeWorkspaceTab !== "runs") {
       return;
     }
 
@@ -2938,13 +5947,14 @@ export const App = () => {
   }, [activeProjectId, activeWorkspaceTab, agentHistoryVersion, manualAgentPageIndex]);
 
   useEffect(() => {
-    if (!activeProjectId || activeWorkspaceTab !== "agents" || !activeAgent?.id) {
+    const agentId = focusedAgentId ?? runsPageAgents[0]?.id ?? activeAgent?.id;
+    if (!activeProjectId || activeWorkspaceTab !== "runs" || !agentId) {
       setAgentDetail(undefined);
       return;
     }
 
     let cancelled = false;
-    void window.workbench.getAgent(activeProjectId, activeAgent.id)
+    void window.workbench.getAgent(activeProjectId, agentId)
       .then((agent) => {
         if (!cancelled) {
           setAgentDetail(agent);
@@ -2955,7 +5965,41 @@ export const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeAgent?.id, activeProjectId, activeWorkspaceTab, agentHistoryVersion]);
+  }, [activeAgent?.id, activeProjectId, activeWorkspaceTab, agentHistoryVersion, focusedAgentId, runsPageAgents]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "repository") {
+      return;
+    }
+    if (repositoryData.projectId === activeProjectId) {
+      return;
+    }
+
+    let cancelled = false;
+    setRepositoryData((current) => ({
+      projectId: activeProjectId,
+      tree: current.projectId === activeProjectId ? current.tree : [],
+      dependencies: current.projectId === activeProjectId ? current.dependencies : [],
+      summaryCache: current.projectId === activeProjectId ? current.summaryCache : [],
+      loading: true
+    }));
+    void window.workbench.getRepositoryView(activeProjectId)
+      .then((view) => {
+        if (!cancelled) {
+          setRepositoryData({ ...view, loading: false });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setRepositoryData((current) => ({ ...current, loading: false }));
+        }
+        handleError(error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeWorkspaceTab, repositoryData.projectId]);
 
   useEffect(() => {
     if (!activeProjectId || activeWorkspaceTab !== "logs") {
@@ -2994,7 +6038,7 @@ export const App = () => {
 
   const importantPathSummaries = useMemo(
     () =>
-      activeProject?.record.summaryCache
+      repositoryData.summaryCache
         .slice()
         .sort((left, right) => {
           if (left.source === right.source) {
@@ -3002,8 +6046,8 @@ export const App = () => {
           }
           return left.source === "hybrid" || left.source === "codex" ? -1 : 1;
         })
-        .slice(0, 10) ?? [],
-    [activeProject]
+        .slice(0, 10),
+    [repositoryData.summaryCache]
   );
 
   const preferredPendingCandidate = useMemo(
@@ -3153,9 +6197,93 @@ export const App = () => {
       if (!exportPath) {
         return;
       }
-      showInfoNotice(`Saved review logs to ${exportPath}. Paths were redacted, but command output may still contain sensitive content.`);
+      showInfoNotice(`Saved review logs to ${exportPath}. Paths and common secret-looking values were redacted.`);
     } catch (error) {
       handleError(error);
+    }
+  };
+
+  const waitForVisualTabReady = async (projectId: string, tab: VisualExportTab) => {
+    await waitForVisualCondition(
+      () => {
+        const readiness = visualExportReadinessRef.current;
+        return readiness.activeProjectId === projectId && readiness.activeWorkspaceTab === tab.id;
+      },
+      `${tab.label} tab to render`
+    );
+    await waitForVisualRender();
+
+    if (tab.id === "logs" || tab.id === "runs" || tab.id === "repository") {
+      await delay(250);
+      await waitForVisualCondition(
+        () => {
+          const readiness = visualExportReadinessRef.current;
+          if (readiness.activeProjectId !== projectId || readiness.activeWorkspaceTab !== tab.id) {
+            return false;
+          }
+          if (tab.id === "logs") {
+            return !readiness.logFeedLoading && readiness.logFeedProjectId === projectId;
+          }
+          if (tab.id === "repository") {
+            return !readiness.repositoryLoading && readiness.repositoryProjectId === projectId;
+          }
+          return !readiness.workflowAgentPageLoading && !readiness.manualAgentPageLoading;
+        },
+        `${tab.label} tab data to load`
+      );
+    }
+
+    window.scrollTo(0, 0);
+    await waitForVisualRender();
+  };
+
+  const extractVisuals = async () => {
+    if (!activeProject || visualExtractBusy) {
+      return;
+    }
+
+    const projectId = activeProject.record.id;
+    const originalTab = selectedWorkspaceTab;
+    const originalScrollY = window.scrollY;
+    let exportId: string | undefined;
+
+    try {
+      setVisualExtractBusy(true);
+      setNotice(undefined);
+      const session = await window.workbench.startVisualExport(projectId, WORKSPACE_VISUAL_TABS);
+      if (!session) {
+        return;
+      }
+      exportId = session.exportId;
+
+      for (const tab of WORKSPACE_VISUAL_TABS) {
+        setActiveWorkspaceTabOverride(tab.id);
+        await window.workbench.updateLayout(projectId, { activeCenterTab: tab.id });
+        await waitForVisualTabReady(projectId, tab);
+        const captureTargets = buildVisualExportCaptureTargets(tab, getVisualExportScrollMetrics());
+        for (const target of captureTargets) {
+          window.scrollTo(0, target.scrollY);
+          await waitForVisualRender();
+          await window.workbench.captureVisualExportPage(exportId, target);
+        }
+      }
+
+      const exportPath = await window.workbench.finishVisualExport(exportId);
+      exportId = undefined;
+      showInfoNotice(`Saved interface visuals PDF to ${exportPath}.`);
+    } catch (error) {
+      if (exportId) {
+        await window.workbench.cancelVisualExport(exportId).catch(() => undefined);
+      }
+      handleError(error);
+    } finally {
+      setVisualExtractBusy(false);
+      if (visualExportReadinessRef.current.activeProjectId === projectId) {
+        setActiveWorkspaceTabOverride(originalTab);
+        await window.workbench.updateLayout(projectId, { activeCenterTab: originalTab }).catch(() => undefined);
+        await waitForVisualRender();
+        window.scrollTo(0, originalScrollY);
+      }
     }
   };
 
@@ -3370,10 +6498,42 @@ export const App = () => {
 
     try {
       setNotice(undefined);
-      await window.workbench.updateUiState(activeProject.record.id, {
-        autopilotEnabled: !autopilotEnabled
+      await window.workbench.setAutopilotPolicy(activeProject.record.id, {
+        enabled: !autopilotEnabled
       });
       showInfoNotice(!autopilotEnabled ? "Autopilot enabled." : "Autopilot disabled.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const setAutopilotProfile = async (profile: AutopilotProfile) => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.setAutopilotPolicy(activeProject.record.id, {
+        profile
+      });
+      showInfoNotice(`Autopilot profile set to ${autopilotProfileLabel(profile)}.`);
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const updateAutopilotPolicy = async (patch: Partial<AutopilotPolicy>) => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.setAutopilotPolicy(activeProject.record.id, patch);
+      if (patch.profile === "custom") {
+        showInfoNotice("Custom autopilot settings saved.");
+      }
     } catch (error) {
       handleError(error);
     }
@@ -3400,6 +6560,99 @@ export const App = () => {
     } catch (error) {
       handleError(error);
     }
+  };
+
+  const toggleWorkflowMode = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      const nextMode = fastModeEnabled ? "normal" : "fast";
+      setNotice(undefined);
+      await window.workbench.setWorkflowMode(activeProject.record.id, nextMode);
+      showInfoNotice(
+        nextMode === "fast"
+          ? "Fast Mode enabled. Future safe workflow transitions will prefer larger coherent work packages."
+          : "Normal Mode enabled. Future safe workflow transitions will use review-oriented scoping."
+      );
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const requestWorkflowPreview = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.requestWorkflowPreview(activeProject.record.id);
+      showInfoNotice("Preview generation queued.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const cancelWorkflowPreview = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.cancelWorkflowPreview(activeProject.record.id);
+      showInfoNotice("Preview request cancelled.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const completeWorkflowPreview = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.completeWorkflowPreview(activeProject.record.id);
+      showInfoNotice("Preview checkpoint completed. Workflow resumed.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const continueWorkflow = async () => {
+    if (previewStatus === "ready") {
+      await completeWorkflowPreview();
+      return;
+    }
+    if (workflowRecoveryAvailable) {
+      await recoverWorkflow();
+      return;
+    }
+    if (autopilotStatus?.pausedReason) {
+      if (!activeProject) {
+        return;
+      }
+      try {
+        setNotice(undefined);
+        await window.workbench.updateUiState(activeProject.record.id, {
+          workflowPauseRequested: false
+        });
+        showInfoNotice("Workflow automation continued from the saved state.");
+      } catch (error) {
+        handleError(error);
+      }
+      return;
+    }
+    if (workflowRuntimeStatus?.canContinue && workflowRuntimeStatus.status === "idle") {
+      await advanceWorkflowStage();
+      showInfoNotice("Workflow automation continued from the saved state.");
+      return;
+    }
+    await toggleWorkflowPause();
   };
 
   const toggleWorkflowPause = async () => {
@@ -3433,6 +6686,20 @@ export const App = () => {
       setNotice(undefined);
       await window.workbench.recoverWorkflow(activeProject.record.id);
       showInfoNotice("Workflow recovery started from the saved state.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const clearStaleWorkflowLock = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.clearStaleWorkflowLock(activeProject.record.id);
+      showInfoNotice("Stale workflow lock cleared. The saved workflow is paused and ready to continue.");
     } catch (error) {
       handleError(error);
     }
@@ -3773,44 +7040,46 @@ export const App = () => {
     );
   }
 
+  const updateSettingsDraft = (next: SettingsDraftUpdate) => setSettingsDraft((current) => {
+    const nextModel = next.interfaceCreationModel ?? current.interfaceCreationModel;
+    const nextReasoning = resolveInterfaceCreationReasoningEffort(
+      modelOptionsByName.get(nextModel),
+      next.interfaceCreationReasoningEffort ?? current.interfaceCreationReasoningEffort
+    ) ?? current.interfaceCreationReasoningEffort;
+    const rawAgentReasoningEfforts = normalizeAgentReasoningEfforts(
+      next.agentReasoningEfforts ?? current.agentReasoningEfforts
+    );
+    const nextAgentReasoningEfforts = Object.fromEntries(
+      configurableAgentCategories.map((category) => [
+        category,
+        resolveAgentReasoningEffort(modelOptionsByName.get(nextModel), category, agentCategoryLabel(category), "manual", rawAgentReasoningEfforts[category])
+      ])
+    ) as Record<AgentCategory, InterfaceReasoningEffort>;
+    return {
+      executionMode: next.executionMode ?? current.executionMode,
+      distroName: next.distroName ?? current.distroName,
+      codexBinaryPath: next.codexBinaryPath ?? current.codexBinaryPath,
+      codexHome: next.codexHome ?? current.codexHome,
+      worktreeBaseDir: next.worktreeBaseDir ?? current.worktreeBaseDir,
+      warnOnMntMount: next.warnOnMntMount ?? current.warnOnMntMount,
+      maxRepairCycles: next.maxRepairCycles ?? current.maxRepairCycles,
+      interfaceCreationModel: nextModel,
+      interfaceCreationReasoningEffort: nextAgentReasoningEfforts.bootstrap ?? nextReasoning,
+      agentReasoningMode: next.agentReasoningMode ?? current.agentReasoningMode,
+      agentReasoningEfforts: nextAgentReasoningEfforts,
+      autoApproveCommands: next.autoApproveCommands ?? current.autoApproveCommands,
+      autoApproveGitCommits: next.autoApproveGitCommits ?? current.autoApproveGitCommits,
+      autoApproveGitPushes: next.autoApproveGitPushes ?? current.autoApproveGitPushes,
+      considerPaidServices: next.considerPaidServices ?? current.considerPaidServices
+    };
+  });
+
   const settingsDialog = showSettings && state ? (
     <SettingsDialog
       state={state}
       github={state.github}
       settingsDraft={settingsDraft}
-      onChange={(next) => setSettingsDraft((current) => {
-        const nextModel = next.interfaceCreationModel ?? current.interfaceCreationModel;
-        const nextReasoning = resolveInterfaceCreationReasoningEffort(
-          modelOptionsByName.get(nextModel),
-          next.interfaceCreationReasoningEffort ?? current.interfaceCreationReasoningEffort
-        ) ?? current.interfaceCreationReasoningEffort;
-        const rawAgentReasoningEfforts = normalizeAgentReasoningEfforts(
-          next.agentReasoningEfforts ?? current.agentReasoningEfforts
-        );
-        const nextAgentReasoningEfforts = Object.fromEntries(
-          configurableAgentCategories.map((category) => [
-            category,
-            resolveAgentReasoningEffort(modelOptionsByName.get(nextModel), category, agentCategoryLabel(category), "manual", rawAgentReasoningEfforts[category])
-          ])
-        ) as Record<AgentCategory, InterfaceReasoningEffort>;
-        return {
-          executionMode: next.executionMode ?? current.executionMode,
-          distroName: next.distroName ?? current.distroName,
-          codexBinaryPath: next.codexBinaryPath ?? current.codexBinaryPath,
-          codexHome: next.codexHome ?? current.codexHome,
-          worktreeBaseDir: next.worktreeBaseDir ?? current.worktreeBaseDir,
-          warnOnMntMount: next.warnOnMntMount ?? current.warnOnMntMount,
-          maxRepairCycles: next.maxRepairCycles ?? current.maxRepairCycles,
-          interfaceCreationModel: nextModel,
-          interfaceCreationReasoningEffort: nextAgentReasoningEfforts.bootstrap ?? nextReasoning,
-          agentReasoningMode: next.agentReasoningMode ?? current.agentReasoningMode,
-          agentReasoningEfforts: nextAgentReasoningEfforts,
-          autoApproveCommands: next.autoApproveCommands ?? current.autoApproveCommands,
-          autoApproveGitCommits: next.autoApproveGitCommits ?? current.autoApproveGitCommits,
-          autoApproveGitPushes: next.autoApproveGitPushes ?? current.autoApproveGitPushes,
-          considerPaidServices: next.considerPaidServices ?? current.considerPaidServices
-        };
-      })}
+      onChange={updateSettingsDraft}
       onSave={saveSettings}
       onClose={() => setShowSettings(false)}
       onOpenDevTools={() => void openDevTools()}
@@ -4060,62 +7329,211 @@ export const App = () => {
     );
   }
 
-  return (
-    <div className="shell">
-      <BrandHeader
-        title={APP_NAME}
-        subtitle="Professional agent workspace"
-        actions={
-          <div className="actions-row">
-            <button className="secondary-button" onClick={() => void showLauncher()}>Home</button>
-            <button className="secondary-button" onClick={() => setShowSettings(true)}>Settings</button>
-            <button className="secondary-button" disabled={!githubLinked} onClick={() => void openFolder("open")}>Open Another Folder</button>
-            <button className="secondary-button" onClick={() => void exportInterfaceToProject()}>Export to Project</button>
-            <button className="secondary-button" onClick={() => void downloadInterface()}>Download Interface</button>
-            <button className="secondary-button" onClick={() => void downloadLogs()}>Download Logs</button>
-            <button className="secondary-button" disabled={overviewRefreshRunning} onClick={() => void refreshOverview()}>Refresh Overview</button>
-            <button className="secondary-button" onClick={() => void window.workbench.revalidate(activeProject.record.id)}>Revalidate</button>
-            <button className="secondary-button" onClick={() => void quitApp()}>Exit App</button>
-          </div>
+  const latestProjectUpdate =
+    allAgents[0]?.lastActivityAt ??
+    allAgents[0]?.completedAt ??
+    recentActivity[0]?.timestamp ??
+    activeProject.record.overview?.generatedAt ??
+    activeProject.record.localState.lastOpenedAt;
+  const projectBranchOrPath = activeProject.record.validation.branch ?? activeProject.record.displayPath;
+  const workflowRecoveryAvailable = Boolean(workflowRuntimeStatus?.status === "stale-running" && workflowPendingApprovals.length === 0);
+  const workflowShellStatus: { label: string; tone: ShellStatusTone } = activeProject.record.interfaceCreation?.status === "running"
+    ? { label: "Running", tone: "running" }
+    : workflowRuntimeStatus
+      ? { label: workflowRuntimeStatus.label, tone: workflowRuntimeStatus.tone }
+      : { label: "Idle", tone: "idle" };
+  const topBarPrimaryAction: ShellAction | undefined = workflowAction?.kind === "resume_workflow"
+    ? {
+      label: "Continue workflow",
+      onClick: () => void toggleWorkflowPause()
+    }
+    : workflowAction?.kind === "recover_workflow"
+      ? {
+        label: "Continue workflow",
+        onClick: () => void recoverWorkflow()
+      }
+      : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
+        ? {
+          label: workflowAction.actionLabel,
+          disabled: shellLaunchBusy || !workflow?.manualHandoff?.shellSupported,
+          onClick: () => void openProjectShell()
         }
+        : workflowAction?.kind === "confirm_goal" || workflowAction?.kind === "choose_recommendation" || workflowAction?.kind === "resolve_blocker"
+          ? {
+            label: workflowAction.actionLabel ?? "Review workflow",
+            onClick: () => void setWorkspaceTab("workflow")
+          }
+          : autopilotStatus?.pausedReason
+            ? {
+              label: "Continue workflow",
+              onClick: () => void continueWorkflow()
+            }
+          : workflow && !workflowHasActiveAgent && !recommendationRegenerationLocked
+            ? {
+              label: "Run recommendation",
+              onClick: () => void runRecommendation()
+            }
+            : undefined;
+  const utilityActions: ShellAction[] = [
+    { label: "Home", onClick: () => void showLauncher() },
+    { label: "Settings", onClick: () => void setWorkspaceTab("settings") },
+    { label: "Open Another Folder", disabled: !githubLinked, onClick: () => void openFolder("open") },
+    { label: "Export to Project", onClick: () => void exportInterfaceToProject() },
+    { label: "Download Interface", onClick: () => void downloadInterface() },
+    { label: "Download Logs", onClick: () => void downloadLogs() },
+    { label: visualExtractBusy ? "Extracting..." : "Extract Visuals", disabled: visualExtractBusy, onClick: () => void extractVisuals() },
+    { label: overviewRefreshRunning ? "Refreshing..." : "Refresh Overview", disabled: overviewRefreshRunning, onClick: () => void refreshOverview() },
+    { label: "Revalidate", onClick: () => void window.workbench.revalidate(activeProject.record.id).catch(handleError) },
+    { label: "Exit App", onClick: () => void quitApp() }
+  ];
+  const projectStatusItems: Array<string | JSX.Element> = [
+    activeProject.record.identity.projectName,
+    projectBranchOrPath,
+    `last updated ${formatClockTime(latestProjectUpdate)}`,
+    `workflow ${workflowShellStatus.label.toLowerCase()}`,
+    `${pendingApprovals.length} approvals pending`
+  ];
+  const scrollWorkflowSectionIntoView = (elementId: string) => {
+    document.getElementById(elementId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const openWorkflowDetailsAndScroll = (elementId: string) => {
+    setWorkflowDetailsMounted(true);
+    window.requestAnimationFrame(() => {
+      const details = document.getElementById("workflow-detail-disclosure");
+      if (details instanceof HTMLDetailsElement) {
+        details.open = true;
+      }
+      const target = document.getElementById(elementId) ?? details;
+      if (target instanceof HTMLDetailsElement) {
+        target.open = true;
+      }
+      window.requestAnimationFrame(() => target?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    });
+  };
+  const workflowHeaderPrimaryAction: ShellAction | undefined = workflowAction?.kind === "resume_workflow"
+    ? {
+      label: "Continue workflow",
+      onClick: () => void toggleWorkflowPause()
+    }
+    : workflowAction?.kind === "recover_workflow"
+      ? {
+        label: "Continue workflow",
+        onClick: () => void recoverWorkflow()
+      }
+      : workflowAction?.kind === "confirm_goal"
+        ? {
+          label: "Confirm Ultimate Goal",
+          disabled: !ultimateGoalDraft.summary.trim(),
+          onClick: () => void saveUltimateGoal()
+        }
+        : workflowAction?.kind === "choose_recommendation"
+        ? {
+          label: workflowAction.actionLabel ?? "Choose recommendation",
+          onClick: () => openWorkflowDetailsAndScroll("workflow-recommendations")
+        }
+            : workflowShellStatus.tone === "blocked"
+            ? {
+              label: workflowPendingApprovals.length > 0 ? "Resolve approval" : "View blocker",
+              onClick: () => scrollWorkflowSectionIntoView("workflow-needs-attention")
+            }
+            : autopilotStatus?.pausedReason
+              ? {
+                label: "Continue workflow",
+                onClick: () => void continueWorkflow()
+              }
+            : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
+              ? {
+                label: workflowAction.actionLabel,
+                disabled: shellLaunchBusy || !workflow?.manualHandoff?.shellSupported,
+                onClick: () => void openProjectShell()
+              }
+              : workflowShellStatus.tone === "running" && !workflowPauseRequested
+                ? {
+                  label: "Pause workflow",
+                  onClick: () => void toggleWorkflowPause()
+                }
+                : workflow && !workflowHasActiveAgent && !recommendationRegenerationLocked
+                  ? {
+                    label: "Run recommendation",
+                    onClick: () => void runRecommendation()
+                  }
+                  : undefined;
+  const workflowSecondaryActions: ShellAction[] = [
+    {
+      label: "Create scoped goal",
+      disabled: !workflow?.approvedRecommendation,
+      onClick: () => void createScopedGoal()
+    },
+    {
+      label: "Run recommendation",
+      disabled: recommendationRegenerationLocked,
+      onClick: () => void runRecommendation()
+    },
+    {
+      label: "Run integrity",
+      onClick: () => void window.workbench.runIntegrity(activeProject.record.id)
+    },
+    {
+      label: "Run merge",
+      onClick: () => void window.workbench.runMerge(activeProject.record.id)
+    },
+    {
+      label: "Advance workflow stage",
+      onClick: () => void advanceWorkflowStage()
+    }
+  ];
+  const workflowStageText = workflow ? workflowStageLabel(workflow.workflowStage) : "Workflow unavailable";
+  const workflowAgentLabel = currentWorkflowAgent?.name ?? "Waiting for next workflow agent";
+  const workflowCurrentFocus = summarizeText(
+    activeWorkflowStep?.currentActivity ?? workflowGlanceActivity,
+    "Waiting for workflow activity.",
+    150
+  );
+  const workflowCurrentRunSummary = currentWorkflowAgent
+    ? summarizeText(agentPreviewText(currentWorkflowAgent, workflow), "No live run summary yet.", 170)
+    : workflowLead;
+  const workflowCurrentPhase = summarizeText(
+    currentWorkflowAgent?.currentPhase ?? currentWorkflowAgent?.currentSubtask ?? activeWorkflowStep?.currentSubstep ?? activeWorkflowStep?.displayStatusLabel,
+    "No active phase",
+    95
+  );
+  const workflowChecksStatus = summarizeWorkflowChecksStatus(currentWorkflowAgent, workflow, activeWorkflowStep);
+  const workflowFilesLikelyInvolved = uniqueSortedStrings([
+    ...(workflow?.approvedRecommendation?.relatedPaths ?? []),
+    ...currentWorkflowChangedFiles
+  ]);
+  const workflowValidationRequired = workflow?.scopedGoal?.testStrategy.length
+    ? workflow.scopedGoal.testStrategy
+    : currentWorkflowAgent?.integrityReport?.checks.map((check) => `${check.name}: ${check.status}`) ?? [];
+  const workflowPlanConstraints = workflow?.scopedGoal?.constraints.length
+    ? workflow.scopedGoal.constraints
+    : workflow?.ultimateGoal.constraints ?? [];
+  const workflowDoneCondition = workflow?.scopedGoal?.acceptanceCriteria.length
+    ? workflow.scopedGoal.acceptanceCriteria
+    : workflowGoalView?.acceptanceCriteria.length
+      ? workflowGoalView.acceptanceCriteria
+      : workflowGlanceSteps;
+  const workflowRawPlan = [
+    workflow?.ultimateGoal.summary ? `Ultimate Goal: ${workflow.ultimateGoal.summary}` : undefined,
+    workflow?.ultimateGoal.detailedIntent ? `Intent: ${workflow.ultimateGoal.detailedIntent}` : undefined,
+    workflow?.approvedRecommendation ? `Recommendation: ${workflow.approvedRecommendation.title}\n${workflow.approvedRecommendation.summary}\n${workflow.approvedRecommendation.rationale}` : undefined,
+    workflow?.scopedGoal ? `Scoped plan: ${workflow.scopedGoal.summary}\n${workflow.scopedGoal.executionBrief}` : undefined,
+    workflow?.scopedGoal?.acceptanceCriteria.length ? `Acceptance criteria:\n${workflow.scopedGoal.acceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n")}` : undefined,
+    workflow?.scopedGoal?.testStrategy.length ? `Validation:\n${workflow.scopedGoal.testStrategy.map((strategy) => `- ${strategy}`).join("\n")}` : undefined
+  ].filter((entry): entry is string => Boolean(entry)).join("\n\n") || "No scoped plan has been generated yet.";
+
+  return (
+    <div className="shell shell--workspace">
+      <TopBar
+        projectName={activeProject.record.identity.projectName}
+        projectContext={projectBranchOrPath}
+        statusLabel={workflowShellStatus.label}
+        statusTone={workflowShellStatus.tone}
+        primaryAction={topBarPrimaryAction}
+        utilityActions={utilityActions}
       />
 
-      <section className="project-hero">
-        <div className="project-hero__main">
-          <div className="eyebrow">Active project</div>
-          <h2>{activeProject.record.identity.projectName}</h2>
-          <p className="project-hero__summary">
-            {activeProject.record.overview?.summary ?? activeProject.record.stats?.explanation ?? "Interface creation is still in progress for this project."}
-          </p>
-          <div className="topbar__meta">
-            <ValidationBadge status={activeProject.validationStatus} />
-            <span>{activeProject.record.validation.branch ?? activeProject.record.validation.projectKind}</span>
-            <span>{activeProject.record.displayPath}</span>
-          </div>
-        </div>
-        <div className="project-hero__stats">
-          <div className="metric-card">
-            <span className="metric-card__label">Project files</span>
-            <strong>{activeProject.record.stats?.totalFiles ?? 0}</strong>
-            <span>{activeProject.record.stats?.includedFiles ?? 0} indexed • {activeProject.record.stats?.excludedFiles ?? 0} excluded</span>
-          </div>
-          <div className="metric-card">
-            <span className="metric-card__label">Indexed size</span>
-            <strong>{formatBytes(activeProject.record.stats?.includedSizeBytes ?? 0)}</strong>
-            <span>Full project {formatBytes(activeProject.record.stats?.totalSizeBytes ?? 0)}</span>
-          </div>
-          <div className="metric-card">
-            <span className="metric-card__label">Dependencies</span>
-            <strong>{activeProject.record.dependencies.length}</strong>
-            <span>{activeProject.record.stats?.primaryManagers?.join(", ") || "Unknown toolchain"}</span>
-          </div>
-          <div className="metric-card">
-            <span className="metric-card__label">Agents</span>
-            <strong>{activeProject.record.agents.length}</strong>
-            <span>{pendingApprovals.length} approvals pending • {activeProject.record.stats?.testsPresent ? "tests detected" : "tests not detected"}</span>
-          </div>
-        </div>
-      </section>
+      <ProjectStatusStrip items={projectStatusItems} />
 
       {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
       {activeProject.record.validation.projectAccess ? (
@@ -4135,7 +7553,7 @@ export const App = () => {
         <section className={`notice notice--status notice--${activeProject.record.interfaceCreation.status}`}>
           <div className="candidate-card__title-row">
             <strong>Creating Interface</strong>
-            <span className={`status-pill status-${activeProject.record.interfaceCreation.status}`}>{activeProject.record.interfaceCreation.status}</span>
+            <StatusChip {...interfaceCreationStatusChip(activeProject.record.interfaceCreation)} />
           </div>
           {activeProject.record.interfaceCreation.status === "queued" || activeProject.record.interfaceCreation.status === "running" ? (
             <LoadingIndicator label={activeProject.record.interfaceCreation.message} />
@@ -4159,218 +7577,327 @@ export const App = () => {
         <div className="workspace-tabs">
           <WorkspaceTabButton
             label="Overview"
-            active={activeWorkspaceTab === "overview"}
+            active={selectedWorkspaceTab === "overview"}
             onClick={() => void setWorkspaceTab("overview")}
           />
           <WorkspaceTabButton
             label="Workflow"
-            active={activeWorkspaceTab === "workflow"}
+            active={selectedWorkspaceTab === "workflow"}
             count={pendingUserInputRequests.length + pendingHumanInterventions.length}
             onClick={() => void setWorkspaceTab("workflow")}
           />
           <WorkspaceTabButton
+            label="Runs"
+            active={selectedWorkspaceTab === "runs"}
+            count={allAgents.length}
+            onClick={() => void setWorkspaceTab("runs")}
+          />
+          <WorkspaceTabButton
             label="Logs"
-            active={activeWorkspaceTab === "logs"}
+            active={selectedWorkspaceTab === "logs"}
             count={pendingApprovals.length}
             onClick={() => void setWorkspaceTab("logs")}
           />
           <WorkspaceTabButton
-            label="Agent History"
-            active={activeWorkspaceTab === "agents"}
-            count={allAgents.length}
-            onClick={() => void setWorkspaceTab("agents")}
+            label="Repository"
+            active={selectedWorkspaceTab === "repository"}
+            count={activeProject.record.stats?.includedFiles}
+            onClick={() => void setWorkspaceTab("repository")}
           />
           <WorkspaceTabButton
-            label="API Keys"
-            active={activeWorkspaceTab === "credentials"}
+            label="Credentials"
+            active={selectedWorkspaceTab === "credentials"}
             count={(activeProject.record.credentials?.requests ?? []).filter((request) => request.status === "pending").length}
             onClick={() => void setWorkspaceTab("credentials")}
+          />
+          <WorkspaceTabButton
+            label="Settings"
+            active={selectedWorkspaceTab === "settings"}
+            onClick={() => void setWorkspaceTab("settings")}
           />
         </div>
 
         {activeWorkspaceTab === "overview" ? (
-          <section className="workspace-summary">
-            <section className="panel panel--repo">
-              <SectionTitle
-                eyebrow="Repository"
-                title="Files"
-                meta={<span className="badge">{activeProject.record.stats?.includedFiles ?? 0} indexed / {activeProject.record.stats?.totalFiles ?? 0} total</span>}
-              />
-              <div className="panel-toolbar">
-                <div className="panel-toolbar__summary">
-                  <span>{activeProject.record.validation.branch ?? activeProject.record.validation.projectKind}</span>
-                  <span>{formatBytes(activeProject.record.stats?.includedSizeBytes ?? 0)} indexed</span>
-                  <span>{activeProject.record.stats?.excludedFiles ?? 0} excluded</span>
-                  <span>{activeProject.record.stats?.testsPresent ? "Tests detected" : "No tests detected"}</span>
+          <section className="overview-page">
+            <section className="overview-executive-header">
+              <div className="overview-executive-header__main">
+                <div className="eyebrow">Home</div>
+                <h2>{activeProject.record.identity.projectName}</h2>
+                <p>{summarizeText(activeProject.record.overview?.summary ?? activeProject.record.overview?.whatProjectDoes ?? activeProject.record.stats?.explanation, "Interface creation is still in progress for this project.", 240)}</p>
+                <div className="overview-executive-header__meta">
+                  <span>{projectBranchOrPath}</span>
+                  <span>Updated {formatDateTime(workflowLastUpdatedAt ?? latestProjectUpdate)}</span>
+                  <span>{workflowStageText}</span>
+                  <span>{workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No cycle"}</span>
                 </div>
-                <input
-                  className="input"
-                  placeholder="Filter files"
-                  value={treeFilterDraft}
-                  onChange={(event) => setTreeFilterDraft(event.target.value)}
-                />
               </div>
-              <RepoTree key={activeProject.record.id} nodes={activeProject.tree} filter={deferredTreeFilter} selected={selectedFile} onSelect={loadSummary} />
+              <div className="overview-executive-header__status">
+                <StatusChip label={workflowShellStatus.label} tone={workflowShellStatus.tone} />
+                <ValidationBadge status={activeProject.validationStatus} />
+                {activeProject.record.overview ? <SourceBadge source={activeProject.record.overview.source} /> : <span className="badge">Overview pending</span>}
+              </div>
             </section>
 
-            <section className="workspace-summary__content">
-              <section
-                className="overview-grid overview-grid--summary"
-              >
-                <article className="overview-card overview-card--feature">
-                  <div className="candidate-card__title-row">
-                    <h3>Project intent</h3>
-                    {activeProject.record.overview ? <SourceBadge source={activeProject.record.overview.source} /> : <span className="badge">Pending</span>}
-                  </div>
-                  <p>{activeProject.record.overview?.whatProjectDoes ?? activeProject.record.overview?.summary ?? "Interface creation is still in progress."}</p>
-                </article>
-                <article className="overview-card">
-                  <h3>How it is organized</h3>
-                  <p>{activeProject.record.overview?.howItIsOrganized ?? activeProject.record.overview?.architecture ?? "Repository structure analysis is still in progress."}</p>
-                  <p>{activeProject.record.overview?.importantToKnowFirst}</p>
-                </article>
-                <article className="overview-card">
-                  <h3>Scan coverage</h3>
-                  <p>
-                    Indexed {activeProject.record.stats?.includedFiles ?? 0} files across {activeProject.record.stats?.includedFolders ?? 0} folders for{" "}
-                    {formatBytes(activeProject.record.stats?.includedSizeBytes ?? 0)}. Excluded {activeProject.record.stats?.excludedFiles ?? 0} files across{" "}
-                    {activeProject.record.stats?.excludedFolders ?? 0} folders for {formatBytes(activeProject.record.stats?.excludedSizeBytes ?? 0)}.
-                  </p>
-                  <p>
-                    Full scanned footprint: {activeProject.record.stats?.totalFiles ?? 0} files and {formatBytes(activeProject.record.stats?.totalSizeBytes ?? 0)}.
-                    Exclusions come from built-in defaults and any project <code>.gitignore</code> rules.
-                  </p>
-                  <div className="tag-row">
-                    {getTopFileTypes(activeProject.record.stats?.fileTypeBreakdown).map(([label, count]) => (
-                      <span key={label} className="tag">{label}: {count}</span>
-                    ))}
-                  </div>
-                </article>
-                <article className="overview-card">
-                  <div className="candidate-card__title-row">
-                    <h3>Dependencies</h3>
-                    <span className="badge">Deterministic scan</span>
-                  </div>
-                  <div className="tag-row">
-                    {activeProject.record.dependencies.slice(0, 12).map((dependency) => (
-                      <span key={`${dependency.manifest}:${dependency.name}`} className="tag">{dependency.name}@{dependency.version}</span>
-                    ))}
-                  </div>
-                  <p>{activeProject.record.overview?.dependencyHighlights?.join(" ") || "Dependency highlights will appear here once analysis is complete."}</p>
-                </article>
-                <article className="overview-card">
-                  <h3>Major subsystems</h3>
-                  <div className="path-summary-list">
-                    {activeProject.record.overview?.subsystemSummaries?.length ? activeProject.record.overview.subsystemSummaries.slice(0, 4).map((subsystem) => (
-                      <div key={subsystem.name} className="path-summary">
-                        <strong>{subsystem.name}</strong>
-                        <p>{subsystem.summary}</p>
-                      </div>
-                    )) : <p>No subsystem breakdown is available yet.</p>}
-                  </div>
-                </article>
-                <article className="overview-card">
-                  <h3>Excluded paths</h3>
-                  <div className="path-summary-list">
-                    {getExcludedPathEntries(activeProject.record.stats?.excludedPaths).length ? getExcludedPathEntries(activeProject.record.stats?.excludedPaths).slice(0, 6).map((entry) => (
-                      <div key={`${entry.rule}:${entry.path}`} className="path-summary">
-                        <div className="candidate-card__title-row">
-                          <strong>{entry.path}</strong>
-                          <span className="badge">{entry.kind}</span>
-                        </div>
-                        <p>
-                          {exclusionRuleLabel(entry.rule)}. {entry.fileCount} file{entry.fileCount === 1 ? "" : "s"} excluded, totaling{" "}
-                          {formatBytes(entry.totalSizeBytes)}.
-                        </p>
-                      </div>
-                    )) : <p>No excluded paths were detected by the scanner.</p>}
-                  </div>
-                </article>
-                <article className="overview-card overview-card--wide">
-                  <h3>Important paths</h3>
-                  <div className="path-summary-list">
-                    {importantPathSummaries.length ? importantPathSummaries.slice(0, 6).map((summary) => (
-                      <div key={summary.relativePath} className="path-summary">
-                        <div className="candidate-card__title-row">
-                          <strong>{summary.relativePath}</strong>
-                          <SourceBadge source={summary.source} />
-                        </div>
-                        <p>{summary.summary}</p>
-                      </div>
-                    )) : <p>The interface-creation agent has not produced important path summaries yet.</p>}
-                  </div>
-                </article>
-              </section>
+            <section className="overview-health-grid" aria-label="Health snapshot">
+              <OverviewMetricCard
+                label="Workflow status"
+                value={workflowShellStatus.label}
+                detail={summarizeText(workflowRunState, "Workflow status unavailable.", 96)}
+                tone={workflowShellStatus.tone === "blocked" ? "danger" : workflowShellStatus.tone === "completed" ? "good" : undefined}
+              />
+              <OverviewMetricCard
+                label="Current stage"
+                value={workflowStageText}
+                detail={summarizeText(workflowCurrentPhase, "No active phase.", 96)}
+              />
+              <OverviewMetricCard
+                label="Approvals pending"
+                value={pendingApprovals.length}
+                detail={pendingApprovals.length ? "Explicit review is required." : "No approvals waiting."}
+                tone={pendingApprovals.length ? "warning" : "good"}
+              />
+              <OverviewMetricCard
+                label="Blockers / warnings"
+                value={workflowAttentionItems.length}
+                detail={workflowAttentionItems.length ? "Review attention items below." : "No urgent attention needed."}
+                tone={workflowAttentionItems.some((item) => item.tone === "danger") ? "danger" : workflowAttentionItems.length ? "warning" : "good"}
+              />
+              <OverviewMetricCard
+                label="Last run status"
+                value={allAgents[0]?.status ?? "No runs"}
+                detail={allAgents[0] ? summarizeText(allAgents[0].name, "Latest run", 96) : "Start from Workflow or run a recommendation."}
+                tone={allAgents[0]?.status === "completed" ? "good" : allAgents[0]?.status === "failed" || allAgents[0]?.status === "conflicted" || allAgents[0]?.status === "disconnected" ? "danger" : undefined}
+              />
+              <OverviewMetricCard
+                label="Goal progress"
+                value={typeof workflowChecklistOverview.percentComplete === "number" ? `${workflowChecklistOverview.percentComplete}%` : workflowChecklistSummary}
+                detail={workflowChecklistOverview.requiredTotal ? `${workflowChecklistOverview.requiredMet}/${workflowChecklistOverview.requiredTotal} required checks met` : "Goal checklist not generated yet."}
+                tone={workflowChecklistOverview.openRequired === 0 && workflowChecklistOverview.requiredTotal > 0 ? "good" : undefined}
+              />
+            </section>
 
-              <article className="overview-card overview-card--file">
-                <div className="candidate-card__title-row">
-                  <h3>File details</h3>
-                  {fileSummary ? <SourceBadge source={fileSummary.source} /> : null}
+            <section className="overview-main-grid">
+              <OverviewAttentionSummary
+                items={workflowAttentionItems}
+                onOpenWorkflow={() => void setWorkspaceTab("workflow")}
+                onOpenLogs={() => void setWorkspaceTab("logs")}
+                onOpenCredentials={() => void setWorkspaceTab("credentials")}
+              />
+              <article className="overview-current-work-card">
+                <SectionTitle eyebrow="Current work" title="Active workflow snapshot" />
+                <div className="overview-current-work-card__goal">
+                  <span className="workflow-option__label">Current goal</span>
+                  <strong>{summarizeText(workflowGlanceGoal, "Set the Ultimate Goal.", 150)}</strong>
                 </div>
-                {fileSummary ? (
-                  <>
-                    <div className="file-summary__title">{fileSummary.relativePath}</div>
-                    <p>{fileSummary.purpose}</p>
-                    <p>{fileSummary.summary}</p>
-                    <div className="tag-row">
-                      {fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>)}
-                    </div>
-                  </>
-                ) : (
-                  <div className="empty-copy">
-                    <p>Select a file in the repository tree to load its summary and related symbols.</p>
+                <div className="overview-current-work-card__facts">
+                  <div>
+                    <span>Agent/stage</span>
+                    <strong>{workflowAgentLabel}</strong>
                   </div>
-                )}
+                  <div>
+                    <span>Status</span>
+                    <strong>{workflowStageText}</strong>
+                  </div>
+                </div>
+                <div>
+                  <span className="workflow-option__label">Next recommended action</span>
+                  <p>{summarizeText(workflowAction?.title ?? workflowNextGuidance, "No action needed right now.", 135)}</p>
+                </div>
+                <div className="actions-row">
+                  <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>Open Workflow</button>
+                </div>
               </article>
+            </section>
+
+            <section className="overview-secondary-grid">
+              <OverviewActivitySnapshot events={recentActivity} />
+              <article className="overview-quick-nav-card">
+                <SectionTitle eyebrow="Next" title="Quick navigation" />
+                <div className="overview-quick-nav-grid">
+                  <QuickNavigationCard title="Open Workflow" detail="Operate the active cycle and resolve workflow decisions." meta={workflowStageText} onClick={() => void setWorkspaceTab("workflow")} />
+                  <QuickNavigationCard title="Review Runs" detail="Inspect agent outputs, evidence, and collapsed raw details." meta={`${allAgents.length} runs`} onClick={() => void setWorkspaceTab("runs")} />
+                  <QuickNavigationCard title="View Logs" detail="Review approvals, activity, and command snippets." meta={`${pendingApprovals.length} approvals`} onClick={() => void setWorkspaceTab("logs")} />
+                  <QuickNavigationCard title="View Repository" detail="Open repository scan details, files, and summaries." meta={`${activeProject.record.stats?.includedFiles ?? 0} files`} onClick={() => void setWorkspaceTab("repository")} />
+                  <QuickNavigationCard title="Manage Credentials" detail="Handle pending credential requests and stored local metadata." meta={`${workflowCredentialRequests.length} pending`} onClick={() => void setWorkspaceTab("credentials")} />
+                </div>
+              </article>
+            </section>
+
+            <section className="overview-repo-health">
+              <div>
+                <span className="workflow-option__label">Repository health</span>
+                <p>
+                  {activeProject.record.stats?.testsPresent ? "Tests detected" : "No tests detected"} · {activeProject.record.stats?.primaryManagers?.join(", ") || "Unknown toolchain"} · {activeProject.record.validation.branch ?? activeProject.record.validation.projectKind}
+                </p>
+              </div>
+              <button className="secondary-button" type="button" onClick={() => void setWorkspaceTab("repository")}>Repository details</button>
             </section>
           </section>
         ) : null}
 
-        {activeWorkspaceTab === "workflow" ? (
-          <section className="workflow-control-center panel workflow-control-center--minimal">
-            <header className="workflow-control-center__header">
-              <div>
-                <div className="eyebrow">Workflow loop</div>
-                <h2>{activeProject.record.identity.projectName}</h2>
-                <p className="workflow-control-center__lead">{workflowLead}</p>
-                <p className="agent-workspace__copy">
-                  {workflow ? activeStageGuidance?.meaning : "Workflow guidance is unavailable."}
-                </p>
-              </div>
-              <div className="workflow-control-center__meta">
-                <div className="metric-card metric-card--compact">
-                  <span className="metric-card__label">Current stage</span>
-                  <strong>{workflow ? workflowStageLabel(workflow.workflowStage) : "Workflow unavailable"}</strong>
-                  <span>{workflow ? workflowStopReasonLabel(workflow.workflowStopReason) : "No workflow state"}</span>
-                </div>
-                <div className="metric-card metric-card--compact">
-                  <span className="metric-card__label">Cycle</span>
-                  <strong>{workflow ? `#${workflow.workflowCycle.cycleNumber}` : "n/a"}</strong>
-                  <span>{workflowRunState}</span>
-                </div>
-                <div className="metric-card metric-card--compact">
-                  <span className="metric-card__label">Repair</span>
-                  <strong>{workflowRepairCounter?.label ?? "No repairs yet"}</strong>
-                  <span>{workflowRepairCounter?.status ?? "idle"}</span>
-                </div>
-              </div>
-            </header>
+        {activeWorkspaceTab === "repository" ? (
+          <RepositoryPanel
+            project={activeProject}
+            repositoryData={repositoryData}
+            treeFilterDraft={treeFilterDraft}
+            deferredTreeFilter={deferredTreeFilter}
+            selectedFile={selectedFile}
+            fileSummary={fileSummary}
+            importantPathSummaries={importantPathSummaries}
+            onTreeFilterChange={setTreeFilterDraft}
+            onSelectFile={(relativePath) => void loadSummary(relativePath)}
+          />
+        ) : null}
 
-            <WorkflowAtAGlance
-              goalTitle={workflowGlanceGoal}
-              currentActivity={workflowGlanceActivity}
-              recommendationTitle={workflowGlanceRecommendation}
-              executionPlan={workflowGlancePlan}
-              intendedSteps={workflowGlanceSteps}
-              stageLabel={workflow ? workflowStageLabel(workflow.workflowStage) : "Workflow unavailable"}
-              activeStepTitle={activeWorkflowStep?.title}
-              agentName={currentWorkflowAgent?.name}
-              agentStatus={currentWorkflowAgent?.status}
-              checklistSummary={workflowChecklistSummary}
-              nextGuidance={workflowNextGuidance}
+        {activeWorkspaceTab === "workflow" ? (
+          <section className="workflow-control-center panel workflow-operator-console">
+            <WorkflowControlHeader
+              projectName={activeProject.record.identity.projectName}
+              statusLabel={workflowShellStatus.label}
+              statusTone={workflowShellStatus.tone}
+              cycleLabel={workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No cycle"}
+              stageLabel={workflowStageText}
+              agentLabel={workflowAgentLabel}
+              lastUpdatedAt={workflowLastUpdatedAt ?? latestProjectUpdate}
+              approvalsPending={workflowPendingApprovals.length}
+              primaryAction={workflowHeaderPrimaryAction}
+              secondaryActions={workflowSecondaryActions}
             />
 
-            <div className="workflow-minimal-layout">
+            <WorkflowStageTimeline steps={workflowTimeline} nowTime={clockNow} />
+
+            <section className="workflow-operator-grid workflow-operator-grid--top">
+              <WorkflowCurrentActionCard
+                stageLabel={workflowStageText}
+                agentName={workflowAgentLabel}
+                agentStatus={currentWorkflowAgent?.status}
+                focus={workflowCurrentFocus}
+                runSummary={workflowCurrentRunSummary}
+                changedFilesCount={currentWorkflowChangedFiles.length}
+                checksStatus={workflowChecksStatus}
+                approvalsPending={workflowPendingApprovals.length}
+                nextAction={summarizeText(workflowAction?.title ?? workflowNextGuidance, "No action needed right now.", 130)}
+                phase={workflowCurrentPhase}
+              />
+              <WorkflowCurrentAgentMessages
+                agent={currentWorkflowAgent}
+                workflow={workflow}
+                recoveryAvailable={workflowRecoveryAvailable}
+                onRecover={() => void recoverWorkflow()}
+              />
+              {workflowRecoveryAvailable ? (
+                <WorkflowStaleRecoveryPanel
+                  recoveryCandidate={workflowRuntimeStatus?.recoveryCandidate ?? workflowRecoveryCandidate}
+                  onContinue={() => void recoverWorkflow()}
+                  onClearLock={() => void clearStaleWorkflowLock()}
+                />
+              ) : null}
+              <WorkflowNeedsAttentionPanel
+                items={workflowAttentionItems}
+                onApprove={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}
+                onReject={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}
+                onOpenCredentials={() => void setWorkspaceTab("credentials")}
+                onViewDetails={(target) => {
+                  if (target === "user-input") {
+                    openWorkflowDetailsAndScroll("workflow-user-input-requests");
+                    return;
+                  }
+                  openWorkflowDetailsAndScroll("workflow-attention-details");
+                }}
+              />
+            </section>
+
+            <section className="workflow-operator-grid workflow-operator-grid--plan">
+              <WorkflowPlanSummaryCard
+                goalSummary={summarizeText(workflowGlanceGoal, "Set the Ultimate Goal.", 260)}
+                recommendationSummary={summarizeText(workflow?.approvedRecommendation?.summary ?? workflowGlanceRecommendation, "No recommendation selected yet.", 190)}
+                objective={workflowObjectiveLabel(workflowObjective)}
+                scope={summarizeText(workflow?.scopedGoal?.executionBrief ?? workflowGlancePlan, "Waiting for a scoped execution plan.", 220)}
+                filesLikelyInvolved={workflowFilesLikelyInvolved}
+                validationRequired={workflowValidationRequired}
+                constraints={workflowPlanConstraints}
+                doneCondition={workflowDoneCondition}
+                rawPlan={workflowRawPlan}
+              />
+              <WorkflowChecklistSummaryCard
+                overview={workflowChecklistOverview}
+                checklist={workflow?.goalChecklist ?? []}
+              />
+            </section>
+
+            <WorkflowStatusStrip
+              items={[
+                { label: "Stage", value: workflowStageText },
+                { label: "Cycle", value: workflow ? String(workflow.workflowCycle.cycleNumber) : "None" },
+                { label: "Mode", value: workflowModeLabel(workflowMode), tone: workflowMode === "fast" ? "success" : "normal" },
+                { label: "Autopilot", value: `${autopilotEnabled ? "On" : "Off"} · ${autopilotProfileLabel(autopilotProfile)}` },
+                { label: "Preview", value: previewStatusLabel(previewStatus), tone: previewStatus === "ready" ? "warning" : previewStatus === "completed" ? "success" : "normal" },
+                { label: "Package", value: autopilotStatus?.currentRecommendationTitle ?? workflow?.approvedRecommendation?.title ?? "None" },
+                { label: "Last", value: autopilotStatus?.lastCompletedAction?.replace(/_/g, " ") ?? "None" },
+                { label: "Next", value: autopilotStatus?.nextPlannedAction?.replace(/_/g, " ") ?? workflowAction?.actionLabel ?? "None" },
+                { label: "Paused", value: autopilotPauseReasonLabel(autopilotStatus?.pausedReason), tone: autopilotStatus?.pausedReason ? "warning" : "normal" }
+              ]}
+            />
+
+            <WorkflowAutopilotPanel
+              autopilotEnabled={autopilotEnabled}
+              autopilotProfile={autopilotProfile}
+              autopilotPolicy={autopilotPolicy}
+              autopilotPausedReason={autopilotStatus?.pausedReason}
+              highRiskPackageRequiresApproval={autopilotStatus?.highRiskPackageRequiresApproval ?? false}
+              currentRecommendationTitle={autopilotStatus?.currentRecommendationTitle}
+              lastCompletedAction={autopilotStatus?.lastCompletedAction}
+              objectiveLabel={workflowObjectiveLabel(workflowObjective)}
+              nextAction={summarizeText(workflowNextGuidance ?? workflowAction?.description, "Continue from the current workflow state.", 140)}
+              workflowPauseRequested={workflowPauseRequested}
+              workflowHasActiveAgent={workflowHasActiveAgent}
+              recoveryAvailable={workflowRecoveryAvailable}
+              optimizeModeEnabled={optimizeModeEnabled}
+              workflowMode={workflowMode}
+              previewStatus={previewStatus}
+              previewDisabledReason={previewDisabledReason}
+              onToggleAutopilot={() => void toggleAutopilot()}
+              onProfileChange={(profile) => void setAutopilotProfile(profile)}
+              onPolicyChange={(patch) => void updateAutopilotPolicy(patch)}
+              onToggleOptimizeMode={() => void toggleOptimizeMode()}
+              onToggleWorkflowMode={() => void toggleWorkflowMode()}
+              onRequestPreview={() => void requestWorkflowPreview()}
+              onCancelPreview={() => void cancelWorkflowPreview()}
+              onCompletePreview={() => void completeWorkflowPreview()}
+              onContinueWorkflow={() => void continueWorkflow()}
+              canContinueWorkflow={workflowRuntimeStatus?.canContinue ?? false}
+              continueDisabledReason={workflowRuntimeStatus?.continueDisabledReason}
+            />
+
+            <section className="workflow-operator-grid workflow-operator-grid--history">
+              <WorkflowContextCards selections={workflow?.memory.lastRelevantContext ?? []} />
+              <WorkflowActivityMiniFeed events={recentActivity} />
+            </section>
+
+            <details
+              id="workflow-detail-disclosure"
+              className="workflow-secondary__details workflow-noisy-detail"
+              onToggle={(event) => {
+                setWorkflowDetailsMounted(event.currentTarget.open);
+              }}
+            >
+              <summary>
+                <span>View workflow details</span>
+                <span className="badge">Full controls</span>
+              </summary>
+              {workflowDetailsMounted ? (
+              <div className="workflow-secondary__content">
+                <WorkflowStepRail steps={workflowTimeline} nowTime={clockNow} />
+                <UltimateGoalProgressCard
+                  progress={workflow?.ultimateGoalProgress}
+                  completion={workflow?.ultimateGoalCompletion}
+                  checklist={workflow?.goalChecklist}
+                  taskMap={workflow?.taskMap}
+                  objective={workflowObjective}
+                  appeal={workflow?.appeal}
+                />
+
+                <div className="workflow-minimal-layout workflow-minimal-layout--legacy">
               <div className="workflow-minimal-layout__main">
                 <article className={`workflow-primary-action ${workflowAction?.kind === "resolve_blocker" ? "workflow-primary-action--blocked" : ""}`}>
                   <div>
@@ -4429,11 +7956,38 @@ export const App = () => {
                           <span className="workflow-option__label">Objective</span>
                           <strong>{workflowObjectiveLabel(workflowObjective)}</strong>
                         </div>
+                        <div className="candidate-card__title-row">
+                          <span className="workflow-option__label">Workflow mode</span>
+                          <strong>{workflowModeLabel(workflowMode)}</strong>
+                        </div>
+                        <div className="candidate-card__title-row">
+                          <span className="workflow-option__label">Autopilot profile</span>
+                          <strong>{autopilotProfileLabel(autopilotProfile)}</strong>
+                        </div>
+                        <label className="form-field">
+                          <span>Profile</span>
+                          <select className="input" value={autopilotProfile} onChange={(event) => void setAutopilotProfile(event.target.value as AutopilotProfile)}>
+                            <option value="balanced">Balanced</option>
+                            <option value="conservative">Conservative</option>
+                            <option value="aggressive">Aggressive</option>
+                            <option value="custom">Custom</option>
+                          </select>
+                        </label>
                         <p className="agent-card__subtle">
                           {optimizeModeEnabled
                             ? "Optimize mode keeps the cycle running after the base goal is satisfied and looks for bounded improvements in UX, correctness, efficiency, resource use, and overall polish."
                             : "Deliver-goal mode runs one final appeal pass for visual projects, then stops once the current Ultimate Goal looks satisfied."}
                         </p>
+                        {autopilotStatus && (autopilotStatus.pausedReason || autopilotStatus.highRiskPackageRequiresApproval) ? (
+                          <div className="lane-note">
+                            <strong>{autopilotStatus.highRiskPackageRequiresApproval ? "High-risk checkpoint" : "Autopilot checkpoint"}</strong>
+                            <span>
+                              {autopilotStatus.highRiskPackageRequiresApproval
+                                ? "The selected package needs explicit approval before autopilot can continue."
+                                : autopilotPauseReasonLabel(autopilotStatus.pausedReason)}
+                            </span>
+                          </div>
+                        ) : null}
                         {workflowPauseRequested ? (
                           <div className="lane-note">
                             <strong>{workflowHasActiveAgent ? "Pause pending" : "Workflow paused"}</strong>
@@ -4450,6 +8004,9 @@ export const App = () => {
                           </button>
                           <button className={optimizeModeEnabled ? "primary-button" : "secondary-button"} onClick={() => void toggleOptimizeMode()}>
                             {optimizeModeEnabled ? "Stop optimizing" : "Optimize"}
+                          </button>
+                          <button className={workflowMode === "fast" ? "primary-button" : "secondary-button"} onClick={() => void toggleWorkflowMode()}>
+                            {workflowMode === "fast" ? "Switch to Normal Mode" : "Switch to Fast Mode"}
                           </button>
                           <button className="secondary-button" onClick={() => void toggleWorkflowPause()}>
                             {workflowPauseRequested ? "Continue workflow" : "Pause after current run"}
@@ -4574,7 +8131,7 @@ export const App = () => {
                 ) : null}
 
                 {(workflowProminence.recommendations || activeProject.record.workflow.recommendations.length > 0 || activeProject.record.workflow.approvedRecommendation) ? (
-                  <details className={`workflow-secondary__details ${workflowProminence.recommendations ? "workflow-panel--prominent" : "workflow-panel--secondary"}`} open={workflowProminence.recommendations}>
+                  <details id="workflow-recommendations" className={`workflow-secondary__details ${workflowProminence.recommendations ? "workflow-panel--prominent" : "workflow-panel--secondary"}`} open={workflowProminence.recommendations}>
                     <summary>
                       <span>Recommendations</span>
                       <span className="badge">{activeProject.record.workflow.recommendations.length}</span>
@@ -4694,7 +8251,7 @@ export const App = () => {
                 </details>
 
                 {pendingUserInputRequests.length > 0 ? (
-                  <article className="overview-card workflow-panel workflow-user-input-panel workflow-panel--prominent">
+                  <article id="workflow-user-input-requests" className="overview-card workflow-panel workflow-user-input-panel workflow-panel--prominent">
                     <SectionTitle
                       eyebrow="Action needed from you"
                       title="External action requests"
@@ -4818,7 +8375,7 @@ export const App = () => {
                 ) : null}
 
                 {pendingHumanInterventions.length > 0 ? (
-                  <article className={`overview-card workflow-panel ${workflowProminence.humanIntervention ? "workflow-panel--prominent" : "workflow-panel--secondary"}`}>
+                  <article id="workflow-attention-details" className={`overview-card workflow-panel ${workflowProminence.humanIntervention ? "workflow-panel--prominent" : "workflow-panel--secondary"}`}>
                     <SectionTitle
                       eyebrow="Action needed from you"
                       title="Human intervention"
@@ -5149,7 +8706,7 @@ export const App = () => {
                 </article>
 
                 <article className="overview-card workflow-agent-list-card workflow-agent-list-card--bounded">
-                  <SectionTitle eyebrow="Current run" title="Active agent" meta={<span className="badge">{currentWorkflowAgent?.status ?? "idle"}</span>} />
+                  <SectionTitle eyebrow="Current run" title="Current saved agent" meta={<span className="badge">{currentWorkflowAgent?.status ?? "idle"}</span>} />
                   {currentWorkflowAgent ? (
                     <AgentCard
                       agent={currentWorkflowAgent}
@@ -5163,173 +8720,79 @@ export const App = () => {
                 </article>
               </aside>
             </div>
+              </div>
+              ) : (
+                <div className="workflow-secondary__content">
+                  <div className="empty-copy">Open details to load advanced workflow controls and traces.</div>
+                </div>
+              )}
+            </details>
           </section>
         ) : null}
 
         {activeWorkspaceTab === "logs" ? (
-          <section className="workflow-control-center panel workflow-log-workspace">
-            <SectionTitle eyebrow="Execution feed" title="Logs" meta={<span className="badge">{pendingApprovals.length} approvals pending</span>} />
-            <div className="workflow-feed-card__grid">
-              <div className="panel support-panel workflow-feed-card__panel">
-                <SectionTitle eyebrow="Approvals" title="Pending requests" />
-                <div className="workflow-feed-card__scroll workflow-feed-card__scroll--tall">
-                  <div className="approval-list">
-                    {pendingApprovals.length ? pendingApprovals.map((approval) => (
-                      <div key={approval.id} className="approval-row">
-                        <div>
-                          <strong>{approval.summary}</strong>
-                          <div>{approval.reason ?? approval.command ?? "Approval required"}</div>
-                        </div>
-                        <div className="actions-row">
-                          <button className="primary-button" onClick={() => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}>Accept</button>
-                          <button className="secondary-button" onClick={() => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}>Reject</button>
-                        </div>
-                      </div>
-                    )) : <div className="empty-copy">No approvals are currently waiting.</div>}
-                  </div>
-                </div>
-              </div>
-
-              <div className="panel support-panel workflow-feed-card__panel">
-                <SectionTitle eyebrow="Workflow" title="Activity log" meta={logFeed.loading ? <span className="badge">Loading</span> : null} />
-                <FeedPager
-                  label="Activity"
-                  pageIndex={activityLogPageIndex}
-                  pageSize={LOG_ACTIVITY_PAGE_SIZE}
-                  total={logFeed.activity.total}
-                  visibleCount={logFeed.activity.entries.length}
-                  onPageChange={setActivityLogPageIndex}
-                />
-                <div className="workflow-feed-card__scroll workflow-feed-card__scroll--tall">
-                  <div className="activity-list">
-                    {logFeed.activity.entries.length ? logFeed.activity.entries
-                      .map((event) => (
-                        <div key={event.id} className="activity-row">
-                          <strong>{event.title}</strong>
-                          <span>{event.detail ?? workflowActivitySourceLabel(event.source)} · {formatClockTime(event.timestamp)}</span>
-                        </div>
-                      )) : <div className="empty-copy">Workflow activity will appear here once work starts.</div>}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <article className="overview-card workflow-panel">
-              <SectionTitle eyebrow="Commands" title="Command snippets" meta={logFeed.loading ? <span className="badge">Loading</span> : null} />
-              <FeedPager
-                label="Commands"
-                pageIndex={commandLogPageIndex}
-                pageSize={LOG_COMMAND_PAGE_SIZE}
-                total={logFeed.commands.total}
-                visibleCount={logFeed.commands.entries.length}
-                onPageChange={setCommandLogPageIndex}
-              />
-              <div className="workflow-feed-card__scroll workflow-feed-card__scroll--commands">
-                <div className="activity-list">
-                  {logFeed.commands.entries.map((command) => (
-                    <div key={command.id} className="activity-row">
-                      <strong>{command.agentName}</strong>
-                      <span>{command.command} · {command.status}</span>
-                    </div>
-                  ))}
-                  {logFeed.commands.entries.length === 0 ? (
-                    <div className="empty-copy">No command snippets have been recorded yet.</div>
-                  ) : null}
-                </div>
-              </div>
-            </article>
-          </section>
+          <LogsPanel
+            logFeed={logFeed}
+            agents={allAgents}
+            pendingApprovals={pendingApprovals}
+            activityLogPageIndex={activityLogPageIndex}
+            commandLogPageIndex={commandLogPageIndex}
+            onActivityPageChange={setActivityLogPageIndex}
+            onCommandPageChange={setCommandLogPageIndex}
+            onApprove={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}
+            onReject={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}
+          />
         ) : null}
 
-        {activeWorkspaceTab === "agents" ? (
+        {activeWorkspaceTab === "runs" ? (
           <section className="workflow-control-center panel agent-history-workspace">
-            <SectionTitle eyebrow="Run history" title="Agent History" meta={<span className="badge">{allAgents.length} runs</span>} />
-            <div className="agent-history-layout">
-              <div className="agent-history-layout__lists">
-                <article className="overview-card workflow-agent-list-card">
-                  <SectionTitle
-                    eyebrow="Workflow"
-                    title="Workflow runs"
-                    meta={<span className="badge">{workflowAgentPage.loading ? "Loading" : `${workflowAgentPage.total} runs`}</span>}
-                  />
-                  <PagedAgentList
-                    agents={workflowAgentPage.agents}
-                    workflow={workflow}
-                    selectedAgentId={activeAgent?.id}
-                    totalAgents={workflowAgentPage.total}
-                    pageIndex={workflowAgentPageIndex}
-                    onPageChange={setWorkflowAgentPageIndex}
-                    emptyCopy="No workflow agents have started yet."
-                    onSelect={(agentId) => void selectAgent(agentId)}
-                  />
-                </article>
-                <article className="overview-card workflow-agent-list-card">
-                  <SectionTitle
-                    eyebrow="Manual"
-                    title="Independent runs"
-                    meta={<span className="badge">{manualAgentPage.loading ? "Loading" : `${manualAgentPage.total} runs`}</span>}
-                  />
-                  <div className="agent-form card-surface">
-                    <textarea
-                      className="textarea"
-                      placeholder="Ask a question about the repo or describe a change outside the workflow cycle."
-                      value={manualAgentPrompt}
-                      onChange={(event) => setManualAgentPrompt(event.target.value)}
-                    />
-                    <select className="input" value={manualAgentModel} onChange={(event) => setManualAgentModel(event.target.value)}>
-                      {state.availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
-                    </select>
-                    <AgentReasoningPicker
-                      category="manual"
-                      model={modelOptionsByName.get(manualAgentModel)}
-                      taskPrompt={manualAgentPrompt}
-                      mode={manualAgentReasoningMode}
-                      effort={manualAgentReasoningEffort}
-                      onModeChange={setManualAgentReasoningMode}
-                      onEffortChange={setManualAgentReasoningEffort}
-                    />
-                    <div className="actions-row">
-                      <button className="primary-button" disabled={!manualAgentPrompt.trim() || !manualAgentModel} onClick={() => void createManualAgent()}>
-                        Run manual agent
-                      </button>
-                      <span className="agent-card__subtle">{manualPendingApprovalCount} manual approvals pending</span>
-                    </div>
-                  </div>
-                  <PagedAgentList
-                    agents={manualAgentPage.agents}
-                    workflow={workflow}
-                    selectedAgentId={activeAgent?.id}
-                    totalAgents={manualAgentPage.total}
-                    pageIndex={manualAgentPageIndex}
-                    onPageChange={setManualAgentPageIndex}
-                    emptyCopy="No manual agents have started yet."
-                    onSelect={(agentId) => void selectAgent(agentId)}
-                  />
-                </article>
-              </div>
-              <div className="agent-history-layout__detail">
-                <AgentFocusPanel agent={activeAgentForDetail} workflow={workflow} />
-                <article className="overview-card workflow-panel">
-                  <SectionTitle eyebrow="Developer" title="Workflow controls" />
-                  <div className="actions-row">
-                    <button className="secondary-button" disabled={!activeProject.record.workflow.approvedRecommendation} onClick={() => void createScopedGoal()}>
-                      Create scoped goal
-                    </button>
-                    <button className="secondary-button" disabled={recommendationRegenerationLocked} onClick={() => void runRecommendation()}>
-                      Run recommendation
-                    </button>
-                    <button className="secondary-button" onClick={() => void window.workbench.runIntegrity(activeProject.record.id)}>Run integrity</button>
-                    <button className="secondary-button" onClick={() => void window.workbench.runMerge(activeProject.record.id)}>Run merge</button>
-                    <button className="secondary-button" onClick={() => void advanceWorkflowStage()}>Advance workflow stage</button>
-                  </div>
-                </article>
-              </div>
-            </div>
+            <RunsReviewPage
+              agents={runsPageAgents}
+              totalAgents={totalRunsCount}
+              workflowPage={workflowAgentPage}
+              manualPage={manualAgentPage}
+              workflowPageIndex={workflowAgentPageIndex}
+              manualPageIndex={manualAgentPageIndex}
+              workflow={workflow}
+              selectedAgent={selectedRunAgent}
+              loading={workflowAgentPage.loading || manualAgentPage.loading}
+              manualAgentPrompt={manualAgentPrompt}
+              manualAgentModel={manualAgentModel}
+              manualAgentReasoningMode={manualAgentReasoningMode}
+              manualAgentReasoningEffort={manualAgentReasoningEffort}
+              availableModels={state.availableModels}
+              modelOptionsByName={modelOptionsByName}
+              manualPendingApprovalCount={manualPendingApprovalCount}
+              onSelectAgent={(agentId) => void selectAgent(agentId)}
+              onWorkflowPageChange={setWorkflowAgentPageIndex}
+              onManualPageChange={setManualAgentPageIndex}
+              onOpenWorkflow={() => void setWorkspaceTab("workflow")}
+              onOpenLogs={() => void setWorkspaceTab("logs")}
+              onManualPromptChange={setManualAgentPrompt}
+              onManualModelChange={setManualAgentModel}
+              onManualReasoningModeChange={setManualAgentReasoningMode}
+              onManualReasoningEffortChange={setManualAgentReasoningEffort}
+              onCreateManualAgent={() => void createManualAgent()}
+            />
           </section>
         ) : null}
 
         {activeWorkspaceTab === "credentials" ? (
           <CredentialsPanel project={activeProject} onSaved={showInfoNotice} onError={handleError} />
+        ) : null}
+
+        {activeWorkspaceTab === "settings" ? (
+          <SettingsDialog
+            mode="page"
+            state={state}
+            github={state.github}
+            settingsDraft={settingsDraft}
+            onChange={updateSettingsDraft}
+            onSave={saveSettings}
+            onClose={() => void setWorkspaceTab("overview")}
+            onOpenDevTools={() => void openDevTools()}
+            onRefreshGitHubStatus={() => void refreshGitHubStatus()}
+          />
         ) : null}
       </main>
 

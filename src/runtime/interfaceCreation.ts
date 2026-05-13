@@ -359,7 +359,7 @@ export const buildInterfaceCreationTurn = async (input: {
       "For trading, market-data, brokerage, or finance-oriented interfaces, do not assume a single provider. Call out likely provider abstractions and credential needs without placing secrets or machine-specific account data in the portable interface.",
       input.considerPaidServices
         ? "Paid external services may be considered only if they are clearly labeled and a free/demo/mock mode remains available."
-        : "Do not make paid API services, subscriptions, billing setup, or credit-card-backed keys part of the required interface path. Prefer no-key, open-data, demo, or free-tier provider options. Free/no-card API keys are acceptable when entered locally through API Keys; do not treat them as secrets that belong in portable interface data.",
+        : "Do not make paid API services, subscriptions, billing setup, or credit-card-backed keys part of the required interface path. Prefer no-key, open-data, demo, or free-tier provider options. Free/no-card API keys are acceptable when entered locally through Credentials; do not treat them as secrets that belong in portable interface data.",
       "Return exactly one JSON object that matches the output schema.",
       "Do not wrap the JSON in markdown fences and do not add any commentary before or after it.",
       "Every overview string field must be present and non-empty. Use concise factual text rather than placeholders.",

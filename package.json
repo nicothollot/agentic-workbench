@@ -20,6 +20,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "repair:state": "node scripts/repair-state.mjs",
     "package:win": "node scripts/package-app.mjs --win",
     "package:mac": "node scripts/package-app.mjs --mac",
     "package:all": "node scripts/package-app.mjs --all",

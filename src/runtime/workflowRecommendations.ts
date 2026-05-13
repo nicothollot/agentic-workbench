@@ -3,10 +3,13 @@ import { nanoid } from "nanoid";
 import type {
   AgentState,
   GoalAttainmentCheck,
+  GoalCheckAuditFlag,
+  GoalCheckItemKind,
   GoalCheckSource,
   GoalCheckStatus,
   ProjectOverview,
   ProjectWorkflowState,
+  WorkPackage,
   WorkflowTaskMap,
   UltimateGoal,
   UltimateGoalCompletionState,
@@ -15,7 +18,13 @@ import type {
   WorkflowRecommendationOption
 } from "@shared/types";
 import { nowIso } from "@shared/utils";
+import { getWorkflowModeConfig, getWorkflowPreviewRequest, resolveEffectiveAutopilotPolicy } from "@shared/workflow";
 import type { RepoScanResult } from "./repoScanner";
+import {
+  sanitizeChecklistEvidenceText,
+  sanitizeGoalAttainmentCheck,
+  sanitizeGoalCheckEvidenceHistory
+} from "./stateSanitizer";
 import { sanitizeRecommendationForCycle } from "./workflowGuardrails";
 
 const STOPWORDS = new Set([
@@ -75,6 +84,8 @@ interface RecommendationDraft {
   estimatedScope: WorkflowRecommendationOption["estimatedScope"];
   riskLevel: WorkflowRecommendationOption["riskLevel"];
   relatedPaths: string[];
+  sourceWorkPackageId?: string;
+  targetedCheckIds?: string[];
 }
 
 export interface WorkflowRecommendationContext {
@@ -186,6 +197,145 @@ const statusRank: Record<GoalCheckStatus, number> = {
 };
 
 const requiredUserGoalCheckSources = new Set<GoalCheckSource>(["success_criterion", "quality_bar", "constraint"]);
+const requiredSystemGoalCheckSources = new Set<GoalCheckSource>(["success_criterion", "quality_bar", "constraint", "deterministic"]);
+
+const getGoalCheckItemKind = (check: Pick<GoalAttainmentCheck, "required"> & { itemKind?: GoalCheckItemKind }): GoalCheckItemKind =>
+  check.itemKind ?? (check.required ? "required" : "backlog");
+
+const isGoalCheckBacklogOrObservation = (check: Pick<GoalAttainmentCheck, "required"> & { itemKind?: GoalCheckItemKind }): boolean =>
+  getGoalCheckItemKind(check) !== "required";
+
+const normalizeGoalCheckKind = (
+  itemKind: GoalCheckItemKind,
+  status: GoalCheckStatus
+): { itemKind: GoalCheckItemKind; required: boolean } => {
+  if (status === "not_applicable") {
+    return { itemKind, required: false };
+  }
+  return {
+    itemKind,
+    required: itemKind === "required"
+  };
+};
+
+const toGoalCheckPathArea = (value: string): string => {
+  const normalized = value.trim().replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+$/, "");
+  if (!normalized) {
+    return "";
+  }
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) {
+    return "";
+  }
+  if (parts[0] === "src" && parts[1]) {
+    return `src/${parts[1]}`;
+  }
+  return parts.length > 1 && !path.extname(normalized) ? parts.slice(0, 2).join("/") : normalized;
+};
+
+const pathAreas = (paths: string[] = []): string[] =>
+  unique(paths.map(toGoalCheckPathArea).filter(Boolean)).sort();
+
+const stemChecklistToken = (token: string): string => {
+  if (token.length > 5 && token.endsWith("ing")) {
+    return token.slice(0, -3);
+  }
+  if (token.length > 4 && token.endsWith("ed")) {
+    return token.slice(0, -2);
+  }
+  if (token.length > 4 && token.endsWith("es")) {
+    return token.slice(0, -2);
+  }
+  if (token.length > 3 && token.endsWith("s")) {
+    return token.slice(0, -1);
+  }
+  return token;
+};
+
+const checklistTokenSet = (value: string): Set<string> =>
+  new Set(tokenize(normalizeGoalCheckSemanticText(value)).map(stemChecklistToken));
+
+const tokenOverlapRatio = (left: Set<string>, right: Set<string>): number => {
+  const [smaller, larger] = left.size < right.size ? [left, right] : [right, left];
+  if (smaller.size === 0 || larger.size === 0) {
+    return 0;
+  }
+  let shared = 0;
+  for (const token of smaller) {
+    if (larger.has(token)) {
+      shared += 1;
+    }
+  }
+  return shared / smaller.size;
+};
+
+const tokenJaccardScore = (left: Set<string>, right: Set<string>): number => {
+  const union = new Set([...left, ...right]);
+  if (union.size === 0) {
+    return 0;
+  }
+  let shared = 0;
+  for (const token of left) {
+    if (right.has(token)) {
+      shared += 1;
+    }
+  }
+  return shared / union.size;
+};
+
+const setsIntersect = <T>(left: T[], right: T[]): boolean => {
+  const rightSet = new Set(right);
+  return left.some((entry) => rightSet.has(entry));
+};
+
+const inferGoalCheckPrimaryTopic = (check: GoalAttainmentCheck): string => buildGoalCheckBatchLabel([check]);
+
+const buildGoalCheckCanonicalKey = (check: GoalAttainmentCheck): string => {
+  const normalizedTitle = normalizeGoalCheckSemanticText(check.title);
+  const tokens = [...checklistTokenSet(`${check.title} ${check.description}`)].sort().slice(0, 10);
+  const paths = pathAreas(check.relatedPaths ?? []).slice(0, 4);
+  const topic = normalizeGoalCheckSemanticText(inferGoalCheckPrimaryTopic(check));
+  const sourceFamily = requiredUserGoalCheckSources.has(check.source)
+    ? "goal"
+    : check.source === "deterministic"
+      ? "deterministic"
+      : getGoalCheckItemKind(check);
+  return [
+    `source:${sourceFamily}`,
+    `topic:${topic}`,
+    paths.length ? `paths:${paths.join(",")}` : "",
+    `intent:${tokens.join("-") || normalizedTitle}`
+  ].filter(Boolean).join("|");
+};
+
+const goalCheckHistoryEntry = (check: GoalAttainmentCheck): NonNullable<GoalAttainmentCheck["evidenceHistory"]>[number] => ({
+  checkId: check.id,
+  title: check.title,
+  source: check.source,
+  status: check.status,
+  evidence: sanitizeChecklistEvidenceText(check.evidence),
+  ownerAgentId: check.ownerAgentId,
+  createdAt: check.createdAt,
+  updatedAt: check.updatedAt
+});
+
+const collectGoalCheckEvidenceHistory = (checks: GoalAttainmentCheck[]): NonNullable<GoalAttainmentCheck["evidenceHistory"]> => {
+  const seen = new Set<string>();
+  const entries = checks
+    .flatMap((check) => [
+      goalCheckHistoryEntry(check),
+      ...(check.evidenceHistory ?? [])
+    ])
+    .filter((entry) => {
+      const key = `${entry.checkId}:${entry.status}:${entry.evidence}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  return sanitizeGoalCheckEvidenceHistory(entries);
+};
 
 const goalCheckSourceRank: Record<GoalCheckSource, number> = {
   success_criterion: 5,
@@ -193,13 +343,6 @@ const goalCheckSourceRank: Record<GoalCheckSource, number> = {
   constraint: 4,
   agent: 2,
   deterministic: 1
-};
-
-const goalCheckStatusMergeRank: Record<GoalCheckStatus, number> = {
-  met: 4,
-  unmet: 3,
-  unknown: 2,
-  not_applicable: 1
 };
 
 const weakChecklistEvidencePatterns = [
@@ -232,27 +375,26 @@ const chooseRepresentativeGoalCheck = (checks: GoalAttainmentCheck[]): GoalAttai
   })[0] ?? checks[0];
 
 const chooseMergedGoalCheckStatus = (checks: GoalAttainmentCheck[]): GoalCheckStatus => {
-  const stillRequired = checks.some((check) => check.required && check.status !== "not_applicable");
-  if (!stillRequired) {
+  const activeChecks = checks.filter((check) => getGoalCheckItemKind(check) === "required");
+  const representative = chooseRepresentativeGoalCheck(checks);
+  if (activeChecks.length === 0) {
     return "not_applicable";
   }
-
-  const strongEvidenceChecks = checks
-    .filter((check) => !isWeakChecklistEvidence(check.evidence))
-    .sort((left, right) =>
-      goalCheckTime(right.updatedAt) - goalCheckTime(left.updatedAt) ||
-      goalCheckStatusMergeRank[right.status] - goalCheckStatusMergeRank[left.status]
-    );
-  const latestStrongStatus = strongEvidenceChecks.find((check) => check.status !== "not_applicable")?.status;
-  if (latestStrongStatus) {
-    return latestStrongStatus;
+  if (representative.status === "not_applicable" && representative.evidence.trim()) {
+    return "not_applicable";
   }
-
-  if (checks.some((check) => check.status === "met" && check.evidence.trim())) {
-    return "met";
+  if (activeChecks.every((check) => check.status === "not_applicable")) {
+    return "not_applicable";
   }
-  if (checks.some((check) => check.status === "unmet")) {
+  const activeNonNotApplicable = activeChecks.filter((check) => check.status !== "not_applicable");
+  if (activeNonNotApplicable.some((check) => check.status === "unmet")) {
     return "unmet";
+  }
+  if (activeNonNotApplicable.some((check) => check.status === "unknown")) {
+    return "unknown";
+  }
+  if (activeNonNotApplicable.length > 0 && activeNonNotApplicable.every((check) => check.status === "met")) {
+    return "met";
   }
   return "unknown";
 };
@@ -269,52 +411,236 @@ const chooseMergedGoalCheckEvidence = (checks: GoalAttainmentCheck[]): string =>
     });
   const primaryEvidence = stripConsolidationNotes(evidenceChecks[0]?.evidence.trim() ?? "");
   if (checks.length <= 1) {
-    return primaryEvidence;
+    return sanitizeChecklistEvidenceText(primaryEvidence);
   }
   const consolidationNote = `Consolidated ${checks.length} semantically equivalent checklist entries.`;
-  return primaryEvidence ? `${primaryEvidence} ${consolidationNote}` : consolidationNote;
+  return sanitizeChecklistEvidenceText(primaryEvidence ? `${primaryEvidence}\n${consolidationNote}` : consolidationNote);
 };
 
-export const consolidateGoalChecklist = (checklist: GoalAttainmentCheck[]): GoalAttainmentCheck[] => {
-  const groups = new Map<string, GoalAttainmentCheck[]>();
-  for (const check of checklist) {
-    const key = goalCheckSemanticKey(check);
-    groups.set(key, [...(groups.get(key) ?? []), check]);
+const normalizedCheckComparableText = (check: GoalAttainmentCheck): string =>
+  normalizeGoalCheckSemanticText(`${check.title} ${check.description}`);
+
+const hasSharedAcceptancePhrase = (left: GoalAttainmentCheck, right: GoalAttainmentCheck): boolean => {
+  const leftEvidence = normalizeGoalCheckSemanticText(left.evidence);
+  const rightEvidence = normalizeGoalCheckSemanticText(right.evidence);
+  if (!leftEvidence || !rightEvidence) {
+    return false;
+  }
+  const leftTokens = checklistTokenSet(leftEvidence);
+  const rightTokens = checklistTokenSet(rightEvidence);
+  return tokenOverlapRatio(leftTokens, rightTokens) >= 0.62 && tokenJaccardScore(leftTokens, rightTokens) >= 0.33;
+};
+
+const areDuplicateGoalChecks = (left: GoalAttainmentCheck, right: GoalAttainmentCheck): boolean => {
+  const leftTitle = normalizeGoalCheckSemanticText(left.title);
+  const rightTitle = normalizeGoalCheckSemanticText(right.title);
+  if (leftTitle && leftTitle === rightTitle) {
+    return true;
+  }
+  const leftNumbers = left.title.match(/\d+/g) ?? [];
+  const rightNumbers = right.title.match(/\d+/g) ?? [];
+  if (leftNumbers.length > 0 && rightNumbers.length > 0 && leftNumbers.join(".") !== rightNumbers.join(".")) {
+    return false;
   }
 
-  return [...groups.values()]
+  const leftText = normalizedCheckComparableText(left);
+  const rightText = normalizedCheckComparableText(right);
+  if (leftText && rightText && (leftText.includes(rightText) || rightText.includes(leftText)) && Math.min(leftText.length, rightText.length) >= 28) {
+    return true;
+  }
+
+  if (goalCheckSemanticKey(left) === goalCheckSemanticKey(right) && goalCheckSemanticKey(left).startsWith("constraint:")) {
+    return true;
+  }
+
+  const leftTokens = checklistTokenSet(leftText);
+  const rightTokens = checklistTokenSet(rightText);
+  const overlap = tokenOverlapRatio(leftTokens, rightTokens);
+  const jaccard = tokenJaccardScore(leftTokens, rightTokens);
+  const sharedPathArea = setsIntersect(pathAreas(left.relatedPaths ?? []), pathAreas(right.relatedPaths ?? []));
+  const sharedTopic = inferGoalCheckPrimaryTopic(left) === inferGoalCheckPrimaryTopic(right);
+  const sharedRequiredSource = left.source === right.source && left.source !== "agent";
+  const sharedSourceHistory = Boolean(left.sourceCheckIds?.some((id) => right.sourceCheckIds?.includes(id) || id === right.id));
+
+  if (sharedSourceHistory) {
+    return true;
+  }
+  if (overlap >= 0.9 || jaccard >= 0.78) {
+    return true;
+  }
+  if (overlap >= 0.74 && (sharedTopic || sharedPathArea || sharedRequiredSource || hasSharedAcceptancePhrase(left, right))) {
+    return true;
+  }
+  if (overlap >= 0.7 && jaccard >= 0.42 && (hasSharedAcceptancePhrase(left, right) || sharedPathArea)) {
+    return true;
+  }
+  if (sharedPathArea && left.source !== right.source && overlap >= 0.55 && jaccard >= 0.28) {
+    return true;
+  }
+  if (overlap >= 0.62 && jaccard >= 0.45 && sharedTopic && (sharedPathArea || sharedRequiredSource)) {
+    return true;
+  }
+  return false;
+};
+
+const addAuditFlag = (flags: Set<GoalCheckAuditFlag>, flag: GoalCheckAuditFlag): void => {
+  flags.add(flag);
+};
+
+const vagueChecklistPatterns = [
+  /\bimprove\b/i,
+  /\bbetter\b/i,
+  /\bnice\b/i,
+  /\bpolish\b/i,
+  /\brobust\b/i,
+  /\bclean up\b/i,
+  /\boptimi[sz]e\b/i,
+  /\benhance\b/i
+];
+
+const taskLikeChecklistPattern = /^\s*(?:add|build|create|fix|implement|investigate|refactor|remove|rename|update|wire)\b/i;
+const observableChecklistPattern = /\b(?:assert|block|display|emit|fail|hide|include|load|persist|prevent|record|render|return|show|store|validate|verify|visible|without|with)\b/i;
+const concreteChecklistPattern = /\b(?:test|spec|validation|command|file|path|screen|button|dialog|ipc|schema|state|error|empty|loading|security|credential|secret|runtime|renderer|preload|main process|src\/|tests?\/|\.tsx?\b|\.jsx?\b|\.css\b)\b/i;
+
+const hasConcreteAcceptanceSignal = (check: GoalAttainmentCheck): boolean => {
+  const text = `${check.title} ${check.description} ${check.evidence} ${(check.relatedPaths ?? []).join(" ")}`;
+  return check.relatedPaths.length > 0 ||
+    Boolean(check.evidence.trim() && !isWeakChecklistEvidence(check.evidence)) ||
+    observableChecklistPattern.test(text) ||
+    concreteChecklistPattern.test(text);
+};
+
+const goalTiesCheck = (check: GoalAttainmentCheck, goal?: UltimateGoal): boolean => {
+  if (!goal || requiredSystemGoalCheckSources.has(check.source)) {
+    return true;
+  }
+  const goalText = [
+    goal.summary,
+    goal.detailedIntent,
+    goal.qualityBar,
+    ...goal.successCriteria,
+    ...goal.constraints
+  ].join(" ");
+  const goalTokens = checklistTokenSet(goalText);
+  const checkTokens = checklistTokenSet(`${check.title} ${check.description}`);
+  return tokenOverlapRatio(checkTokens, goalTokens) >= 0.42 || tokenJaccardScore(checkTokens, goalTokens) >= 0.24;
+};
+
+export const auditGoalChecklist = (checklist: GoalAttainmentCheck[], goal?: UltimateGoal): GoalAttainmentCheck[] =>
+  checklist.map((check) => {
+    const flags = new Set<GoalCheckAuditFlag>(check.auditFlags ?? []);
+    const text = normalizeSpace(`${check.title} ${check.description}`);
+    const concrete = hasConcreteAcceptanceSignal(check);
+    const itemKind = getGoalCheckItemKind(check);
+
+    if (vagueChecklistPatterns.some((pattern) => pattern.test(text)) && !concrete) {
+      addAuditFlag(flags, "vague");
+    }
+    if (!concrete && check.status !== "not_applicable") {
+      addAuditFlag(flags, "not_observable");
+    }
+    if (text.length > 220 || text.split(/\b(?:and|or)\b|[,;]/i).filter((entry) => entry.trim().length > 0).length >= 5) {
+      addAuditFlag(flags, "too_broad");
+    }
+    if (taskLikeChecklistPattern.test(check.title) && !/\bmust\b|\bshould\b|\brequires?\b|\bacceptance\b/i.test(check.title)) {
+      addAuditFlag(flags, "task_not_requirement");
+    }
+    if (/\b(?:nice to have|optional|polish|fit and finish|cleanup|clean up)\b/i.test(text) && !requiredUserGoalCheckSources.has(check.source)) {
+      addAuditFlag(flags, "polish_not_required");
+    }
+    if (/\b(?:impossible to validate|cannot validate|not observable|unverifiable)\b/i.test(text)) {
+      addAuditFlag(flags, "impossible_to_validate");
+    }
+    if (!goalTiesCheck(check, goal) && !/\b(?:block|blocked|credential|secret|security|validation|integrity|merge conflict|runtime safety)\b/i.test(text)) {
+      addAuditFlag(flags, "not_tied_to_goal");
+    }
+
+    const normalizedKind = normalizeGoalCheckKind(itemKind, check.status);
+    return {
+      ...check,
+      ...normalizedKind,
+      auditFlags: [...flags].sort(),
+      needsRefinement: flags.has("vague") || flags.has("not_observable") || flags.has("too_broad") || flags.has("impossible_to_validate") || undefined,
+      classificationReason: check.classificationReason
+    };
+  });
+
+export const consolidateGoalChecklist = (checklist: GoalAttainmentCheck[]): GoalAttainmentCheck[] => {
+  const groups: GoalAttainmentCheck[][] = [];
+  for (const rawCheck of checklist) {
+    const itemKind = getGoalCheckItemKind(rawCheck);
+    const normalizedKind = normalizeGoalCheckKind(itemKind, rawCheck.status);
+    const check: GoalAttainmentCheck = sanitizeGoalAttainmentCheck({
+      ...rawCheck,
+      ...normalizedKind,
+      relatedPaths: [...(rawCheck.relatedPaths ?? [])],
+      sourceCheckIds: rawCheck.sourceCheckIds ?? [rawCheck.id],
+      relatedCheckIds: rawCheck.relatedCheckIds ?? [],
+      evidenceHistory: rawCheck.evidenceHistory ?? []
+    });
+    const matchingGroup = groups.find((group) => group.some((entry) => areDuplicateGoalChecks(entry, check)));
+    if (matchingGroup) {
+      matchingGroup.push(check);
+    } else {
+      groups.push([check]);
+    }
+  }
+
+  return groups
     .map((group) => {
       if (group.length === 1) {
         const [check] = group;
-        return {
+        const canonicalKey = buildGoalCheckCanonicalKey(check);
+        return sanitizeGoalAttainmentCheck({
           ...check,
-          relatedPaths: [...(check.relatedPaths ?? [])]
-        };
+          canonicalKey,
+          groupId: check.groupId ?? `goal-check:${stableHash(canonicalKey)}`,
+          sourceCheckIds: unique(check.sourceCheckIds ?? [check.id]),
+          relatedCheckIds: unique(check.relatedCheckIds ?? []),
+          evidenceHistory: collectGoalCheckEvidenceHistory([check])
+        });
       }
 
       const representative = chooseRepresentativeGoalCheck(group);
       const status = chooseMergedGoalCheckStatus(group);
-      const required = group.some((check) => check.required && check.status !== "not_applicable");
+      const itemKind: GoalCheckItemKind = group.some((check) => getGoalCheckItemKind(check) === "required" && check.status !== "not_applicable")
+        ? "required"
+        : group.some((check) => getGoalCheckItemKind(check) === "backlog")
+          ? "backlog"
+          : "observation";
+      const { required } = normalizeGoalCheckKind(itemKind, status);
       const description = [...group]
         .sort((left, right) => right.description.length - left.description.length)[0]?.description ?? representative.description;
       const confidence = Math.max(...group.map((check) => check.confidence ?? 0));
       const ownerAgent = [...group]
         .sort((left, right) => goalCheckTime(right.updatedAt) - goalCheckTime(left.updatedAt))
         .find((check) => check.ownerAgentId)?.ownerAgentId;
+      const canonicalKey = buildGoalCheckCanonicalKey(representative);
+      const groupId = representative.groupId ?? `goal-check:${stableHash(canonicalKey)}`;
+      const relatedCheckIds = unique(group.flatMap((check) => [check.id, ...(check.relatedCheckIds ?? [])]).filter((id) => id !== representative.id));
+      const auditFlags = unique([...group.flatMap((check) => check.auditFlags ?? []), "duplicate" as const]).sort();
 
-      return {
+      return sanitizeGoalAttainmentCheck({
         ...representative,
         title: representative.title,
         description,
-        required: status === "not_applicable" ? false : required,
+        required,
+        itemKind,
+        canonicalKey,
+        groupId,
+        sourceCheckIds: unique(group.flatMap((check) => check.sourceCheckIds ?? [check.id])),
+        relatedCheckIds,
+        auditFlags,
+        needsRefinement: auditFlags.some((flag) => flag !== "duplicate") || undefined,
         status,
         confidence: confidence > 0 ? confidence : representative.confidence,
         evidence: chooseMergedGoalCheckEvidence(group),
+        evidenceHistory: collectGoalCheckEvidenceHistory(group),
         relatedPaths: unique(group.flatMap((check) => check.relatedPaths ?? [])).slice(0, 8),
         ownerAgentId: ownerAgent ?? representative.ownerAgentId,
         createdAt: [...group].sort((left, right) => goalCheckTime(left.createdAt) - goalCheckTime(right.createdAt))[0]?.createdAt ?? representative.createdAt,
         updatedAt: [...group].sort((left, right) => goalCheckTime(right.updatedAt) - goalCheckTime(left.updatedAt))[0]?.updatedAt ?? representative.updatedAt
-      };
+      });
     })
     .sort((left, right) => {
       if (left.required !== right.required) {
@@ -328,7 +654,7 @@ export const consolidateGoalChecklist = (checklist: GoalAttainmentCheck[]): Goal
 };
 
 const isRequiredForCompletion = (check: GoalAttainmentCheck): boolean =>
-  check.required && check.status !== "not_applicable";
+  check.required && getGoalCheckItemKind(check) === "required" && check.status !== "not_applicable";
 
 const isMetForCompletion = (check: GoalAttainmentCheck): boolean => check.status === "met";
 
@@ -350,7 +676,8 @@ const goalCheckStatusImpactScore: Record<GoalCheckStatus, number> = {
 const goalCheckCompletionImpactScore = (check: GoalAttainmentCheck): number =>
   goalCheckSourceImpactScore[check.source] +
   goalCheckStatusImpactScore[check.status] +
-  (check.required ? 12 : 0);
+  (check.required ? 12 : 0) -
+  (isGoalCheckBacklogOrObservation(check) ? 120 : 0);
 
 const rankGoalChecksByCompletionImpact = (checks: GoalAttainmentCheck[]): GoalAttainmentCheck[] =>
   checks
@@ -483,6 +810,39 @@ const buildGoalCheckTaskGroups = (
     );
 };
 
+const buildPathCoherentGoalCheckTaskGroups = (
+  context: WorkflowRecommendationContext,
+  rankedChecks: GoalAttainmentCheck[]
+): GoalCheckTaskGroup[] => {
+  const groups = new Map<string, GoalAttainmentCheck[]>();
+  const candidates = rankedChecks.filter((check) => batchableGoalCheckSources.has(check.source));
+
+  for (const check of candidates) {
+    const likelyPaths = collectGoalCheckBatchPaths(context, [check]);
+    const areas = pathAreas(likelyPaths.length ? likelyPaths : check.relatedPaths ?? []);
+    for (const area of areas.slice(0, 2)) {
+      groups.set(area, [...(groups.get(area) ?? []), check]);
+    }
+  }
+
+  return [...groups.entries()]
+    .filter(([, checks]) => checks.length >= 2)
+    .map(([area, checks]) => {
+      const ranked = rankGoalChecksByCompletionImpact(checks);
+      return {
+        label: `${area} required checks`,
+        checks: ranked,
+        relatedPaths: collectGoalCheckBatchPaths(context, ranked),
+        score: rankGoalCheckBatch(ranked) + ranked.length * 14
+      };
+    })
+    .sort((left, right) =>
+      right.score - left.score ||
+      right.checks.length - left.checks.length ||
+      left.label.localeCompare(right.label)
+    );
+};
+
 const buildGoalCheckBatches = (
   context: WorkflowRecommendationContext,
   rankedChecks: GoalAttainmentCheck[]
@@ -491,16 +851,220 @@ const buildGoalCheckBatches = (
     .filter((batch) => batch.checks.length >= 2)
     .map(({ label, checks, relatedPaths }) => ({ label, checks, relatedPaths }));
 
+export interface ChecklistWorkPackageOptions {
+  maxPackages?: number;
+  minChecksPerPackage?: number;
+  maxChecksPerPackage?: number;
+}
+
+const safetyCriticalPackagePattern =
+  /\b(?:credential|credentials|secret|secrets|api key|token|oauth|approval|sandbox|node api|contextisolation|nodeintegration|renderer\/main|renderer-main|main process|runtime safety|brokerage|trade|order|security|privileged|merge conflict|integrity|validation)\b/i;
+
+const isSafetyCriticalPackage = (checks: GoalAttainmentCheck[], likelyPaths: string[] = []): boolean =>
+  safetyCriticalPackagePattern.test([
+    ...checks.flatMap((check) => [check.title, check.description, check.evidence, ...check.relatedPaths]),
+    ...likelyPaths
+  ].join(" "));
+
+const estimatePackageBreadth = (
+  checks: GoalAttainmentCheck[],
+  likelyPaths: string[],
+  maxChecksPerPackage: number
+): WorkPackage["estimatedBreadth"] => {
+  const areaCount = pathAreas(likelyPaths).length;
+  if (checks.length <= 1 && areaCount <= 1) {
+    return "small";
+  }
+  if (checks.length <= 4 && areaCount <= 3) {
+    return "medium";
+  }
+  if (checks.length <= maxChecksPerPackage && areaCount <= 2) {
+    return "medium";
+  }
+  return "large";
+};
+
+const estimatePackageRisk = (
+  checks: GoalAttainmentCheck[],
+  likelyPaths: string[],
+  maxChecksPerPackage: number
+): WorkPackage["riskLevel"] => {
+  const text = checks.map(goalCheckSearchText).join(" ");
+  if (
+    checks.length > maxChecksPerPackage ||
+    pathAreas(likelyPaths).length > 4 ||
+    /\b(?:credential|secret|token|brokerage|trade|order|runtime safety|security)\b/i.test(text)
+  ) {
+    return "high";
+  }
+  if (checks.length >= 3 || pathAreas(likelyPaths).length >= 2 || /\b(?:schema|migration|ipc|preload|main process|validation|integrity)\b/i.test(text)) {
+    return "medium";
+  }
+  return "low";
+};
+
+const packageCoherenceScore = (checks: GoalAttainmentCheck[]): number => {
+  if (checks.length <= 1) {
+    return 0.62;
+  }
+  const pairs: number[] = [];
+  for (let leftIndex = 0; leftIndex < checks.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < checks.length; rightIndex += 1) {
+      const left = checks[leftIndex];
+      const right = checks[rightIndex];
+      const tokenScore = tokenJaccardScore(
+        checklistTokenSet(goalCheckSearchText(left)),
+        checklistTokenSet(goalCheckSearchText(right))
+      );
+      const topicScore = inferGoalCheckPrimaryTopic(left) === inferGoalCheckPrimaryTopic(right) ? 0.22 : 0;
+      const pathScore = setsIntersect(pathAreas(left.relatedPaths ?? []), pathAreas(right.relatedPaths ?? [])) ? 0.18 : 0;
+      const sourceScore = left.source === right.source ? 0.08 : 0;
+      pairs.push(Math.min(1, tokenScore + topicScore + pathScore + sourceScore));
+    }
+  }
+  return pairs.length ? pairs.reduce((sum, score) => sum + score, 0) / pairs.length : 0.62;
+};
+
+const buildWorkPackageTitle = (topic: string, checks: GoalAttainmentCheck[]): string => {
+  const normalizedTopic = normalizeSpace(topic);
+  if (checks.length > 1) {
+    return `${normalizedTopic} work package`;
+  }
+  return truncate(checks[0]?.title ?? normalizedTopic, 90);
+};
+
+const buildPackageAcceptanceHints = (checks: GoalAttainmentCheck[]): string[] =>
+  unique(checks.flatMap((check) => {
+    const hints = [
+      check.status === "unmet"
+        ? `Show repository evidence that "${check.title}" is no longer unmet.`
+        : `Gather direct evidence for "${check.title}".`,
+      check.evidence && !isWeakChecklistEvidence(check.evidence) ? `Current evidence to address: ${truncate(normalizeSpace(check.evidence), 150)}` : "",
+      check.relatedPaths.length ? `Verify relevant paths: ${check.relatedPaths.slice(0, 3).join(", ")}.` : ""
+    ];
+    return hints.filter((entry) => entry.length > 0);
+  })).slice(0, 6);
+
+export const buildChecklistWorkPackages = (
+  workflowOrContext: ProjectWorkflowState | WorkflowRecommendationContext,
+  options: ChecklistWorkPackageOptions = {}
+): WorkPackage[] => {
+  const context = "workflow" in workflowOrContext ? workflowOrContext : undefined;
+  const workflow = context?.workflow ?? (workflowOrContext as ProjectWorkflowState);
+  const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow));
+  const maxPackages = options.maxPackages ?? 6;
+  const minChecksPerPackage = options.minChecksPerPackage ?? 1;
+  const maxChecksPerPackage = options.maxChecksPerPackage ?? modeConfig.maxChecksPerPackage;
+  const checklist = context
+    ? buildGoalChecklistForAssessment(context)
+    : auditGoalChecklist(consolidateGoalChecklist(workflow.goalChecklist ?? []), workflow.ultimateGoal);
+  const openRequiredChecks = rankGoalChecksByCompletionImpact(
+    checklist.filter((check) => isRequiredForCompletion(check) && !isMetForCompletion(check))
+  );
+  if (openRequiredChecks.length === 0) {
+    return [];
+  }
+
+  const topicGroups = context
+    ? buildGoalCheckTaskGroups(context, openRequiredChecks)
+    : [...openRequiredChecks.reduce((map, check) => {
+      const topic = buildGoalCheckBatchLabel([check]);
+      map.set(topic, [...(map.get(topic) ?? []), check]);
+      return map;
+    }, new Map<string, GoalAttainmentCheck[]>()).entries()].map(([label, checks]) => ({
+      label,
+      checks: rankGoalChecksByCompletionImpact(checks),
+      relatedPaths: unique(checks.flatMap((check) => check.relatedPaths ?? [])).slice(0, 4),
+      score: rankGoalCheckBatch(checks)
+    }));
+  const pathGroups = context && modeConfig.mode === "fast"
+    ? buildPathCoherentGoalCheckTaskGroups(context, openRequiredChecks)
+    : [];
+  const seenGroupKeys = new Set<string>();
+  const groups = [...topicGroups, ...pathGroups].filter((group) => {
+    const key = group.checks.map((check) => check.id).sort().join("|");
+    if (seenGroupKeys.has(key)) {
+      return false;
+    }
+    seenGroupKeys.add(key);
+    return true;
+  });
+
+  return groups
+    .flatMap((group) => {
+      const sortedChecks = rankGoalChecksByCompletionImpact(group.checks);
+      const chunks: GoalAttainmentCheck[][] = [];
+      for (let index = 0; index < sortedChecks.length; index += maxChecksPerPackage) {
+        chunks.push(sortedChecks.slice(index, index + maxChecksPerPackage));
+      }
+      return chunks
+        .filter((checks) => checks.length >= minChecksPerPackage)
+        .map((checks) => {
+          const likelyPaths = context ? collectGoalCheckBatchPaths(context, checks) : unique([
+            ...group.relatedPaths,
+            ...checks.flatMap((check) => check.relatedPaths ?? [])
+          ]).slice(0, 4);
+          const coherence = packageCoherenceScore(checks);
+          const coverageScore = checks.reduce((sum, check) => sum + goalCheckCompletionImpactScore(check), 0);
+          const breadth = estimatePackageBreadth(checks, likelyPaths, maxChecksPerPackage);
+          const riskLevel = estimatePackageRisk(checks, likelyPaths, maxChecksPerPackage);
+          const safetyCritical = isSafetyCriticalPackage(checks, likelyPaths);
+          const sharedPathBonus = likelyPaths.length > 0 && pathAreas(likelyPaths).length <= 3 ? 24 : 0;
+          const sharedPathConfidenceBonus = sharedPathBonus > 0 ? 0.07 : 0;
+          const acceptanceBonus = checks.some((check) => hasConcreteAcceptanceSignal(check)) ? 18 : 0;
+          const fastGroupedBonus = modeConfig.mode === "fast"
+            ? Math.max(0, checks.length - 1) * modeConfig.groupedRequiredCheckBonus
+            : Math.max(0, checks.length - 1) * 18;
+          const score = Math.round(
+            coverageScore +
+            checks.length * (modeConfig.mode === "fast" ? 54 : 36) +
+            fastGroupedBonus +
+            sharedPathBonus +
+            acceptanceBonus +
+            coherence * (modeConfig.mode === "fast" ? 118 : 90) -
+            (breadth === "large" ? modeConfig.mode === "fast" ? 18 : 38 : 0) -
+            (riskLevel === "high" && !safetyCritical ? 30 : riskLevel === "medium" ? 8 : 0)
+          );
+          const impact: WorkPackage["estimatedImpact"] = score >= 260 || checks.length >= 3 ? "high" : score >= 150 ? "medium" : "low";
+          const title = buildWorkPackageTitle(group.label, checks);
+          return {
+            id: `work-package:${stableHash(checks.map((check) => check.id).sort().join("|"))}`,
+            title,
+            summary: `Close ${checks.length} related required check${checks.length === 1 ? "" : "s"} without changing checklist granularity.`,
+            checkIds: checks.map((check) => check.id),
+            primaryTopic: group.label,
+            likelyPaths,
+            estimatedBreadth: breadth,
+            estimatedImpact: impact,
+            confidence: Math.max(0.45, Math.min(0.96, 0.54 + coherence * 0.34 + Math.min(checks.length, 4) * 0.03 + sharedPathConfidenceBonus)),
+            riskLevel,
+            reason: `Grouped by ${group.label} plus shared checklist semantics${likelyPaths.length ? ` and likely paths ${likelyPaths.join(", ")}` : ""}.`,
+            acceptanceHints: buildPackageAcceptanceHints(checks),
+            score
+          } satisfies WorkPackage;
+        });
+    })
+    .sort((left, right) =>
+      right.score - left.score ||
+      right.checkIds.length - left.checkIds.length ||
+      left.riskLevel.localeCompare(right.riskLevel) ||
+      left.title.localeCompare(right.title)
+    )
+    .slice(0, maxPackages);
+};
+
 export interface GoalCheckUpdateInput {
   action?: "add" | "update" | "remove";
   id?: string;
   title: string;
   description?: string;
   required?: boolean;
+  itemKind?: GoalCheckItemKind;
   status?: GoalCheckStatus;
   confidence?: number;
   evidence?: string;
   relatedPaths?: string[];
+  promotionReason?: string;
 }
 
 const findExistingGoalCheck = (
@@ -528,12 +1092,14 @@ const createOrPreserveGoalCheck = (
   const id = buildGoalCheckId(source, `${source}:${normalizedTitle}`);
   const found = findExistingGoalCheck(existing, id, normalizedTitle);
   if (found) {
+    const itemKind = required ? "required" : getGoalCheckItemKind(found);
+    const normalizedKind = normalizeGoalCheckKind(itemKind, found.status);
     return {
       ...found,
       id,
       title: normalizedTitle,
       description: description.trim() || found.description,
-      required,
+      ...normalizedKind,
       source,
       relatedPaths: found.relatedPaths ?? [],
       createdAt: found.createdAt || timestamp,
@@ -545,7 +1111,7 @@ const createOrPreserveGoalCheck = (
     id,
     title: normalizedTitle,
     description: description.trim(),
-    required,
+    ...normalizeGoalCheckKind(required ? "required" : "backlog", "unknown"),
     status: "unknown",
     evidence: "",
     source,
@@ -610,8 +1176,11 @@ export const buildGoalChecklistFromUltimateGoal = (
       continue;
     }
     if (check.source === "agent" || check.source === "deterministic" || !check.required) {
+      const itemKind = getGoalCheckItemKind(check);
+      const normalizedKind = normalizeGoalCheckKind(itemKind, check.status);
       checks.push({
         ...check,
+        ...normalizedKind,
         relatedPaths: check.relatedPaths ?? [],
         createdAt: check.createdAt || timestamp,
         updatedAt: check.updatedAt || timestamp
@@ -620,7 +1189,7 @@ export const buildGoalChecklistFromUltimateGoal = (
     }
   }
 
-  return consolidateGoalChecklist(checks);
+  return auditGoalChecklist(consolidateGoalChecklist(checks), goal);
 };
 
 const toTime = (value?: string): number => value ? new Date(value).getTime() : 0;
@@ -682,6 +1251,8 @@ const upsertDeterministicCheck = (
     title: input.title,
     description: input.description,
     required: true,
+    itemKind: "required",
+    promotionReason: "Deterministic workflow blocker or validation state is required for completion.",
     status: input.status,
     evidence: input.evidence,
     source: "deterministic",
@@ -762,7 +1333,111 @@ export const buildGoalChecklistForAssessment = (
     timestamp
   });
 
-  return consolidateGoalChecklist(checks);
+  return auditGoalChecklist(consolidateGoalChecklist(checks), context.workflow.ultimateGoal);
+};
+
+const hardBlockerPromotionPattern = /\b(?:hard blocker|blocks?|blocked|blocking|cannot complete|prevents? completion|required before completion|must resolve|merge conflict|integrity failed|validation failed|typecheck failed|lint failed|test failed|build failed)\b/i;
+const validationPromotionPattern = /\b(?:validation|integrity|typecheck|lint|test|build|schema|migration|corrupt|invalid|incompatible|broken|failing|failed)\b/i;
+const securityPromotionPattern = /\b(?:secret|credential|api key|token|oauth|private key|security|sandbox|node api|contextisolation|nodeintegration|runtime safety|approval|privileged)\b/i;
+
+const textMatchesUltimateGoal = (input: {
+  title: string;
+  description?: string;
+  evidence?: string;
+  ultimateGoal?: UltimateGoal;
+}): boolean => {
+  const goal = input.ultimateGoal;
+  if (!goal) {
+    return false;
+  }
+  const checkTokens = checklistTokenSet(`${input.title} ${input.description ?? ""} ${input.evidence ?? ""}`);
+  const goalTokens = checklistTokenSet([
+    goal.summary,
+    goal.detailedIntent,
+    goal.qualityBar,
+    ...goal.successCriteria,
+    ...goal.constraints
+  ].join(" "));
+  return tokenOverlapRatio(checkTokens, goalTokens) >= 0.5 || tokenJaccardScore(checkTokens, goalTokens) >= 0.28;
+};
+
+const determineGoalCheckPromotion = (
+  update: GoalCheckUpdateInput,
+  options: {
+    ultimateGoal?: UltimateGoal;
+    operatorFeedback?: boolean;
+  }
+): { itemKind: GoalCheckItemKind; required: boolean; reason?: string; capExempt: boolean } => {
+  if (update.itemKind === "observation") {
+    return {
+      itemKind: "observation",
+      required: false,
+      reason: "Agent supplied this checklist item as a non-blocking observation.",
+      capExempt: false
+    };
+  }
+  if (update.itemKind === "backlog" || update.required === false) {
+    return {
+      itemKind: "backlog",
+      required: false,
+      reason: "Agent supplied this checklist item as backlog, so it does not gate Ultimate Goal completion.",
+      capExempt: false
+    };
+  }
+
+  const text = `${update.title} ${update.description ?? ""} ${update.evidence ?? ""}`;
+  if (options.operatorFeedback) {
+    return {
+      itemKind: "required",
+      required: true,
+      reason: update.promotionReason ?? "Promoted because the item came from explicit operator feedback.",
+      capExempt: false
+    };
+  }
+  if (securityPromotionPattern.test(text)) {
+    return {
+      itemKind: "required",
+      required: true,
+      reason: update.promotionReason ?? "Promoted because the item describes a security, credential, approval, or runtime-safety issue.",
+      capExempt: true
+    };
+  }
+  if (hardBlockerPromotionPattern.test(text)) {
+    return {
+      itemKind: "required",
+      required: true,
+      reason: update.promotionReason ?? "Promoted because the item describes a hard blocker that prevents completion.",
+      capExempt: true
+    };
+  }
+  if (validationPromotionPattern.test(text) && /\b(?:fail|failed|failing|broken|invalid|corrupt|incompatible|prevents?|blocks?)\b/i.test(text)) {
+    return {
+      itemKind: "required",
+      required: true,
+      reason: update.promotionReason ?? "Promoted because the item describes a validation or integrity failure that prevents completion.",
+      capExempt: true
+    };
+  }
+  if (textMatchesUltimateGoal({
+    title: update.title,
+    description: update.description,
+    evidence: update.evidence,
+    ultimateGoal: options.ultimateGoal
+  })) {
+    return {
+      itemKind: "required",
+      required: true,
+      reason: update.promotionReason ?? "Promoted because the item is derived from the confirmed Ultimate Goal.",
+      capExempt: false
+    };
+  }
+
+  return {
+    itemKind: "backlog",
+    required: false,
+    reason: "Agent-suggested item stayed in backlog because it was not derived from the Ultimate Goal, a hard blocker, explicit operator feedback, a validation failure, or a safety issue.",
+    capExempt: false
+  };
 };
 
 export const applyGoalChecklistUpdates = (
@@ -771,10 +1446,16 @@ export const applyGoalChecklistUpdates = (
   options: {
     timestamp?: string;
     ownerAgentId?: string;
+    ultimateGoal?: UltimateGoal;
+    cycleNumber?: number;
+    maxNewRequiredChecks?: number;
+    operatorFeedback?: boolean;
   } = {}
 ): GoalAttainmentCheck[] => {
   const timestamp = options.timestamp ?? nowIso();
   const next = checklist.map((check) => ({ ...check, relatedPaths: [...(check.relatedPaths ?? [])] }));
+  const maxNewRequiredChecks = options.maxNewRequiredChecks ?? 2;
+  let newRequiredChecksIntroduced = 0;
 
   for (const update of updates) {
     const title = normalizeSpace(update.title);
@@ -796,7 +1477,7 @@ export const applyGoalChecklistUpdates = (
           ...existing,
           status: "not_applicable",
           required: false,
-          evidence: update.evidence?.trim() || "An agent marked this user-derived check as not applicable.",
+          evidence: sanitizeChecklistEvidenceText(update.evidence?.trim() || "An agent marked this user-derived check as not applicable."),
           confidence: update.confidence ?? existing.confidence,
           updatedAt: timestamp,
           ownerAgentId: options.ownerAgentId ?? existing.ownerAgentId
@@ -809,20 +1490,57 @@ export const applyGoalChecklistUpdates = (
 
     const existing = index >= 0 ? next[index] : undefined;
     let status = update.status ?? existing?.status ?? "unknown";
-    let evidence = update.evidence?.trim() ?? existing?.evidence ?? "";
+    let evidence = sanitizeChecklistEvidenceText(update.evidence?.trim() ?? existing?.evidence ?? "");
     if (status === "met" && !evidence) {
       status = "unknown";
       evidence = "An agent tried to mark this met without evidence, so the check remains unknown.";
     }
+    const promotion = existing
+      ? {
+        itemKind: update.itemKind ?? (update.required === false ? "backlog" as const : update.required === true ? "required" as const : getGoalCheckItemKind(existing)),
+        required: update.required ?? existing.required,
+        reason: update.promotionReason ?? existing.promotionReason,
+        capExempt: false
+      }
+      : determineGoalCheckPromotion(update, {
+        ultimateGoal: options.ultimateGoal,
+        operatorFeedback: options.operatorFeedback
+      });
+    const isNewRequired = !existing && promotion.required && promotion.itemKind === "required";
+    const cappedPromotion =
+      isNewRequired &&
+      !promotion.capExempt &&
+      newRequiredChecksIntroduced >= maxNewRequiredChecks;
+    const itemKind = cappedPromotion ? "backlog" : promotion.itemKind;
+    const normalizedKind = normalizeGoalCheckKind(itemKind, status);
+    if (isNewRequired && !cappedPromotion && !promotion.capExempt) {
+      newRequiredChecksIntroduced += 1;
+    }
+    const classificationReason = cappedPromotion
+      ? `Kept as backlog because the normal cap of ${maxNewRequiredChecks} new required checks for this cycle was already reached.`
+      : promotion.capExempt && newRequiredChecksIntroduced >= maxNewRequiredChecks
+        ? `Promoted outside the normal cap because ${promotion.reason ?? "the item is a safety or hard blocker."}`
+        : promotion.reason;
 
-    const merged: GoalAttainmentCheck = {
+    const merged: GoalAttainmentCheck = sanitizeGoalAttainmentCheck({
       id: existing?.id ?? id,
       title: existing?.title ?? title,
       description: update.description?.trim() ?? existing?.description ?? "",
-      required: update.required ?? existing?.required ?? true,
+      required: normalizedKind.required,
+      itemKind: normalizedKind.itemKind,
+      canonicalKey: existing?.canonicalKey,
+      groupId: existing?.groupId,
+      sourceCheckIds: existing?.sourceCheckIds ?? (existing ? [existing.id] : [id]),
+      relatedCheckIds: existing?.relatedCheckIds ?? [],
+      auditFlags: existing?.auditFlags ?? [],
+      needsRefinement: existing?.needsRefinement,
+      classificationReason,
+      promotionReason: normalizedKind.itemKind === "required" ? classificationReason : existing?.promotionReason,
+      introducedCycleNumber: existing?.introducedCycleNumber ?? (normalizedKind.itemKind === "required" ? options.cycleNumber : undefined),
       status,
       confidence: update.confidence ?? existing?.confidence,
       evidence,
+      evidenceHistory: existing?.evidenceHistory ?? [],
       source: existing?.source ?? "agent",
       relatedPaths: unique([...(existing?.relatedPaths ?? []), ...(update.relatedPaths ?? [])]).slice(0, 8),
       ownerAgentId: options.ownerAgentId ?? existing?.ownerAgentId,
@@ -831,10 +1549,10 @@ export const applyGoalChecklistUpdates = (
         existing &&
         existing.status === status &&
         existing.evidence === evidence &&
-        existing.required === (update.required ?? existing.required)
+        existing.required === normalizedKind.required
           ? existing.updatedAt
           : timestamp
-    };
+    });
 
     if (index >= 0) {
       next[index] = merged;
@@ -843,7 +1561,7 @@ export const applyGoalChecklistUpdates = (
     }
   }
 
-  return consolidateGoalChecklist(next).sort((left, right) => {
+  return auditGoalChecklist(consolidateGoalChecklist(next), options.ultimateGoal).sort((left, right) => {
     if (left.required !== right.required) {
       return left.required ? -1 : 1;
     }
@@ -1242,6 +1960,10 @@ export const isVisualProject = (context: WorkflowRecommendationContext): boolean
   );
 
 export const buildAppealRecommendations = (context: WorkflowRecommendationContext): WorkflowRecommendationOption[] => {
+  const modeConfig = getWorkflowModeConfig(context.workflow.workflowMode, resolveEffectiveAutopilotPolicy(context.workflow));
+  if (!modeConfig.finalAppealEnabled) {
+    return [];
+  }
   if (!isVisualProject(context)) {
     return [];
   }
@@ -1311,9 +2033,11 @@ export const buildAppealRecommendations = (context: WorkflowRecommendationContex
       confidence: draft.confidence,
       estimatedScope: draft.estimatedScope,
       riskLevel: draft.riskLevel,
-      relatedPaths: draft.relatedPaths
+      relatedPaths: draft.relatedPaths,
+      sourceWorkPackageId: draft.sourceWorkPackageId,
+      targetedCheckIds: draft.targetedCheckIds
     }))
-    .map((entry) => sanitizeRecommendationForCycle(entry))
+    .map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
     .filter((entry): entry is WorkflowRecommendationOption => Boolean(entry))
     .slice(0, Math.max(1, Math.min(context.maxOptions, 3)))
     .map((entry, index) => ({
@@ -1323,6 +2047,7 @@ export const buildAppealRecommendations = (context: WorkflowRecommendationContex
 };
 
 export const buildWorkflowRecommendations = (context: WorkflowRecommendationContext): WorkflowRecommendationOption[] => {
+  const modeConfig = getWorkflowModeConfig(context.workflow.workflowMode, resolveEffectiveAutopilotPolicy(context.workflow));
   const recentChangedFiles = collectRecentChangedFiles(context.agents);
   const openIssues = context.workflow.memory.knownOpenIssues.filter((issue) => issue.status === "open");
   const pendingInterventions = context.workflow.humanInterventions.filter((intervention) => intervention.status === "pending");
@@ -1332,9 +2057,50 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
   const lastDecision = context.workflow.memory.lastAcceptedDecisions[0];
   const customFocus = normalizeCustomFocus(context.customFocus);
   const unmetGoalChecks = rankedUnmetRequiredGoalChecks(context);
-  const goalCheckBatches = buildGoalCheckBatches(context, unmetGoalChecks);
-  const batchedCheckIds = new Set(goalCheckBatches[0]?.checks.map((check) => check.id) ?? []);
+  const checklistWorkPackages = buildChecklistWorkPackages(context, {
+    maxChecksPerPackage: modeConfig.maxChecksPerPackage
+  })
+    .filter((workPackage) =>
+      workPackage.checkIds.length > 1 &&
+      (modeConfig.mode === "fast" || workPackage.estimatedBreadth !== "large" || workPackage.riskLevel === "high")
+    )
+    .sort((left, right) =>
+      (left.riskLevel === "high" && !/security|credential|approval|runtime|integrity|validation|brokerage|safety/i.test(left.primaryTopic) ? 1 : 0) -
+      (right.riskLevel === "high" && !/security|credential|approval|runtime|integrity|validation|brokerage|safety/i.test(right.primaryTopic) ? 1 : 0) ||
+      right.score - left.score ||
+      right.checkIds.length - left.checkIds.length ||
+      left.title.localeCompare(right.title)
+    );
+  const packagedCheckIds = new Set(checklistWorkPackages.flatMap((workPackage) => workPackage.checkIds));
   const drafts: RecommendationDraft[] = [];
+  const previewRequest = getWorkflowPreviewRequest(context.workflow);
+  const previewMode = previewRequest.status === "queued" || previewRequest.status === "active";
+
+  if (previewMode) {
+    const previewPathHints = unique([
+      ...context.scan.files
+        .filter((file) =>
+          /\b(?:app|page|route|screen|workflow|dashboard|index|main)\b/i.test(file.relativePath) &&
+          /\.(tsx?|jsx?|svelte|vue|html|css)$/i.test(file.relativePath)
+        )
+        .map((file) => file.relativePath),
+      ...context.scan.stats.entryPoints,
+      ...relevantPaths
+    ]).slice(0, 5);
+    pushDraft(drafts, {
+      key: `preview:${previewRequest.requestedAt ?? context.workflow.workflowCycle.cycleNumber}`,
+      score: 260,
+      title: "Generate runnable preview checkpoint",
+      summary: "Make the current product structure visible and locally inspectable without presenting it as final completion.",
+      rationale: "The operator requested a preview checkpoint, so the next bounded cycle should expose the UI shell, routes, empty/demo states, and integration boundaries before normal workflow resumes.",
+      expectedImpact: "The project can be inspected in its current state while preserving honest missing-credential, offline/demo, loading, and incomplete-state labels.",
+      priority: "high",
+      confidence: 0.96,
+      estimatedScope: "small",
+      riskLevel: "low",
+      relatedPaths: previewPathHints
+    });
+  }
 
   if (customFocus) {
     pushDraft(drafts, {
@@ -1412,24 +2178,34 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     });
   }
 
-  for (const [index, batch] of goalCheckBatches.entries()) {
-    const representativeChecks = batch.checks.slice(0, 3).map((check) => check.title).join("; ");
+  for (const [index, workPackage] of checklistWorkPackages.entries()) {
+    const packageChecks = workPackage.checkIds
+      .map((checkId) => unmetGoalChecks.find((check) => check.id === checkId))
+      .filter((check): check is GoalAttainmentCheck => Boolean(check));
+    const representativeChecks = packageChecks.slice(0, 3).map((check) => check.title).join("; ");
+    const safetyCritical = /security|credential|approval|runtime|integrity|validation|brokerage|safety/i.test(workPackage.primaryTopic);
     pushDraft(drafts, {
-      key: `goal-batch:${batch.checks.map((check) => check.id).sort().join("|")}`,
-      score: 134 - index * 5,
-      title: `Satisfy goal batch: ${truncate(batch.label, 72)}`,
-      summary: `Treat ${batch.label} as the next SWE task group covering ${batch.checks.length} related required checks.`,
-      rationale: `These checks belong together by implementation path, validation evidence, or architecture. Representative checks: ${truncate(representativeChecks, 150)}.`,
-      expectedImpact: "This turns a coherent task group into repository evidence instead of spending cycles on isolated checklist items.",
+      key: `work-package:${workPackage.checkIds.slice().sort().join("|")}`,
+      score: 150 +
+        Math.round(workPackage.score / (modeConfig.mode === "fast" ? 10 : 18)) +
+        (modeConfig.mode === "fast" ? workPackage.checkIds.length * 24 : 0) -
+        index * 5 -
+        (workPackage.riskLevel === "high" && !safetyCritical ? 28 : 0),
+      title: `Satisfy work package: ${truncate(workPackage.primaryTopic, 72)}`,
+      summary: `Use this coherent work package to close ${workPackage.checkIds.length} related required checks.`,
+      rationale: `${workPackage.reason} Representative checks: ${truncate(representativeChecks, 150)}.`,
+      expectedImpact: "This moves the Ultimate Goal percentage by producing shared repository evidence for multiple required checks.",
       priority: "high",
-      confidence: Math.max(0.55, 0.91 - index * 0.04),
-      estimatedScope: "medium",
-      riskLevel: batch.checks.length >= 4 ? "high" : "medium",
-      relatedPaths: batch.relatedPaths
+      confidence: Math.max(0.55, workPackage.confidence - index * 0.03),
+      estimatedScope: workPackage.estimatedBreadth === "small" ? "small" : "medium",
+      riskLevel: workPackage.riskLevel,
+      relatedPaths: workPackage.likelyPaths,
+      sourceWorkPackageId: workPackage.id,
+      targetedCheckIds: workPackage.checkIds
     });
   }
 
-  const singleGoalChecks = unmetGoalChecks.filter((check) => !batchedCheckIds.has(check.id));
+  const singleGoalChecks = unmetGoalChecks.filter((check) => !packagedCheckIds.has(check.id));
   for (const [index, unmetGoalCheck] of singleGoalChecks.slice(0, 3).entries()) {
     const goalCheckKeywords = tokenize(`${unmetGoalCheck.title} ${unmetGoalCheck.description}`);
     const checkRelevantPaths = rankRelevantPaths(
@@ -1456,7 +2232,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     const explicitChecklistWorkAvailable = unmetGoalChecks.length > 0 && pendingInterventions.length === 0 && openIssues.length === 0;
     pushDraft(drafts, {
       key: `changes:${recentChangedFiles.slice(0, 3).join(",")}`,
-      score: explicitChecklistWorkAvailable ? 58 : 88,
+      score: explicitChecklistWorkAvailable ? Math.max(10, 88 - modeConfig.genericStabilizationPenalty) : 88,
       title: `Stabilize recent work in ${focusArea}`,
       summary: `Review the latest agent changes and close the loop around ${recentChangedFiles.slice(0, 3).join(", ")}.`,
       rationale: explicitChecklistWorkAvailable
@@ -1466,7 +2242,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
         ? "This is a fallback safety task; it should not displace checklist-completion work that can move the Ultimate Goal percentage."
         : "This converts partial progress into durable progress instead of letting recent work sprawl across multiple cycles.",
       priority: explicitChecklistWorkAvailable ? "low" : "high",
-      confidence: explicitChecklistWorkAvailable ? 0.68 : 0.9,
+      confidence: explicitChecklistWorkAvailable ? (modeConfig.mode === "fast" ? 0.52 : 0.68) : 0.9,
       estimatedScope: "small",
       riskLevel: "medium",
       relatedPaths: recentChangedFiles.slice(0, 4)
@@ -1588,9 +2364,11 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
       confidence: draft.confidence,
       estimatedScope: draft.estimatedScope,
       riskLevel: draft.riskLevel,
-      relatedPaths: draft.relatedPaths
+      relatedPaths: draft.relatedPaths,
+      sourceWorkPackageId: draft.sourceWorkPackageId,
+      targetedCheckIds: draft.targetedCheckIds
     }))
-    .map((entry) => sanitizeRecommendationForCycle(entry))
+    .map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
     .filter((entry): entry is WorkflowRecommendationOption => Boolean(entry))
     .slice(0, Math.max(1, Math.min(context.maxOptions, 5)))
     .map((entry, index) => ({

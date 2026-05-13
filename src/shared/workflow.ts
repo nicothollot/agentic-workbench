@@ -1,12 +1,24 @@
 import { nanoid } from "nanoid";
 import { defaultWorkflowStepProgressState } from "./defaults";
+import {
+  canUseAgentRecommendationWhenDeterministicPackageExists,
+  createDefaultAutopilotPolicy,
+  getAutopilotMaxChecksPerWorkPackage,
+  getAutopilotMaxNewRequiredChecksPerCycle,
+  resolveEffectiveAutopilotPolicy,
+  validateAutopilotPolicy
+} from "./autopilotPolicy";
 import type {
   AgentState,
+  AutopilotPolicy,
   ProjectKind,
   ProjectWorkflowState,
   ScopedGoal,
   UltimateGoal,
+  WorkPackage,
+  WorkflowMode,
   WorkflowObjective,
+  WorkflowPreviewRequest,
   WorkflowRecommendationOption,
   WorkflowStage,
   WorkflowStepId,
@@ -15,9 +27,152 @@ import type {
 } from "./types";
 import { nowIso } from "./utils";
 
+export {
+  canUseAgentRecommendationWhenDeterministicPackageExists,
+  createDefaultAutopilotPolicy,
+  getAutopilotMaxChecksPerWorkPackage,
+  getAutopilotMaxNewRequiredChecksPerCycle,
+  getAutopilotPolicyConfig,
+  hasRepeatedAutopilotFailure,
+  isHighRiskAutopilotRecommendation,
+  resolveEffectiveAutopilotPolicy,
+  shouldAutopilotPause,
+  validateAutopilotPolicy
+} from "./autopilotPolicy";
+
 const activeAgentStatuses = new Set(["starting", "running", "waiting_approval"]);
+const workflowPreviewStatuses = new Set(["none", "queued", "active", "ready", "completed", "cancelled"]);
 
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
+
+const normalizePreviewCycleCount = (value: unknown): number => {
+  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : 1;
+  return Math.max(0, Math.min(3, numeric));
+};
+
+export const normalizeWorkflowPreviewRequest = (
+  previewRequest?: Partial<WorkflowPreviewRequest> | null
+): WorkflowPreviewRequest => {
+  const status = workflowPreviewStatuses.has(previewRequest?.status ?? "")
+    ? previewRequest?.status
+    : "none";
+  return {
+    status: status ?? "none",
+    remainingCycles: normalizePreviewCycleCount(previewRequest?.remainingCycles ?? 1),
+    requestedAt: previewRequest?.requestedAt,
+    startedAt: previewRequest?.startedAt,
+    completedAt: previewRequest?.completedAt,
+    modeBeforePreview: previewRequest?.modeBeforePreview === "fast" ? "fast" : previewRequest?.modeBeforePreview === "normal" ? "normal" : undefined,
+    autopilotWasEnabled: previewRequest?.autopilotWasEnabled,
+    reason: previewRequest?.reason,
+    evidence: previewRequest?.evidence?.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).slice(0, 8)
+  };
+};
+
+export const getWorkflowPreviewRequest = (
+  workflow?: Pick<ProjectWorkflowState, "previewRequest"> | null
+): WorkflowPreviewRequest => normalizeWorkflowPreviewRequest(workflow?.previewRequest);
+
+export const isWorkflowPreviewPending = (
+  workflow?: Pick<ProjectWorkflowState, "previewRequest"> | null
+): boolean => {
+  const status = getWorkflowPreviewRequest(workflow).status;
+  return status === "queued" || status === "active";
+};
+
+export const isWorkflowPreviewReady = (
+  workflow?: Pick<ProjectWorkflowState, "previewRequest"> | null
+): boolean => getWorkflowPreviewRequest(workflow).status === "ready";
+
+export const isPreviewRecommendation = (
+  recommendation?: Pick<WorkflowRecommendationOption, "title" | "summary"> | null
+): boolean => Boolean(
+  recommendation &&
+  /\bpreview\b/i.test(`${recommendation.title} ${recommendation.summary}`) &&
+  /\b(?:generate|runnable|visible|checkpoint|inspect)\b/i.test(`${recommendation.title} ${recommendation.summary}`)
+);
+
+export interface WorkflowModeConfig {
+  mode: WorkflowMode;
+  maxChecksPerPackage: number;
+  preferredMinChecksPerPackage: number;
+  breadthLimit: number;
+  deterministicRecommendationFirst: boolean;
+  useRecommendationAgent: "always" | "when_no_high_confidence_package";
+  useDeterministicScopingWhenClear: boolean;
+  contextEntries: number;
+  contextCharBudget: number;
+  maxNewRequiredChecksPerCycle: number;
+  finalAppealEnabled: boolean;
+  groupedRequiredCheckBonus: number;
+  genericStabilizationPenalty: number;
+  highConfidencePackageThreshold: number;
+}
+
+export const normalizeWorkflowMode = (mode?: string): WorkflowMode =>
+  mode === "fast" ? "fast" : "normal";
+
+export const getWorkflowModeConfig = (mode?: string, policy?: AutopilotPolicy): WorkflowModeConfig => {
+  const normalizedMode = normalizeWorkflowMode(mode);
+  const effectivePolicy = policy ? validateAutopilotPolicy(policy) : undefined;
+  const baseConfig: WorkflowModeConfig = normalizedMode === "fast"
+    ? {
+      mode: "fast",
+      maxChecksPerPackage: 8,
+      preferredMinChecksPerPackage: 4,
+      breadthLimit: 3.5,
+      deterministicRecommendationFirst: true,
+      useRecommendationAgent: "when_no_high_confidence_package",
+      useDeterministicScopingWhenClear: true,
+      contextEntries: 3,
+      contextCharBudget: 1_700,
+      maxNewRequiredChecksPerCycle: 0,
+      finalAppealEnabled: false,
+      groupedRequiredCheckBonus: 92,
+      genericStabilizationPenalty: 130,
+      highConfidencePackageThreshold: 0.73
+    }
+    : {
+    mode: "normal",
+    maxChecksPerPackage: 4,
+    preferredMinChecksPerPackage: 2,
+    breadthLimit: 2,
+    deterministicRecommendationFirst: false,
+    useRecommendationAgent: "always",
+    useDeterministicScopingWhenClear: true,
+    contextEntries: 5,
+    contextCharBudget: 2_600,
+    maxNewRequiredChecksPerCycle: 2,
+    finalAppealEnabled: true,
+    groupedRequiredCheckBonus: 42,
+    genericStabilizationPenalty: 70,
+    highConfidencePackageThreshold: 0.78
+  };
+
+  if (!effectivePolicy) {
+    return baseConfig;
+  }
+
+  const maxChecksPerPackage = getAutopilotMaxChecksPerWorkPackage(effectivePolicy, normalizedMode);
+  return {
+    ...baseConfig,
+    maxChecksPerPackage,
+    preferredMinChecksPerPackage: normalizedMode === "fast"
+      ? Math.min(maxChecksPerPackage, Math.max(2, Math.ceil(maxChecksPerPackage / 2)))
+      : Math.min(maxChecksPerPackage, Math.max(1, Math.ceil(maxChecksPerPackage / 2))),
+    deterministicRecommendationFirst: effectivePolicy.preferGroupedChecklistPackages || baseConfig.deterministicRecommendationFirst,
+    useRecommendationAgent: canUseAgentRecommendationWhenDeterministicPackageExists(effectivePolicy, normalizedMode)
+      ? "always"
+      : "when_no_high_confidence_package",
+    useDeterministicScopingWhenClear: effectivePolicy.allowDeterministicScoping,
+    maxNewRequiredChecksPerCycle: getAutopilotMaxNewRequiredChecksPerCycle(effectivePolicy, normalizedMode),
+    highConfidencePackageThreshold: effectivePolicy.profile === "conservative"
+      ? Math.min(0.92, baseConfig.highConfidencePackageThreshold + 0.05)
+      : effectivePolicy.profile === "aggressive"
+        ? Math.max(0.62, baseConfig.highConfidencePackageThreshold - 0.05)
+        : baseConfig.highConfidencePackageThreshold
+  };
+};
 
 export const latestAgentByCategory = (agents: AgentState[], category: AgentState["category"]): AgentState | undefined =>
   [...agents]
@@ -73,36 +228,183 @@ export const createScopedGoalFromRecommendation = (
 ): ScopedGoal => {
   const inheritedCriteria = ultimateGoal.successCriteria.slice(0, 3);
   const inheritedConstraints = ultimateGoal.constraints.slice(0, 3);
-  const scopedAcceptanceCriteria = [
-    recommendation.summary,
-    `Deliver the change in a way that advances the ultimate goal: ${ultimateGoal.summary || "project charter alignment required"}.`,
-    ...inheritedCriteria.map((criterion) => `Maintain or improve: ${criterion}`),
-    ultimateGoal.qualityBar ? `Satisfy the quality bar for this slice: ${ultimateGoal.qualityBar}` : ""
-  ].filter((entry) => entry.trim().length > 0);
+  const previewRecommendation = isPreviewRecommendation(recommendation);
+  const scopedAcceptanceCriteria = previewRecommendation
+    ? [
+      "Create or stabilize a visible/runnable preview path for the current product structure.",
+      "Show incomplete areas honestly with labeled demo/offline, empty, loading, error, or missing-credential states.",
+      "Run the project-supported build or render validation needed to inspect the preview.",
+      "Do not mark the Ultimate Goal complete unless its real checklist criteria are actually satisfied."
+    ]
+    : [
+      recommendation.summary,
+      `Deliver the change in a way that advances the ultimate goal: ${ultimateGoal.summary || "project charter alignment required"}.`,
+      ...inheritedCriteria.map((criterion) => `Maintain or improve: ${criterion}`),
+      ultimateGoal.qualityBar ? `Satisfy the quality bar for this slice: ${ultimateGoal.qualityBar}` : ""
+    ].filter((entry) => entry.trim().length > 0);
 
   return {
     id: nanoid(),
     sourceRecommendationId: recommendation.id,
+    sourceWorkPackageId: recommendation.sourceWorkPackageId,
     summary: recommendation.title,
     executionBrief: [
-      `Implement the approved next step: ${recommendation.title}.`,
+      previewRecommendation
+        ? `Generate a bounded preview checkpoint: ${recommendation.title}.`
+        : `Implement the approved next step: ${recommendation.title}.`,
       recommendation.rationale ? `Why now: ${recommendation.rationale}` : "",
       recommendation.expectedImpact ? `Expected impact: ${recommendation.expectedImpact}` : "",
       recommendation.relatedPaths.length ? `Likely files or areas: ${recommendation.relatedPaths.join(", ")}` : "",
-      ultimateGoal.detailedIntent ? `Project intent: ${ultimateGoal.detailedIntent}` : ""
+      recommendation.targetedCheckIds?.length ? `Targeted checklist IDs: ${recommendation.targetedCheckIds.join(", ")}` : "",
+      ultimateGoal.detailedIntent ? `Project intent: ${ultimateGoal.detailedIntent}` : "",
+      previewRecommendation
+        ? "Preview checkpoint rules: preserve offline/demo behavior, do not require paid services or secrets, label mock data clearly, and keep live integrations honest with explicit missing-credential states."
+        : ""
     ]
       .filter((entry) => entry.length > 0)
       .join("\n\n"),
     acceptanceCriteria: scopedAcceptanceCriteria,
     constraints: [
       ...inheritedConstraints,
-      ...ultimateGoal.nonGoals.slice(0, 2).map((nonGoal) => `Do not spend this cycle on non-goal: ${nonGoal}`)
+      ...ultimateGoal.nonGoals.slice(0, 2).map((nonGoal) => `Do not spend this cycle on non-goal: ${nonGoal}`),
+      ...(previewRecommendation
+        ? [
+          "Do not fake live data or embed secrets.",
+          "Do not skip validation, approval, or merge safety.",
+          "Do not use preview readiness as final project completion."
+        ]
+        : [])
     ],
     testStrategy: [
       "Run the relevant deterministic verification commands before considering the task complete.",
-      "Verify the implementation satisfies the scoped goal and still aligns with the ultimate goal."
+      previewRecommendation
+        ? "Verify the preview path can be inspected locally or that the relevant UI renders under the repo's supported tooling."
+        : "Verify the implementation satisfies the scoped goal and still aligns with the ultimate goal."
     ],
+    targetedCheckIds: recommendation.targetedCheckIds,
+    likelyPaths: recommendation.relatedPaths,
     createdAt: nowIso()
+  };
+};
+
+export interface WorkPackageScopedGoalOptions {
+  mode?: WorkflowMode;
+  now?: string;
+  sourceRecommendationId?: string;
+  requireModelForHighRisk?: boolean;
+  autopilotPolicy?: AutopilotPolicy;
+}
+
+const scopedGoalHighRiskPattern =
+  /\b(?:credential|credentials|secret|secrets|api key|token|oauth|approval policy|approval|ipc|preload|renderer\/main|main process|node api|contextisolation|nodeintegration|runtime command|command execution|sandbox|network policy|merge logic|workflow state machine|persistent storage|storage migration|migration|local credential|git push|git commit|privileged)\b/i;
+
+const normalizeScopedGoalText = (value: string): string => value.trim().replace(/\s+/g, " ");
+
+const truncateScopedGoalText = (value: string, maxLength: number): string => {
+  const normalized = normalizeScopedGoalText(value);
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+};
+
+const uniqueScopedGoalList = (values: string[], limit: number): string[] =>
+  [...new Set(values.map(normalizeScopedGoalText).filter(Boolean))].slice(0, limit);
+
+const workflowChecksForPackage = (
+  workflow: ProjectWorkflowState,
+  workPackage: WorkPackage
+): ProjectWorkflowState["goalChecklist"] => {
+  const targetIds = new Set(workPackage.checkIds);
+  return workflow.goalChecklist.filter((check) => targetIds.has(check.id));
+};
+
+export const workPackageRequiresModelScoping = (
+  workPackage: WorkPackage,
+  workflow: ProjectWorkflowState,
+  options: WorkPackageScopedGoalOptions = {}
+): boolean => {
+  if (options.requireModelForHighRisk !== false && workPackage.riskLevel === "high") {
+    return true;
+  }
+  const checks = workflowChecksForPackage(workflow, workPackage);
+  const highRiskText = [
+    workPackage.title,
+    workPackage.summary,
+    workPackage.reason,
+    workPackage.primaryTopic,
+    ...workPackage.acceptanceHints,
+    ...workPackage.likelyPaths,
+    ...checks.flatMap((check) => [check.title, check.description, check.evidence, ...check.relatedPaths])
+  ].join(" ");
+  return scopedGoalHighRiskPattern.test(highRiskText);
+};
+
+export const createScopedGoalFromWorkPackage = (
+  workPackage: WorkPackage,
+  workflow: ProjectWorkflowState,
+  options: WorkPackageScopedGoalOptions = {}
+): ScopedGoal | undefined => {
+  const modeConfig = getWorkflowModeConfig(options.mode ?? workflow.workflowMode, options.autopilotPolicy);
+  if (!modeConfig.useDeterministicScopingWhenClear) {
+    return undefined;
+  }
+  if (
+    workPackage.checkIds.length === 0 ||
+    workPackage.acceptanceHints.length === 0 ||
+    workPackage.confidence < (modeConfig.mode === "fast" ? 0.68 : 0.74) ||
+    workPackage.estimatedBreadth === "large" ||
+    workPackageRequiresModelScoping(workPackage, workflow, options)
+  ) {
+    return undefined;
+  }
+
+  const targetedChecks = workflowChecksForPackage(workflow, workPackage);
+  const targetedTitles = targetedChecks.length
+    ? targetedChecks.map((check) => truncateScopedGoalText(check.title, 120))
+    : workPackage.checkIds;
+  const inheritedConstraints = workflow.ultimateGoal.constraints.slice(0, 3);
+  const nonGoalConstraints = workflow.ultimateGoal.nonGoals
+    .slice(0, 2)
+    .map((nonGoal) => `Do not spend this cycle on non-goal: ${nonGoal}`);
+  const likelyPathBrief = workPackage.likelyPaths.length
+    ? `Likely files or areas: ${workPackage.likelyPaths.join(", ")}.`
+    : "Use repository search to keep edits inside the smallest coherent implementation area.";
+  const targetedCheckBrief = targetedTitles.length
+    ? `Target required checks: ${targetedTitles.join("; ")}.`
+    : `Target checklist IDs: ${workPackage.checkIds.join(", ")}.`;
+
+  return {
+    id: nanoid(),
+    sourceRecommendationId: options.sourceRecommendationId ?? workPackage.id,
+    sourceWorkPackageId: workPackage.id,
+    summary: `Satisfy ${truncateScopedGoalText(workPackage.primaryTopic || workPackage.title, 82)}`,
+    executionBrief: [
+      `Implement this deterministic work package: ${workPackage.title}.`,
+      workPackage.summary,
+      workPackage.reason ? `Why this grouping is safe: ${workPackage.reason}` : "",
+      targetedCheckBrief,
+      likelyPathBrief,
+      workflow.ultimateGoal.summary ? `Ultimate Goal: ${workflow.ultimateGoal.summary}` : ""
+    ].filter((entry) => entry.trim().length > 0).join("\n\n"),
+    acceptanceCriteria: uniqueScopedGoalList([
+      `The targeted required checks are satisfied with direct repository evidence: ${targetedTitles.join("; ")}.`,
+      ...workPackage.acceptanceHints,
+      "No unrelated backlog, polish, or new required checklist scope is introduced by this pass."
+    ], 6),
+    constraints: uniqueScopedGoalList([
+      ...inheritedConstraints,
+      ...nonGoalConstraints,
+      "Keep the work scoped to this coherent work package.",
+      "Preserve existing approval, credential, merge, IPC, renderer/main, and runtime safety boundaries."
+    ], 6),
+    testStrategy: uniqueScopedGoalList([
+      workPackage.likelyPaths.some((entry) => /\.(test|spec)\./i.test(entry))
+        ? `Run or update the targeted tests around: ${workPackage.likelyPaths.filter((entry) => /\.(test|spec)\./i.test(entry)).slice(0, 3).join(", ")}.`
+        : "Run focused deterministic checks for the changed files or modules.",
+      "Run broader repository validation when shared runtime, state, or integration behavior changes.",
+      "Verify the goal checklist evidence directly names the targeted checks and relevant paths."
+    ], 4),
+    targetedCheckIds: workPackage.checkIds,
+    likelyPaths: workPackage.likelyPaths,
+    createdAt: options.now ?? nowIso()
   };
 };
 
@@ -468,6 +770,7 @@ const openRequiredGoalChecks = (
 ): ProjectWorkflowState["goalChecklist"] =>
   workflow?.goalChecklist.filter((check) =>
     check.required &&
+    (check.itemKind ?? (check.required ? "required" : "backlog")) === "required" &&
     check.status !== "met" &&
     check.status !== "not_applicable"
   ) ?? [];
@@ -486,8 +789,12 @@ const goalCheckStatusScore = (status: ProjectWorkflowState["goalChecklist"][numb
 
 const checklistAlignmentScore = (
   recommendation: WorkflowRecommendationOption,
-  workflow?: Pick<ProjectWorkflowState, "goalChecklist">
+  workflow?: Pick<ProjectWorkflowState, "goalChecklist"> & { workflowMode?: WorkflowMode; autopilotPolicy?: AutopilotPolicy }
 ): number => {
+  const autopilotPolicy = workflow?.autopilotPolicy
+    ? resolveEffectiveAutopilotPolicy({ autopilotPolicy: workflow.autopilotPolicy })
+    : undefined;
+  const modeConfig = getWorkflowModeConfig(workflow?.workflowMode, autopilotPolicy);
   const text = recommendationText(recommendation);
   const title = recommendation.title.trim();
   const openChecks = openRequiredGoalChecks(workflow);
@@ -495,15 +802,16 @@ const checklistAlignmentScore = (
 
   const isGoalCheckRecommendation = /^satisfy goal check:/i.test(title);
   const isGoalBatchRecommendation = /^satisfy goal batch:/i.test(title);
-  if (isGoalBatchRecommendation) {
-    score += 240;
+  const isWorkPackageRecommendation = /^satisfy work package:/i.test(title);
+  if (isGoalBatchRecommendation || isWorkPackageRecommendation) {
+    score += 240 + modeConfig.groupedRequiredCheckBonus;
   } else if (isGoalCheckRecommendation) {
     score += 100;
   }
-  if (/\b(?:goal checklist|required check|checklist item)\b/i.test(`${recommendation.summary} ${recommendation.rationale}`)) {
+  if (/\b(?:goal checklist|required check|checklist item|work package)\b/i.test(`${recommendation.summary} ${recommendation.rationale}`)) {
     score += 34;
   }
-  if (/\b(?:related required checks|multiple required|coherent batch|shared code|shared implementation)\b/i.test(`${recommendation.summary} ${recommendation.rationale} ${recommendation.expectedImpact}`)) {
+  if (/\b(?:related required checks|multiple required|coherent batch|coherent work package|shared code|shared implementation)\b/i.test(`${recommendation.summary} ${recommendation.rationale} ${recommendation.expectedImpact}`)) {
     score += 24;
   }
   if (/\bUltimate Goal percentage\b/i.test(recommendation.expectedImpact)) {
@@ -511,32 +819,73 @@ const checklistAlignmentScore = (
   }
 
   let matchedChecks = 0;
+  const targetedCheckIds = new Set(recommendation.targetedCheckIds ?? []);
   for (const check of openChecks) {
     const candidates = [check.title, check.description]
       .map(normalizeRecommendationMatchText)
       .filter((entry) => entry.length >= 8);
-    if (candidates.some((candidate) => text.includes(candidate) || candidate.includes(text))) {
-      score += goalCheckSourceScore(check.source) + goalCheckStatusScore(check.status);
+    if (targetedCheckIds.has(check.id) || candidates.some((candidate) => text.includes(candidate) || candidate.includes(text))) {
+      score += goalCheckSourceScore(check.source) + goalCheckStatusScore(check.status) + (targetedCheckIds.has(check.id) ? 34 : 0);
       matchedChecks += 1;
-      if (!isGoalBatchRecommendation || matchedChecks >= 3) {
+      if ((!isGoalBatchRecommendation && !isWorkPackageRecommendation) || matchedChecks >= modeConfig.maxChecksPerPackage) {
         break;
       }
     }
   }
 
+  if ((isGoalBatchRecommendation || isWorkPackageRecommendation) && matchedChecks > 1) {
+    score += matchedChecks * (modeConfig.mode === "fast" ? 36 : 18);
+  }
+  if (openChecks.length > 0 && matchedChecks === 0 && !isGoalBatchRecommendation && !isWorkPackageRecommendation && !isGoalCheckRecommendation) {
+    score -= modeConfig.mode === "fast" ? 170 : 115;
+  }
+  if (recommendation.confidence < 0.68) {
+    score -= Math.round((0.68 - recommendation.confidence) * 180);
+  }
+  if (recommendation.riskLevel === "high" && !/security|credential|approval|runtime|integrity|validation|sandbox|safety/i.test(`${title} ${recommendation.summary}`)) {
+    score -= 64;
+  } else if (recommendation.riskLevel === "medium") {
+    score -= 12;
+  }
+
   if (openChecks.length > 0 && /\b(?:stabilize recent work|operator feedback|package\/startup|startup-readiness|test-harness)\b/i.test(title)) {
-    score -= 70;
+    score -= modeConfig.genericStabilizationPenalty;
+  }
+  if (openChecks.length > 0 && /\b(?:polish|cleanup|clean up|nice to have|fit and finish|optimi[sz]e|generic)\b/i.test(`${title} ${recommendation.summary}`)) {
+    score -= Math.round(modeConfig.genericStabilizationPenalty * 0.7);
   }
 
   return score;
 };
 
+const isAutopilotRecommendationCandidate = (
+  recommendation: WorkflowRecommendationOption,
+  workflow?: Pick<ProjectWorkflowState, "goalChecklist"> & { workflowMode?: WorkflowMode; autopilotPolicy?: AutopilotPolicy }
+): boolean => {
+  if (recommendation.estimatedScope === "large" || recommendation.confidence < 0.55) {
+    return false;
+  }
+  const openChecks = openRequiredGoalChecks(workflow);
+  if (openChecks.length === 0) {
+    return true;
+  }
+  const title = recommendation.title.trim();
+  const targetsRequiredChecks = /^Satisfy (?:goal (?:check|batch)|work package):/i.test(title) ||
+    (recommendation.targetedCheckIds?.some((checkId) => openChecks.some((check) => check.id === checkId)) ?? false);
+  if (targetsRequiredChecks) {
+    return true;
+  }
+  return !/\b(?:backlog|polish|cleanup|clean up|nice to have|fit and finish|generic)\b/i.test(`${title} ${recommendation.summary}`);
+};
+
 export const pickAutopilotRecommendation = (
   recommendations: WorkflowRecommendationOption[],
-  workflow?: Pick<ProjectWorkflowState, "goalChecklist">
+  workflow?: Pick<ProjectWorkflowState, "goalChecklist"> & { workflowMode?: WorkflowMode; autopilotPolicy?: AutopilotPolicy }
 ): WorkflowRecommendationOption | undefined =>
   [...recommendations]
+    .filter((recommendation) => isAutopilotRecommendationCandidate(recommendation, workflow))
     .sort((left, right) =>
+      (isPreviewRecommendation(right) ? 1 : 0) - (isPreviewRecommendation(left) ? 1 : 0) ||
       checklistAlignmentScore(right, workflow) - checklistAlignmentScore(left, workflow) ||
       right.confidence - left.confidence ||
       recommendationPriorityScore(left.priority) - recommendationPriorityScore(right.priority) ||
@@ -548,15 +897,27 @@ export const getNextWorkflowAutomationAction = (
   workflow: ProjectWorkflowState,
   agents: AgentState[],
   projectKind: ProjectKind,
-  autopilotEnabled = false,
+  autopilot: boolean | AutopilotPolicy = false,
   workflowPauseRequested = false,
   workflowObjective: WorkflowObjective = "deliver"
 ): WorkflowAutomationAction | null => {
+  const autopilotPolicy = typeof autopilot === "boolean"
+    ? createDefaultAutopilotPolicy(autopilot)
+    : validateAutopilotPolicy(autopilot);
+  const autopilotEnabled = autopilotPolicy.enabled;
   const recommendationAgentActive = agents.some((agent) => agent.category === "recommendation" && isAgentActive(agent));
   const goalAgentActive = agents.some((agent) => agent.category === "goal" && isAgentActive(agent));
   const codingAgentActive = agents.some((agent) => agent.category === "coding" && isAgentActive(agent));
   const integrityAgentActive = agents.some((agent) => agent.category === "integrity" && isAgentActive(agent));
   const mergeAgentActive = agents.some((agent) => agent.category === "merge" && isAgentActive(agent));
+
+  if (isWorkflowPreviewReady(workflow)) {
+    return null;
+  }
+
+  if (getWorkflowPreviewRequest(workflow).status === "queued" && (codingAgentActive || integrityAgentActive || mergeAgentActive)) {
+    return null;
+  }
 
   if (workflowPauseRequested) {
     return null;

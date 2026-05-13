@@ -5,6 +5,7 @@ import type {
   AgentListResponse,
   AgentReasoningMode,
   AgentState,
+  AutopilotPolicy,
   ApprovalDecision,
   CredentialEntryMetadata,
   CredentialEntryStatus,
@@ -18,14 +19,19 @@ import type {
   OpenProjectShellResult,
   ProjectLogFeedResponse,
   ProjectLoadResult,
+  ProjectRepositoryView,
+  ProjectWorkflowState,
   UserInputRequestRecord,
   UltimateGoalImportPreview,
   UltimateGoal,
+  VisualExportCaptureTarget,
+  VisualExportSessionStart,
+  VisualExportTab,
   WorkbenchState
 } from "@shared/types";
 
 const invoke = async <T>(channel: string, payload?: unknown): Promise<T> => await ipcRenderer.invoke(channel, payload) as T;
-const STATE_UPDATE_COALESCE_MS = 50;
+const STATE_UPDATE_COALESCE_MS = 150;
 
 export interface WorkbenchApi {
   getState(): Promise<WorkbenchState>;
@@ -42,6 +48,7 @@ export interface WorkbenchApi {
   selectInterface(source: "portable" | "local" | "fresh", path?: string, freshBehavior?: "replace" | "duplicate"): Promise<LoadedProjectView>;
   updateSettings(payload: Record<string, unknown>): Promise<unknown>;
   getFileSummary(projectId: string, relativePath: string): Promise<FileSummary>;
+  getRepositoryView(projectId: string): Promise<ProjectRepositoryView>;
   listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
   getLogFeed(
@@ -83,8 +90,14 @@ export interface WorkbenchApi {
   approveRecommendation(projectId: string, recommendationId: string): Promise<unknown>;
   createScopedGoal(projectId: string): Promise<unknown>;
   retryWorkflowGoal(projectId: string): Promise<unknown>;
+  setWorkflowMode(projectId: string, workflowMode: ProjectWorkflowState["workflowMode"]): Promise<ProjectWorkflowState>;
+  requestWorkflowPreview(projectId: string, reason?: string, remainingCycles?: number): Promise<ProjectWorkflowState>;
+  cancelWorkflowPreview(projectId: string): Promise<ProjectWorkflowState>;
+  completeWorkflowPreview(projectId: string): Promise<ProjectWorkflowState>;
+  setAutopilotPolicy(projectId: string, policy: Partial<AutopilotPolicy>): Promise<ProjectWorkflowState>;
   advanceWorkflowStage(projectId: string): Promise<string>;
   recoverWorkflow(projectId: string): Promise<string>;
+  clearStaleWorkflowLock(projectId: string): Promise<string>;
   requestHumanIntervention(
     projectId: string,
     payload: Omit<HumanInterventionRecord, "id" | "status" | "createdAt" | "resolvedAt" | "resolutionNotes">
@@ -101,6 +114,10 @@ export interface WorkbenchApi {
   exportInterface(projectId: string, destinationPath?: string): Promise<string>;
   downloadInterface(projectId: string): Promise<string | null>;
   downloadLogs(projectId: string): Promise<string | null>;
+  startVisualExport(projectId: string, tabs: VisualExportTab[]): Promise<VisualExportSessionStart | null>;
+  captureVisualExportPage(exportId: string, target: VisualExportCaptureTarget): Promise<void>;
+  finishVisualExport(exportId: string): Promise<string>;
+  cancelVisualExport(exportId: string): Promise<void>;
   importInterface(projectRootPath: string, importPath: string, allowMismatch?: boolean): Promise<LoadedProjectView>;
   createAgent(
     projectId: string,
@@ -159,6 +176,7 @@ const api: WorkbenchApi = {
     await invoke<LoadedProjectView>("project:selectInterface", { projectId: "pending", source, path, freshBehavior }),
   updateSettings: async (payload) => await invoke<unknown>("settings:update", payload),
   getFileSummary: async (projectId, relativePath) => await invoke<FileSummary>("project:getFileSummary", { projectId, relativePath }),
+  getRepositoryView: async (projectId) => await invoke<ProjectRepositoryView>("project:getRepositoryView", { projectId }),
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),
@@ -179,8 +197,15 @@ const api: WorkbenchApi = {
     await invoke("workflow:approveRecommendation", { projectId, recommendationId }),
   createScopedGoal: async (projectId) => await invoke("workflow:createScopedGoal", { projectId }),
   retryWorkflowGoal: async (projectId) => await invoke("workflow:retryGoal", { projectId }),
+  setWorkflowMode: async (projectId, workflowMode) => await invoke<ProjectWorkflowState>("workflow:setMode", { projectId, workflowMode }),
+  requestWorkflowPreview: async (projectId, reason, remainingCycles = 1) =>
+    await invoke<ProjectWorkflowState>("workflow:requestPreview", { projectId, reason, remainingCycles }),
+  cancelWorkflowPreview: async (projectId) => await invoke<ProjectWorkflowState>("workflow:cancelPreview", { projectId }),
+  completeWorkflowPreview: async (projectId) => await invoke<ProjectWorkflowState>("workflow:completePreview", { projectId }),
+  setAutopilotPolicy: async (projectId, policy) => await invoke<ProjectWorkflowState>("workflow:setAutopilotPolicy", { projectId, policy }),
   advanceWorkflowStage: async (projectId) => await invoke<string>("workflow:advanceStage", { projectId }),
   recoverWorkflow: async (projectId) => await invoke<string>("workflow:recover", { projectId }),
+  clearStaleWorkflowLock: async (projectId) => await invoke<string>("workflow:clearStaleLock", { projectId }),
   requestHumanIntervention: async (projectId, payload) =>
     await invoke<HumanInterventionRecord>("workflow:requestHumanIntervention", { projectId, ...payload }),
   resolveHumanIntervention: async (projectId, interventionId, status = "resolved", resolutionNotes = "") =>
@@ -194,6 +219,12 @@ const api: WorkbenchApi = {
   exportInterface: async (projectId, destinationPath) => await invoke<string>("project:exportInterface", { projectId, destinationPath }),
   downloadInterface: async (projectId) => await invoke<string | null>("project:downloadInterface", { projectId }),
   downloadLogs: async (projectId) => await invoke<string | null>("project:downloadLogs", { projectId }),
+  startVisualExport: async (projectId, tabs) =>
+    await invoke<VisualExportSessionStart | null>("project:startVisualExport", { projectId, tabs }),
+  captureVisualExportPage: async (exportId, target) =>
+    await invoke<void>("project:captureVisualExportPage", { exportId, target }),
+  finishVisualExport: async (exportId) => await invoke<string>("project:finishVisualExport", { exportId }),
+  cancelVisualExport: async (exportId) => await invoke<void>("project:cancelVisualExport", { exportId }),
   importInterface: async (projectRootPath, importPath, allowMismatch = false) =>
     await invoke<LoadedProjectView>("project:importInterface", { projectRootPath, importPath, allowMismatch }),
   listAgents: async (projectId, scope = "all", offset = 0, limit = 20) =>
