@@ -387,6 +387,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly workflowAutomationTimers = new Map<string, WorkflowAutomationTimer>();
   private readonly workflowAutomationGenerations = new Map<string, number>();
   private readonly workflowRecoveryInFlight = new Set<string>();
+  private readonly workflowMergeInFlight = new Set<string>();
+  private readonly workflowMergeRetryInFlight = new Set<string>();
   private readonly liveDeltaLastReducedAt = new Map<string, number>();
   private pendingStateEmitTimer?: ReturnType<typeof setTimeout>;
   private readonly pendingProjectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -6735,36 +6737,49 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return project.record.workflow.scopedGoal;
   }
 
-  async retryWorkflowGoal(projectId: string): Promise<void> {
-    const project = this.findProject(projectId);
-    const workflow = this.ensureWorkflowState(project.record);
+  private isWaitingForMergeConflictResolution(workflow: ProjectWorkflowState): boolean {
+    return workflow.repair.status === "merge_conflicts" || workflow.manualHandoff?.reason === "merge_conflicts";
+  }
 
-    this.cancelScheduledWorkflowAutomation(projectId);
-    project.record.localState.workflowPauseRequested = false;
-    if (workflow.repair.status === "merge_conflicts" || workflow.manualHandoff?.reason === "merge_conflicts") {
-      const latestFailureReason =
-        workflow.manualHandoff?.latestFailureReason ??
-        workflow.repair.latestFailureReason ??
-        "Deterministic merge reported conflicts.";
-      this.resetWorkflowStepProgress(workflow, "merge", {
-        status: "waiting",
-        requiresUserInput: false,
-        currentActivity: "Checking resolved integration worktree",
-        latestProgressNote: latestFailureReason,
-        message: "Merge retry will use a resolved conflict worktree when one is ready, otherwise it will rerun integration.",
-        warning: undefined
-      });
-      this.recordWorkflowActivity(workflow, {
-        source: "workflow",
-        status: "waiting",
-        title: "Manual merge retry requested",
-        detail: latestFailureReason,
-        stepId: "merge"
-      });
-      this.syncWorkflowState(project);
-      await this.persistProjectUpdate(project);
+  private queueManualMergeRetry(projectId: string, latestFailureReason: string): boolean {
+    if (this.workflowMergeRetryInFlight.has(projectId)) {
+      return false;
+    }
+    this.workflowMergeRetryInFlight.add(projectId);
+    const immediate = setImmediate(() => {
+      void this.runQueuedManualMergeRetry(projectId, latestFailureReason);
+    });
+    immediate.unref?.();
+    return true;
+  }
+
+  private async runQueuedManualMergeRetry(projectId: string, latestFailureReason: string): Promise<void> {
+    try {
+      await this.yieldWorkflowAutomationLoop();
+      if (this.disposed) {
+        return;
+      }
+      let project = this.projects.get(projectId);
+      if (!project) {
+        return;
+      }
+      let workflow = this.ensureWorkflowState(project.record);
+      if (!this.isWaitingForMergeConflictResolution(workflow)) {
+        this.logWorkflowPerf(`manual merge retry skipped for ${project.record.identity.projectName}: conflict state already changed`);
+        return;
+      }
 
       if (await this.tryFinalizeResolvedMergeConflictWorktree(project)) {
+        return;
+      }
+
+      project = this.projects.get(projectId);
+      if (!project) {
+        return;
+      }
+      workflow = this.ensureWorkflowState(project.record);
+      if (!this.isWaitingForMergeConflictResolution(workflow)) {
+        this.logWorkflowPerf(`manual merge retry skipped for ${project.record.identity.projectName}: conflict state already resolved`);
         return;
       }
 
@@ -6779,8 +6794,123 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         warning: undefined
       });
       this.syncWorkflowState(project);
-      await this.persistProjectUpdate(project);
+      await this.persistProjectUpdate(project, {
+        save: false,
+        emit: "coalesced",
+        reason: "manual merge retry starting"
+      });
       await this.runMerge(projectId, true);
+    } catch (error) {
+      await this.recordManualMergeRetryFailure(projectId, error);
+    } finally {
+      this.workflowMergeRetryInFlight.delete(projectId);
+    }
+  }
+
+  private async recordManualMergeRetryFailure(projectId: string, error: unknown): Promise<void> {
+    const project = this.projects.get(projectId);
+    if (!project || this.disposed) {
+      return;
+    }
+    const workflow = this.ensureWorkflowState(project.record);
+    const detail = error instanceof Error ? error.message : String(error);
+    this.updateWorkflowRepairState(workflow, {
+      status: "merge_conflicts",
+      latestIssueSummary: "Merge retry failed before integration could complete.",
+      latestFailureReason: detail
+    });
+    workflow.manualHandoff ??= this.buildRepairManualHandoff(
+      project,
+      "Merge retry failed before integration could complete.",
+      detail,
+      "merge_conflicts",
+      this.getMergeConflictHandoffPaths([detail])
+    );
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "failed",
+      title: "Manual merge retry failed",
+      detail,
+      stepId: "merge"
+    });
+    this.updateWorkflowStepProgress(workflow, "merge", {
+      status: "failed",
+      requiresUserInput: true,
+      currentActivity: "Merge retry failed",
+      latestProgressNote: detail,
+      message: "Review the merge conflict details and retry after resolving the blocker.",
+      warning: detail
+    });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: "deferred",
+      emit: "coalesced",
+      reason: "manual merge retry failed"
+    });
+  }
+
+  async retryWorkflowGoal(projectId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+
+    this.cancelScheduledWorkflowAutomation(projectId);
+    project.record.localState.workflowPauseRequested = false;
+    if (this.workflowMergeRetryInFlight.has(projectId)) {
+      const latestFailureReason =
+        workflow.manualHandoff?.latestFailureReason ??
+        workflow.repair.latestFailureReason ??
+        "A merge retry is already running for this project.";
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        requiresUserInput: false,
+        currentActivity: "Merge retry already queued",
+        latestProgressNote: latestFailureReason,
+        message: "A merge retry is already running for this project.",
+        warning: undefined
+      });
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: "Manual merge retry already running",
+        detail: latestFailureReason,
+        stepId: "merge"
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, {
+        save: false,
+        emit: "immediate",
+        reason: "manual merge retry coalesced"
+      });
+      return;
+    }
+    if (this.isWaitingForMergeConflictResolution(workflow)) {
+      const latestFailureReason =
+        workflow.manualHandoff?.latestFailureReason ??
+        workflow.repair.latestFailureReason ??
+        "Deterministic merge reported conflicts.";
+      const queued = this.queueManualMergeRetry(projectId, latestFailureReason);
+      this.resetWorkflowStepProgress(workflow, "merge", {
+        status: "waiting",
+        requiresUserInput: false,
+        currentActivity: queued ? "Queued to check resolved integration worktree" : "Merge retry already queued",
+        latestProgressNote: latestFailureReason,
+        message: queued
+          ? "Merge retry will use a resolved conflict worktree when one is ready, otherwise it will rerun integration."
+          : "A merge retry is already running for this project.",
+        warning: undefined
+      });
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: queued ? "Manual merge retry requested" : "Manual merge retry already running",
+        detail: latestFailureReason,
+        stepId: "merge"
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, {
+        save: false,
+        emit: "immediate",
+        reason: queued ? "manual merge retry requested" : "manual merge retry coalesced"
+      });
       return;
     }
 
@@ -7650,6 +7780,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       turnPrompt?: string;
       launchThread?: boolean;
       targetBranch?: string;
+      persistOnCreate?: boolean;
     }
   ): Promise<AgentState> {
     const launchThread = options?.launchThread !== false;
@@ -7785,7 +7916,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       });
     }
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project);
+    if (options?.persistOnCreate === false) {
+      this.emitState();
+    } else {
+      await this.persistProjectUpdate(project);
+    }
 
     if (!launchThread) {
       return agent;
@@ -8641,6 +8776,39 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   async runMerge(projectId: string, automate = false): Promise<void> {
+    if (this.workflowMergeInFlight.has(projectId)) {
+      const project = this.findProject(projectId);
+      const workflow = this.ensureWorkflowState(project.record);
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: "Merge already running",
+        detail: "A merge is already in progress for this project, so the duplicate request was ignored.",
+        stepId: "merge"
+      });
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        requiresUserInput: false,
+        currentActivity: "Merge already running",
+        message: "A merge is already in progress for this project."
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, {
+        save: false,
+        emit: "coalesced",
+        reason: "merge request coalesced"
+      });
+      return;
+    }
+
+    this.workflowMergeInFlight.add(projectId);
+    try {
+      await this.runMergeInternal(projectId, automate);
+    } finally {
+      this.workflowMergeInFlight.delete(projectId);
+    }
+  }
+
+  private async runMergeInternal(projectId: string, automate = false): Promise<void> {
     const project = this.findProject(projectId);
     this.assertResolvedPathCompatible(project.record.distroName);
     const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
@@ -8661,7 +8829,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       agentCategory: "merge"
     }, { status: "running", incrementRunCount: true, incrementAttemptCount: true });
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project);
+    await this.persistProjectUpdate(project, {
+      save: false,
+      emit: "coalesced",
+      reason: "merge started"
+    });
 
     const mergeModel = this.getDefaultAgentModel();
     const mergeAgent = await this.createAgent(
@@ -8670,7 +8842,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Merge Agent",
       "Integrate validated work deterministically.",
       mergeModel,
-      { launchThread: false }
+      { launchThread: false, persistOnCreate: false }
     );
 
     if (project.scan.kind !== "git") {
@@ -8744,9 +8916,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       conflictCycleCount: mergeResult.conflicts.length > 0 ? 1 : 0,
       generatedAt: nowIso()
     };
-    mergeAgent.status = mergeResult.conflicts.length === 0 ? "completed" : "conflicted";
-    mergeAgent.completedAt = nowIso();
     if (mergeResult.conflicts.length > 0) {
+      mergeAgent.status = "conflicted";
+      mergeAgent.completedAt = nowIso();
       const latestFailureReason = mergeResult.conflicts[0] ?? "Deterministic merge reported conflicts.";
       this.updateWorkflowRepairState(workflow, {
         attemptCount: workflow.repair.attemptCount + 1,
@@ -8781,6 +8953,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         warning: "Automatic merge repair is not available for these conflicts."
       }, { status: "failed" });
     } else {
+      mergeAgent.status = "running";
+      mergeAgent.completedAt = undefined;
       try {
         appliedCheckoutBranch = integrationBranch
           ? await this.applyGitBranchToProjectCheckout(project, integrationBranch, "Merge finalization")
@@ -8789,6 +8963,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         const detail = error instanceof Error ? error.message : String(error);
         mergeAgent.mergeReport.summary = `Merged cleanly in the integration worktree, but the opened checkout was not updated. ${detail}`;
         mergeAgent.status = "failed";
+        mergeAgent.completedAt = nowIso();
         this.recordWorkflowOpenIssue(workflow, "Opened checkout was not updated", detail, "merge");
         if (!workflow.humanInterventions.some((entry) => entry.status === "pending" && entry.title === "Opened checkout update blocked")) {
           await this.createHumanInterventionRecord(project, {
@@ -8827,6 +9002,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
       workflow.workflowCycle.status = "merged";
+      await this.cleanupCompletedManagedWorktrees(project, this.getRetiredMergeWorktreePaths(project, mergeAgent.id));
+      mergeAgent.status = "completed";
+      mergeAgent.completedAt = nowIso();
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
         status: "completed",
@@ -8842,7 +9020,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         message: mergeAgent.mergeReport.summary,
         warning: undefined
       }, { status: "completed" });
-      await this.cleanupCompletedManagedWorktrees(project, this.getRetiredMergeWorktreePaths(project, mergeAgent.id));
     }
     this.syncWorkflowState(project);
     await this.persistProjectUpdate(project, {

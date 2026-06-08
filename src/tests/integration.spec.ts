@@ -940,7 +940,8 @@ describe("integration flows", () => {
     const record = await waitFor(() => {
       const candidate = getProjectRecord(service, selected.record.id);
       const mergeAgents = candidate?.agents.filter((agent) => agent.category === "merge") ?? [];
-      return mergeAgents.length > previousMergeAgentCount ? candidate : null;
+      const latestMergeAgent = mergeAgents[0];
+      return mergeAgents.length > previousMergeAgentCount && latestMergeAgent?.status === "completed" ? candidate : null;
     }, 8_000);
 
     const latestMergeAgent = record.agents.filter((agent) => agent.category === "merge")[0];
@@ -952,6 +953,56 @@ describe("integration flows", () => {
     expect(await readFile(path.join(root, "src/index.ts"), "utf8")).toContain("resolved");
     await expect(access(conflictedWorktreePath!)).rejects.toThrow();
   }, 12_000);
+
+  it("queues merge conflict retries without awaiting merge work on the caller path", async () => {
+    const root = await createSampleRepo("merge-retry-queued");
+    const appData = await createTempDir("appdata-merge-retry-queued");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    const latestFailureReason = "CONFLICT (content): Merge conflict in src/index.ts";
+
+    workflow.repair.status = "merge_conflicts";
+    workflow.repair.latestIssueSummary = "Merge conflicts were detected and require follow-up.";
+    workflow.repair.latestFailureReason = latestFailureReason;
+    workflow.manualHandoff = {
+      reason: "merge_conflicts",
+      title: "Merge conflicts detected",
+      whatSystemWasTryingToDo: "Integrate validated coding-agent branches into the opened project checkout",
+      validationIssue: "Merge conflicts were detected and require follow-up.",
+      latestFailureReason,
+      involvedPaths: ["src/index.ts"],
+      shellSupported: false,
+      createdAt: nowIso()
+    };
+    workflow.stepProgress.merge.status = "failed";
+
+    const runMergeCalls: Array<{ projectId: string; automate: boolean }> = [];
+    let releaseRunMerge: (() => void) | undefined;
+    (service as any).runMerge = async (queuedProjectId: string, automate = false): Promise<void> => {
+      runMergeCalls.push({ projectId: queuedProjectId, automate });
+      await new Promise<void>((resolve) => {
+        releaseRunMerge = resolve;
+      });
+    };
+
+    const startedAt = performance.now();
+    await service.retryWorkflowGoal(selected.record.id);
+
+    expect(performance.now() - startedAt).toBeLessThan(250);
+    expect(runMergeCalls).toHaveLength(0);
+
+    await waitFor(() => runMergeCalls.length === 1 ? true : null, 1_000);
+    expect(runMergeCalls).toEqual([{ projectId: selected.record.id, automate: true }]);
+
+    await service.retryWorkflowGoal(selected.record.id);
+    expect(runMergeCalls).toHaveLength(1);
+
+    releaseRunMerge?.();
+    await waitFor(() => ((service as any).workflowMergeRetryInFlight as Set<string>).has(selected.record.id) ? null : true, 1_000);
+  }, 6_000);
 
   it("applies a manually resolved integration worktree when retrying merge conflicts", async () => {
     const root = await createSampleRepo("merge-retry-worktree");
