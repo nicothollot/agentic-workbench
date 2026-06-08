@@ -253,6 +253,7 @@ const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
 export class WorkbenchStorage {
   private readonly writeQueues = new Map<string, Promise<void>>();
   private readonly debugState = process.env.AWB_DEBUG_STATE === "1";
+  private readonly debugPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
 
   constructor(
     private readonly appDataDir: string,
@@ -424,7 +425,14 @@ export class WorkbenchStorage {
   async saveProject(record: LocalProjectRecord): Promise<void> {
     await this.ensureBaseDirs();
     await mkdir(this.projectDir(record.id), { recursive: true });
+    const sanitizeStartedAt = performance.now();
     const sanitized = sanitizeProjectRecord(record);
+    if (this.debugPerf) {
+      const serializedBytes = JSON.stringify(sanitized.record).length;
+      console.info(
+        `[workflow-perf] sanitizeProjectRecord ${record.identity.projectName}: ${serializedBytes} bytes in ${Math.round(performance.now() - sanitizeStartedAt)}ms`
+      );
+    }
     await this.writeJsonAtomically(this.projectStatePath(record.id), sanitized.record);
   }
 
@@ -558,7 +566,10 @@ export class WorkbenchStorage {
 
   async loadAllProjects(): Promise<LocalProjectRecord[]> {
     const projectIds = await this.loadRegistry();
-    const records = await Promise.all(projectIds.map((projectId) => this.loadProject(projectId)));
+    const records: Array<LocalProjectRecord | null> = [];
+    for (const projectId of projectIds) {
+      records.push(await this.loadProject(projectId));
+    }
     return records.filter((record): record is LocalProjectRecord => record !== null);
   }
 

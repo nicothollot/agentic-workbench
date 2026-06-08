@@ -45,7 +45,8 @@ export type AutopilotPauseReason =
   | "high_risk_package_requires_approval"
   | "unsafe_scope_broadening"
   | "required_check_promotion_cap"
-  | "max_consecutive_cycles";
+  | "max_consecutive_cycles"
+  | "automation_no_progress";
 export interface AutopilotPolicy {
   enabled: boolean;
   profile: AutopilotProfile;
@@ -988,6 +989,13 @@ export interface RecommendationReport {
   generatedAt: string;
 }
 
+export interface StructuredOutputApplication {
+  kind: "recommendation" | "scoped_goal";
+  contentHash: string;
+  appliedAt: string;
+  source?: string;
+}
+
 export interface AgentState {
   id: string;
   category: AgentCategory;
@@ -1016,6 +1024,7 @@ export interface AgentState {
   integrityReport?: IntegrityReport;
   mergeReport?: MergeReport;
   recommendationReport?: RecommendationReport;
+  appliedStructuredOutputs?: StructuredOutputApplication[];
 }
 
 export type AgentHistoryScope = "all" | "workflow" | "manual";

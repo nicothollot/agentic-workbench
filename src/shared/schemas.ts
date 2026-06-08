@@ -754,7 +754,8 @@ export const autopilotRuntimeStatusSchema = z.object({
     "high_risk_package_requires_approval",
     "unsafe_scope_broadening",
     "required_check_promotion_cap",
-    "max_consecutive_cycles"
+    "max_consecutive_cycles",
+    "automation_no_progress"
   ]).optional(),
   pausedDetail: z.string().optional(),
   highRiskPackageRequiresApproval: z.boolean().default(false),
@@ -959,7 +960,15 @@ export const agentStateSchema = z.object({
   recoveryHandledAt: isoDatetime().optional(),
   integrityReport: integrityReportSchema.optional(),
   mergeReport: mergeReportSchema.optional(),
-  recommendationReport: recommendationReportSchema.optional()
+  recommendationReport: recommendationReportSchema.optional(),
+  appliedStructuredOutputs: z.array(
+    z.object({
+      kind: z.enum(["recommendation", "scoped_goal"]),
+      contentHash: z.string().min(1),
+      appliedAt: isoDatetime(),
+      source: z.string().optional()
+    })
+  ).default([])
 });
 
 export const portableInterfaceSchema = z.object({

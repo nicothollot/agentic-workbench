@@ -18,13 +18,15 @@
     "build:electron": "vite build -c vite.main.config.ts && vite build -c vite.preload.config.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
     "lint": "eslint .",
-    "test": "vitest run",
+    "test": "vitest run --fileParallelism=false",
     "test:watch": "vitest",
     "repair:state": "node scripts/repair-state.mjs",
     "package:win": "node scripts/package-app.mjs --win",
+    "package:win:portable": "node scripts/package-app.mjs --win-portable",
     "package:mac": "node scripts/package-app.mjs --mac",
     "package:all": "node scripts/package-app.mjs --all",
     "dist:win": "node scripts/package-app.mjs --win",
+    "dist:win:portable": "node scripts/package-app.mjs --win-portable",
     "generate:app-server": "node scripts/generate-app-server.mjs"
   },
   "dependencies": {
@@ -93,7 +95,7 @@
       ],
       "target": [
         {
-          "target": "portable",
+          "target": "dir",
           "arch": [
             "x64"
           ]

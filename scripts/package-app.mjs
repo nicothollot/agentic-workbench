@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,8 +10,9 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
 const stageDir = path.join(rootDir, ".electron-builder", "app");
 const packageOutputRoot = path.join(rootDir, ".electron-builder", "out");
+const packageMetadata = JSON.parse(readFileSync(path.join(rootDir, "package.json"), "utf8"));
 
-const appTargets = new Set(["win", "mac"]);
+const appTargets = new Set(["win", "win-portable", "mac"]);
 const windowsLocalExecutableArgs = ["--config.win.signAndEditExecutable=false"];
 const packagingCredentialEnvKeys = [
   "AWB_SIGN_WINDOWS",
@@ -27,6 +28,12 @@ const packagingCredentialEnvKeys = [
 const expectedBuilderInfoFilters = [
   /file signing skipped via signExts configuration/
 ];
+
+const readElectronPackageVersion = () => {
+  const electronPackagePath = path.join(rootDir, "node_modules", "electron", "package.json");
+  const electronPackage = JSON.parse(readFileSync(electronPackagePath, "utf8"));
+  return electronPackage.version;
+};
 
 export const isWslEnvironment = (env = process.env, platform = process.platform) => {
   if (platform !== "linux") {
@@ -166,8 +173,12 @@ export const parsePackageArgs = (argv) => {
   let compile = true;
 
   for (const arg of argv) {
-    if (arg === "--win" || arg === "--windows") {
+    if (arg === "--win" || arg === "--windows" || arg === "--win-unpacked") {
       targets.add("win");
+      continue;
+    }
+    if (arg === "--win-portable" || arg === "--windows-portable") {
+      targets.add("win-portable");
       continue;
     }
     if (arg === "--mac" || arg === "--macos") {
@@ -257,6 +268,31 @@ const run = (command, args, env = process.env, options = {}) =>
     });
   });
 
+const tryRun = (command, args, env = process.env) =>
+  new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: rootDir,
+      env,
+      stdio: "ignore",
+      shell: process.platform === "win32"
+    });
+
+    child.on("error", () => resolve(false));
+    child.on("exit", (code) => resolve(code === 0));
+  });
+
+const walkFiles = async (directoryPath, visitor) => {
+  const entries = await readdir(directoryPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(directoryPath, entry.name);
+    if (entry.isDirectory()) {
+      await walkFiles(entryPath, visitor);
+      continue;
+    }
+    await visitor(entryPath);
+  }
+};
+
 export const createBuilderEnv = (env = process.env) => {
   const builderEnv = Object.fromEntries(
     Object.entries(env).filter(([key]) => !key.startsWith("npm_"))
@@ -312,6 +348,16 @@ export const buildTargetArgs = (target, outputDir) => {
     return [
       ...commonArgs,
       "--win",
+      "dir",
+      "--x64",
+      ...windowsLocalExecutableArgs
+    ];
+  }
+
+  if (target === "win-portable") {
+    return [
+      ...commonArgs,
+      "--win",
       "portable",
       "--x64",
       ...windowsLocalExecutableArgs
@@ -328,7 +374,15 @@ export const buildTargetArgs = (target, outputDir) => {
 };
 
 const collectDistributableArtifacts = async (outputDir, target) => {
-  const extensions = target === "win" ? [".exe"] : [".dmg"];
+  if (target === "win") {
+    const unpackedDir = path.join(outputDir, "win-unpacked");
+    if (directoryExists(unpackedDir)) {
+      return [unpackedDir];
+    }
+    return [];
+  }
+
+  const extensions = target === "win-portable" ? [".exe"] : [".dmg"];
   const artifacts = [];
 
   const walk = async (directoryPath) => {
@@ -360,24 +414,37 @@ export const buildArtifactCopyFallbackPath = (destinationPath, attempt = 1, now 
   return path.join(path.dirname(destinationPath), `${baseName}-${timestamp}${attemptSuffix}${extension}`);
 };
 
+const buildDirectoryCopyFallbackPath = (destinationPath, attempt = 1, now = new Date()) => {
+  const timestamp = now.toISOString().replace(/\D/g, "").slice(0, 14);
+  const attemptSuffix = attempt > 1 ? `-${attempt}` : "";
+  return path.join(path.dirname(destinationPath), `${path.basename(destinationPath)}-${timestamp}${attemptSuffix}`);
+};
+
 const isLockedDestinationError = (error) =>
   error && typeof error === "object" && ["EACCES", "EPERM"].includes(error.code);
 
 const copyArtifactToDownloads = async (artifactPath, downloadsDir) => {
-  const destinationPath = path.join(downloadsDir, path.basename(artifactPath));
+  const artifactName = path.basename(artifactPath) === "win-unpacked"
+    ? `${packageMetadata.build?.productName ?? packageMetadata.name}-${packageMetadata.version}-windows-x64-unpacked`
+    : path.basename(artifactPath);
+  const destinationPath = path.join(downloadsDir, artifactName);
 
   try {
-    await cp(artifactPath, destinationPath, { force: true });
+    await rm(destinationPath, { recursive: true, force: true });
+    await cp(artifactPath, destinationPath, { recursive: true, force: true });
     return destinationPath;
   } catch (error) {
     if (!isLockedDestinationError(error)) {
       throw error;
     }
 
+    const sourceStat = await stat(artifactPath);
     for (let attempt = 1; attempt <= 20; attempt += 1) {
-      const fallbackPath = buildArtifactCopyFallbackPath(destinationPath, attempt);
+      const fallbackPath = sourceStat.isDirectory()
+        ? buildDirectoryCopyFallbackPath(destinationPath, attempt)
+        : buildArtifactCopyFallbackPath(destinationPath, attempt);
       try {
-        await cp(artifactPath, fallbackPath, { errorOnExist: true, force: false });
+        await cp(artifactPath, fallbackPath, { errorOnExist: true, force: false, recursive: true });
         console.warn(`Could not replace ${destinationPath}; copied artifact to ${fallbackPath} instead.`);
         return fallbackPath;
       } catch (fallbackError) {
@@ -403,6 +470,113 @@ const copyArtifactsToDownloads = async (artifacts, downloadsDir) => {
   return copiedArtifacts;
 };
 
+const findOfficialElectronZip = async (version, cacheRoot = process.env.ELECTRON_CACHE) => {
+  const cacheCandidates = [
+    cacheRoot,
+    path.join(os.homedir(), ".cache", "electron"),
+    path.join(os.homedir(), "AppData", "Local", "electron", "Cache")
+  ].filter(Boolean);
+  const expectedName = `electron-v${version}-win32-x64.zip`;
+
+  for (const candidate of cacheCandidates) {
+    if (!directoryExists(candidate)) {
+      continue;
+    }
+
+    let found;
+    await walkFiles(candidate, async (filePath) => {
+      if (!found && path.basename(filePath) === expectedName) {
+        found = filePath;
+      }
+    });
+
+    if (found) {
+      return found;
+    }
+  }
+
+  return undefined;
+};
+
+const extractOfficialWindowsElectronExecutable = async (zipPath) => {
+  const extractDir = await mkdtemp(path.join(os.tmpdir(), "awb-electron-win-"));
+  const extractCommands = process.platform === "win32"
+    ? [
+        ["tar", ["-xf", zipPath, "-C", extractDir, "electron.exe"]],
+        ["powershell.exe", [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "Add-Type -AssemblyName System.IO.Compression.FileSystem; " +
+            `$zip = [IO.Compression.ZipFile]::OpenRead('${zipPath.replaceAll("'", "''")}'); ` +
+            `$entry = $zip.GetEntry('electron.exe'); ` +
+            `[IO.Compression.ZipFileExtensions]::ExtractToFile($entry, '${path.join(extractDir, "electron.exe").replaceAll("'", "''")}', $true); ` +
+            "$zip.Dispose();"
+        ]]
+      ]
+    : [
+        ["unzip", ["-q", zipPath, "electron.exe", "-d", extractDir]],
+        ["bsdtar", ["-xf", zipPath, "-C", extractDir, "electron.exe"]]
+      ];
+
+  for (const [command, args] of extractCommands) {
+    if (await tryRun(command, args)) {
+      const executablePath = path.join(extractDir, "electron.exe");
+      if (existsSync(executablePath)) {
+        return executablePath;
+      }
+    }
+  }
+
+  throw new Error(`Unable to extract electron.exe from ${zipPath}`);
+};
+
+export const resolveOfficialWindowsElectronExecutable = async () => {
+  const localWindowsExecutable = path.join(rootDir, "node_modules", "electron", "dist", "electron.exe");
+  if (existsSync(localWindowsExecutable)) {
+    return localWindowsExecutable;
+  }
+
+  const electronVersion = readElectronPackageVersion();
+  const zipPath = await findOfficialElectronZip(electronVersion);
+  if (!zipPath) {
+    throw new Error(`Could not find cached official Electron Windows zip for v${electronVersion}. Run the Windows package build once to populate the Electron cache.`);
+  }
+
+  return await extractOfficialWindowsElectronExecutable(zipPath);
+};
+
+export const patchWindowsExecutableWithOfficialElectron = async (unpackedDir) => {
+  const executableName = `${packageMetadata.build?.productName ?? packageMetadata.name}.exe`;
+  const appExecutablePath = path.join(unpackedDir, executableName);
+  const officialExecutablePath = await resolveOfficialWindowsElectronExecutable();
+  await cp(officialExecutablePath, appExecutablePath, { force: true });
+  return appExecutablePath;
+};
+
+const artifactSizeBytes = async (artifactPath) => {
+  const artifactStat = await stat(artifactPath);
+  if (!artifactStat.isDirectory()) {
+    return artifactStat.size;
+  }
+
+  let total = 0;
+  const walk = async (directoryPath) => {
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = path.join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entryPath);
+      } else {
+        total += (await stat(entryPath)).size;
+      }
+    }
+  };
+  await walk(artifactPath);
+  return total;
+};
+
 export const packageApp = async (argv = process.argv.slice(2)) => {
   const { compile, targets } = parsePackageArgs(argv);
   assertTargetsCanBuildOnHost(targets);
@@ -424,6 +598,9 @@ export const packageApp = async (argv = process.argv.slice(2)) => {
     await run(process.execPath, buildTargetArgs(target, outputDir), builderEnv, {
       outputFilters: target === "win" ? expectedBuilderInfoFilters : []
     });
+    if (target === "win") {
+      await patchWindowsExecutableWithOfficialElectron(path.join(outputDir, "win-unpacked"));
+    }
 
     const artifacts = await collectDistributableArtifacts(outputDir, target);
     if (artifacts.length === 0) {
@@ -435,8 +612,7 @@ export const packageApp = async (argv = process.argv.slice(2)) => {
 
   console.log("Packaged distributable artifacts:");
   for (const artifactPath of copiedArtifacts) {
-    const artifactStat = await stat(artifactPath);
-    const sizeMb = (artifactStat.size / 1024 / 1024).toFixed(1);
+    const sizeMb = ((await artifactSizeBytes(artifactPath)) / 1024 / 1024).toFixed(1);
     console.log(`- ${artifactPath} (${sizeMb} MB)`);
   }
 

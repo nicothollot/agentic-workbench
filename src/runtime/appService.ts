@@ -185,6 +185,25 @@ interface PendingLoad {
 }
 
 type InterfaceCreationParseFailure = Exclude<InterfaceCreationParseResult, { ok: true }>;
+type ProjectSaveMode = "immediate" | "deferred" | false;
+type StateEmitMode = "immediate" | "coalesced" | false;
+type PersistProjectUpdateOptions = {
+  save?: ProjectSaveMode;
+  emit?: StateEmitMode;
+  automate?: boolean;
+  reason?: string;
+};
+type WorkflowAutomationTimer = {
+  timer: ReturnType<typeof setTimeout>;
+  generation: number;
+};
+type StructuredOutputKind = "recommendation" | "scoped_goal";
+type StructuredOutputGuard = {
+  key: string;
+  kind: StructuredOutputKind;
+  contentHash: string;
+  source?: string;
+};
 
 const writeEnabledAgentCategories = new Set<AgentCategory>(["coding", "manual"]);
 const isWriteEnabledAgentCategory = (category: AgentCategory): boolean => writeEnabledAgentCategories.has(category);
@@ -205,8 +224,12 @@ const RENDERER_RAW_EVENT_LIMIT = 4_000;
 const RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT = 32;
 const RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT = 8;
 const STATE_EMIT_THROTTLE_MS = 350;
-const LIVE_PROJECT_SAVE_THROTTLE_MS = 750;
-const WORKFLOW_AUTOMATION_SCHEDULE_DELAY_MS = 150;
+const LIVE_PROJECT_SAVE_THROTTLE_MS = 100;
+const LIVE_DELTA_REDUCE_THROTTLE_MS = 1_500;
+const WORKFLOW_AUTOMATION_SCHEDULE_DELAY_MS = 25;
+const WORKFLOW_AUTOMATION_NO_PROGRESS_LIMIT = 2;
+const WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT = 20;
+const STRUCTURED_OUTPUT_HISTORY_LIMIT = 24;
 const WSL_WINDOWS_MOUNT_PATH = /^\/mnt\/[a-z](?:\/|$)/i;
 const liveTransportUpdateMethods = new Set<string>([
   "thread/tokenUsage/updated",
@@ -221,15 +244,26 @@ const liveTransportUpdateMethods = new Set<string>([
   "item/commandExecution/outputDelta",
   "item/fileChange/outputDelta"
 ]);
+const throttledTransportDeltaMethods = new Set<string>([
+  "item/agentMessage/delta",
+  "item/plan/delta",
+  "item/reasoning/summaryTextDelta",
+  "item/reasoning/textDelta",
+  "command/exec/outputDelta",
+  "item/commandExecution/outputDelta",
+  "item/fileChange/outputDelta"
+]);
 const workflowActivitySuppressedTransportMethods = new Set<string>([
   "thread/tokenUsage/updated",
   "turn/plan/updated",
   "rawResponseItem/completed",
-  "item/reasoning/summaryPartAdded"
+  "item/reasoning/summaryPartAdded",
+  ...[...throttledTransportDeltaMethods].filter((method) => method !== "item/agentMessage/delta")
 ]);
 const ignoredRendererUpdateMethods = new Set<string>([
   "thread/tokenUsage/updated",
-  "item/reasoning/summaryPartAdded"
+  "item/reasoning/summaryPartAdded",
+  ...throttledTransportDeltaMethods
 ]);
 const immediateTransportFlushMethods = new Set<string>([
   "turn/completed",
@@ -331,6 +365,7 @@ const genericGoalCompletionEvidencePatterns = [
 ];
 
 export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }> {
+  private static readonly activeServicesByAppDataDir = new Map<string, AppService>();
   private settings: AppSettings = defaultSettings();
   private githubStatus: GitHubStatus = {
     state: "not_linked",
@@ -349,13 +384,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly interfaceCreationRepairAttempts = new Map<string, number>();
   private readonly workflowAutomationInFlight = new Set<string>();
   private readonly workflowAutomationQueued = new Set<string>();
-  private readonly workflowAutomationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly workflowAutomationTimers = new Map<string, WorkflowAutomationTimer>();
+  private readonly workflowAutomationGenerations = new Map<string, number>();
   private readonly workflowRecoveryInFlight = new Set<string>();
+  private readonly liveDeltaLastReducedAt = new Map<string, number>();
   private pendingStateEmitTimer?: ReturnType<typeof setTimeout>;
   private readonly pendingProjectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly projectSaveFingerprints = new Map<string, string>();
+  private readonly projectSaveInFlight = new Map<string, Promise<void>>();
+  private readonly projectSaveQueued = new Map<string, Promise<void>>();
+  private readonly registeredProjectIds = new Set<string>();
+  private readonly structuredOutputApplicationsInFlight = new Set<string>();
   private suppressTransportExitHandling = false;
   private transportInitialization?: Promise<void>;
-  private readonly debugWorkflowPerf = process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
+  private disposed = false;
+  private disposePromise?: Promise<void>;
+  private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
   private readonly workflowPerfCounters = new Map<string, { count: number; startedAt: number; lastLoggedAt: number }>();
 
   constructor(
@@ -388,22 +432,150 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.workflowPerfCounters.set(name, counter);
   }
 
+  private collectRendererStateStats(state: WorkbenchState): string {
+    let agents = 0;
+    let events = 0;
+    let commands = 0;
+    let activity = 0;
+    let recommendations = 0;
+    for (const project of state.projects) {
+      agents += project.record.agents.length;
+      activity += project.record.workflow.activityLog.length;
+      recommendations += project.record.workflow.recommendations.length;
+      for (const agent of project.record.agents) {
+        events += agent.events.length;
+        commands += agent.commandLog.length;
+      }
+    }
+    return [
+      `projects=${state.projects.length}`,
+      `agents=${agents}`,
+      `events=${events}`,
+      `commands=${commands}`,
+      `activity=${activity}`,
+      `recommendations=${recommendations}`
+    ].join(" ");
+  }
+
+  private normalizePersistProjectUpdateOptions(
+    options?: boolean | PersistProjectUpdateOptions
+  ): Required<PersistProjectUpdateOptions> {
+    if (typeof options === "boolean" || options === undefined) {
+      return {
+        save: options ? "immediate" : "deferred",
+        emit: "coalesced",
+        automate: Boolean(options),
+        reason: options ? "project update with automation" : "project update"
+      };
+    }
+    return {
+      save: options.save ?? "immediate",
+      emit: options.emit ?? "coalesced",
+      automate: options.automate ?? false,
+      reason: options.reason ?? "project update"
+    };
+  }
+
+  private structuredOutputContentHash(rawText: string): string {
+    return sha256(rawText.trim().replace(/\s+/g, " "));
+  }
+
+  private beginStructuredOutputApplication(
+    project: LoadedProject,
+    agent: AgentState,
+    kind: StructuredOutputKind,
+    rawText: string,
+    source?: string
+  ): StructuredOutputGuard | undefined {
+    const contentHash = this.structuredOutputContentHash(rawText);
+    agent.appliedStructuredOutputs ??= [];
+    if (agent.appliedStructuredOutputs.some((entry) => entry.kind === kind && entry.contentHash === contentHash)) {
+      return undefined;
+    }
+    const key = `${project.record.id}:${agent.id}:${kind}:${contentHash}`;
+    if (this.structuredOutputApplicationsInFlight.has(key)) {
+      return undefined;
+    }
+    this.structuredOutputApplicationsInFlight.add(key);
+    return { key, kind, contentHash, source };
+  }
+
+  private finishStructuredOutputApplication(agent: AgentState, guard: StructuredOutputGuard): void {
+    this.structuredOutputApplicationsInFlight.delete(guard.key);
+    agent.appliedStructuredOutputs ??= [];
+    if (!agent.appliedStructuredOutputs.some((entry) => entry.kind === guard.kind && entry.contentHash === guard.contentHash)) {
+      agent.appliedStructuredOutputs.unshift({
+        kind: guard.kind,
+        contentHash: guard.contentHash,
+        appliedAt: nowIso(),
+        source: guard.source
+      });
+      agent.appliedStructuredOutputs = agent.appliedStructuredOutputs.slice(0, STRUCTURED_OUTPUT_HISTORY_LIMIT);
+    }
+  }
+
+  private abortStructuredOutputApplication(guard: StructuredOutputGuard | undefined): void {
+    if (guard) {
+      this.structuredOutputApplicationsInFlight.delete(guard.key);
+    }
+  }
+
+  private markProjectDirty(projectId: string): void {
+    this.projectSaveFingerprints.delete(projectId);
+  }
+
+  private getTransportDeltaItemId(notification: ServerNotification): string {
+    if (!("params" in notification) || !notification.params || typeof notification.params !== "object") {
+      return "unknown";
+    }
+    const params = notification.params as { itemId?: unknown; processId?: unknown };
+    const rawId = params.itemId ?? params.processId;
+    return typeof rawId === "string" || typeof rawId === "number" ? String(rawId) : "unknown";
+  }
+
+  private shouldReduceLiveTransportDelta(projectId: string, agentId: string, notification: ServerNotification): boolean {
+    if (!throttledTransportDeltaMethods.has(notification.method)) {
+      return true;
+    }
+    if (notification.method === "item/agentMessage/delta") {
+      return true;
+    }
+
+    const key = `${projectId}:${agentId}:${notification.method}:${this.getTransportDeltaItemId(notification)}`;
+    const now = performance.now();
+    const lastReducedAt = this.liveDeltaLastReducedAt.get(key);
+    if (lastReducedAt !== undefined && now - lastReducedAt < LIVE_DELTA_REDUCE_THROTTLE_MS) {
+      return false;
+    }
+    this.liveDeltaLastReducedAt.set(key, now);
+    return true;
+  }
+
   private getRendererStateForEmit(label: string): WorkbenchState {
     const startedAt = performance.now();
     const state = this.getRendererState();
     if (this.debugWorkflowPerf) {
       let payloadSize = 0;
+      let activeProjectSize = 0;
       try {
         payloadSize = JSON.stringify(state).length;
+        const activeProject = state.projects.find((project) => project.record.id === state.activeProjectId);
+        activeProjectSize = activeProject ? JSON.stringify(activeProject.record).length : 0;
       } catch {
         payloadSize = -1;
+        activeProjectSize = -1;
       }
-      this.logWorkflowPerf(`${label}: renderer payload ${payloadSize} bytes in ${Math.round(performance.now() - startedAt)}ms`);
+      this.logWorkflowPerf(
+        `${label}: renderer payload ${payloadSize} bytes, activeProject=${activeProjectSize} bytes, ${this.collectRendererStateStats(state)} in ${Math.round(performance.now() - startedAt)}ms`
+      );
     }
     return state;
   }
 
   private emitStateNow(label = "state emit"): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.pendingStateEmitTimer) {
       clearTimeout(this.pendingStateEmitTimer);
       this.pendingStateEmitTimer = undefined;
@@ -413,6 +585,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private emitState(): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.pendingStateEmitTimer) {
       return;
     }
@@ -426,6 +601,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private scheduleProjectSave(project: LoadedProject): void {
+    if (this.disposed) {
+      return;
+    }
     const projectId = project.record.id;
     this.recordWorkflowPerfCounter("project save schedules", project.record.identity.projectName);
     if (this.pendingProjectSaveTimers.has(projectId)) {
@@ -445,6 +623,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private flushProjectSaveNow(project: LoadedProject, reason: string): void {
+    if (this.disposed) {
+      return;
+    }
     const projectId = project.record.id;
     const timer = this.pendingProjectSaveTimers.get(projectId);
     if (timer) {
@@ -463,7 +644,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       });
   }
 
-  private async flushScheduledProjectSaves(): Promise<void> {
+  private async flushScheduledProjectSaves(force = false): Promise<void> {
     const pendingProjectIds = [...this.pendingProjectSaveTimers.keys()];
     for (const projectId of pendingProjectIds) {
       const timer = this.pendingProjectSaveTimers.get(projectId);
@@ -473,7 +654,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
       const project = this.projects.get(projectId);
       if (project) {
-        await this.saveProject(project);
+        await this.saveProject(project, { force });
       }
     }
   }
@@ -1235,6 +1416,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private syncWorkflowState(project: LoadedProject): void {
+    const startedAt = performance.now();
     const workflow = this.ensureWorkflowState(project.record);
     const projection = deriveWorkflowProjection(workflow, project.record.agents);
     workflow.workflowStage = projection.stage;
@@ -1325,10 +1507,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       recommendation: autopilotRecommendation,
       previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
     }, autopilotPolicy);
+    const preserveNoProgressPause =
+      project.record.localState.workflowPauseRequested &&
+      workflow.autopilotStatus?.pausedReason === "automation_no_progress"
+        ? workflow.autopilotStatus
+        : undefined;
     this.updateAutopilotRuntimeStatus(project, {
       nextPlannedAction: nextAutopilotAction ?? undefined,
       recommendation: autopilotRecommendation,
-      pause: autopilotPause.shouldPause
+      pause: preserveNoProgressPause
+        ? {
+          reason: "automation_no_progress",
+          detail: preserveNoProgressPause.pausedDetail,
+          highRiskPackageRequiresApproval: false
+        }
+        : autopilotPause.shouldPause
         ? {
           reason: autopilotPause.reason,
           detail: autopilotPause.detail,
@@ -1339,6 +1532,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         }
     });
     this.refreshWorkflowMemory(workflow);
+    this.logWorkflowPerf(`syncWorkflowState ${project.record.identity.projectName}: ${Math.round(performance.now() - startedAt)}ms`);
   }
 
   private prepareWorkflowForNextRecommendationCycle(project: LoadedProject): void {
@@ -1861,37 +2055,83 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.syncWorkflowState(project);
   }
 
-  private async persistProjectUpdate(project: LoadedProject, automate = false): Promise<void> {
-    await this.saveProject(project);
-    this.emitState();
-    if (automate && !this.workflowAutomationInFlight.has(project.record.id)) {
-      this.scheduleWorkflowAutomation(project.record.id);
+  private async persistProjectUpdate(project: LoadedProject, options?: boolean | PersistProjectUpdateOptions): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+    const normalized = this.normalizePersistProjectUpdateOptions(options);
+    const startedAt = performance.now();
+    if (normalized.save === "immediate") {
+      await this.saveProject(project);
+    } else if (normalized.save === "deferred") {
+      this.scheduleProjectSave(project);
+    }
+    if (normalized.emit === "immediate") {
+      this.emitStateNow(normalized.reason);
+    } else if (normalized.emit === "coalesced") {
+      this.emitState();
+    }
+    this.logWorkflowPerf(
+      `${normalized.reason}: persist save=${normalized.save || "none"} emit=${normalized.emit || "none"} automate=${normalized.automate} in ${Math.round(performance.now() - startedAt)}ms`
+    );
+    if (normalized.automate && this.shouldScheduleWorkflowAutomation(project)) {
+      this.scheduleWorkflowAutomation(project.record.id, normalized.reason);
     }
   }
 
-  private scheduleWorkflowAutomation(projectId: string): void {
-    if (this.workflowAutomationInFlight.has(projectId) || this.workflowAutomationInFlight.size > 0) {
+  private nextWorkflowAutomationGeneration(projectId: string): number {
+    const nextGeneration = (this.workflowAutomationGenerations.get(projectId) ?? 0) + 1;
+    this.workflowAutomationGenerations.set(projectId, nextGeneration);
+    return nextGeneration;
+  }
+
+  private scheduleWorkflowAutomation(projectId: string, reason = "workflow update"): void {
+    if (this.disposed) {
+      return;
+    }
+    const project = this.projects.get(projectId);
+    if (!project || !this.shouldScheduleWorkflowAutomation(project)) {
+      this.logWorkflowPerf(`automation not scheduled for ${project?.record.identity.projectName ?? projectId}: ${reason}`);
+      return;
+    }
+    if (this.workflowAutomationInFlight.has(projectId)) {
       this.workflowAutomationQueued.add(projectId);
+      this.logWorkflowPerf(`automation queued for ${project.record.identity.projectName}: ${reason}`);
       return;
     }
     if (this.workflowAutomationTimers.has(projectId)) {
+      this.workflowAutomationQueued.add(projectId);
+      this.logWorkflowPerf(`automation timer coalesced for ${project.record.identity.projectName}: ${reason}`);
       return;
     }
 
+    const generation = this.nextWorkflowAutomationGeneration(projectId);
     const timer = setTimeout(() => {
+      const scheduled = this.workflowAutomationTimers.get(projectId);
+      if (!scheduled || scheduled.generation !== generation) {
+        return;
+      }
       this.workflowAutomationTimers.delete(projectId);
+      const latestProject = this.projects.get(projectId);
+      if (!latestProject || !this.shouldScheduleWorkflowAutomation(latestProject)) {
+        this.workflowAutomationQueued.delete(projectId);
+        this.logWorkflowPerf(`stale automation skipped for ${latestProject?.record.identity.projectName ?? projectId}: ${reason}`);
+        return;
+      }
+      this.logWorkflowPerf(`automation started for ${latestProject.record.identity.projectName}: ${reason}`);
       void this.runWorkflowAutomation(projectId);
     }, WORKFLOW_AUTOMATION_SCHEDULE_DELAY_MS);
-    this.workflowAutomationTimers.set(projectId, timer);
+    this.workflowAutomationTimers.set(projectId, { timer, generation });
     timer.unref?.();
   }
 
   private cancelScheduledWorkflowAutomation(projectId: string): void {
-    const timer = this.workflowAutomationTimers.get(projectId);
-    if (timer) {
-      clearTimeout(timer);
+    const scheduled = this.workflowAutomationTimers.get(projectId);
+    if (scheduled) {
+      clearTimeout(scheduled.timer);
       this.workflowAutomationTimers.delete(projectId);
     }
+    this.nextWorkflowAutomationGeneration(projectId);
     this.workflowAutomationQueued.delete(projectId);
   }
 
@@ -1905,6 +2145,38 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       project.record.localState.workflowPauseRequested,
       project.record.localState.workflowObjective
     );
+  }
+
+  private shouldScheduleWorkflowAutomation(project: LoadedProject): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+    const action = getNextWorkflowAutomationAction(
+      workflow,
+      project.record.agents,
+      project.scan.kind,
+      autopilotPolicy,
+      project.record.localState.workflowPauseRequested,
+      project.record.localState.workflowObjective
+    );
+    if (!action) {
+      return false;
+    }
+
+    const recommendation = action === "approve_recommendation"
+      ? pickAutopilotRecommendation(workflow.recommendations, workflow)
+      : undefined;
+    const pauseDecision = shouldAutopilotPause({
+      workflow,
+      agents: project.record.agents,
+      projectKind: project.scan.kind,
+      workflowObjective: project.record.localState.workflowObjective,
+      workflowPauseRequested: project.record.localState.workflowPauseRequested,
+      projectAccessStatus: project.record.validation.projectAccess?.status ?? "unknown",
+      nextAction: action,
+      recommendation,
+      previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
+    }, autopilotPolicy);
+    return !pauseDecision.shouldPause;
   }
 
   private getWorkflowStepIdForAutomationAction(action: ReturnType<typeof getNextWorkflowAutomationAction>): WorkflowStepId | undefined {
@@ -2000,17 +2272,106 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
   }
 
+  private buildWorkflowAutomationProgressSignature(
+    project: LoadedProject,
+    action: ReturnType<typeof getNextWorkflowAutomationAction>
+  ): string {
+    const workflow = this.ensureWorkflowState(project.record);
+    const activeAgents = project.record.agents
+      .filter((agent) => agent.category !== "manual" && isAgentActive(agent))
+      .map((agent) => `${agent.category}:${agent.id}:${agent.status}:${agent.threadId ?? ""}`)
+      .sort();
+    const stepProgress = Object.fromEntries(
+      Object.entries(workflow.stepProgress).map(([stepId, progress]) => [
+        stepId,
+        [
+          progress.status,
+          progress.requiresUserInput,
+          progress.runCount,
+          progress.attemptCount,
+          progress.currentActivity ?? "",
+          progress.latestProgressNote ?? ""
+        ].join(":")
+      ])
+    );
+    return JSON.stringify({
+      action,
+      stage: workflow.workflowStage,
+      stopReason: workflow.workflowStopReason,
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      cycleStatus: workflow.workflowCycle.status,
+      approvedRecommendationId: workflow.approvedRecommendation?.recommendationId,
+      scopedGoalId: workflow.scopedGoal?.id,
+      recommendations: workflow.recommendations.map((recommendation) => recommendation.id).join(","),
+      recommendationGeneratedAt: workflow.recommendationsGeneratedAt,
+      repairStatus: workflow.repair.status,
+      repairAttempts: workflow.repair.attemptCount,
+      mergeStatus: workflow.stepProgress.merge.status,
+      previewStatus: getWorkflowPreviewRequest(workflow).status,
+      pauseRequested: project.record.localState.workflowPauseRequested,
+      pausedReason: workflow.autopilotStatus?.pausedReason,
+      activeAgents,
+      stepProgress
+    });
+  }
+
+  private async yieldWorkflowAutomationLoop(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const immediate = setImmediate(resolve);
+      immediate.unref?.();
+    });
+  }
+
+  private pauseWorkflowAutomationForNoProgress(
+    project: LoadedProject,
+    action: ReturnType<typeof getNextWorkflowAutomationAction>
+  ): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    const detail = `The next automation action stayed at ${action ?? "none"} without changing workflow progress, so automation was paused to avoid a loop.`;
+    project.record.localState.workflowPauseRequested = true;
+    this.updateAutopilotRuntimeStatus(project, {
+      nextPlannedAction: action ?? undefined,
+      pause: {
+        reason: "automation_no_progress",
+        detail,
+        highRiskPackageRequiresApproval: false
+      }
+    });
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: "Workflow automation paused to avoid a loop",
+      detail,
+      stepId: getWorkflowActiveStepId(workflow)
+    });
+    this.updateWorkflowStepProgress(workflow, getWorkflowActiveStepId(workflow), {
+      warning: detail,
+      message: detail
+    });
+    this.syncWorkflowState(project);
+  }
+
   private async runWorkflowAutomation(projectId: string): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     if (this.workflowAutomationInFlight.has(projectId)) {
       this.workflowAutomationQueued.add(projectId);
       return;
     }
 
     this.workflowAutomationInFlight.add(projectId);
+    this.workflowAutomationQueued.delete(projectId);
     try {
       let automaticActionsThisPass = 0;
       let completedCyclesThisPass = 0;
+      let repeatedNoProgressCount = 0;
+      let repeatedNoProgressSignature = "";
       for (;;) {
+        if (this.disposed) {
+          return;
+        }
+        const iterationStartedAt = performance.now();
         const project = this.projects.get(projectId);
         if (!project) {
           return;
@@ -2018,15 +2379,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
         this.syncWorkflowState(project);
         if (this.prepareQueuedWorkflowPreviewForRecommendation(project)) {
-          await this.saveProject(project);
-          this.emitState();
+          await this.persistProjectUpdate(project, {
+            save: "immediate",
+            emit: "coalesced",
+            reason: "workflow preview prepared"
+          });
         }
         const workflow = this.ensureWorkflowState(project.record);
         const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
-        if (automaticActionsThisPass >= autopilotPolicy.maxAutomaticActionsPerPass) {
+        const maxActionsThisPass = Math.min(autopilotPolicy.maxAutomaticActionsPerPass, WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT);
+        if (automaticActionsThisPass >= maxActionsThisPass) {
           this.updateAutopilotRuntimeStatus(project);
-          await this.saveProject(project);
-          this.emitState();
+          await this.persistProjectUpdate(project, {
+            save: "immediate",
+            emit: "coalesced",
+            reason: "workflow automation action limit"
+          });
           break;
         }
         if (
@@ -2041,8 +2409,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           };
           this.updateAutopilotRuntimeStatus(project, { pause });
           this.recordAutopilotPause(workflow, pause.reason, pause.detail);
-          await this.saveProject(project);
-          this.emitState();
+          await this.persistProjectUpdate(project, {
+            save: "immediate",
+            emit: "coalesced",
+            reason: "workflow automation cycle limit"
+          });
           break;
         }
         const action = getNextWorkflowAutomationAction(
@@ -2082,14 +2453,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         });
         if (pauseDecision.shouldPause) {
           this.recordAutopilotPause(workflow, pauseDecision.reason, pauseDecision.detail);
-          await this.saveProject(project);
-          this.emitState();
+          await this.persistProjectUpdate(project, {
+            save: "immediate",
+            emit: "coalesced",
+            reason: "workflow automation paused"
+          });
           break;
         }
         if (!action) {
           break;
         }
 
+        const beforeSignature = this.buildWorkflowAutomationProgressSignature(project, action);
+        this.logWorkflowPerf(`automation action ${action} for ${project.record.identity.projectName}`);
         switch (action) {
           case "generate_recommendations":
             await this.runRecommendation(projectId, true);
@@ -2116,7 +2492,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             break;
           case "finalize_cycle": {
             this.finalizeWorkflowCycle(project);
-            await this.persistProjectUpdate(project, true);
+            await this.persistProjectUpdate(project, {
+              save: "immediate",
+              emit: "coalesced",
+              automate: true,
+              reason: "workflow cycle finalized"
+            });
             break;
           }
         }
@@ -2127,13 +2508,37 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         const updatedProject = this.projects.get(projectId);
         if (updatedProject) {
           this.updateAutopilotRuntimeStatus(updatedProject, { lastCompletedAction: action });
-          await this.saveProject(updatedProject);
-          this.emitState();
+          this.syncWorkflowState(updatedProject);
+          const afterAction = this.getNextAutomationActionForProject(updatedProject);
+          const afterSignature = this.buildWorkflowAutomationProgressSignature(updatedProject, afterAction);
+          if (beforeSignature === afterSignature) {
+            const noProgressKey = `${action}:${beforeSignature}`;
+            repeatedNoProgressCount = noProgressKey === repeatedNoProgressSignature ? repeatedNoProgressCount + 1 : 1;
+            repeatedNoProgressSignature = noProgressKey;
+          } else {
+            repeatedNoProgressCount = 0;
+            repeatedNoProgressSignature = "";
+          }
+          if (repeatedNoProgressCount >= WORKFLOW_AUTOMATION_NO_PROGRESS_LIMIT) {
+            this.pauseWorkflowAutomationForNoProgress(updatedProject, action);
+            await this.persistProjectUpdate(updatedProject, {
+              save: "immediate",
+              emit: "immediate",
+              reason: "workflow automation no progress"
+            });
+            break;
+          }
+          await this.persistProjectUpdate(updatedProject, {
+            save: false,
+            emit: "coalesced",
+            reason: `workflow automation completed ${action}`
+          });
         }
 
-        // Yield between automatic steps so UI state transitions remain observable
-        // and pause requests can take effect before the next step starts.
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        this.logWorkflowPerf(
+          `automation iteration ${action} for ${project.record.identity.projectName}: ${Math.round(performance.now() - iterationStartedAt)}ms`
+        );
+        await this.yieldWorkflowAutomationLoop();
       }
     } catch (error) {
       this.diagnostics.unshift(
@@ -2149,7 +2554,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : this.workflowAutomationQueued.values().next().value;
       if (nextQueuedProjectId) {
         this.workflowAutomationQueued.delete(nextQueuedProjectId);
-        this.scheduleWorkflowAutomation(nextQueuedProjectId);
+        this.scheduleWorkflowAutomation(nextQueuedProjectId, "coalesced automation rerun");
       }
     }
   }
@@ -2829,6 +3234,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   async initialize(): Promise<void> {
+    const existingService = AppService.activeServicesByAppDataDir.get(this.appDataDir);
+    if (existingService && existingService !== this) {
+      await existingService.dispose();
+    }
+    AppService.activeServicesByAppDataDir.set(this.appDataDir, this);
+    this.disposed = false;
     await this.storage.ensureBaseDirs();
     const persistedSettings = await this.storage.loadSettings();
     if (persistedSettings) {
@@ -2851,6 +3262,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const records = await this.storage.loadAllProjects();
     for (const storedRecord of records) {
       const record = this.normalizeStoredProjectRecord(storedRecord);
+      this.registeredProjectIds.add(record.id);
       const tree = record.stats ? [] : [];
       const summaryCache = new SummaryCache(record.summaryCache);
       const project: LoadedProject = {
@@ -2898,7 +3310,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         summaryCache,
         candidates: []
       };
-      this.syncWorkflowState(project);
       this.projects.set(record.id, project);
     }
 
@@ -2926,17 +3337,43 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options?: { flush?: boolean }): Promise<void> {
+    if (this.disposePromise) {
+      return this.disposePromise;
+    }
+    this.disposePromise = this.disposeInternal(options);
+    return this.disposePromise;
+  }
+
+  private async disposeInternal(options?: { flush?: boolean }): Promise<void> {
+    this.disposed = true;
+    if (AppService.activeServicesByAppDataDir.get(this.appDataDir) === this) {
+      AppService.activeServicesByAppDataDir.delete(this.appDataDir);
+    }
     this.threadToAgent.clear();
     this.interfaceCreationRepairAttempts.clear();
     this.workflowRecoveryInFlight.clear();
+    this.workflowAutomationQueued.clear();
+    for (const scheduled of this.workflowAutomationTimers.values()) {
+      clearTimeout(scheduled.timer);
+    }
+    this.workflowAutomationTimers.clear();
+    this.structuredOutputApplicationsInFlight.clear();
+    this.projectSaveQueued.clear();
     if (this.pendingStateEmitTimer) {
       clearTimeout(this.pendingStateEmitTimer);
       this.pendingStateEmitTimer = undefined;
     }
-    await this.flushScheduledProjectSaves();
-    for (const project of this.projects.values()) {
-      await this.saveProject(project);
+    if (options?.flush === false) {
+      for (const timer of this.pendingProjectSaveTimers.values()) {
+        clearTimeout(timer);
+      }
+      this.pendingProjectSaveTimers.clear();
+    } else {
+      await this.flushScheduledProjectSaves(true);
+      for (const project of this.projects.values()) {
+        await this.saveProject(project, { force: true });
+      }
     }
     if (!this.transport) {
       return;
@@ -4013,35 +4450,92 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     this.emitState();
     void this.runBootstrapIfNeeded(project);
-    if (this.getNextAutomationActionForProject(project)) {
+    if (this.shouldScheduleWorkflowAutomation(project)) {
       this.scheduleWorkflowAutomation(projectId);
     }
     return this.toRendererLoadedProjectView(project);
   }
 
-  private async saveProject(project: LoadedProject): Promise<void> {
+  private async saveProject(project: LoadedProject, options?: { force?: boolean }): Promise<void> {
+    if (this.disposed && !options?.force) {
+      return;
+    }
+    const projectId = project.record.id;
+    const inFlight = this.projectSaveInFlight.get(projectId);
+    if (inFlight) {
+      const existingQueued = this.projectSaveQueued.get(projectId);
+      if (existingQueued) {
+        await existingQueued;
+        return;
+      }
+
+      const queuedPromise = inFlight
+        .catch(() => undefined)
+        .then(async () => {
+          if (this.projectSaveQueued.get(projectId) !== queuedPromise) {
+            return;
+          }
+          this.projectSaveQueued.delete(projectId);
+          await this.saveProject(project, options);
+        });
+      this.projectSaveQueued.set(projectId, queuedPromise);
+      await queuedPromise;
+      return;
+    }
+
+    const savePromise = this.writeProjectToStorage(project).finally(() => {
+      if (this.projectSaveInFlight.get(projectId) === savePromise) {
+        this.projectSaveInFlight.delete(projectId);
+      }
+    });
+    this.projectSaveInFlight.set(projectId, savePromise);
+    await savePromise;
+  }
+
+  private async writeProjectToStorage(project: LoadedProject): Promise<void> {
     const startedAt = performance.now();
     let payloadSize: number | undefined;
     this.compactProjectRuntimeHistory(project);
     for (const agent of project.record.agents) {
       this.recordAgentContextDescriptor(project, agent);
     }
+    const syncStartedAt = performance.now();
     this.syncWorkflowState(project);
+    this.logWorkflowPerf(`syncWorkflowState before save ${project.record.identity.projectName}: ${Math.round(performance.now() - syncStartedAt)}ms`);
     project.record.summaryCache = project.summaryCache.list();
-    if (this.debugWorkflowPerf) {
-      try {
-        payloadSize = JSON.stringify(project.record).length;
-      } catch {
-        payloadSize = undefined;
+    let serializedRecord: string | undefined;
+    try {
+      serializedRecord = JSON.stringify(project.record);
+      payloadSize = serializedRecord.length;
+    } catch {
+      payloadSize = undefined;
+      serializedRecord = undefined;
+    }
+    if (serializedRecord) {
+      const fingerprint = sha256(serializedRecord);
+      if (this.projectSaveFingerprints.get(project.record.id) === fingerprint) {
+        this.recordWorkflowPerfCounter("project save skips", `${payloadSize} bytes`);
+        this.logWorkflowPerf(`save skipped ${project.record.identity.projectName}: unchanged ${payloadSize} bytes`);
+        return;
       }
     }
     await this.storage.saveProject(project.record);
+    if (serializedRecord) {
+      this.projectSaveFingerprints.set(project.record.id, sha256(serializedRecord));
+    }
     this.recordWorkflowPerfCounter("project saves", payloadSize === undefined ? undefined : `${payloadSize} bytes`);
     this.logWorkflowPerf(`save ${project.record.identity.projectName}: ${payloadSize ?? "unknown"} bytes in ${Math.round(performance.now() - startedAt)}ms`);
-    const registry = await this.storage.loadRegistry();
-    if (!registry.includes(project.record.id)) {
+    if (!this.registeredProjectIds.has(project.record.id)) {
+      const registry = await this.storage.loadRegistry();
+      for (const projectId of registry) {
+        this.registeredProjectIds.add(projectId);
+      }
+      if (this.registeredProjectIds.has(project.record.id)) {
+        return;
+      }
       registry.push(project.record.id);
       await this.storage.saveRegistry(registry);
+      this.registeredProjectIds.add(project.record.id);
     }
   }
 
@@ -4076,7 +4570,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     const exportPath = await this.storage.writePortableInterface(project.record.hostPath, project.record, destinationPath);
     project.record.interfacePath = exportPath;
-    await this.persistProjectUpdate(project);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      reason: "interface exported"
+    });
     return exportPath;
   }
 
@@ -4572,7 +5070,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       !hasActiveWorkflowAgent &&
       project.record.localState.autopilotEnabled &&
       !project.record.localState.workflowPauseRequested;
-    await this.persistProjectUpdate(project, shouldContinueAutomation);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: shouldContinueAutomation,
+      reason: "workflow mode changed"
+    });
     return project.record.workflow;
   }
 
@@ -4606,7 +5109,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       !hasActiveWorkflowAgent &&
       workflow.autopilotPolicy.enabled &&
       !project.record.localState.workflowPauseRequested;
-    await this.persistProjectUpdate(project, shouldContinueAutomation);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: shouldContinueAutomation,
+      reason: "autopilot policy changed"
+    });
     return project.record.workflow;
   }
 
@@ -4774,7 +5282,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       });
     }
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, confirm);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: confirm,
+      reason: confirm ? "ultimate goal confirmed" : "ultimate goal draft saved"
+    });
     return updatedGoal;
   }
 
@@ -5490,7 +6003,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }, { status: "completed" });
     }
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, automate);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate,
+      reason: "recommendations finalized"
+    });
   }
 
   private async applyFallbackRecommendations(
@@ -5549,13 +6067,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     );
   }
 
-  private async applyRecommendationOutput(project: LoadedProject, agent: AgentState, rawText: string, automate = false): Promise<boolean> {
+  private async applyRecommendationOutput(
+    project: LoadedProject,
+    agent: AgentState,
+    rawText: string,
+    automate = false,
+    source = "agentMessage"
+  ): Promise<boolean> {
     if (agent.recommendationReport && project.record.workflow.recommendations.length > 0) {
+      return true;
+    }
+    const outputGuard = this.beginStructuredOutputApplication(project, agent, "recommendation", rawText, source);
+    if (!outputGuard) {
       return true;
     }
 
     const parsed = this.parseRecommendationOutput(project, rawText);
     if (!parsed) {
+      this.abortStructuredOutputApplication(outputGuard);
       reduceAgentRuntimeEvent(agent, {
         kind: "raw",
         title: "Recommendation output rejected",
@@ -5594,20 +6123,27 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : []
       : parsed.recommendations;
     if (objective === "optimize" && recommendations.length === 0) {
+      this.abortStructuredOutputApplication(outputGuard);
       return false;
     }
 
-    await this.applyRecommendationSet(
-      project,
-      agent,
-      parsed.summary,
-      recommendations,
-      progressEstimate,
-      goalCompletion,
-      automate,
-      parsed.goalCheckUpdates,
-      this.extractCustomRecommendationFocus(agent)
-    );
+    try {
+      await this.applyRecommendationSet(
+        project,
+        agent,
+        parsed.summary,
+        recommendations,
+        progressEstimate,
+        goalCompletion,
+        automate,
+        parsed.goalCheckUpdates,
+        this.extractCustomRecommendationFocus(agent)
+      );
+      this.finishStructuredOutputApplication(agent, outputGuard);
+    } catch (error) {
+      this.abortStructuredOutputApplication(outputGuard);
+      throw error;
+    }
     return true;
   }
 
@@ -5626,7 +6162,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           continue;
         }
 
-        if (await this.applyRecommendationOutput(project, agent, item.text, automate)) {
+        if (await this.applyRecommendationOutput(project, agent, item.text, automate, "thread/read")) {
           return;
         }
       }
@@ -5810,7 +6346,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       stepId: "goal_plan"
     });
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, automate);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate,
+      reason: "scoped goal finalized"
+    });
   }
 
   private findWorkPackageForApprovedRecommendation(
@@ -5901,14 +6442,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     agent: AgentState,
     approvedRecommendation: ApprovedRecommendation,
     rawText: string,
-    automate = false
+    automate = false,
+    source = "agentMessage"
   ): Promise<boolean> {
     if (project.record.workflow.scopedGoal?.sourceRecommendationId === approvedRecommendation.recommendationId) {
+      return true;
+    }
+    const outputGuard = this.beginStructuredOutputApplication(project, agent, "scoped_goal", rawText, source);
+    if (!outputGuard) {
       return true;
     }
 
     const parsed = this.parseScopedGoalOutput(approvedRecommendation, rawText);
     if (!parsed) {
+      this.abortStructuredOutputApplication(outputGuard);
       reduceAgentRuntimeEvent(agent, {
         kind: "raw",
         title: "Scoped goal output rejected",
@@ -5918,7 +6465,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return false;
     }
 
-    await this.applyScopedGoalState(project, parsed, agent, automate);
+    try {
+      await this.applyScopedGoalState(project, parsed, agent, automate);
+      this.finishStructuredOutputApplication(agent, outputGuard);
+    } catch (error) {
+      this.abortStructuredOutputApplication(outputGuard);
+      throw error;
+    }
     return true;
   }
 
@@ -5941,7 +6494,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           continue;
         }
 
-        if (await this.applyScopedGoalOutput(project, agent, approvedRecommendation, item.text, automate)) {
+        if (await this.applyScopedGoalOutput(project, agent, approvedRecommendation, item.text, automate, "thread/read")) {
           return;
         }
       }
@@ -5955,6 +6508,32 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return /array buffer allocation failed|codex app-server|transport|model|invalid[_ ]json[_ ]schema|invalid schema|response_format|request failed|request timed out|timed out|timeout|systemerror|unavailable/i.test(detail);
   }
 
+  private resolveRecommendationForApproval(
+    workflow: ProjectWorkflowState,
+    recommendationId: string | undefined
+  ): ProjectWorkflowState["recommendations"][number] | undefined {
+    if (!recommendationId) {
+      return undefined;
+    }
+
+    const exactMatch = workflow.recommendations.find((entry) => entry.id === recommendationId);
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    const canRecoverAutopilotCheckpoint =
+      workflow.autopilotStatus?.pausedReason === "high_risk_package_requires_approval" &&
+      workflow.autopilotStatus.currentRecommendationId === recommendationId;
+    if (!canRecoverAutopilotCheckpoint) {
+      return undefined;
+    }
+
+    const checkpointTitle = workflow.autopilotStatus?.currentRecommendationTitle;
+    return checkpointTitle
+      ? workflow.recommendations.find((entry) => entry.title === checkpointTitle) ?? pickAutopilotRecommendation(workflow.recommendations, workflow)
+      : pickAutopilotRecommendation(workflow.recommendations, workflow);
+  }
+
   async approveRecommendation(
     projectId: string,
     recommendationId: string,
@@ -5962,7 +6541,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   ): Promise<ApprovedRecommendation> {
     const project = this.findProject(projectId);
     const existingWorkflow = this.ensureWorkflowState(project.record);
-    const recommendation = existingWorkflow.recommendations.find((entry) => entry.id === recommendationId);
+    const recommendation = this.resolveRecommendationForApproval(existingWorkflow, recommendationId);
     if (!recommendation) {
       throw new Error(`Unknown recommendation: ${recommendationId}`);
     }
@@ -6051,7 +6630,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       stepId: "recommendation"
     });
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, true);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: true,
+      reason: decisionSource === "autopilot" ? "autopilot recommendation approved" : "recommendation approved"
+    });
     return approvedRecommendation;
   }
 
@@ -6888,12 +7472,51 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   async advanceWorkflowStage(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
     const project = this.findProject(projectId);
     this.syncWorkflowState(project);
+    const workflow = this.ensureWorkflowState(project.record);
+    if (workflow.autopilotStatus?.pausedReason === "high_risk_package_requires_approval") {
+      const recommendation = this.resolveRecommendationForApproval(workflow, workflow.autopilotStatus.currentRecommendationId);
+      if (recommendation) {
+        await this.approveRecommendation(projectId, recommendation.id, "manual");
+        return this.findProject(projectId).record.workflow.workflowStage;
+      }
+
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: "Stale recommendation checkpoint refreshed",
+        detail: "The selected checkpoint no longer exists in the saved recommendation list. Regenerate recommendations, then choose the next package.",
+        stepId: "recommendation"
+      });
+      workflow.approvedRecommendation = undefined;
+      workflow.scopedGoal = undefined;
+      workflow.recommendations = [];
+      workflow.recommendationsGeneratedAt = undefined;
+      this.resetWorkflowStepProgress(workflow, "recommendation", {
+        status: "waiting",
+        requiresUserInput: false,
+        currentActivity: "Queued for recommendation refresh",
+        message: "The previous checkpoint was stale, so recommendations will be generated again."
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, true);
+      return project.record.workflow.workflowStage;
+    }
+    if (this.workflowAutomationInFlight.has(projectId) || this.workflowAutomationTimers.has(projectId)) {
+      this.workflowAutomationQueued.add(projectId);
+      this.logWorkflowPerf(`advanceWorkflowStage coalesced for ${project.record.identity.projectName}`);
+      return project.record.workflow.workflowStage;
+    }
     if (project.record.workflow.workflowStage === "merged") {
       this.finalizeWorkflowCycle(project);
     } else {
       this.syncWorkflowState(project);
     }
-    await this.persistProjectUpdate(project, true);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: true,
+      reason: "advance workflow stage"
+    });
     return project.record.workflow.workflowStage;
   }
 
@@ -7851,7 +8474,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
     }
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, automate || (passed && !retryingExternalEnvironmentValidation) || workflow.repair.status === "repairing");
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: automate || (passed && !retryingExternalEnvironmentValidation) || workflow.repair.status === "repairing",
+      reason: "integrity completed"
+    });
   }
 
   private async detectVerificationCommands(
@@ -8217,7 +8845,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       await this.cleanupCompletedManagedWorktrees(project, this.getRetiredMergeWorktreePaths(project, mergeAgent.id));
     }
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, automate || mergeResult.conflicts.length === 0);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: automate || mergeResult.conflicts.length === 0,
+      reason: mergeResult.conflicts.length > 0 ? "merge conflicts recorded" : "merge completed"
+    });
   }
 
   private findHighConfidenceDeterministicWorkPackage(context: WorkflowRecommendationContext): WorkPackage | undefined {
@@ -8507,7 +9140,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private logInterfaceCreationPayload(agent: AgentState, source: string, rawText: string): void {
     const payload = rawText.trim();
-    console.info(`[interfaceCreation] raw payload (${source})`, payload);
+    if (this.debugWorkflowPerf) {
+      console.info(`[interfaceCreation] raw payload (${source}) ${payload.length} bytes`);
+    }
     reduceAgentRuntimeEvent(agent, {
       kind: "raw",
       title: "Interface payload received",
@@ -9272,6 +9907,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private handleTransportNotification(notification: ServerNotification): void {
+    if (this.disposed) {
+      return;
+    }
     const threadId =
       "params" in notification && notification.params && "threadId" in notification.params
         ? String((notification.params as { threadId?: string }).threadId)
@@ -9323,6 +9961,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const shouldMirrorWorkflowActivity = !workflowActivitySuppressedTransportMethods.has(notification.method);
     const shouldPersistProject = !ignoredRendererUpdateMethods.has(notification.method);
     const shouldEmitRendererUpdate = !ignoredRendererUpdateMethods.has(notification.method);
+    if (!this.shouldReduceLiveTransportDelta(mapping.projectId, mapping.agentId, notification)) {
+      agent.lastActivityAt = nowIso();
+      return;
+    }
 
     switch (notification.method) {
       case "thread/tokenUsage/updated":
@@ -9436,7 +10078,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             void this.applyUltimateGoalDetectionOutput(project, agent, agentMessageText).catch(() => undefined);
           }
           if (agent.category === "recommendation") {
-            void this.applyRecommendationOutput(project, agent, agentMessageText, true).catch(() => undefined);
+            void this.applyRecommendationOutput(project, agent, agentMessageText, true, "item/completed").catch(() => undefined);
           }
           if (agent.category === "goal" && agent.name === "Goal Agent" && project.record.workflow.approvedRecommendation) {
             void this.applyScopedGoalOutput(
@@ -9444,7 +10086,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               agent,
               project.record.workflow.approvedRecommendation,
               agentMessageText,
-              true
+              true,
+              "item/completed"
             ).catch(() => undefined);
           }
           reduceAgentRuntimeEvent(agent, {
@@ -9525,16 +10168,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           void this.applyUltimateGoalDetectionOutput(project, agent, rawResponseText).catch(() => undefined);
         }
         if (agent.category === "recommendation" && rawResponseText) {
-          void this.applyRecommendationOutput(project, agent, rawResponseText, true).catch(() => undefined);
+          void this.applyRecommendationOutput(project, agent, rawResponseText, true, "rawResponseItem/completed").catch(() => undefined);
         }
         if (agent.category === "goal" && agent.name === "Goal Agent" && rawResponseText && project.record.workflow.approvedRecommendation) {
           void this.applyScopedGoalOutput(
             project,
             agent,
-            project.record.workflow.approvedRecommendation,
-            rawResponseText,
-            true
-          ).catch(() => undefined);
+              project.record.workflow.approvedRecommendation,
+              rawResponseText,
+              true,
+              "rawResponseItem/completed"
+            ).catch(() => undefined);
         }
         reduceAgentRuntimeEvent(agent, {
           kind: "raw",

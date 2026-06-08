@@ -20,6 +20,7 @@ import {
   workflowStageLabel,
   workflowStatusSummary
 } from "@shared/workflowView";
+import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import type {
   AgentCategory,
   AgentListResponse,
@@ -29,7 +30,6 @@ import type {
   AutopilotPolicy,
   AutopilotProfile,
   ApprovalRequestRecord,
-  CredentialRequestRecord,
   CredentialEntryMetadata,
   DiscoveredModel,
   ExecutionMode,
@@ -552,24 +552,6 @@ const buildManualAgentName = (prompt: string): string => {
   return `Manual Agent: ${summary}`;
 };
 
-const workflowStopReasonLabel = (reason?: string): string =>
-  ({
-    none: "No blocker",
-    charter_missing: "Ultimate Goal needs confirmation",
-    recommendation_missing: "Run recommendations for the next cycle",
-    awaiting_recommendation_approval: "Approve one recommended next step",
-    goal_not_scoped: "Turn the approved recommendation into a scoped goal",
-    human_intervention_required: "A blocking human intervention is pending",
-    integrity_failed: "Integrity validation found follow-up work",
-    repair_stopped_early: "Automatic repair stopped early",
-    repair_budget_exhausted: "Automatic repair limit reached",
-    merge_conflicts: "Merge conflicts require follow-up",
-    appeal_missing: "Prepare final appeal pass",
-    awaiting_appeal_approval: "Approve one appeal improvement",
-    ultimate_goal_satisfied: "Ultimate Goal satisfied",
-    cycle_completed: "Cycle complete"
-  })[reason ?? "none"] ?? reason ?? "No blocker";
-
 const isEnvironmentRepairHandoff = (workflow?: ProjectWorkflowState | null): boolean =>
   workflow?.manualHandoff?.reason === "repair_stopped_early" &&
   workflow.manualHandoff.latestFailureReason.startsWith("Integrity hit an environment or dependency blocker");
@@ -701,17 +683,6 @@ type WorkflowChecklistOverview = {
   topUnknownGroups: WorkflowChecklistGroupSummary[];
 };
 
-type WorkflowAttentionItem = {
-  id: string;
-  kind: "approval" | "blocker" | "credential" | "integrity" | "warning";
-  title: string;
-  detail: string;
-  tone: "neutral" | "warning" | "danger";
-  createdAt?: string;
-  approval?: ApprovalRequestRecord;
-  target?: "credentials" | "user-input" | "blocker";
-};
-
 const summarizeText = (value?: string, fallback = "Not available", maxLength = 180): string => {
   const normalized = (value ?? "").replace(/\s+/g, " ").trim();
   if (!normalized) {
@@ -750,9 +721,6 @@ const redactSensitiveText = (value?: string): string => {
 
 const summarizeSafeText = (value?: string, fallback = "Not available", maxLength = 180): string =>
   summarizeText(redactSensitiveText(value), fallback, maxLength);
-
-const pluralize = (count: number, singular: string, plural = `${singular}s`): string =>
-  `${count} ${count === 1 ? singular : plural}`;
 
 const uniqueSortedStrings = (values: string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))].sort((left, right) => left.localeCompare(right));
@@ -951,133 +919,6 @@ const summarizeWorkflowChecksStatus = (
     return activeStep.displayStatusLabel;
   }
   return workflow?.scopedGoal?.testStrategy.length ? `${workflow.scopedGoal.testStrategy.length} validations planned` : "No validation result yet";
-};
-
-const buildWorkflowAttentionItems = ({
-  workflow,
-  approvals,
-  userInputRequests,
-  humanInterventions,
-  credentialRequests,
-  timeline,
-  agents
-}: {
-  workflow?: ProjectWorkflowState;
-  approvals: ApprovalRequestRecord[];
-  userInputRequests: UserInputRequestRecord[];
-  humanInterventions: HumanInterventionRecord[];
-  credentialRequests: CredentialRequestRecord[];
-  timeline: ReturnType<typeof buildWorkflowTimelineSteps>;
-  agents: AgentState[];
-}): WorkflowAttentionItem[] => {
-  const items: WorkflowAttentionItem[] = [];
-
-  for (const approval of approvals) {
-    items.push({
-      id: `approval:${approval.id}`,
-      kind: "approval",
-      title: approval.summary,
-      detail: summarizeText(approval.reason ?? approval.command ?? "Approval required before the workflow can continue.", "Approval required.", 130),
-      tone: "warning",
-      createdAt: approval.createdAt,
-      approval
-    });
-  }
-
-  for (const intervention of humanInterventions) {
-    items.push({
-      id: `intervention:${intervention.id}`,
-      kind: "blocker",
-      title: intervention.title,
-      detail: summarizeText(intervention.description || intervention.reason, "Human intervention is required.", 140),
-      tone: intervention.blocking ? "danger" : "warning",
-      createdAt: intervention.createdAt,
-      target: "blocker"
-    });
-  }
-
-  for (const request of userInputRequests) {
-    items.push({
-      id: `user-input:${request.id}`,
-      kind: "blocker",
-      title: request.title,
-      detail: summarizeText(request.description, "External action is required.", 140),
-      tone: "danger",
-      createdAt: request.createdAt,
-      target: "user-input"
-    });
-  }
-
-  for (const request of credentialRequests) {
-    items.push({
-      id: `credential:${request.id}`,
-      kind: "credential",
-      title: `${request.providerName} ${request.keyLabel}`,
-      detail: summarizeText(request.description, "Credential is required.", 140),
-      tone: "warning",
-      createdAt: request.createdAt,
-      target: "credentials"
-    });
-  }
-
-  if (workflow?.manualHandoff) {
-    items.push({
-      id: `manual-handoff:${workflow.manualHandoff.reason}`,
-      kind: "blocker",
-      title: workflow.manualHandoff.title,
-      detail: summarizeText(workflow.manualHandoff.latestFailureReason, "Manual handoff is required.", 150),
-      tone: "danger",
-      createdAt: workflow.manualHandoff.createdAt,
-      target: "blocker"
-    });
-  } else if (workflow?.workflowStage === "blocked_human" && humanInterventions.length === 0 && userInputRequests.length === 0) {
-    items.push({
-      id: "workflow:blocker",
-      kind: "blocker",
-      title: "Workflow is blocked",
-      detail: workflowStopReasonLabel(workflow.workflowStopReason),
-      tone: "danger"
-    });
-  }
-
-  const failedIntegrityAgent = agents.find((agent) => agent.integrityReport?.checks.some((check) => check.status === "failed"));
-  if (failedIntegrityAgent?.integrityReport) {
-    const failedCount = failedIntegrityAgent.integrityReport.checks.filter((check) => check.status === "failed").length;
-    items.push({
-      id: `integrity-agent:${failedIntegrityAgent.id}`,
-      kind: "integrity",
-      title: `${pluralize(failedCount, "integrity check")} failed`,
-      detail: summarizeText(failedIntegrityAgent.integrityReport.summary, "Integrity validation failed.", 150),
-      tone: "danger",
-      createdAt: failedIntegrityAgent.completedAt ?? failedIntegrityAgent.lastActivityAt
-    });
-  } else if (workflow?.stepProgress.integrity.status === "failed" || workflow?.workflowStopReason === "integrity_failed") {
-    items.push({
-      id: "integrity:failed",
-      kind: "integrity",
-      title: "Integrity needs repair",
-      detail: summarizeText(workflow.repair.latestFailureReason ?? workflow.repair.latestIssueSummary, workflowStopReasonLabel(workflow.workflowStopReason), 150),
-      tone: "warning",
-      createdAt: workflow.repair.lastUpdatedAt
-    });
-  }
-
-  for (const step of timeline.filter((step) => step.warning).slice(0, 3)) {
-    items.push({
-      id: `warning:${step.id}`,
-      kind: "warning",
-      title: `${step.title} warning`,
-      detail: summarizeText(step.warning, "Workflow warning.", 150),
-      tone: "warning",
-      createdAt: step.updatedAt ?? step.lastEventAt
-    });
-  }
-
-  return items.sort((left, right) => {
-    const toneScore = { danger: 0, warning: 1, neutral: 2 } as const;
-    const toneDelta = toneScore[left.tone] - toneScore[right.tone];
-    return toneDelta !== 0 ? toneDelta : toTime(right.createdAt) - toTime(left.createdAt);
-  });
 };
 
 const workflowAttentionKindLabel = (kind: WorkflowAttentionItem["kind"]): string =>
@@ -3910,16 +3751,31 @@ const WorkflowNeedsAttentionPanel = ({
   onApprove,
   onReject,
   onOpenCredentials,
-  onViewDetails
+  onViewDetails,
+  onRetryManualHandoff,
+  onOpenProjectShell,
+  onDownloadRepairReport,
+  shellLaunchBusy,
+  repairReportAvailable
 }: {
   items: WorkflowAttentionItem[];
   onApprove: (approval: ApprovalRequestRecord) => void;
   onReject: (approval: ApprovalRequestRecord) => void;
   onOpenCredentials: () => void;
   onViewDetails: (target?: WorkflowAttentionItem["target"]) => void;
+  onRetryManualHandoff: () => void;
+  onOpenProjectShell: () => void;
+  onDownloadRepairReport: () => void;
+  shellLaunchBusy: boolean;
+  repairReportAvailable: boolean;
 }) => {
+  const [expandedItemId, setExpandedItemId] = useState<string>();
   const visibleItems = items.slice(0, 8);
   const hiddenCount = Math.max(0, items.length - visibleItems.length);
+  const toggleDetails = (item: WorkflowAttentionItem) => {
+    setExpandedItemId((current) => current === item.id ? undefined : item.id);
+    onViewDetails(item.target);
+  };
 
   return (
     <article id="workflow-needs-attention" className={`workflow-attention-panel ${items.length === 0 ? "workflow-attention-panel--empty" : ""}`}>
@@ -3934,6 +3790,8 @@ const WorkflowNeedsAttentionPanel = ({
         <div className="workflow-attention-list">
           {visibleItems.map((item) => {
             const approval = item.approval;
+            const manualHandoff = item.manualHandoff;
+            const detailsExpanded = expandedItemId === item.id;
             return (
               <div key={item.id} className={`workflow-attention-item workflow-attention-item--${item.tone}`}>
                 <div className="workflow-attention-item__copy">
@@ -3952,7 +3810,54 @@ const WorkflowNeedsAttentionPanel = ({
                 ) : item.target === "credentials" ? (
                   <button className="secondary-button" onClick={onOpenCredentials} type="button">Open credentials</button>
                 ) : item.target ? (
-                  <button className="secondary-button" onClick={() => onViewDetails(item.target)} type="button">View details</button>
+                  <button className="secondary-button" onClick={() => toggleDetails(item)} type="button">
+                    {detailsExpanded ? "Hide details" : "View details"}
+                  </button>
+                ) : null}
+                {detailsExpanded && manualHandoff ? (
+                  <div className="workflow-attention-item__details">
+                    <div className="workflow-manual-handoff__grid">
+                      <div className="workflow-manual-handoff__section">
+                        <span className="workflow-option__label">What failed</span>
+                        <p>{manualHandoff.validationIssue}</p>
+                      </div>
+                      <div className="workflow-manual-handoff__section">
+                        <span className="workflow-option__label">Latest failure reason</span>
+                        <p>{manualHandoff.latestFailureReason}</p>
+                      </div>
+                    </div>
+                    {manualHandoff.involvedPaths.length ? (
+                      <div className="workflow-goal-panel__criteria">
+                        <span className="workflow-option__label">Conflict paths</span>
+                        <div className="tag-row">
+                          {manualHandoff.involvedPaths.map((involvedPath) => (
+                            <span key={involvedPath} className="tag">{involvedPath}</span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="actions-row">
+                      <button className="primary-button" onClick={onRetryManualHandoff} type="button">
+                        {manualHandoff.reason === "merge_conflicts" ? "Retry merge" : "Retry current goal"}
+                      </button>
+                      <button
+                        className="secondary-button"
+                        disabled={shellLaunchBusy || !manualHandoff.shellSupported}
+                        onClick={onOpenProjectShell}
+                        type="button"
+                      >
+                        {shellLaunchBusy ? "Opening terminal..." : "Open Codex terminal"}
+                      </button>
+                      <button
+                        className="secondary-button"
+                        disabled={!repairReportAvailable}
+                        onClick={onDownloadRepairReport}
+                        type="button"
+                      >
+                        Download repair report
+                      </button>
+                    </div>
+                  </div>
                 ) : null}
               </div>
             );
@@ -4189,6 +4094,7 @@ const WorkflowAutopilotPanel = ({
   workflowMode,
   previewStatus,
   previewDisabledReason,
+  commandBusy,
   onToggleAutopilot,
   onProfileChange,
   onPolicyChange,
@@ -4198,6 +4104,7 @@ const WorkflowAutopilotPanel = ({
   onCancelPreview,
   onCompletePreview,
   onContinueWorkflow,
+  continueActionLabel,
   canContinueWorkflow,
   continueDisabledReason
 }: {
@@ -4217,6 +4124,7 @@ const WorkflowAutopilotPanel = ({
   workflowMode: ProjectWorkflowState["workflowMode"];
   previewStatus: NonNullable<ProjectWorkflowState["previewRequest"]>["status"];
   previewDisabledReason?: string;
+  commandBusy: boolean;
   onToggleAutopilot: () => void;
   onProfileChange: (profile: AutopilotProfile) => void;
   onPolicyChange: (patch: Partial<AutopilotPolicy>) => void;
@@ -4226,6 +4134,7 @@ const WorkflowAutopilotPanel = ({
   onCancelPreview: () => void;
   onCompletePreview: () => void;
   onContinueWorkflow: () => void;
+  continueActionLabel: string;
   canContinueWorkflow: boolean;
   continueDisabledReason?: string;
 }) => {
@@ -4233,7 +4142,7 @@ const WorkflowAutopilotPanel = ({
   const previewCanRequest = previewStatus === "none" || previewStatus === "completed" || previewStatus === "cancelled";
   const previewCanCancel = previewStatus === "queued";
   const previewCanComplete = previewStatus === "ready";
-  const canContinue = canContinueWorkflow || workflowPauseRequested || previewCanComplete || recoveryAvailable || Boolean(autopilotPausedReason);
+  const canContinue = !commandBusy && (canContinueWorkflow || workflowPauseRequested || previewCanComplete || recoveryAvailable || Boolean(autopilotPausedReason));
   const numberPatch = (key: "maxChecksPerWorkPackageNormal" | "maxChecksPerWorkPackageFast" | "maxNewRequiredChecksPerCycle", value: string) => {
     const parsed = Number(value);
     if (Number.isFinite(parsed)) {
@@ -4305,16 +4214,16 @@ const WorkflowAutopilotPanel = ({
         <button className={workflowMode === "fast" ? "primary-button" : "secondary-button"} onClick={onToggleWorkflowMode} type="button">
           {workflowMode === "fast" ? "Switch to Normal Mode" : "Switch to Fast Mode"}
         </button>
-        <button className="secondary-button" disabled={!previewCanRequest || Boolean(previewDisabledReason)} onClick={onRequestPreview} type="button">
+        <button className="secondary-button" disabled={commandBusy || !previewCanRequest || Boolean(previewDisabledReason)} onClick={onRequestPreview} type="button">
           {previewButtonLabel(previewStatus)}
         </button>
         {previewCanCancel ? (
-          <button className="secondary-button" onClick={onCancelPreview} type="button">
+          <button className="secondary-button" disabled={commandBusy} onClick={onCancelPreview} type="button">
             Cancel Preview
           </button>
         ) : null}
         {previewCanComplete ? (
-          <button className="primary-button" onClick={onCompletePreview} type="button">
+          <button className="primary-button" disabled={commandBusy} onClick={onCompletePreview} type="button">
             Resume Workflow
           </button>
         ) : null}
@@ -4322,7 +4231,7 @@ const WorkflowAutopilotPanel = ({
           {optimizeModeEnabled ? "Stop optimizing" : "Optimize"}
         </button>
         <button className="secondary-button" disabled={!canContinue} onClick={onContinueWorkflow} title={!canContinue ? continueDisabledReason : undefined} type="button">
-          Continue workflow
+          {continueActionLabel}
         </button>
       </div>
       <details className="workflow-autopilot-settings">
@@ -5231,6 +5140,7 @@ export const App = () => {
   const [userInputDrafts, setUserInputDrafts] = useState<Record<string, Record<string, string>>>({});
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [shellLaunchBusy, setShellLaunchBusy] = useState(false);
+  const [workflowCommandBusyKey, setWorkflowCommandBusyKey] = useState<string>();
   const [overviewRefreshBusy, setOverviewRefreshBusy] = useState(false);
   const [visualExtractBusy, setVisualExtractBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
@@ -5281,6 +5191,7 @@ export const App = () => {
     loading: false
   });
   const [workflowDetailsMounted, setWorkflowDetailsMounted] = useState(false);
+  const workflowCommandBusyRef = useRef<string | undefined>(undefined);
   const visualExportReadinessRef = useRef<VisualExportReadiness>({
     activeProjectId: undefined,
     activeWorkspaceTab: "overview",
@@ -5316,8 +5227,10 @@ export const App = () => {
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
-      setClockNow(Date.now());
-    }, 10_000);
+      if (!document.hidden) {
+        setClockNow(Date.now());
+      }
+    }, 60_000);
 
     return () => window.clearInterval(intervalId);
   }, []);
@@ -5350,6 +5263,8 @@ export const App = () => {
   const launcherActionsLocked = !githubLinked;
   const createWorkspaceLocked = !githubSshReady;
   const activeProjectId = activeProject?.record.id;
+  const workflowCommandBusy = Boolean(activeProjectId && workflowCommandBusyKey?.startsWith(`${activeProjectId}:`));
+  const workflowCommandBusyReason = workflowCommandBusy ? "Workflow command is already running." : undefined;
   const selectedFileFromState = activeProject?.record.localState.selectedFile;
   const storedTreeFilter = activeProject?.record.localState.treeFilter ?? "";
   const storedActiveAgentId = activeProject?.record.localState.activeAgentId;
@@ -5488,6 +5403,15 @@ export const App = () => {
         title: "Workflow is paused",
         description: "The current workflow state was saved. Continue when you want automation to resume from here.",
         actionLabel: "Continue workflow"
+      };
+    }
+    if (workflow.autopilotStatus?.pausedReason) {
+      return {
+        kind: "none",
+        title: workflow.autopilotStatus.pausedReason === "high_risk_package_requires_approval"
+          ? "Approve the workflow checkpoint"
+          : "Workflow checkpoint paused",
+        description: workflow.autopilotStatus.pausedDetail ?? "Autopilot is paused until you continue."
       };
     }
     return workflowActionGuide(workflow, workflowPendingApprovals.length > 0, autopilotEnabled, workflowObjective);
@@ -6478,17 +6402,42 @@ export const App = () => {
     }
   };
 
+  const runWorkflowCommand = async (command: string, task: () => Promise<void>): Promise<boolean> => {
+    const projectId = activeProject?.record.id;
+    if (!projectId) {
+      return false;
+    }
+
+    if (workflowCommandBusyRef.current?.startsWith(`${projectId}:`)) {
+      return false;
+    }
+
+    const busyKey = `${projectId}:${command}`;
+    workflowCommandBusyRef.current = busyKey;
+    setWorkflowCommandBusyKey(busyKey);
+    try {
+      await task();
+      return true;
+    } catch (error) {
+      handleError(error);
+      return false;
+    } finally {
+      if (workflowCommandBusyRef.current === busyKey) {
+        workflowCommandBusyRef.current = undefined;
+        setWorkflowCommandBusyKey(undefined);
+      }
+    }
+  };
+
   const runRecommendation = async (customFocus?: string) => {
     if (!activeProject) {
       return;
     }
 
-    try {
+    await runWorkflowCommand("run-recommendation", async () => {
       setNotice(undefined);
       await window.workbench.runRecommendation(activeProject.record.id, customFocus?.trim() || undefined);
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const toggleAutopilot = async () => {
@@ -6614,45 +6563,61 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("complete-preview", async () => {
       setNotice(undefined);
       await window.workbench.completeWorkflowPreview(activeProject.record.id);
       showInfoNotice("Preview checkpoint completed. Workflow resumed.");
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const continueWorkflow = async () => {
-    if (previewStatus === "ready") {
-      await completeWorkflowPreview();
+    if (!activeProject) {
       return;
     }
-    if (workflowRecoveryAvailable) {
-      await recoverWorkflow();
-      return;
-    }
-    if (autopilotStatus?.pausedReason) {
-      if (!activeProject) {
+
+    await runWorkflowCommand("continue", async () => {
+      setNotice(undefined);
+      if (previewStatus === "ready") {
+        await window.workbench.completeWorkflowPreview(activeProject.record.id);
+        showInfoNotice("Preview checkpoint completed. Workflow resumed.");
         return;
       }
-      try {
-        setNotice(undefined);
+      if (workflowRecoveryAvailable) {
+        await window.workbench.recoverWorkflow(activeProject.record.id);
+        showInfoNotice("Workflow recovery started from the saved state.");
+        return;
+      }
+      if (autopilotStatus?.pausedReason) {
+        if (
+          autopilotStatus.pausedReason === "high_risk_package_requires_approval" &&
+          autopilotStatus.currentRecommendationId
+        ) {
+          await window.workbench.advanceWorkflowStage(activeProject.record.id);
+          showInfoNotice("Approved or refreshed the checkpointed package. Workflow automation continued.");
+          return;
+        }
         await window.workbench.updateUiState(activeProject.record.id, {
           workflowPauseRequested: false
         });
         showInfoNotice("Workflow automation continued from the saved state.");
-      } catch (error) {
-        handleError(error);
+        return;
       }
-      return;
-    }
-    if (workflowRuntimeStatus?.canContinue && workflowRuntimeStatus.status === "idle") {
-      await advanceWorkflowStage();
-      showInfoNotice("Workflow automation continued from the saved state.");
-      return;
-    }
-    await toggleWorkflowPause();
+      if (workflowRuntimeStatus?.canContinue && workflowRuntimeStatus.status === "idle") {
+        await window.workbench.advanceWorkflowStage(activeProject.record.id);
+        showInfoNotice("Workflow automation continued from the saved state.");
+        return;
+      }
+      await window.workbench.updateUiState(activeProject.record.id, {
+        workflowPauseRequested: !workflowPauseRequested
+      });
+      showInfoNotice(
+        workflowPauseRequested
+          ? "Workflow automation resumed."
+          : workflowHasActiveAgent
+            ? "Workflow will pause after the current agent finishes."
+            : "Workflow paused."
+      );
+    });
   };
 
   const toggleWorkflowPause = async () => {
@@ -6660,7 +6625,7 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("toggle-pause", async () => {
       setNotice(undefined);
       await window.workbench.updateUiState(activeProject.record.id, {
         workflowPauseRequested: !workflowPauseRequested
@@ -6672,9 +6637,7 @@ export const App = () => {
             ? "Workflow will pause after the current agent finishes."
             : "Workflow paused."
       );
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const recoverWorkflow = async () => {
@@ -6682,13 +6645,11 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("recover", async () => {
       setNotice(undefined);
       await window.workbench.recoverWorkflow(activeProject.record.id);
       showInfoNotice("Workflow recovery started from the saved state.");
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const clearStaleWorkflowLock = async () => {
@@ -6696,13 +6657,11 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("clear-stale-lock", async () => {
       setNotice(undefined);
       await window.workbench.clearStaleWorkflowLock(activeProject.record.id);
       showInfoNotice("Stale workflow lock cleared. The saved workflow is paused and ready to continue.");
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const retryWorkflowGoal = async () => {
@@ -6712,7 +6671,7 @@ export const App = () => {
 
     const retryingMerge = isMergeConflictHandoff(activeProject.record.workflow);
     const retryingValidation = isEnvironmentRepairHandoff(activeProject.record.workflow);
-    try {
+    await runWorkflowCommand("retry-goal", async () => {
       setNotice(undefined);
       await window.workbench.retryWorkflowGoal(activeProject.record.id);
       showInfoNotice(
@@ -6722,9 +6681,7 @@ export const App = () => {
           ? "Retrying validation after the environment fix."
           : "Retrying the current scoped goal."
       );
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const saveUltimateGoal = async () => {
@@ -6833,12 +6790,10 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("approve-recommendation", async () => {
       setNotice(undefined);
       await window.workbench.approveRecommendation(activeProject.record.id, recommendationId);
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const createScopedGoal = async () => {
@@ -6846,12 +6801,10 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("create-scoped-goal", async () => {
       setNotice(undefined);
       await window.workbench.createScopedGoal(activeProject.record.id);
-    } catch (error) {
-      handleError(error);
-    }
+    });
   };
 
   const advanceWorkflowStage = async () => {
@@ -6859,12 +6812,32 @@ export const App = () => {
       return;
     }
 
-    try {
+    await runWorkflowCommand("advance-stage", async () => {
       setNotice(undefined);
       await window.workbench.advanceWorkflowStage(activeProject.record.id);
-    } catch (error) {
-      handleError(error);
+    });
+  };
+
+  const runWorkflowIntegrity = async () => {
+    if (!activeProject) {
+      return;
     }
+
+    await runWorkflowCommand("run-integrity", async () => {
+      setNotice(undefined);
+      await window.workbench.runIntegrity(activeProject.record.id);
+    });
+  };
+
+  const runWorkflowMerge = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    await runWorkflowCommand("run-merge", async () => {
+      setNotice(undefined);
+      await window.workbench.runMerge(activeProject.record.id);
+    });
   };
 
   const resolveHumanIntervention = async (interventionId: string, status: "resolved" | "dismissed" = "resolved") => {
@@ -7337,6 +7310,9 @@ export const App = () => {
     activeProject.record.localState.lastOpenedAt;
   const projectBranchOrPath = activeProject.record.validation.branch ?? activeProject.record.displayPath;
   const workflowRecoveryAvailable = Boolean(workflowRuntimeStatus?.status === "stale-running" && workflowPendingApprovals.length === 0);
+  const workflowContinueActionLabel = autopilotStatus?.pausedReason === "high_risk_package_requires_approval"
+    ? "Approve package"
+    : "Continue workflow";
   const workflowShellStatus: { label: string; tone: ShellStatusTone } = activeProject.record.interfaceCreation?.status === "running"
     ? { label: "Running", tone: "running" }
     : workflowRuntimeStatus
@@ -7344,12 +7320,14 @@ export const App = () => {
       : { label: "Idle", tone: "idle" };
   const topBarPrimaryAction: ShellAction | undefined = workflowAction?.kind === "resume_workflow"
     ? {
-      label: "Continue workflow",
+      label: workflowContinueActionLabel,
+      disabled: workflowCommandBusy,
       onClick: () => void toggleWorkflowPause()
     }
     : workflowAction?.kind === "recover_workflow"
       ? {
-        label: "Continue workflow",
+        label: workflowContinueActionLabel,
+        disabled: workflowCommandBusy,
         onClick: () => void recoverWorkflow()
       }
       : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
@@ -7365,12 +7343,14 @@ export const App = () => {
           }
           : autopilotStatus?.pausedReason
             ? {
-              label: "Continue workflow",
+              label: workflowContinueActionLabel,
+              disabled: workflowCommandBusy,
               onClick: () => void continueWorkflow()
             }
           : workflow && !workflowHasActiveAgent && !recommendationRegenerationLocked
             ? {
               label: "Run recommendation",
+              disabled: workflowCommandBusy,
               onClick: () => void runRecommendation()
             }
             : undefined;
@@ -7394,30 +7374,50 @@ export const App = () => {
     `${pendingApprovals.length} approvals pending`
   ];
   const scrollWorkflowSectionIntoView = (elementId: string) => {
-    document.getElementById(elementId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setWorkspaceTab("workflow");
+    const tryScroll = (attempt = 0) => {
+      const target = document.getElementById(elementId);
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
+      if (attempt < 12) {
+        window.requestAnimationFrame(() => tryScroll(attempt + 1));
+      }
+    };
+    window.requestAnimationFrame(() => tryScroll());
   };
   const openWorkflowDetailsAndScroll = (elementId: string) => {
+    setWorkspaceTab("workflow");
     setWorkflowDetailsMounted(true);
-    window.requestAnimationFrame(() => {
+    const tryOpenAndScroll = (attempt = 0) => {
       const details = document.getElementById("workflow-detail-disclosure");
       if (details instanceof HTMLDetailsElement) {
         details.open = true;
       }
-      const target = document.getElementById(elementId) ?? details;
+      const target = document.getElementById(elementId);
+      if (!target && attempt < 16) {
+        window.requestAnimationFrame(() => tryOpenAndScroll(attempt + 1));
+        return;
+      }
+      const scrollTarget = target ?? details;
       if (target instanceof HTMLDetailsElement) {
         target.open = true;
       }
-      window.requestAnimationFrame(() => target?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    });
+      window.requestAnimationFrame(() => scrollTarget?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    };
+    window.requestAnimationFrame(() => tryOpenAndScroll());
   };
   const workflowHeaderPrimaryAction: ShellAction | undefined = workflowAction?.kind === "resume_workflow"
     ? {
-      label: "Continue workflow",
+      label: workflowContinueActionLabel,
+      disabled: workflowCommandBusy,
       onClick: () => void toggleWorkflowPause()
     }
     : workflowAction?.kind === "recover_workflow"
       ? {
-        label: "Continue workflow",
+        label: workflowContinueActionLabel,
+        disabled: workflowCommandBusy,
         onClick: () => void recoverWorkflow()
       }
       : workflowAction?.kind === "confirm_goal"
@@ -7438,7 +7438,8 @@ export const App = () => {
             }
             : autopilotStatus?.pausedReason
               ? {
-                label: "Continue workflow",
+                label: workflowContinueActionLabel,
+                disabled: workflowCommandBusy,
                 onClick: () => void continueWorkflow()
               }
             : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
@@ -7450,35 +7451,40 @@ export const App = () => {
               : workflowShellStatus.tone === "running" && !workflowPauseRequested
                 ? {
                   label: "Pause workflow",
+                  disabled: workflowCommandBusy,
                   onClick: () => void toggleWorkflowPause()
                 }
                 : workflow && !workflowHasActiveAgent && !recommendationRegenerationLocked
                   ? {
                     label: "Run recommendation",
+                    disabled: workflowCommandBusy,
                     onClick: () => void runRecommendation()
                   }
                   : undefined;
   const workflowSecondaryActions: ShellAction[] = [
     {
       label: "Create scoped goal",
-      disabled: !workflow?.approvedRecommendation,
+      disabled: workflowCommandBusy || !workflow?.approvedRecommendation,
       onClick: () => void createScopedGoal()
     },
     {
       label: "Run recommendation",
-      disabled: recommendationRegenerationLocked,
+      disabled: workflowCommandBusy || recommendationRegenerationLocked,
       onClick: () => void runRecommendation()
     },
     {
       label: "Run integrity",
-      onClick: () => void window.workbench.runIntegrity(activeProject.record.id)
+      disabled: workflowCommandBusy,
+      onClick: () => void runWorkflowIntegrity()
     },
     {
       label: "Run merge",
-      onClick: () => void window.workbench.runMerge(activeProject.record.id)
+      disabled: workflowCommandBusy,
+      onClick: () => void runWorkflowMerge()
     },
     {
       label: "Advance workflow stage",
+      disabled: workflowCommandBusy,
       onClick: () => void advanceWorkflowStage()
     }
   ];
@@ -7802,8 +7808,17 @@ export const App = () => {
                     openWorkflowDetailsAndScroll("workflow-user-input-requests");
                     return;
                   }
+                  if (target === "manual-handoff") {
+                    openWorkflowDetailsAndScroll("workflow-manual-handoff");
+                    return;
+                  }
                   openWorkflowDetailsAndScroll("workflow-attention-details");
                 }}
+                onRetryManualHandoff={() => void retryWorkflowGoal()}
+                onOpenProjectShell={() => void openProjectShell()}
+                onDownloadRepairReport={downloadRepairReport}
+                shellLaunchBusy={shellLaunchBusy}
+                repairReportAvailable={repairAttemptReports.length > 0}
               />
             </section>
 
@@ -7856,6 +7871,7 @@ export const App = () => {
               workflowMode={workflowMode}
               previewStatus={previewStatus}
               previewDisabledReason={previewDisabledReason}
+              commandBusy={workflowCommandBusy}
               onToggleAutopilot={() => void toggleAutopilot()}
               onProfileChange={(profile) => void setAutopilotProfile(profile)}
               onPolicyChange={(patch) => void updateAutopilotPolicy(patch)}
@@ -7865,8 +7881,9 @@ export const App = () => {
               onCancelPreview={() => void cancelWorkflowPreview()}
               onCompletePreview={() => void completeWorkflowPreview()}
               onContinueWorkflow={() => void continueWorkflow()}
-              canContinueWorkflow={workflowRuntimeStatus?.canContinue ?? false}
-              continueDisabledReason={workflowRuntimeStatus?.continueDisabledReason}
+              continueActionLabel={workflowContinueActionLabel}
+              canContinueWorkflow={!workflowCommandBusy && (workflowRuntimeStatus?.canContinue ?? false)}
+              continueDisabledReason={workflowCommandBusyReason ?? workflowRuntimeStatus?.continueDisabledReason}
             />
 
             <section className="workflow-operator-grid workflow-operator-grid--history">
@@ -7887,7 +7904,6 @@ export const App = () => {
               </summary>
               {workflowDetailsMounted ? (
               <div className="workflow-secondary__content">
-                <WorkflowStepRail steps={workflowTimeline} nowTime={clockNow} />
                 <UltimateGoalProgressCard
                   progress={workflow?.ultimateGoalProgress}
                   completion={workflow?.ultimateGoalCompletion}
@@ -7911,11 +7927,11 @@ export const App = () => {
                       {workflowAction.actionLabel ?? "Confirm Ultimate Goal"}
                     </button>
                   ) : workflowAction?.kind === "resume_workflow" ? (
-                    <button className="primary-button" onClick={() => void toggleWorkflowPause()}>
+                    <button className="primary-button" disabled={workflowCommandBusy} onClick={() => void toggleWorkflowPause()}>
                       {workflowAction.actionLabel}
                     </button>
                   ) : workflowAction?.kind === "recover_workflow" ? (
-                    <button className="primary-button" onClick={() => void recoverWorkflow()}>
+                    <button className="primary-button" disabled={workflowCommandBusy} onClick={() => void recoverWorkflow()}>
                       {workflowAction.actionLabel}
                     </button>
                   ) : workflowAction?.kind === "manual_takeover" ? (
@@ -8008,7 +8024,7 @@ export const App = () => {
                           <button className={workflowMode === "fast" ? "primary-button" : "secondary-button"} onClick={() => void toggleWorkflowMode()}>
                             {workflowMode === "fast" ? "Switch to Normal Mode" : "Switch to Fast Mode"}
                           </button>
-                          <button className="secondary-button" onClick={() => void toggleWorkflowPause()}>
+                          <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void toggleWorkflowPause()}>
                             {workflowPauseRequested ? "Continue workflow" : "Pause after current run"}
                           </button>
                         </div>
@@ -8069,7 +8085,7 @@ export const App = () => {
                 ) : null}
 
                 {workflowProminence.manualHandoff && workflow?.manualHandoff ? (
-                  <article className="overview-card workflow-panel workflow-manual-handoff">
+                  <article id="workflow-manual-handoff" className="overview-card workflow-panel workflow-manual-handoff">
                     <SectionTitle
                       eyebrow="Manual fallback"
                       title={workflow.manualHandoff.title}
@@ -8086,6 +8102,16 @@ export const App = () => {
                         <p>{workflow.manualHandoff.latestFailureReason}</p>
                       </div>
                     </div>
+                    {workflow.manualHandoff.involvedPaths.length ? (
+                      <div className="workflow-goal-panel__criteria">
+                        <span className="workflow-option__label">Conflict paths</span>
+                        <div className="tag-row">
+                          {workflow.manualHandoff.involvedPaths.map((involvedPath) => (
+                            <span key={involvedPath} className="tag">{involvedPath}</span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                     <div className="actions-row">
                       <button
                         className="primary-button"
@@ -8156,7 +8182,7 @@ export const App = () => {
                       <div className="actions-row">
                         <button
                           className="secondary-button"
-                          disabled={!customRecommendationPrompt.trim() || recommendationRegenerationLocked}
+                          disabled={workflowCommandBusy || !customRecommendationPrompt.trim() || recommendationRegenerationLocked}
                           onClick={() => void runRecommendation(customRecommendationPrompt)}
                         >
                           Generate related recommendations
@@ -8179,6 +8205,7 @@ export const App = () => {
                           recommendation={recommendation}
                           approved={activeProject.record.workflow.approvedRecommendation?.recommendationId === recommendation.id}
                           disabled={
+                            workflowCommandBusy ||
                             Boolean(activeProject.record.workflow.approvedRecommendation) &&
                             activeProject.record.workflow.approvedRecommendation?.recommendationId !== recommendation.id
                           }
@@ -8645,19 +8672,19 @@ export const App = () => {
                     These controls are kept for debugging and scaffolding. The normal workflow should advance automatically.
                   </p>
                   <div className="actions-row">
-                    <button className="secondary-button" disabled={!activeProject.record.workflow.approvedRecommendation} onClick={() => void createScopedGoal()}>
+                    <button className="secondary-button" disabled={workflowCommandBusy || !activeProject.record.workflow.approvedRecommendation} onClick={() => void createScopedGoal()}>
                       Create scoped goal
                     </button>
-                    <button className="secondary-button" disabled={recommendationRegenerationLocked} onClick={() => void runRecommendation()}>
+                    <button className="secondary-button" disabled={workflowCommandBusy || recommendationRegenerationLocked} onClick={() => void runRecommendation()}>
                       Run recommendation
                     </button>
-                    <button className="secondary-button" onClick={() => void window.workbench.runIntegrity(activeProject.record.id)}>
+                    <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void runWorkflowIntegrity()}>
                       Run integrity
                     </button>
-                    <button className="secondary-button" onClick={() => void window.workbench.runMerge(activeProject.record.id)}>
+                    <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void runWorkflowMerge()}>
                       Run merge
                     </button>
-                    <button className="secondary-button" onClick={() => void advanceWorkflowStage()}>
+                    <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void advanceWorkflowStage()}>
                       Advance workflow stage
                     </button>
                   </div>

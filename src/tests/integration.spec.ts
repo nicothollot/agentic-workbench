@@ -2,7 +2,7 @@ import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppService } from "@runtime/appService";
 import { MockCodexTransport } from "@runtime/mockCodexTransport";
 import { WorkbenchStorage } from "@runtime/storage";
@@ -18,13 +18,26 @@ import { nowIso } from "@shared/utils";
 import { createTempDir, initGitRepo, commitAll, writeMockSettings } from "./helpers";
 
 const execFileAsync = promisify(execFile);
+const createdServices = new Set<AppService>();
 
 const createService = async (appDataDir: string): Promise<AppService> => {
   await writeMockSettings(appDataDir);
   const service = new AppService(appDataDir);
+  const dispose = service.dispose.bind(service);
+  service.dispose = async () => {
+    createdServices.delete(service);
+    await dispose();
+  };
+  createdServices.add(service);
   await service.initialize();
   return service;
 };
+
+afterEach(async () => {
+  const services = [...createdServices];
+  createdServices.clear();
+  await Promise.allSettled(services.map((service) => service.dispose({ flush: false })));
+});
 
 const createSampleProject = async (
   name: string,
@@ -105,8 +118,8 @@ exit 1
 };
 
 const waitFor = async <T>(getValue: () => T | null | undefined | false, timeoutMs = 4_000): Promise<T> => {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
     const value = getValue();
     if (value) {
       return value;
@@ -2993,6 +3006,7 @@ describe("integration flows", () => {
     await service.updateUiState(selected.record.id, {});
 
     const reopenedService = new AppService(appData);
+    createdServices.add(reopenedService);
     await reopenedService.initialize();
     await reopenedService.updateSettings({
       maxRepairCycles: 2
@@ -3229,7 +3243,16 @@ describe("integration flows", () => {
     const selected = await service.selectPendingInterface("fresh");
     await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
 
-    const agent = await service.createAgent(selected.record.id, "coding", "Streaming Agent", "Stream progress.", "gpt-5.4");
+    const agent = await service.createAgent(
+      selected.record.id,
+      "coding",
+      "Streaming Agent",
+      "Stream progress.",
+      "gpt-5.4",
+      { launchThread: false }
+    );
+    agent.threadId = "streaming-agent-thread";
+    (service as any).threadToAgent.set(agent.threadId, { projectId: selected.record.id, agentId: agent.id });
 
     (service as any).handleTransportNotification({
       method: "item/agentMessage/delta",

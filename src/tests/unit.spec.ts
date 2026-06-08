@@ -71,6 +71,7 @@ import {
   workflowStatusSummary
 } from "@shared/workflowView";
 import { reduceAgentRuntimeEvent } from "@runtime/runtimeEvents";
+import { AppService } from "@runtime/appService";
 import { buildInterfaceCreationOutputSchema, parseInterfaceCreationOutput } from "@runtime/interfaceCreation";
 import { parseManifestFile } from "@runtime/manifestParser";
 import { createProjectIdentity } from "@runtime/projectIdentity";
@@ -131,6 +132,7 @@ import {
   sanitizeRecommendationForCycle,
   sanitizeScopedGoalForSingleAgent
 } from "@runtime/workflowGuardrails";
+import { buildWorkflowAttentionItems } from "@renderer/workflowAttention";
 import { buildRepairStrategyContext } from "@runtime/workflowRepairPlanner";
 import {
   createAgentContextDescriptor,
@@ -152,8 +154,10 @@ type PackageAppScript = {
     outputDir: string
   ) => string[];
   createBuilderEnv: (env?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+  patchWindowsExecutableWithOfficialElectron: (unpackedDir: string) => Promise<string>;
   parsePackageArgs: (argv: string[]) => { compile: boolean; targets: string[] };
   resolveDownloadsDir: (env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform) => string;
+  resolveOfficialWindowsElectronExecutable: () => Promise<string>;
   windowsPathToWslPath: (inputPath: string) => string;
 };
 
@@ -285,6 +289,65 @@ const makeGoalCheck = (overrides: Partial<GoalAttainmentCheck> = {}): GoalAttain
   updatedAt: overrides.updatedAt ?? "2026-04-07T00:00:00.000Z"
 });
 
+const makeAppServiceLoadedProject = (projectId = "project-1") => {
+  const workflow = defaultProjectWorkflowState();
+  workflow.ultimateGoal = {
+    ...emptyUltimateGoal("user"),
+    summary: "Keep the workflow moving without freezing.",
+    detailedIntent: "Advance a bounded implementation cycle while preserving workflow state.",
+    successCriteria: ["A bounded next step can run."],
+    confirmedAt: "2026-04-07T00:00:00.000Z"
+  };
+  workflow.goalChecklist = [
+    makeGoalCheck({
+      id: "workflow-responsive",
+      title: "Workflow remains responsive during automation",
+      status: "unmet",
+      relatedPaths: ["src/runtime/appService.ts"]
+    })
+  ];
+  workflow.workflowMode = "normal";
+  const identity = createProjectIdentity({
+    kind: "git",
+    projectRoot: "/repo",
+    projectName: "repo",
+    repositoryName: "repo",
+    normalizedRemotes: ["git@github.com:awb-tests/repo.git"],
+    manifestSignature: "manifest",
+    treeSignature: "tree"
+  });
+  const record = createLocalProjectRecord(
+    projectId,
+    "/repo",
+    "/repo",
+    "/repo",
+    "/repo",
+    identity,
+    {
+      interfaceSchemaVersion: 1,
+      appMinVersion: "0.1.0",
+      projectKind: "git"
+    }
+  );
+  record.localState.autopilotEnabled = true;
+  record.workflow = workflow;
+  const context = makeWorkflowRecommendationContext(workflow);
+  return {
+    record,
+    tree: [],
+    scan: context.scan,
+    gitMetadata: {
+      branch: "main",
+      head: "abc123",
+      isGitRepository: true,
+      hasUncommittedChanges: false,
+      remotes: []
+    },
+    summaryCache: new SummaryCache(record.summaryCache),
+    candidates: []
+  };
+};
+
 describe("path utils", () => {
   it("converts Windows paths into WSL paths", () => {
     expect(windowsPathToWslPath("C:\\Users\\nicot\\project")).toBe("/mnt/c/Users/nicot/project");
@@ -356,6 +419,10 @@ describe("packaging script", () => {
       compile: false,
       targets: ["win"]
     });
+    expect(packageAppScript.parsePackageArgs(["--win-portable", "--no-compile"])).toEqual({
+      compile: false,
+      targets: ["win-portable"]
+    });
     expect(packageAppScript.parsePackageArgs(["--all"]).targets.sort()).toEqual(["mac", "win"]);
     expect(packageAppScript.buildArtifactCopyFallbackPath(
       "/mnt/c/Users/nicot/Downloads/Codex Agent Workbench-0.1.0-windows-x64.exe",
@@ -371,15 +438,22 @@ describe("packaging script", () => {
     expect(packageAppScript.resolveDownloadsDir({ USERPROFILE: "C:\\Users\\TestUser" }, "win32")).toBe("C:\\Users\\TestUser\\Downloads");
   });
 
-  it("builds the Windows portable executable without extra packaging credentials", async () => {
+  it("builds the default unpacked Windows app without extra packaging credentials", async () => {
     const packageAppScript = await loadPackageAppScript();
     const args = packageAppScript.buildTargetArgs("win", "/tmp/out");
     const packageJson = JSON.parse(await readFile(path.resolve("package.json"), "utf8"));
 
     expect(args).toContain("--win");
-    expect(args).toContain("portable");
+    expect(args).toContain("dir");
     expect(args).toContain("--config.win.signAndEditExecutable=false");
     expect(packageJson.build.win.signExts).toEqual(["!.exe"]);
+  });
+
+  it("exports a Windows executable patch step for preserving the official Electron binary", async () => {
+    const packageAppScript = await loadPackageAppScript();
+
+    expect(typeof packageAppScript.resolveOfficialWindowsElectronExecutable).toBe("function");
+    expect(typeof packageAppScript.patchWindowsExecutableWithOfficialElectron).toBe("function");
   });
 
   it("drops inherited Windows package credential environment before running the builder", async () => {
@@ -2725,6 +2799,52 @@ describe("workflow view helpers", () => {
     });
     expect(workflowRunStateLabel(workflow, "git")).toBe("Waiting on you");
     expect(workflowSectionProminence(workflow).manualHandoff).toBe(true);
+  });
+
+  it("routes merge-conflict attention details to the manual handoff panel", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Finish the integration flow.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "merge_conflicts";
+    workflow.stepProgress.merge.status = "failed";
+    workflow.repair = {
+      attemptCount: 1,
+      maxAttempts: 5,
+      status: "merge_conflicts",
+      latestIssueSummary: "Merge conflicts were detected and require follow-up.",
+      latestFailureReason: "CONFLICT (content): Merge conflict in smoke/question-bank.spec.ts",
+      lastUpdatedAt: "2026-04-07T00:04:00.000Z"
+    };
+    workflow.manualHandoff = {
+      reason: "merge_conflicts",
+      title: "Merge conflicts detected",
+      whatSystemWasTryingToDo: "Integrate validated coding-agent branches into the opened project checkout",
+      validationIssue: "Merge conflicts were detected and require follow-up.",
+      latestFailureReason: "CONFLICT (content): Merge conflict in smoke/question-bank.spec.ts",
+      involvedPaths: ["smoke/question-bank.spec.ts", "src/App.tsx"],
+      shellSupported: true,
+      createdAt: "2026-04-07T00:04:00.000Z"
+    };
+
+    const attentionItems = buildWorkflowAttentionItems({
+      workflow,
+      approvals: [],
+      userInputRequests: [],
+      humanInterventions: [],
+      credentialRequests: [],
+      timeline: buildWorkflowTimelineSteps(workflow),
+      agents: []
+    });
+
+    expect(attentionItems).toContainEqual(expect.objectContaining({
+      id: "manual-handoff:merge_conflicts",
+      title: "Merge conflicts detected",
+      target: "manual-handoff"
+    }));
   });
 
   it("does not classify checkout update failures without conflicts as merge conflicts", () => {
@@ -5546,6 +5666,189 @@ describe("ultimate goal text import", () => {
     expect(preview.completeness).toBe("partial");
     expect(preview.missingFields).toContain("constraints");
     expect(preview.warnings.some((warning) => warning.includes("expected field order"))).toBe(true);
+  });
+});
+
+describe("AppService workflow performance guards", () => {
+  it("coalesces duplicate workflow automation schedules for one project", async () => {
+    const service = new AppService(await createTempDir("automation-schedule")) as unknown as {
+      projects: Map<string, unknown>;
+      workflowAutomationTimers: Map<string, unknown>;
+      workflowAutomationQueued: Set<string>;
+      shouldScheduleWorkflowAutomation: () => boolean;
+      runWorkflowAutomation: () => Promise<void>;
+      scheduleWorkflowAutomation: (projectId: string, reason?: string) => void;
+      cancelScheduledWorkflowAutomation: (projectId: string) => void;
+    };
+    const project = makeAppServiceLoadedProject("schedule-project");
+    service.projects.set(project.record.id, project);
+    service.shouldScheduleWorkflowAutomation = () => true;
+    let runs = 0;
+    service.runWorkflowAutomation = async () => {
+      runs += 1;
+    };
+
+    service.scheduleWorkflowAutomation(project.record.id, "first click");
+    service.scheduleWorkflowAutomation(project.record.id, "second click");
+
+    expect(service.workflowAutomationTimers.size).toBe(1);
+    expect(service.workflowAutomationQueued.has(project.record.id)).toBe(true);
+    expect(runs).toBe(0);
+    service.cancelScheduledWorkflowAutomation(project.record.id);
+  });
+
+  it("pauses workflow automation instead of repeating a no-progress action forever", async () => {
+    const service = new AppService(await createTempDir("automation-no-progress")) as unknown as {
+      pauseWorkflowAutomationForNoProgress: (project: ReturnType<typeof makeAppServiceLoadedProject>, action: ReturnType<typeof getNextWorkflowAutomationAction>) => void;
+    };
+    const project = makeAppServiceLoadedProject("no-progress-project");
+
+    service.pauseWorkflowAutomationForNoProgress(project, "run_merge");
+
+    expect(project.record.localState.workflowPauseRequested).toBe(true);
+    expect(project.record.workflow.autopilotStatus?.pausedReason).toBe("automation_no_progress");
+    expect(project.record.workflow.activityLog[0]?.title).toBe("Workflow automation paused to avoid a loop");
+  });
+
+  it("applies duplicate recommendation and scoped-goal outputs only once", async () => {
+    const service = new AppService(await createTempDir("structured-output")) as unknown as {
+      persistProjectUpdate: () => Promise<void>;
+      applyRecommendationOutput: (
+        project: ReturnType<typeof makeAppServiceLoadedProject>,
+        agent: AgentState,
+        rawText: string,
+        automate?: boolean,
+        source?: string
+      ) => Promise<boolean>;
+      applyScopedGoalOutput: (
+        project: ReturnType<typeof makeAppServiceLoadedProject>,
+        agent: AgentState,
+        approvedRecommendation: ApprovedRecommendation,
+        rawText: string,
+        automate?: boolean,
+        source?: string
+      ) => Promise<boolean>;
+    };
+    const project = makeAppServiceLoadedProject("structured-project");
+    const recommendationAgent = createAgentSkeleton("recommendation", "Recommendation", "prompt", "gpt-5.4");
+    const goalAgent = createAgentSkeleton("goal", "Goal", "prompt", "gpt-5.4");
+    project.record.agents.push(recommendationAgent, goalAgent);
+    let saves = 0;
+    service.persistProjectUpdate = async () => {
+      saves += 1;
+    };
+    const recommendationOutput = JSON.stringify({
+      summary: "A bounded recommendation is ready.",
+      ultimateGoalProgress: { percentComplete: 25, rationale: "One required check still needs implementation." },
+      ultimateGoalCompletion: { state: "needs_more_work", rationale: "The workflow still needs a coding pass." },
+      recommendations: [
+        {
+          title: "Implement the responsive workflow guard",
+          summary: "Add bounded runtime guards around workflow automation.",
+          rationale: "It prevents repeated workflow action loops.",
+          expectedImpact: "One click cannot freeze the app.",
+          priority: "high",
+          confidence: 0.9,
+          estimatedScope: "small",
+          riskLevel: "medium",
+          relatedPaths: ["src/runtime/appService.ts"]
+        }
+      ],
+      goalCheckUpdates: []
+    });
+
+    await expect(service.applyRecommendationOutput(project, recommendationAgent, recommendationOutput, false, "item/completed")).resolves.toBe(true);
+    const recommendationCountAfterFirstApply = project.record.workflow.recommendations.length;
+    await expect(service.applyRecommendationOutput(project, recommendationAgent, recommendationOutput, false, "rawResponseItem/completed")).resolves.toBe(true);
+    await expect(service.applyRecommendationOutput(project, recommendationAgent, recommendationOutput, false, "thread/read")).resolves.toBe(true);
+    expect(recommendationCountAfterFirstApply).toBeGreaterThan(0);
+    expect(project.record.workflow.recommendations).toHaveLength(recommendationCountAfterFirstApply);
+    expect(recommendationAgent.appliedStructuredOutputs).toHaveLength(1);
+
+    const approved = approveRecommendation(project.record.workflow.recommendations[0]);
+    project.record.workflow.approvedRecommendation = approved;
+    const scopedGoalOutput = JSON.stringify({
+      summary: "Implement workflow automation guards.",
+      executionBrief: "Add single-flight scheduling, no-progress detection, and bounded renderer updates.",
+      acceptanceCriteria: ["Duplicate workflow commands are coalesced.", "Automation pauses when no progress repeats."],
+      constraints: ["Keep typed IPC.", "Do not disable automation."],
+      testStrategy: ["Run focused unit tests."]
+    });
+
+    await expect(service.applyScopedGoalOutput(project, goalAgent, approved, scopedGoalOutput, false, "item/completed")).resolves.toBe(true);
+    await expect(service.applyScopedGoalOutput(project, goalAgent, approved, scopedGoalOutput, false, "rawResponseItem/completed")).resolves.toBe(true);
+    await expect(service.applyScopedGoalOutput(project, goalAgent, approved, scopedGoalOutput, false, "thread/read")).resolves.toBe(true);
+    expect(project.record.workflow.scopedGoal?.sourceRecommendationId).toBe(approved.recommendationId);
+    expect(goalAgent.appliedStructuredOutputs).toHaveLength(1);
+    expect(saves).toBe(2);
+  });
+
+  it("skips unchanged project writes and trims renderer snapshots", async () => {
+    const service = new AppService(await createTempDir("save-trim")) as unknown as {
+      storage: {
+        saveProject: () => Promise<void>;
+        loadRegistry: () => Promise<string[]>;
+        saveRegistry: () => Promise<void>;
+      };
+      compactProjectRuntimeHistory: () => void;
+      recordAgentContextDescriptor: () => void;
+      syncWorkflowState: () => void;
+      saveProject: (project: ReturnType<typeof makeAppServiceLoadedProject>) => Promise<void>;
+      compactRendererProjectRecord: (
+        record: ReturnType<typeof makeAppServiceLoadedProject>["record"],
+        options?: { inactive?: boolean }
+      ) => ReturnType<typeof makeAppServiceLoadedProject>["record"];
+    };
+    const project = makeAppServiceLoadedProject("save-project");
+    const agent = createAgentSkeleton("coding", "Long history", "prompt ".repeat(400), "gpt-5.4");
+    agent.events = Array.from({ length: 100 }, (_, index) => ({
+      id: `event-${index}`,
+      agentId: agent.id,
+      timestamp: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      type: "raw" as const,
+      title: `Event ${index}`,
+      detail: "detail ".repeat(400),
+      raw: { output: "raw ".repeat(400) }
+    }));
+    agent.commandLog = Array.from({ length: 40 }, (_, index) => ({
+      itemId: `cmd-${index}`,
+      command: `npm test -- --run ${index}`,
+      output: "output ".repeat(1_000),
+      status: "completed",
+      startedAt: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:10.000Z`,
+      completedAt: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:20.000Z`,
+      exitCode: 0
+    }));
+    project.record.agents = [agent];
+    project.record.workflow.activityLog = Array.from({ length: 120 }, (_, index) => ({
+      id: `activity-${index}`,
+      timestamp: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:30.000Z`,
+      source: "workflow" as const,
+      status: "running" as const,
+      title: `Activity ${index}`,
+      detail: "activity ".repeat(400)
+    }));
+    let writes = 0;
+    service.compactProjectRuntimeHistory = () => undefined;
+    service.recordAgentContextDescriptor = () => undefined;
+    service.syncWorkflowState = () => undefined;
+    service.storage.saveProject = async () => {
+      writes += 1;
+    };
+    service.storage.loadRegistry = async () => [project.record.id];
+    service.storage.saveRegistry = async () => undefined;
+
+    await service.saveProject(project);
+    await service.saveProject(project);
+
+    expect(writes).toBe(1);
+    const activeRecord = service.compactRendererProjectRecord(project.record);
+    const inactiveRecord = service.compactRendererProjectRecord(project.record, { inactive: true });
+    expect(activeRecord.agents[0]?.events.length).toBeLessThanOrEqual(3);
+    expect(activeRecord.agents[0]?.commandLog.length).toBeLessThanOrEqual(3);
+    expect(activeRecord.workflow.activityLog.length).toBeLessThanOrEqual(80);
+    expect(inactiveRecord.agents).toHaveLength(0);
+    expect(inactiveRecord.workflow.activityLog).toHaveLength(0);
   });
 });
 
