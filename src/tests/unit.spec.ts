@@ -5850,6 +5850,74 @@ describe("AppService workflow performance guards", () => {
     expect(inactiveRecord.agents).toHaveLength(0);
     expect(inactiveRecord.workflow.activityLog).toHaveLength(0);
   });
+
+  it("does not await slow project saves when advancing workflow from the UI", async () => {
+    const service = new AppService(await createTempDir("advance-nonblocking")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      saveProject: () => Promise<void>;
+      shouldScheduleWorkflowAutomation: () => boolean;
+      scheduleWorkflowAutomation: (projectId: string, reason?: string) => void;
+      advanceWorkflowStage: (projectId: string) => Promise<string>;
+      dispose: (options?: { flush?: boolean }) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("advance-nonblocking-project");
+    project.record.workflow.stepProgress.merge.status = "running";
+    service.projects.set(project.record.id, project);
+    service.shouldScheduleWorkflowAutomation = () => true;
+    let automationScheduled = false;
+    service.scheduleWorkflowAutomation = () => {
+      automationScheduled = true;
+    };
+    let saveStarted = false;
+    service.saveProject = async () => {
+      saveStarted = true;
+      await new Promise(() => undefined);
+    };
+
+    const startedAt = performance.now();
+    await service.advanceWorkflowStage(project.record.id);
+
+    expect(performance.now() - startedAt).toBeLessThan(100);
+    expect(project.record.workflow.stepProgress.merge.status).toBe("waiting");
+    expect(project.record.workflow.activityLog[0]?.title).toBe("Stale workflow active step requeued");
+    expect(automationScheduled).toBe(true);
+    expect(saveStarted).toBe(false);
+    await service.dispose({ flush: false });
+  });
+
+  it("does not await slow project saves when resuming workflow from the UI", async () => {
+    const service = new AppService(await createTempDir("resume-nonblocking")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      saveProject: () => Promise<void>;
+      shouldScheduleWorkflowAutomation: () => boolean;
+      scheduleWorkflowAutomation: (projectId: string, reason?: string) => void;
+      updateUiState: (projectId: string, partial: Partial<ReturnType<typeof makeAppServiceLoadedProject>["record"]["localState"]>) => Promise<void>;
+      dispose: (options?: { flush?: boolean }) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("resume-nonblocking-project");
+    project.record.localState.workflowPauseRequested = true;
+    service.projects.set(project.record.id, project);
+    service.shouldScheduleWorkflowAutomation = () => true;
+    let automationScheduled = false;
+    service.scheduleWorkflowAutomation = () => {
+      automationScheduled = true;
+    };
+    let saveStarted = false;
+    service.saveProject = async () => {
+      saveStarted = true;
+      await new Promise(() => undefined);
+    };
+
+    const startedAt = performance.now();
+    await service.updateUiState(project.record.id, { workflowPauseRequested: false });
+
+    expect(performance.now() - startedAt).toBeLessThan(100);
+    expect(project.record.localState.workflowPauseRequested).toBe(false);
+    expect(project.record.workflow.activityLog[0]?.title).toBe("Workflow automation resumed");
+    expect(automationScheduled).toBe(true);
+    expect(saveStarted).toBe(false);
+    await service.dispose({ flush: false });
+  });
 });
 
 describe("event reducer", () => {

@@ -2495,7 +2495,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           case "finalize_cycle": {
             this.finalizeWorkflowCycle(project);
             await this.persistProjectUpdate(project, {
-              save: "immediate",
+              save: "deferred",
               emit: "coalesced",
               automate: true,
               reason: "workflow cycle finalized"
@@ -5034,15 +5034,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
 
-    await this.saveProject(project);
-    this.emitState();
-    if (
-      partial.autopilotEnabled !== undefined ||
-      partial.workflowObjective !== undefined ||
-      (partial.workflowPauseRequested !== undefined && !nextPauseRequested)
-    ) {
-      this.scheduleWorkflowAutomation(projectId);
-    }
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: "deferred",
+      emit: "coalesced",
+      automate:
+        partial.autopilotEnabled !== undefined ||
+        partial.workflowObjective !== undefined ||
+        (partial.workflowPauseRequested !== undefined && !nextPauseRequested),
+      reason: "ui workflow state updated"
+    });
   }
 
   async setWorkflowMode(projectId: string, workflowMode: WorkflowMode): Promise<ProjectWorkflowState> {
@@ -7602,6 +7603,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   async advanceWorkflowStage(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
     const project = this.findProject(projectId);
     this.syncWorkflowState(project);
+    if (!this.hasActiveWorkflowAgent(project) && this.requeueStaleRunningWorkflowSteps(project)) {
+      this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+        source: "system",
+        status: "waiting",
+        title: "Stale workflow active step requeued",
+        detail: "The saved active step had no live agent attached, so it was returned to a queued state before continuing.",
+        stepId: getWorkflowActiveStepId(this.ensureWorkflowState(project.record))
+      });
+      this.syncWorkflowState(project);
+    }
     const workflow = this.ensureWorkflowState(project.record);
     if (workflow.autopilotStatus?.pausedReason === "high_risk_package_requires_approval") {
       const recommendation = this.resolveRecommendationForApproval(workflow, workflow.autopilotStatus.currentRecommendationId);
@@ -7628,7 +7639,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         message: "The previous checkpoint was stale, so recommendations will be generated again."
       });
       this.syncWorkflowState(project);
-      await this.persistProjectUpdate(project, true);
+      await this.persistProjectUpdate(project, {
+        save: "deferred",
+        emit: "coalesced",
+        automate: true,
+        reason: "stale recommendation checkpoint refreshed"
+      });
       return project.record.workflow.workflowStage;
     }
     if (this.workflowAutomationInFlight.has(projectId) || this.workflowAutomationTimers.has(projectId)) {
@@ -7642,7 +7658,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.syncWorkflowState(project);
     }
     await this.persistProjectUpdate(project, {
-      save: "immediate",
+      save: "deferred",
       emit: "coalesced",
       automate: true,
       reason: "advance workflow stage"
@@ -8771,7 +8787,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }, { status: "completed" });
     await this.cleanupCompletedManagedWorktrees(project, [mergeAgent.worktree.worktreePath]);
     this.syncWorkflowState(project);
-    await this.persistProjectUpdate(project, true);
+    await this.persistProjectUpdate(project, {
+      save: "deferred",
+      emit: "coalesced",
+      automate: true,
+      reason: "resolved merge-conflict worktree applied"
+    });
     return true;
   }
 
@@ -9023,7 +9044,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     this.syncWorkflowState(project);
     await this.persistProjectUpdate(project, {
-      save: "immediate",
+      save: "deferred",
       emit: "coalesced",
       automate: automate || mergeResult.conflicts.length === 0,
       reason: mergeResult.conflicts.length > 0 ? "merge conflicts recorded" : "merge completed"
