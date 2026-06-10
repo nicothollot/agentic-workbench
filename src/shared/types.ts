@@ -135,6 +135,7 @@ export type CredentialRequestStatus = "pending" | "fulfilled" | "dismissed";
 export type WorkspaceCenterTab =
   | "overview"
   | "workflow"
+  | "history"
   | "runs"
   | "logs"
   | "repository"
@@ -144,7 +145,7 @@ export type WorkspaceCenterTab =
   | "file"
   | "diff"
   | "reports";
-export type WorkspaceVisualTabId = Extract<WorkspaceCenterTab, "overview" | "workflow" | "runs" | "logs" | "repository" | "credentials" | "settings">;
+export type WorkspaceVisualTabId = Extract<WorkspaceCenterTab, "overview" | "workflow" | "history" | "runs" | "logs" | "repository" | "credentials" | "settings">;
 
 export interface VisualExportTab {
   id: WorkspaceVisualTabId;
@@ -254,6 +255,41 @@ export interface RuntimeReadinessReport {
   summary: string;
   blockAgentActions: boolean;
   checks: RuntimeDependencyCheck[];
+}
+
+export interface CodexReadinessReport {
+  checkedAt?: string;
+  executionMode: ExecutionMode;
+  distroName?: string;
+  codexBinaryPath: string;
+  codexPath?: string;
+  nodePath?: string;
+  codexVersion?: string;
+  latestCodexVersion?: string;
+  updateAvailable: boolean;
+  updateCommand?: string;
+  status: "checking" | "ready" | "outdated" | "unavailable" | "skipped";
+  message: string;
+}
+
+export interface CodexUpdateCheckResult {
+  checkedAt: string;
+  currentVersion?: string;
+  latestVersion?: string;
+  updateAvailable: boolean;
+  updateCommand?: string;
+  status: "up-to-date" | "outdated" | "unavailable" | "skipped";
+  message: string;
+}
+
+export interface CodexUpdateRunResult {
+  checkedAt: string;
+  status: "updated" | "up-to-date" | "failed" | "skipped";
+  previousVersion?: string;
+  currentVersion?: string;
+  latestVersion?: string;
+  command?: string;
+  message: string;
 }
 
 export interface UltimateGoal {
@@ -1065,6 +1101,32 @@ export interface AgentState {
 
 export type AgentHistoryScope = "all" | "workflow" | "manual";
 
+export interface AgentHistorySummary {
+  id: string;
+  name: string;
+  category: AgentCategory;
+  status: AgentLifecycleStatus;
+  model: string;
+  reasoningEffort?: InterfaceReasoningEffort;
+  reasoningEffortSource?: AgentReasoningMode;
+  taskPrompt: string;
+  workflowCycleNumber?: number;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  lastActivityAt?: string;
+  currentPhase?: string;
+  currentSubtask?: string;
+  preview: string;
+  changedFiles: string[];
+  commandCount: number;
+  commands: string[];
+  approvalCount: number;
+  pendingApprovalCount: number;
+  errorCount: number;
+  tokenUsage?: string;
+}
+
 export interface AgentListResponse {
   projectId: string;
   scope: AgentHistoryScope;
@@ -1072,6 +1134,78 @@ export interface AgentListResponse {
   limit: number;
   total: number;
   agents: AgentState[];
+}
+
+export interface WorkflowCycleSummaryView {
+  id: string;
+  projectId: string;
+  cycleNumber: number;
+  goalPrompt: string;
+  status: WorkflowCycleStatus | "manual";
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  modelsUsed: string[];
+  filesChanged: string[];
+  commandsRun: string[];
+  hasErrors: boolean;
+  hasApprovals: boolean;
+  hasUserInputRequests: boolean;
+  agentCount: number;
+  summary: string;
+}
+
+export interface WorkflowCycleListResponse {
+  projectId: string;
+  cursor?: string;
+  nextCursor?: string;
+  limit: number;
+  total: number;
+  cycles: WorkflowCycleSummaryView[];
+  recentPreloaded: number;
+}
+
+export interface WorkflowCycleDetail extends WorkflowCycleSummaryView {
+  activity: WorkflowActivityEvent[];
+  openIssues: WorkflowOpenIssue[];
+  decisions: WorkflowAcceptedDecision[];
+}
+
+export interface CycleAgentListResponse {
+  projectId: string;
+  cycleId: string;
+  cycleNumber: number;
+  total: number;
+  agents: AgentHistorySummary[];
+}
+
+export interface AgentTranscriptEntry {
+  id: string;
+  timestamp: string;
+  kind: "message" | "command" | "event" | "approval" | "raw";
+  title: string;
+  text?: string;
+  itemId?: string;
+  metadata?: Record<string, string | number | boolean | null>;
+  raw?: unknown;
+}
+
+export interface AgentTranscriptResponse {
+  projectId: string;
+  agentId: string;
+  agentName: string;
+  generatedAt: string;
+  entries: AgentTranscriptEntry[];
+  fromSidecar: boolean;
+}
+
+export interface AgentFullOutputResponse {
+  projectId: string;
+  agentId: string;
+  agentName: string;
+  generatedAt: string;
+  output: string;
+  fromSidecar: boolean;
 }
 
 export interface ProjectCommandLogEntry {
@@ -1278,6 +1412,40 @@ export interface ProjectRepositorySummary {
   scanTruncationReason?: string;
 }
 
+export interface RepositoryScanStatus {
+  projectId: string;
+  status: "scanning" | "indexed" | "partially_indexed" | "truncated" | "failed";
+  lastScanAt?: string;
+  lastError?: string;
+  filesIndexed: number;
+  foldersIndexed: number;
+  filesTotal: number;
+  foldersTotal: number;
+  skippedCount: number;
+  skippedReasons: Array<{
+    reason: string;
+    count: number;
+    detail?: string;
+  }>;
+  truncated: boolean;
+  truncationReason?: string;
+  limits: {
+    includedFileLimit?: number;
+    includedDirectoryLimit?: number;
+    maxDepth?: number;
+    maxScanDurationMs?: number;
+    maxManifestFileSizeBytes?: number;
+    excludedPathLimit?: number;
+  };
+  searchScope: "full_index" | "loaded_nodes";
+  excludedPaths: ProjectStats["excludedPaths"];
+  deepScanAvailable: boolean;
+}
+
+export interface RepositoryRescanOptions {
+  mode?: "normal" | "deep";
+}
+
 export interface OpenProjectShellResult {
   launched: boolean;
   message: string;
@@ -1308,6 +1476,8 @@ export interface WorkbenchState {
   activeProjectId?: string;
   availableModels: DiscoveredModel[];
   codexAvailability: CodexAvailability;
+  codexReadiness: CodexReadinessReport;
+  codexUpdate?: CodexUpdateCheckResult;
   runtimeReadiness: RuntimeReadinessReport;
   diagnostics: string[];
 }

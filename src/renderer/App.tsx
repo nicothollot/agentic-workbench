@@ -24,10 +24,13 @@ import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workf
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
 import type {
   AgentCategory,
+  AgentFullOutputResponse,
+  AgentHistorySummary,
   AgentListResponse,
   AgentReasoningEfforts,
   AgentReasoningMode,
   AgentState,
+  AgentTranscriptResponse,
   AutopilotPolicy,
   AutopilotProfile,
   ApprovalRequestRecord,
@@ -46,6 +49,7 @@ import type {
   ProjectRepositorySummary,
   ProjectWorkflowState,
   RepositoryChildrenResponse,
+  RepositoryScanStatus,
   RepositorySearchResponse,
   RepositoryTreeEntry,
   RuntimeReadinessReport,
@@ -60,6 +64,9 @@ import type {
   VisualExportTab,
   ValidationStatus,
   WorkflowActivityEvent,
+  WorkflowCycleDetail,
+  WorkflowCycleListResponse,
+  WorkflowCycleSummaryView,
   WorkspaceVisualTabId,
   WorkflowRecommendationOption,
   WorkbenchState
@@ -76,6 +83,31 @@ type AgentPageView = Pick<AgentListResponse, "agents" | "total" | "offset" | "li
 
 type LogFeedView = ProjectLogFeedResponse & {
   loading: boolean;
+};
+
+type HistoryCycleView = WorkflowCycleListResponse & {
+  loading: boolean;
+  error?: string;
+  expandedCycleIds: string[];
+  detailsByCycleId: Record<string, WorkflowCycleDetail>;
+  agentsByCycleId: Record<string, {
+    loading: boolean;
+    total: number;
+    agents: AgentHistorySummary[];
+    error?: string;
+  }>;
+};
+
+type AgentOutputViewerState = {
+  projectId: string;
+  agentId: string;
+  agentName: string;
+  loading: boolean;
+  output?: AgentFullOutputResponse;
+  transcript?: AgentTranscriptResponse;
+  error?: string;
+  query: string;
+  wrap: boolean;
 };
 
 type RepositoryDataView = ProjectRepositorySummary & {
@@ -112,6 +144,21 @@ const emptyRepositoryData = (): RepositoryDataView => ({
   searchResults: null,
   searchLoading: false,
   treeError: undefined
+});
+
+const emptyHistoryData = (): HistoryCycleView => ({
+  projectId: "",
+  cursor: undefined,
+  nextCursor: undefined,
+  limit: 20,
+  total: 0,
+  cycles: [],
+  recentPreloaded: 0,
+  loading: false,
+  error: undefined,
+  expandedCycleIds: [],
+  detailsByCycleId: {},
+  agentsByCycleId: {}
 });
 
 const mergeRepositoryChildrenPage = (
@@ -225,10 +272,8 @@ const RUN_DETAIL_PREVIEW_TEXT_LIMIT = 4_000;
 const WORKSPACE_VISUAL_TABS: VisualExportTab[] = [
   { id: "overview", label: "Overview" },
   { id: "workflow", label: "Workflow" },
-  { id: "runs", label: "Runs" },
-  { id: "logs", label: "Logs" },
+  { id: "history", label: "History" },
   { id: "repository", label: "Repository" },
-  { id: "credentials", label: "Credentials" },
   { id: "settings", label: "Settings" }
 ];
 const WORKSPACE_TAB_IDS = new Set<WorkspaceVisualTabId>(WORKSPACE_VISUAL_TABS.map((tab) => tab.id));
@@ -253,6 +298,8 @@ type VisualExportReadiness = {
   logFeedLoading: boolean;
   repositoryProjectId: string;
   repositoryLoading: boolean;
+  historyProjectId: string;
+  historyLoading: boolean;
   workflowAgentPageLoading: boolean;
   manualAgentPageLoading: boolean;
 };
@@ -354,8 +401,14 @@ const normalizeWorkspaceTab = (tab?: string): WorkspaceVisualTabId => {
   if (tab === "reports") {
     return "workflow";
   }
-  if (tab === "file" || tab === "diff" || tab === "agents") {
-    return tab === "agents" ? "runs" : "repository";
+  if (tab === "runs" || tab === "logs" || tab === "agents") {
+    return "history";
+  }
+  if (tab === "credentials") {
+    return "settings";
+  }
+  if (tab === "file" || tab === "diff") {
+    return "repository";
   }
   return WORKSPACE_TAB_IDS.has(tab as WorkspaceVisualTabId) ? tab as WorkspaceVisualTabId : "overview";
 };
@@ -1784,6 +1837,41 @@ const validationStatusChip = (status: ValidationStatus): { label: string; tone: 
     unvalidated: { label: "Pending", tone: "pending" }
   })[status] as { label: string; tone: StatusChipTone };
 
+const repositoryScanStatusChip = (status?: RepositoryScanStatus["status"]): { label: string; tone: StatusChipTone } => {
+  if (status === "indexed") {
+    return { label: "Indexed", tone: "success" };
+  }
+  if (status === "scanning") {
+    return { label: "Scanning", tone: "running" };
+  }
+  if (status === "truncated") {
+    return { label: "Truncated", tone: "warning" };
+  }
+  if (status === "partially_indexed") {
+    return { label: "Partially indexed", tone: "warning" };
+  }
+  if (status === "failed") {
+    return { label: "Failed", tone: "error" };
+  }
+  return { label: "Unknown", tone: "pending" };
+};
+
+const codexReadinessStatusChip = (status: WorkbenchState["codexReadiness"]["status"]): { label: string; tone: StatusChipTone } => {
+  if (status === "ready") {
+    return { label: "Ready", tone: "success" };
+  }
+  if (status === "outdated") {
+    return { label: "Update available", tone: "warning" };
+  }
+  if (status === "checking") {
+    return { label: "Checking", tone: "running" };
+  }
+  if (status === "skipped") {
+    return { label: "Skipped", tone: "idle" };
+  }
+  return { label: "Unavailable", tone: "error" };
+};
+
 const buildLogEvents = ({
   activity,
   commands,
@@ -2215,7 +2303,7 @@ const RunDetailPanel = ({
         <div className="runs-detail-card__header-actions">
           <StatusChip label={status.label} tone={status.tone} />
           <button className="secondary-button" type="button" onClick={onOpenWorkflow}>Open Workflow</button>
-          <button className="secondary-button" type="button" onClick={onOpenLogs}>View Logs</button>
+          <button className="secondary-button" type="button" onClick={onOpenLogs}>Open History</button>
         </div>
       </div>
 
@@ -2547,6 +2635,234 @@ const RunsReviewPage = ({
     </section>
   );
 };
+
+const cycleStatusLabel = (status: WorkflowCycleSummaryView["status"]): string =>
+  status === "blocked_human"
+    ? "Needs attention"
+    : status === "repair_loop"
+      ? "Repairing"
+      : status.replace(/_/g, " ");
+
+const formatDurationMs = (durationMs?: number): string =>
+  durationMs === undefined
+    ? "Not recorded"
+    : durationMs < 60_000
+      ? `${Math.round(durationMs / 1000)}s`
+      : durationMs < 3_600_000
+        ? `${Math.floor(durationMs / 60_000)}m ${Math.round((durationMs % 60_000) / 1000)}s`
+        : `${Math.floor(durationMs / 3_600_000)}h ${Math.round((durationMs % 3_600_000) / 60_000)}m`;
+
+const HistoryAgentCard = ({
+  agent,
+  onOpenOutput
+}: {
+  agent: AgentHistorySummary;
+  onOpenOutput: (agent: AgentHistorySummary) => void;
+}) => {
+  const status = agentLifecycleStatusChip(agent.status);
+  return (
+    <article className="history-agent-card">
+      <div className="history-agent-card__header">
+        <div>
+          <div className="candidate-card__title-row">
+            <strong>{agent.name}</strong>
+            <StatusChip label={status.label} tone={status.tone} />
+          </div>
+          <p>{agent.preview}</p>
+        </div>
+        <button className="primary-button" type="button" onClick={() => onOpenOutput(agent)}>
+          View full output
+        </button>
+      </div>
+      <div className="history-agent-card__grid">
+        <RunDetailField label="Category" value={agentCategoryLabel(agent.category)} />
+        <RunDetailField label="Model" value={agent.model} />
+        <RunDetailField label="Reasoning" value={agent.reasoningEffort ? reasoningEffortLabel(agent.reasoningEffort) : "Default"} />
+        <RunDetailField label="Phase" value={agent.currentPhase ?? agent.currentSubtask ?? "Not recorded"} />
+        <RunDetailField label="Started" value={formatDateTime(agent.startedAt)} />
+        <RunDetailField label="Ended" value={formatDateTime(agent.completedAt)} />
+        <RunDetailField label="Files changed" value={agent.changedFiles.length} />
+        <RunDetailField label="Commands run" value={agent.commandCount} />
+        <RunDetailField label="Approvals" value={`${agent.pendingApprovalCount} pending / ${agent.approvalCount} total`} />
+        <RunDetailField label="Errors" value={agent.errorCount} />
+      </div>
+      <details className="workflow-inline-details">
+        <summary>Task prompt and run details</summary>
+        <p>{redactSensitiveText(agent.taskPrompt)}</p>
+        {agent.commands.length ? (
+          <div className="tag-row">
+            {agent.commands.map((command) => <span key={command} className="tag">{redactSensitiveText(command)}</span>)}
+          </div>
+        ) : <p className="agent-card__subtle">No commands were recorded for this agent.</p>}
+        {agent.changedFiles.length ? (
+          <div className="tag-row">
+            {agent.changedFiles.slice(0, 24).map((file) => <span key={file} className="tag">{file}</span>)}
+          </div>
+        ) : null}
+      </details>
+    </article>
+  );
+};
+
+const AgentOutputViewer = ({
+  viewer,
+  onClose,
+  onQueryChange,
+  onWrapChange
+}: {
+  viewer?: AgentOutputViewerState;
+  onClose: () => void;
+  onQueryChange: (value: string) => void;
+  onWrapChange: (value: boolean) => void;
+}) => {
+  if (!viewer) {
+    return null;
+  }
+
+  const outputText = viewer.output?.output ?? "";
+  const query = viewer.query.trim().toLowerCase();
+  const visibleOutput = query
+    ? outputText
+      .split(/\r?\n/)
+      .filter((line) => line.toLowerCase().includes(query))
+      .join("\n")
+    : outputText;
+  const rawJson = viewer.transcript ? JSON.stringify(viewer.transcript.entries, null, 2) : "";
+
+  return (
+    <div className="agent-output-modal" role="dialog" aria-modal="true" aria-label="Agent output">
+      <div className="agent-output-panel">
+        <header className="agent-output-panel__header">
+          <div>
+            <div className="eyebrow">Agent output</div>
+            <h2>{viewer.agentName}</h2>
+            <p>{viewer.output?.fromSidecar ? "Loaded from full transcript storage." : "Loaded from retained run preview data."}</p>
+          </div>
+          <div className="actions-row">
+            <CopyButton value={outputText} label="Copy output" />
+            <button className="secondary-button" type="button" onClick={onClose}>Close</button>
+          </div>
+        </header>
+        <div className="agent-output-toolbar">
+          <input
+            className="input"
+            placeholder="Search within output"
+            value={viewer.query}
+            onChange={(event) => onQueryChange(event.target.value)}
+          />
+          <label className="checkbox-row">
+            <input type="checkbox" checked={viewer.wrap} onChange={(event) => onWrapChange(event.target.checked)} />
+            <span>Wrap text</span>
+          </label>
+        </div>
+        {viewer.loading ? (
+          <LoadingIndicator label="Loading full output" />
+        ) : viewer.error ? (
+          <div className="notice notice--error">{viewer.error}</div>
+        ) : (
+          <>
+            <pre className={`agent-output-block ${viewer.wrap ? "agent-output-block--wrap" : ""}`}>
+              {visibleOutput || "No output text is available for this agent."}
+            </pre>
+            <details className="workflow-inline-details">
+              <summary>Technical details</summary>
+              <pre className="agent-output-raw">{rawJson || "No transcript JSON is available."}</pre>
+            </details>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const HistoryPage = ({
+  history,
+  onLoadMore,
+  onToggleCycle,
+  onOpenOutput
+}: {
+  history: HistoryCycleView;
+  onLoadMore: () => void;
+  onToggleCycle: (cycle: WorkflowCycleSummaryView) => void;
+  onOpenOutput: (agent: AgentHistorySummary) => void;
+}) => (
+  <section className="history-page">
+    <header className="runs-page-header">
+      <div>
+        <div className="eyebrow">What happened</div>
+        <h2>History</h2>
+        <p>Workflow cycles are summarized first. Expand a cycle to load its agents and open full output only when you need it.</p>
+      </div>
+      <div className="runs-page-header__stats">
+        <RunDetailField label="Cycles" value={history.total} />
+        <RunDetailField label="Loaded" value={history.cycles.length} />
+        <RunDetailField label="Ready fast" value={history.recentPreloaded} />
+      </div>
+    </header>
+
+    {history.error ? <div className="notice notice--error">{history.error}</div> : null}
+
+    <div className="history-cycle-list">
+      {history.cycles.length ? history.cycles.map((cycle) => {
+        const expanded = history.expandedCycleIds.includes(cycle.id);
+        const agents = history.agentsByCycleId[cycle.id];
+        const statusTone: StatusChipTone = cycle.hasErrors
+          ? "error"
+          : cycle.status === "completed" || cycle.status === "merged"
+            ? "completed"
+            : cycle.hasApprovals || cycle.hasUserInputRequests
+              ? "pending"
+              : "running";
+        return (
+          <article key={cycle.id} className={`history-cycle-card ${expanded ? "history-cycle-card--expanded" : ""}`}>
+            <button className="history-cycle-card__summary" type="button" onClick={() => onToggleCycle(cycle)}>
+              <div className="history-cycle-card__main">
+                <div className="candidate-card__title-row">
+                  <strong>Cycle {cycle.cycleNumber}</strong>
+                  <StatusChip label={cycleStatusLabel(cycle.status)} tone={statusTone} />
+                </div>
+                <p>{cycle.summary}</p>
+                <span className="agent-card__subtle">{redactSensitiveText(cycle.goalPrompt)}</span>
+              </div>
+              <div className="history-cycle-card__facts">
+                <span>{formatDateTime(cycle.startedAt)} - {formatDateTime(cycle.completedAt)}</span>
+                <span>{formatDurationMs(cycle.durationMs)}</span>
+                <span>{cycle.agentCount} agents</span>
+                <span>{cycle.filesChanged.length} files</span>
+                <span>{cycle.commandsRun.length} commands</span>
+              </div>
+            </button>
+            <div className="history-cycle-card__meta">
+              <span>Models: {cycle.modelsUsed.join(", ") || "Not recorded"}</span>
+              <span>{cycle.hasErrors ? "Errors recorded" : "No errors recorded"}</span>
+              <span>{cycle.hasApprovals ? "Approvals requested" : "No approvals"}</span>
+              <span>{cycle.hasUserInputRequests ? "User input requested" : "No user input request"}</span>
+            </div>
+            {expanded ? (
+              <div className="history-cycle-card__details">
+                {agents?.loading ? <LoadingIndicator label="Loading cycle agents" compact /> : null}
+                {agents?.error ? <div className="notice notice--error">{agents.error}</div> : null}
+                {agents?.agents.length ? agents.agents.map((agent) => (
+                  <HistoryAgentCard key={agent.id} agent={agent} onOpenOutput={onOpenOutput} />
+                )) : !agents?.loading ? <CompactEmptyState>No retained agents are attached to this cycle.</CompactEmptyState> : null}
+              </div>
+            ) : null}
+          </article>
+        );
+      }) : (
+        <CompactEmptyState>No workflow cycles have been recorded yet.</CompactEmptyState>
+      )}
+    </div>
+
+    {history.nextCursor ? (
+      <div className="actions-row">
+        <button className="secondary-button" type="button" disabled={history.loading} onClick={onLoadMore}>
+          {history.loading ? "Loading..." : "Load older cycles"}
+        </button>
+      </div>
+    ) : null}
+  </section>
+);
 
 const LogsPanel = ({
   logFeed,
@@ -3100,11 +3416,15 @@ const interfaceCreationStatusChip = (status?: LoadedProjectView["record"]["inter
 const RepositoryPanel = ({
   project,
   repositoryData,
+  repositoryScanStatus,
+  repositoryRescanBusy,
   treeFilterDraft,
   deferredTreeFilter,
   selectedFile,
   fileSummary,
   importantPathSummaries,
+  onRescanRepository,
+  onDeepScanRepository,
   onTreeFilterChange,
   onSelectFile,
   onToggleDirectory,
@@ -3112,11 +3432,15 @@ const RepositoryPanel = ({
 }: {
   project: LoadedProjectView;
   repositoryData: RepositoryDataView;
+  repositoryScanStatus: RepositoryScanStatus | null;
+  repositoryRescanBusy?: "normal" | "deep";
   treeFilterDraft: string;
   deferredTreeFilter: string;
   selectedFile?: string;
   fileSummary: FileSummary | null;
   importantPathSummaries: FileSummary[];
+  onRescanRepository: () => void;
+  onDeepScanRepository: () => void;
   onTreeFilterChange: (value: string) => void;
   onSelectFile: (relativePath: string) => void;
   onToggleDirectory: (relativePath: string) => void;
@@ -3130,7 +3454,8 @@ const RepositoryPanel = ({
   const rootChildren = repositoryData.projectId === record.id
     ? repositoryData.childrenByParent[REPOSITORY_ROOT_PARENT]?.children ?? []
     : [];
-  const scanStatus = interfaceCreationStatusChip(record.interfaceCreation);
+  const interfaceScanStatus = interfaceCreationStatusChip(record.interfaceCreation);
+  const scanStatus = repositoryScanStatusChip(repositoryScanStatus?.status);
   const validationStatus = validationStatusChip(project.validationStatus);
   const accessProbe = record.validation.projectAccess;
   const accessStatus: { label: string; tone: StatusChipTone } = accessProbe
@@ -3174,6 +3499,7 @@ const RepositoryPanel = ({
         </div>
         <div className="repository-header__chips">
           <StatusChip label={scanStatus.label} tone={scanStatus.tone} />
+          <StatusChip label={interfaceScanStatus.label} tone={interfaceScanStatus.tone} />
           <StatusChip label={validationStatus.label} tone={validationStatus.tone} />
         </div>
       </header>
@@ -3205,6 +3531,65 @@ const RepositoryPanel = ({
           <p>{record.interfaceCreation?.phase || record.interfaceCreation?.message || "Scan state saved locally"}</p>
         </article>
       </section>
+
+      <article className="repository-section repository-scan-status-card">
+        <SectionTitle
+          eyebrow="Index status"
+          title="Repository indexed"
+          meta={<StatusChip label={scanStatus.label} tone={scanStatus.tone} />}
+        />
+        <div className="repository-coverage-grid">
+          <div>
+            <span>Status</span>
+            <strong>{scanStatus.label}</strong>
+          </div>
+          <div>
+            <span>Last scan</span>
+            <strong>{formatDateTime(repositoryScanStatus?.lastScanAt ?? overview?.generatedAt ?? stats?.createdAt)}</strong>
+          </div>
+          <div>
+            <span>Files indexed</span>
+            <strong>{repositoryScanStatus?.filesIndexed ?? stats?.includedFiles ?? 0}</strong>
+          </div>
+          <div>
+            <span>Folders indexed</span>
+            <strong>{repositoryScanStatus?.foldersIndexed ?? stats?.includedFolders ?? 0}</strong>
+          </div>
+          <div>
+            <span>Skipped</span>
+            <strong>{repositoryScanStatus?.skippedCount ?? stats?.excludedFiles ?? 0}</strong>
+          </div>
+          <div>
+            <span>Search scope</span>
+            <strong>{repositoryScanStatus?.searchScope === "loaded_nodes" ? "Loaded tree" : "Indexed repo"}</strong>
+          </div>
+        </div>
+        {repositoryScanStatus?.truncated || scanTruncationMessage ? (
+          <div className="notice notice--compact">
+            Scan limits were reached: {repositoryScanStatus?.truncationReason ?? scanTruncationMessage}. Use Deep Scan if you need broader coverage.
+          </div>
+        ) : null}
+        {repositoryScanStatus?.lastError ? <div className="notice notice--compact notice--error">{repositoryScanStatus.lastError}</div> : null}
+        <div className="actions-row">
+          <button className="secondary-button" type="button" disabled={Boolean(repositoryRescanBusy)} onClick={onRescanRepository}>
+            {repositoryRescanBusy === "normal" ? "Rescanning..." : "Rescan Repository"}
+          </button>
+          <button className="secondary-button" type="button" disabled={Boolean(repositoryRescanBusy) || repositoryScanStatus?.deepScanAvailable === false} onClick={onDeepScanRepository}>
+            {repositoryRescanBusy === "deep" ? "Deep scanning..." : "Deep Scan"}
+          </button>
+        </div>
+        <details className="workflow-inline-details">
+          <summary>Skipped paths and scan limits</summary>
+          <div className="tag-row">
+            {repositoryScanStatus?.skippedReasons.length ? repositoryScanStatus.skippedReasons.map((entry) => (
+              <span key={`${entry.reason}:${entry.detail ?? ""}`} className="tag">
+                {entry.reason}: {entry.count}{entry.detail ? ` · ${entry.detail}` : ""}
+              </span>
+            )) : <span className="tag">No skipped-path summary is available.</span>}
+          </div>
+          <pre className="runtime-readiness-command"><code>{JSON.stringify(repositoryScanStatus?.limits ?? {}, null, 2)}</code></pre>
+        </details>
+      </article>
 
       <section className="repository-report-layout">
         <div className="repository-report-main">
@@ -3371,6 +3756,7 @@ const RepositoryPanel = ({
               <div className="panel-toolbar__summary">
                 <span>{formatBytes(stats?.includedSizeBytes ?? 0)} indexed</span>
                 <span>{stats?.testsPresent ? "Tests detected" : "No tests detected"}</span>
+                <span>{repositoryScanStatus?.searchScope === "loaded_nodes" ? "Search loaded nodes" : "Search indexed repo"}</span>
               </div>
               <input
                 className="input"
@@ -4806,6 +5192,75 @@ const RuntimeReadinessPanel = ({
   );
 };
 
+const CodexReadinessPanel = ({
+  state,
+  busy,
+  onCheckUpdate,
+  onRunUpdate
+}: {
+  state: WorkbenchState;
+  busy: boolean;
+  onCheckUpdate: () => void;
+  onRunUpdate: () => void;
+}) => {
+  const report = state.codexReadiness;
+  const update = state.codexUpdate;
+  const statusChip = codexReadinessStatusChip(report.status);
+  const updateCommand = update?.updateCommand ?? report.updateCommand;
+  const updateAvailable = update?.updateAvailable ?? report.updateAvailable;
+
+  return (
+    <section className="runtime-readiness-panel codex-readiness-panel">
+      <div className="candidate-card__title-row">
+        <strong>Codex readiness</strong>
+        <StatusChip {...statusChip} />
+      </div>
+      <p>{update?.message ?? report.message}</p>
+      <div className="repository-coverage-grid">
+        <div>
+          <span>Codex CLI</span>
+          <strong>{report.codexVersion ?? update?.currentVersion ?? "Not detected"}</strong>
+        </div>
+        <div>
+          <span>Latest available</span>
+          <strong>{report.latestCodexVersion ?? update?.latestVersion ?? "Unknown"}</strong>
+        </div>
+        <div>
+          <span>Execution mode</span>
+          <strong>{report.executionMode}</strong>
+        </div>
+        <div>
+          <span>WSL distro</span>
+          <strong>{report.distroName || "Not used"}</strong>
+        </div>
+        <div>
+          <span>Codex path</span>
+          <strong>{report.codexPath ?? report.codexBinaryPath}</strong>
+        </div>
+        <div>
+          <span>Node path</span>
+          <strong>{report.nodePath ?? "Not detected"}</strong>
+        </div>
+      </div>
+      {report.checkedAt ? <div className="agent-card__subtle">Last checked {formatDateTime(report.checkedAt)}</div> : null}
+      {updateCommand ? (
+        <div className="lane-note">
+          <strong>Update command preview</strong>
+          <span><code>{updateCommand}</code></span>
+        </div>
+      ) : null}
+      <div className="actions-row">
+        <button className="secondary-button" type="button" disabled={busy || report.status === "checking"} onClick={onCheckUpdate}>
+          {busy ? "Checking..." : "Check Codex Update"}
+        </button>
+        <button className="primary-button" type="button" disabled={busy || !updateAvailable || !updateCommand} onClick={onRunUpdate}>
+          {busy ? "Updating..." : "Update Codex CLI"}
+        </button>
+      </div>
+    </section>
+  );
+};
+
 const SettingsDialog = ({
   state,
   settingsDraft,
@@ -4816,7 +5271,10 @@ const SettingsDialog = ({
   onOpenDevTools,
   onRefreshGitHubStatus,
   onCheckRuntimeReadiness,
+  onCheckCodexUpdate,
+  onRunCodexUpdate,
   runtimeCheckBusy = false,
+  codexUpdateBusy = false,
   mode = "modal"
 }: {
   state: WorkbenchState;
@@ -4828,7 +5286,10 @@ const SettingsDialog = ({
   onOpenDevTools: () => void;
   onRefreshGitHubStatus: () => void;
   onCheckRuntimeReadiness: () => void;
+  onCheckCodexUpdate: () => void;
+  onRunCodexUpdate: () => void;
   runtimeCheckBusy?: boolean;
+  codexUpdateBusy?: boolean;
   mode?: "modal" | "page";
 }) => {
   const selectedModel = state.availableModels.find((model) => model.model === settingsDraft.interfaceCreationModel);
@@ -4857,6 +5318,12 @@ const SettingsDialog = ({
           onRunChecks={onCheckRuntimeReadiness}
           busy={runtimeCheckBusy}
           compact={mode === "modal"}
+        />
+        <CodexReadinessPanel
+          state={state}
+          busy={codexUpdateBusy}
+          onCheckUpdate={onCheckCodexUpdate}
+          onRunUpdate={onRunCodexUpdate}
         />
         <div className="settings-section">
           <div className="settings-card">
@@ -5376,6 +5843,7 @@ export const App = () => {
   const [shellLaunchBusy, setShellLaunchBusy] = useState(false);
   const [workflowCommandBusyKey, setWorkflowCommandBusyKey] = useState<string>();
   const [runtimeCheckBusy, setRuntimeCheckBusy] = useState(false);
+  const [codexUpdateBusy, setCodexUpdateBusy] = useState(false);
   const [overviewRefreshBusy, setOverviewRefreshBusy] = useState(false);
   const [visualExtractBusy, setVisualExtractBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
@@ -5403,6 +5871,10 @@ export const App = () => {
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
   const [repositoryData, setRepositoryData] = useState<RepositoryDataView>(() => emptyRepositoryData());
+  const [repositoryScanStatus, setRepositoryScanStatus] = useState<RepositoryScanStatus | null>(null);
+  const [repositoryRescanBusy, setRepositoryRescanBusy] = useState<"normal" | "deep">();
+  const [historyData, setHistoryData] = useState<HistoryCycleView>(() => emptyHistoryData());
+  const [agentOutputViewer, setAgentOutputViewer] = useState<AgentOutputViewerState>();
   const [logFeed, setLogFeed] = useState<LogFeedView>({
     projectId: "",
     activity: {
@@ -5428,6 +5900,8 @@ export const App = () => {
     logFeedLoading: false,
     repositoryProjectId: "",
     repositoryLoading: false,
+    historyProjectId: "",
+    historyLoading: false,
     workflowAgentPageLoading: false,
     manualAgentPageLoading: false
   });
@@ -5870,12 +6344,16 @@ export const App = () => {
       logFeedLoading: logFeed.loading,
       repositoryProjectId: repositoryData.projectId,
       repositoryLoading: repositoryTreeBusy,
+      historyProjectId: historyData.projectId,
+      historyLoading: historyData.loading,
       workflowAgentPageLoading: workflowAgentPage.loading,
       manualAgentPageLoading: manualAgentPage.loading
     };
   }, [
     activeProjectId,
     activeWorkspaceTab,
+    historyData.loading,
+    historyData.projectId,
     logFeed.loading,
     logFeed.projectId,
     repositoryData.projectId,
@@ -6029,6 +6507,9 @@ export const App = () => {
       setAgentDetail(undefined);
       setActiveWorkspaceTabOverride(undefined);
       setRepositoryData(emptyRepositoryData());
+      setRepositoryScanStatus(null);
+      setHistoryData(emptyHistoryData());
+      setAgentOutputViewer(undefined);
       return;
     }
 
@@ -6049,6 +6530,9 @@ export const App = () => {
     setAgentDetail(undefined);
     setActiveWorkspaceTabOverride(activeProjectId ? "overview" : undefined);
     setRepositoryData(emptyRepositoryData());
+    setRepositoryScanStatus(null);
+    setHistoryData(emptyHistoryData());
+    setAgentOutputViewer(undefined);
   }, [activeProjectId]);
 
   useEffect(() => {
@@ -6157,6 +6641,25 @@ export const App = () => {
         }
         handleError(error);
       });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeWorkspaceTab, repositoryData.projectId]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "repository") {
+      return;
+    }
+
+    let cancelled = false;
+    void window.workbench.getRepositoryScanStatus(activeProjectId)
+      .then((status) => {
+        if (!cancelled) {
+          setRepositoryScanStatus(status);
+        }
+      })
+      .catch(handleError);
 
     return () => {
       cancelled = true;
@@ -6292,6 +6795,50 @@ export const App = () => {
   }, [activeProjectId, activeWorkspaceTab, activityLogPageIndex, agentHistoryVersion, commandLogPageIndex]);
 
   useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "history") {
+      return;
+    }
+
+    const projectId = activeProjectId;
+    let cancelled = false;
+    setHistoryData((current) => ({
+      ...(current.projectId === projectId ? current : emptyHistoryData()),
+      projectId,
+      loading: true,
+      error: undefined
+    }));
+    void window.workbench.listWorkflowCycles(projectId, { limit: 20 })
+      .then((page) => {
+        if (!cancelled) {
+          setHistoryData((current) => ({
+            ...current,
+            ...page,
+            loading: false,
+            error: undefined,
+            expandedCycleIds: current.projectId === projectId ? current.expandedCycleIds.filter((cycleId) => page.cycles.some((cycle) => cycle.id === cycleId)) : [],
+            detailsByCycleId: current.projectId === projectId ? current.detailsByCycleId : {},
+            agentsByCycleId: current.projectId === projectId ? current.agentsByCycleId : {}
+          }));
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setHistoryData((current) => ({
+            ...current,
+            projectId,
+            loading: false,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        }
+        handleError(error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProjectId, activeWorkspaceTab, agentHistoryVersion]);
+
+  useEffect(() => {
     if (!activeProjectId || treeFilterDraft === storedTreeFilter) {
       return;
     }
@@ -6340,6 +6887,204 @@ export const App = () => {
 
   const handleError = (error: unknown) => {
     setNotice({ message: error instanceof Error ? error.message : String(error), tone: "error" });
+  };
+
+  const loadMoreHistoryCycles = () => {
+    if (!activeProjectId || !historyData.nextCursor || historyData.loading) {
+      return;
+    }
+
+    const projectId = activeProjectId;
+    const cursor = historyData.nextCursor;
+    setHistoryData((current) => ({ ...current, loading: true, error: undefined }));
+    void window.workbench.listWorkflowCycles(projectId, { cursor, limit: historyData.limit })
+      .then((page) => {
+        setHistoryData((current) => current.projectId === projectId
+          ? {
+            ...current,
+            cursor: page.cursor,
+            nextCursor: page.nextCursor,
+            limit: page.limit,
+            total: page.total,
+            recentPreloaded: page.recentPreloaded,
+            cycles: [...current.cycles, ...page.cycles.filter((cycle) => !current.cycles.some((existing) => existing.id === cycle.id))],
+            loading: false,
+            error: undefined
+          }
+          : current);
+      })
+      .catch((error) => {
+        setHistoryData((current) => ({ ...current, loading: false, error: error instanceof Error ? error.message : String(error) }));
+        handleError(error);
+      });
+  };
+
+  const toggleHistoryCycle = (cycle: WorkflowCycleSummaryView) => {
+    if (!activeProjectId) {
+      return;
+    }
+
+    const projectId = activeProjectId;
+    const isExpanded = historyData.expandedCycleIds.includes(cycle.id);
+    setHistoryData((current) => ({
+      ...current,
+      expandedCycleIds: isExpanded
+        ? current.expandedCycleIds.filter((cycleId) => cycleId !== cycle.id)
+        : [...current.expandedCycleIds, cycle.id],
+      agentsByCycleId: isExpanded || current.agentsByCycleId[cycle.id]
+        ? current.agentsByCycleId
+        : {
+          ...current.agentsByCycleId,
+          [cycle.id]: { loading: true, total: 0, agents: [] }
+        }
+    }));
+
+    if (isExpanded || (historyData.detailsByCycleId[cycle.id] && historyData.agentsByCycleId[cycle.id])) {
+      return;
+    }
+
+    void Promise.all([
+      window.workbench.getWorkflowCycle(projectId, cycle.id),
+      window.workbench.listCycleAgents(projectId, cycle.id)
+    ])
+      .then(([detail, agents]) => {
+        setHistoryData((current) => current.projectId === projectId
+          ? {
+            ...current,
+            detailsByCycleId: {
+              ...current.detailsByCycleId,
+              [cycle.id]: detail
+            },
+            agentsByCycleId: {
+              ...current.agentsByCycleId,
+              [cycle.id]: {
+                loading: false,
+                total: agents.total,
+                agents: agents.agents
+              }
+            }
+          }
+          : current);
+      })
+      .catch((error) => {
+        setHistoryData((current) => ({
+          ...current,
+          agentsByCycleId: {
+            ...current.agentsByCycleId,
+            [cycle.id]: {
+              loading: false,
+              total: current.agentsByCycleId[cycle.id]?.total ?? 0,
+              agents: current.agentsByCycleId[cycle.id]?.agents ?? [],
+              error: error instanceof Error ? error.message : String(error)
+            }
+          }
+        }));
+        handleError(error);
+      });
+  };
+
+  const openAgentOutput = (agent: AgentHistorySummary) => {
+    if (!activeProjectId) {
+      return;
+    }
+
+    const projectId = activeProjectId;
+    setAgentOutputViewer({
+      projectId,
+      agentId: agent.id,
+      agentName: agent.name,
+      loading: true,
+      query: "",
+      wrap: true
+    });
+    void Promise.all([
+      window.workbench.getAgentFullOutput(projectId, agent.id),
+      window.workbench.getAgentTranscript(projectId, agent.id)
+    ])
+      .then(([output, transcript]) => {
+        setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agent.id
+          ? {
+            ...current,
+            loading: false,
+            output,
+            transcript,
+            error: undefined
+          }
+          : current);
+      })
+      .catch((error) => {
+        setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agent.id
+          ? {
+            ...current,
+            loading: false,
+            error: error instanceof Error ? error.message : String(error)
+          }
+          : current);
+        handleError(error);
+      });
+  };
+
+  const rescanRepository = async (mode: "normal" | "deep") => {
+    if (!activeProject) {
+      return;
+    }
+
+    const projectId = activeProject.record.id;
+    try {
+      setRepositoryRescanBusy(mode);
+      setNotice(undefined);
+      const summary = await window.workbench.rescanRepository(projectId, { mode });
+      setRepositoryData({
+        ...summary,
+        childrenByParent: {
+          [REPOSITORY_ROOT_PARENT]: summary.rootChildren
+        },
+        expandedPaths: [],
+        loadingParents: {},
+        searchResults: null,
+        searchLoading: false,
+        treeError: undefined,
+        loading: false
+      });
+      setRepositoryScanStatus(await window.workbench.getRepositoryScanStatus(projectId));
+      showInfoNotice(mode === "deep" ? "Deep repository scan completed." : "Repository rescan completed.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setRepositoryRescanBusy(undefined);
+    }
+  };
+
+  const checkCodexUpdate = async () => {
+    try {
+      setCodexUpdateBusy(true);
+      setNotice(undefined);
+      const result = await window.workbench.checkCodexUpdate();
+      setNotice({
+        message: result.message,
+        tone: result.status === "unavailable" ? "error" : "info"
+      });
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setCodexUpdateBusy(false);
+    }
+  };
+
+  const runCodexUpdate = async () => {
+    try {
+      setCodexUpdateBusy(true);
+      setNotice(undefined);
+      const result = await window.workbench.runCodexUpdate();
+      setNotice({
+        message: result.message,
+        tone: result.status === "failed" ? "error" : "info"
+      });
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setCodexUpdateBusy(false);
+    }
   };
 
   const refreshGitHubStatus = async () => {
@@ -6480,7 +7225,7 @@ export const App = () => {
     );
     await waitForVisualRender();
 
-    if (tab.id === "logs" || tab.id === "runs" || tab.id === "repository") {
+    if (tab.id === "history" || tab.id === "logs" || tab.id === "runs" || tab.id === "repository") {
       await delay(250);
       await waitForVisualCondition(
         () => {
@@ -6493,6 +7238,9 @@ export const App = () => {
           }
           if (tab.id === "repository") {
             return !readiness.repositoryLoading && readiness.repositoryProjectId === projectId;
+          }
+          if (tab.id === "history") {
+            return !readiness.historyLoading && readiness.historyProjectId === projectId;
           }
           return !readiness.workflowAgentPageLoading && !readiness.manualAgentPageLoading;
         },
@@ -7435,7 +8183,10 @@ export const App = () => {
       onOpenDevTools={() => void openDevTools()}
       onRefreshGitHubStatus={() => void refreshGitHubStatus()}
       onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
+      onCheckCodexUpdate={() => void checkCodexUpdate()}
+      onRunCodexUpdate={() => void runCodexUpdate()}
       runtimeCheckBusy={runtimeCheckBusy}
+      codexUpdateBusy={codexUpdateBusy}
     />
   ) : null;
 
@@ -7998,16 +8749,10 @@ export const App = () => {
             onClick={() => void setWorkspaceTab("workflow")}
           />
           <WorkspaceTabButton
-            label="Runs"
-            active={selectedWorkspaceTab === "runs"}
-            count={allAgents.length}
-            onClick={() => void setWorkspaceTab("runs")}
-          />
-          <WorkspaceTabButton
-            label="Logs"
-            active={selectedWorkspaceTab === "logs"}
-            count={pendingApprovals.length}
-            onClick={() => void setWorkspaceTab("logs")}
+            label="History"
+            active={selectedWorkspaceTab === "history"}
+            count={historyData.total || allAgents.length}
+            onClick={() => void setWorkspaceTab("history")}
           />
           <WorkspaceTabButton
             label="Repository"
@@ -8016,14 +8761,9 @@ export const App = () => {
             onClick={() => void setWorkspaceTab("repository")}
           />
           <WorkspaceTabButton
-            label="Credentials"
-            active={selectedWorkspaceTab === "credentials"}
-            count={(activeProject.record.credentials?.requests ?? []).filter((request) => request.status === "pending").length}
-            onClick={() => void setWorkspaceTab("credentials")}
-          />
-          <WorkspaceTabButton
             label="Settings"
             active={selectedWorkspaceTab === "settings"}
+            count={(activeProject.record.credentials?.requests ?? []).filter((request) => request.status === "pending").length}
             onClick={() => void setWorkspaceTab("settings")}
           />
         </div>
@@ -8048,6 +8788,19 @@ export const App = () => {
                 {activeProject.record.overview ? <SourceBadge source={activeProject.record.overview.source} /> : <span className="badge">Overview pending</span>}
               </div>
             </section>
+
+            {!workflow?.ultimateGoal.confirmedAt ? (
+              <section className="overview-goal-empty-state">
+                <div>
+                  <strong>No Ultimate Goal is set</strong>
+                  <p>Auto-detect a draft from the repository or open Workflow to write one manually. Nothing runs automatically until you confirm the goal.</p>
+                </div>
+                <div className="actions-row">
+                  <button className="primary-button" type="button" onClick={() => void detectUltimateGoal()}>Auto-detect Ultimate Goal</button>
+                  <button className="secondary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>Enter Manually</button>
+                </div>
+              </section>
+            ) : null}
 
             <section className="overview-health-grid" aria-label="Health snapshot">
               <OverviewMetricCard
@@ -8091,8 +8844,8 @@ export const App = () => {
               <OverviewAttentionSummary
                 items={workflowAttentionItems}
                 onOpenWorkflow={() => void setWorkspaceTab("workflow")}
-                onOpenLogs={() => void setWorkspaceTab("logs")}
-                onOpenCredentials={() => void setWorkspaceTab("credentials")}
+                onOpenLogs={() => void setWorkspaceTab("history")}
+                onOpenCredentials={() => void setWorkspaceTab("settings")}
               />
               <article className="overview-current-work-card">
                 <SectionTitle eyebrow="Current work" title="Active workflow snapshot" />
@@ -8116,6 +8869,11 @@ export const App = () => {
                 </div>
                 <div className="actions-row">
                   <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>Open Workflow</button>
+                  {!workflow?.ultimateGoal.confirmedAt ? (
+                    <button className="secondary-button" type="button" onClick={() => void detectUltimateGoal()}>
+                      Auto-detect Ultimate Goal
+                    </button>
+                  ) : null}
                 </div>
               </article>
             </section>
@@ -8126,10 +8884,9 @@ export const App = () => {
                 <SectionTitle eyebrow="Next" title="Quick navigation" />
                 <div className="overview-quick-nav-grid">
                   <QuickNavigationCard title="Open Workflow" detail="Operate the active cycle and resolve workflow decisions." meta={workflowStageText} onClick={() => void setWorkspaceTab("workflow")} />
-                  <QuickNavigationCard title="Review Runs" detail="Inspect agent outputs, evidence, and collapsed raw details." meta={`${allAgents.length} runs`} onClick={() => void setWorkspaceTab("runs")} />
-                  <QuickNavigationCard title="View Logs" detail="Review approvals, activity, and command snippets." meta={`${pendingApprovals.length} approvals`} onClick={() => void setWorkspaceTab("logs")} />
+                  <QuickNavigationCard title="Open History" detail="Understand completed cycles and inspect full agent output." meta={`${historyData.total || allAgents.length} runs`} onClick={() => void setWorkspaceTab("history")} />
                   <QuickNavigationCard title="View Repository" detail="Open repository scan details, files, and summaries." meta={`${activeProject.record.stats?.includedFiles ?? 0} files`} onClick={() => void setWorkspaceTab("repository")} />
-                  <QuickNavigationCard title="Manage Credentials" detail="Handle pending credential requests and stored local metadata." meta={`${workflowCredentialRequests.length} pending`} onClick={() => void setWorkspaceTab("credentials")} />
+                  <QuickNavigationCard title="Open Settings" detail="Runtime readiness, Codex updates, credentials, and model defaults." meta={`${workflowCredentialRequests.length} credential requests`} onClick={() => void setWorkspaceTab("settings")} />
                 </div>
               </article>
             </section>
@@ -8150,15 +8907,28 @@ export const App = () => {
           <RepositoryPanel
             project={activeProject}
             repositoryData={repositoryData}
+            repositoryScanStatus={repositoryScanStatus}
+            repositoryRescanBusy={repositoryRescanBusy}
             treeFilterDraft={treeFilterDraft}
             deferredTreeFilter={deferredTreeFilter}
             selectedFile={selectedFile}
             fileSummary={fileSummary}
             importantPathSummaries={importantPathSummaries}
+            onRescanRepository={() => void rescanRepository("normal")}
+            onDeepScanRepository={() => void rescanRepository("deep")}
             onTreeFilterChange={setTreeFilterDraft}
             onSelectFile={(relativePath) => void loadSummary(relativePath)}
             onToggleDirectory={toggleRepositoryDirectory}
             onLoadMoreRepositoryChildren={loadMoreRepositoryChildren}
+          />
+        ) : null}
+
+        {activeWorkspaceTab === "history" ? (
+          <HistoryPage
+            history={historyData}
+            onLoadMore={loadMoreHistoryCycles}
+            onToggleCycle={toggleHistoryCycle}
+            onOpenOutput={openAgentOutput}
           />
         ) : null}
 
@@ -8209,7 +8979,7 @@ export const App = () => {
                 items={workflowAttentionItems}
                 onApprove={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}
                 onReject={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}
-                onOpenCredentials={() => void setWorkspaceTab("credentials")}
+                onOpenCredentials={() => void setWorkspaceTab("settings")}
                 onViewDetails={(target) => {
                   if (target === "user-input") {
                     openWorkflowDetailsAndScroll("workflow-user-input-requests");
@@ -9202,7 +9972,7 @@ export const App = () => {
               onWorkflowPageChange={setWorkflowAgentPageIndex}
               onManualPageChange={setManualAgentPageIndex}
               onOpenWorkflow={() => void setWorkspaceTab("workflow")}
-              onOpenLogs={() => void setWorkspaceTab("logs")}
+              onOpenLogs={() => void setWorkspaceTab("history")}
               onManualPromptChange={setManualAgentPrompt}
               onManualModelChange={setManualAgentModel}
               onManualReasoningModeChange={setManualAgentReasoningMode}
@@ -9217,21 +9987,34 @@ export const App = () => {
         ) : null}
 
         {activeWorkspaceTab === "settings" ? (
-          <SettingsDialog
-            mode="page"
-            state={state}
-            github={state.github}
-            settingsDraft={settingsDraft}
-            onChange={updateSettingsDraft}
-            onSave={saveSettings}
-            onClose={() => void setWorkspaceTab("overview")}
-            onOpenDevTools={() => void openDevTools()}
-            onRefreshGitHubStatus={() => void refreshGitHubStatus()}
-            onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
-            runtimeCheckBusy={runtimeCheckBusy}
-          />
+          <div className="settings-page-stack">
+            <SettingsDialog
+              mode="page"
+              state={state}
+              github={state.github}
+              settingsDraft={settingsDraft}
+              onChange={updateSettingsDraft}
+              onSave={saveSettings}
+              onClose={() => void setWorkspaceTab("overview")}
+              onOpenDevTools={() => void openDevTools()}
+              onRefreshGitHubStatus={() => void refreshGitHubStatus()}
+              onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
+              onCheckCodexUpdate={() => void checkCodexUpdate()}
+              onRunCodexUpdate={() => void runCodexUpdate()}
+              runtimeCheckBusy={runtimeCheckBusy}
+              codexUpdateBusy={codexUpdateBusy}
+            />
+            <CredentialsPanel project={activeProject} onSaved={showInfoNotice} onError={handleError} />
+          </div>
         ) : null}
       </main>
+
+      <AgentOutputViewer
+        viewer={agentOutputViewer}
+        onClose={() => setAgentOutputViewer(undefined)}
+        onQueryChange={(query) => setAgentOutputViewer((current) => current ? { ...current, query } : current)}
+        onWrapChange={(wrap) => setAgentOutputViewer((current) => current ? { ...current, wrap } : current)}
+      />
 
       {settingsDialog}
     </div>

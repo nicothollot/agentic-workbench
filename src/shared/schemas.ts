@@ -321,7 +321,7 @@ export const layoutConfigSchema = z.object({
   leftPanelWidth: z.number().int().positive(),
   rightPanelWidth: z.number().int().positive(),
   bottomPanelHeight: z.number().int().positive(),
-  activeCenterTab: z.enum(["overview", "workflow", "runs", "logs", "repository", "credentials", "settings", "agents", "file", "diff", "reports"])
+  activeCenterTab: z.enum(["overview", "workflow", "history", "runs", "logs", "repository", "credentials", "settings", "agents", "file", "diff", "reports"])
 });
 
 export const localProjectStateSchema = z.object({

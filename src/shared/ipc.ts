@@ -91,7 +91,7 @@ export const downloadLogsRequestSchema = z.object({
 });
 
 export const visualExportTabSchema = z.object({
-  id: z.enum(["overview", "workflow", "runs", "logs", "repository", "credentials", "settings"]),
+  id: z.enum(["overview", "workflow", "history", "runs", "logs", "repository", "credentials", "settings"]),
   label: z.string().min(1).max(80)
 });
 
@@ -174,12 +174,40 @@ export const projectLogFeedRequestSchema = z.object({
   commandLimit: z.number().int().min(1).max(120).default(50)
 });
 
+export const workflowCycleListRequestSchema = z.object({
+  projectId: z.string().min(1),
+  cursor: z.string().optional(),
+  limit: z.number().int().min(1).max(50).default(20)
+});
+
+export const workflowCycleDetailRequestSchema = z.object({
+  projectId: z.string().min(1),
+  cycleId: z.string().min(1)
+});
+
+export const cycleAgentListRequestSchema = z.object({
+  projectId: z.string().min(1),
+  cycleId: z.string().min(1)
+});
+
+export const agentTranscriptRequestSchema = z.object({
+  projectId: z.string().min(1),
+  agentId: z.string().min(1)
+});
+
+export const repositoryRescanRequestSchema = z.object({
+  projectId: z.string().min(1),
+  options: z.object({
+    mode: z.enum(["normal", "deep"]).default("normal")
+  }).default({ mode: "normal" })
+});
+
 export const layoutUpdateRequestSchema = z.object({
   projectId: z.string().min(1),
   leftPanelWidth: z.number().int().positive().optional(),
   rightPanelWidth: z.number().int().positive().optional(),
   bottomPanelHeight: z.number().int().positive().optional(),
-  activeCenterTab: z.enum(["overview", "workflow", "runs", "logs", "repository", "credentials", "settings", "agents", "file", "diff", "reports"]).optional()
+  activeCenterTab: z.enum(["overview", "workflow", "history", "runs", "logs", "repository", "credentials", "settings", "agents", "file", "diff", "reports"]).optional()
 });
 
 export const uiStateUpdateRequestSchema = z.object({
@@ -316,6 +344,29 @@ export const rendererStateSchema = z.object({
     generatedProtocolVersion: z.string().optional(),
     protocolCompatibility: z.enum(["compatible", "installed-newer", "installed-older", "unknown"]).optional()
   }).optional(),
+  codexReadiness: z.object({
+    checkedAt: z.string().optional(),
+    executionMode: z.enum(["local", "wsl"]),
+    distroName: z.string().optional(),
+    codexBinaryPath: z.string(),
+    codexPath: z.string().optional(),
+    nodePath: z.string().optional(),
+    codexVersion: z.string().optional(),
+    latestCodexVersion: z.string().optional(),
+    updateAvailable: z.boolean(),
+    updateCommand: z.string().optional(),
+    status: z.enum(["checking", "ready", "outdated", "unavailable", "skipped"]),
+    message: z.string()
+  }),
+  codexUpdate: z.object({
+    checkedAt: z.string(),
+    currentVersion: z.string().optional(),
+    latestVersion: z.string().optional(),
+    updateAvailable: z.boolean(),
+    updateCommand: z.string().optional(),
+    status: z.enum(["up-to-date", "outdated", "unavailable", "skipped"]),
+    message: z.string()
+  }).optional(),
   runtimeReadiness: z.object({
     status: z.enum(["checking", "ready", "blocked"]),
     checkedAt: z.string().optional(),
@@ -342,6 +393,9 @@ export type IpcChannel =
   | "app:showLauncher"
   | "app:openDevTools"
   | "app:checkRuntimeReadiness"
+  | "app:getCodexReadiness"
+  | "app:checkCodexUpdate"
+  | "app:runCodexUpdate"
   | "app:quit"
   | "settings:get"
   | "settings:update"
@@ -361,8 +415,15 @@ export type IpcChannel =
   | "project:getRepositorySummary"
   | "project:listRepositoryChildren"
   | "project:searchRepositoryFiles"
+  | "project:getRepositoryScanStatus"
+  | "project:rescanRepository"
   | "project:listAgents"
   | "project:getAgent"
+  | "project:listWorkflowCycles"
+  | "project:getWorkflowCycle"
+  | "project:listCycleAgents"
+  | "project:getAgentTranscript"
+  | "project:getAgentFullOutput"
   | "project:getLogFeed"
   | "project:updateLayout"
   | "project:updateUiState"

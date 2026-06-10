@@ -5500,6 +5500,203 @@ select.input {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
 }
 
+.overview-goal-empty-state,
+.repository-scan-status-card,
+.history-page,
+.settings-page-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.overview-goal-empty-state {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid rgba(184, 154, 106, 0.34);
+  border-radius: 8px;
+  background: rgba(255, 246, 231, 0.9);
+}
+
+.overview-goal-empty-state p,
+.history-cycle-card p,
+.history-agent-card p,
+.codex-readiness-panel p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.history-cycle-list {
+  display: grid;
+  gap: 12px;
+}
+
+.history-cycle-card,
+.history-agent-card {
+  min-width: 0;
+  border: 1px solid rgba(15, 39, 71, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 250, 242, 0.92);
+}
+
+.history-cycle-card--expanded {
+  border-color: rgba(39, 91, 130, 0.22);
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.history-cycle-card__summary {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 0.42fr);
+  gap: 14px;
+  padding: 14px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-cycle-card__main,
+.history-cycle-card__facts,
+.history-agent-card__header,
+.history-agent-card__grid,
+.history-cycle-card__details,
+.agent-output-panel,
+.agent-output-toolbar {
+  min-width: 0;
+}
+
+.history-cycle-card__main {
+  display: grid;
+  gap: 7px;
+}
+
+.history-cycle-card__facts {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  justify-items: end;
+}
+
+.history-cycle-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 14px 14px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.history-cycle-card__meta span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: rgba(15, 39, 71, 0.06);
+}
+
+.history-cycle-card__details {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-top: 1px solid rgba(15, 39, 71, 0.08);
+}
+
+.history-agent-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.history-agent-card__header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
+.history-agent-card__grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.agent-output-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(8, 18, 32, 0.46);
+}
+
+.agent-output-panel {
+  width: min(1180px, 100%);
+  max-height: min(88vh, 920px);
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid rgba(15, 39, 71, 0.14);
+  border-radius: 8px;
+  background: #fffaf2;
+  box-shadow: 0 30px 80px rgba(8, 18, 32, 0.3);
+}
+
+.agent-output-panel__header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: start;
+}
+
+.agent-output-panel__header h2 {
+  margin: 0;
+  font-size: 1.35rem;
+  line-height: 1.2;
+}
+
+.agent-output-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.agent-output-block,
+.agent-output-raw {
+  min-height: 420px;
+  max-height: 58vh;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  border-radius: 8px;
+  background: rgba(7, 24, 45, 0.94);
+  color: #f7f2ea;
+  font-size: 0.86rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.agent-output-block--wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-output-raw {
+  min-height: 180px;
+  max-height: 360px;
+}
+
+.codex-readiness-panel .repository-coverage-grid strong,
+.repository-scan-status-card .repository-coverage-grid strong {
+  font-size: 0.98rem;
+}
+
+.settings-page-stack {
+  align-items: start;
+}
+
 @media (max-width: 1180px) {
   .top-app-bar,
   .page-header {
@@ -5537,6 +5734,10 @@ select.input {
   }
 
   .runs-detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .history-agent-card__grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -5663,8 +5864,31 @@ select.input {
   .log-approval-card,
   .credential-request-card,
   .repository-two-column,
-  .repository-coverage-grid {
+  .repository-coverage-grid,
+  .overview-goal-empty-state,
+  .history-cycle-card__summary,
+  .history-agent-card__header,
+  .history-agent-card__grid,
+  .agent-output-panel__header,
+  .agent-output-toolbar {
     grid-template-columns: 1fr;
+  }
+
+  .history-cycle-card__facts {
+    justify-items: start;
+  }
+
+  .agent-output-modal {
+    padding: 10px;
+  }
+
+  .agent-output-panel {
+    max-height: 94vh;
+    padding: 12px;
+  }
+
+  .agent-output-block {
+    min-height: 300px;
   }
 
   .logs-header__stats,

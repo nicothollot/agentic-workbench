@@ -37,7 +37,7 @@ import {
   visualExportStartRequestSchema
 } from "@shared/ipc";
 import { createAgentSkeleton, createLocalProjectRecord, defaultLayout, defaultLocalState, defaultProjectWorkflowState, defaultWorkflowStepProgressState, emptyUltimateGoal } from "@shared/defaults";
-import type { AgentState, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
+import type { AgentState, AgentTranscriptEntry, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
 import {
   createScopedGoalFromWorkPackage,
   createScopedGoalFromRecommendation,
@@ -73,6 +73,7 @@ import {
 } from "@shared/workflowView";
 import { reduceAgentRuntimeEvent } from "@runtime/runtimeEvents";
 import { AppService } from "@runtime/appService";
+import { WorkbenchStorage } from "@runtime/storage";
 import { buildInterfaceCreationOutputSchema, parseInterfaceCreationOutput } from "@runtime/interfaceCreation";
 import { parseManifestFile } from "@runtime/manifestParser";
 import { createProjectIdentity } from "@runtime/projectIdentity";
@@ -5862,6 +5863,247 @@ describe("ultimate goal text import", () => {
 });
 
 describe("AppService workflow performance guards", () => {
+  it("repairs appended project state JSON and quarantines unrecoverable state without throwing", async () => {
+    const appData = await createTempDir("state-repair-storage");
+    const storage = new WorkbenchStorage(appData);
+    const repairedRecord = makeAppServiceLoadedProject("repaired-state").record;
+    const repairedStatePath = path.join(appData, "projects", repairedRecord.id, "state.json");
+    await mkdir(path.dirname(repairedStatePath), { recursive: true });
+    await storage.saveRegistry([repairedRecord.id]);
+    await writeFile(repairedStatePath, `${JSON.stringify(repairedRecord)}${JSON.stringify({ duplicate: true })}`);
+
+    const repairedProjects = await storage.loadAllProjects();
+    const repairedIssues = storage.consumeLoadIssues();
+    const repairedStateText = await readFile(repairedStatePath, "utf8");
+
+    expect(repairedProjects).toHaveLength(1);
+    expect(repairedProjects[0]?.id).toBe(repairedRecord.id);
+    expect(repairedIssues.some((issue) => issue.action === "repaired" && issue.statePath === repairedStatePath)).toBe(true);
+    expect(() => JSON.parse(repairedStateText)).not.toThrow();
+    expect(repairedStateText).not.toContain("\"duplicate\":true");
+
+    const brokenRecord = makeAppServiceLoadedProject("broken-state").record;
+    const brokenStatePath = path.join(appData, "projects", brokenRecord.id, "state.json");
+    await mkdir(path.dirname(brokenStatePath), { recursive: true });
+    await storage.saveRegistry([brokenRecord.id]);
+    await writeFile(brokenStatePath, "{ malformed");
+
+    await expect(storage.loadAllProjects()).resolves.toEqual([]);
+    const quarantineIssues = storage.consumeLoadIssues();
+    const quarantineIssue = quarantineIssues.find((issue) => issue.action === "quarantined" && issue.statePath === brokenStatePath);
+    expect(quarantineIssue?.quarantinePath).toContain("state.json.quarantine.");
+  });
+
+  it("repair:state reports a malformed state path and exits cleanly after quarantine", async () => {
+    const appData = await createTempDir("repair-state-script");
+    const projectDir = path.join(appData, "projects", "script-broken");
+    const statePath = path.join(projectDir, "state.json");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(statePath, "not json");
+
+    const repairModule = await import(pathToFileURL(path.resolve("scripts/repair-state.mjs")).href) as {
+      loadSanitizer: () => Promise<unknown>;
+      repairFile: (targetStatePath: string, sanitizer: unknown) => Promise<unknown>;
+      buildPrintableResult: (result: unknown) => Record<string, unknown>;
+    };
+    const result = await repairModule.repairFile(statePath, await repairModule.loadSanitizer());
+    const printable = repairModule.buildPrintableResult(result);
+
+    expect(printable).toMatchObject({
+      statePath,
+      action: "quarantined",
+      changed: true
+    });
+    expect(String(printable.message)).toContain("Malformed JSON");
+    expect(String(printable.quarantinePath)).toContain("state.json.quarantine.repair-");
+  });
+
+  it("stores full agent transcript text in a sidecar and reads it back without truncation", async () => {
+    const appData = await createTempDir("agent-transcript-sidecar");
+    const storage = new WorkbenchStorage(appData);
+    const projectId = "transcript-project";
+    const agent = { id: "agent-long-output", name: "Long Output Agent" };
+    const fullText = `FULL OUTPUT\n${"line with details\n".repeat(2_500)}`;
+    const entry: AgentTranscriptEntry = {
+      id: "entry-full-output",
+      timestamp: "2026-04-07T00:00:00.000Z",
+      kind: "message",
+      title: "Final agent output",
+      text: fullText
+    };
+
+    await storage.appendAgentTranscriptEntry(projectId, agent, entry);
+
+    const entries = await storage.readAgentTranscript(projectId, agent.id);
+    expect(entries).toHaveLength(1);
+    expect(entries?.[0]?.text).toBe(fullText);
+  });
+
+  it("lists workflow cycles as capped summaries and loads older cycle agents/full output on demand", async () => {
+    const appData = await createTempDir("history-lazy-service");
+    const service = new AppService(appData) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      storage: WorkbenchStorage;
+      listWorkflowCycles: AppService["listWorkflowCycles"];
+      listCycleAgents: AppService["listCycleAgents"];
+      getAgentTranscript: AppService["getAgentTranscript"];
+      getAgentFullOutput: AppService["getAgentFullOutput"];
+    };
+    const project = makeAppServiceLoadedProject("history-project");
+    project.record.workflow.workflowCycle.cycleNumber = 12;
+    project.record.workflow.workflowCycle.status = "coding";
+    project.record.workflow.memory.perCycleSummaries = Array.from({ length: 11 }, (_, index) => ({
+      cycleNumber: index + 1,
+      summary: `Human readable cycle ${index + 1} summary.`,
+      openIssueIds: [],
+      createdAt: `2026-04-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`
+    }));
+    const longOutput = `complete sidecar output ${"x".repeat(50_000)}`;
+    const cycleEightAgent = {
+      ...createAgentSkeleton("coding", "Cycle 8 Coding", "Implement cycle 8.", "gpt-5.4"),
+      id: "cycle-8-agent",
+      workflowCycleNumber: 8,
+      status: "completed" as const,
+      startedAt: "2026-04-08T00:00:00.000Z",
+      completedAt: "2026-04-08T00:04:00.000Z",
+      changedFiles: ["src/cycle-eight.ts"],
+      commandLog: [{
+        itemId: "cmd-cycle-8",
+        command: "npm test -- cycle-eight",
+        output: "short retained command output",
+        status: "completed",
+        startedAt: "2026-04-08T00:02:00.000Z",
+        completedAt: "2026-04-08T00:03:00.000Z",
+        exitCode: 0
+      }]
+    } satisfies AgentState;
+    project.record.agents = [
+      cycleEightAgent,
+      {
+        ...createAgentSkeleton("coding", "Cycle 12 Coding", "Implement current cycle.", "gpt-5.4"),
+        id: "cycle-12-agent",
+        workflowCycleNumber: 12,
+        status: "running" as const,
+        startedAt: "2026-04-12T00:00:00.000Z",
+        changedFiles: [],
+        commandLog: []
+      },
+      {
+        ...createAgentSkeleton("integrity", "Cycle 11 Integrity", "Validate cycle 11.", "gpt-5.4"),
+        id: "cycle-11-agent",
+        workflowCycleNumber: 11,
+        status: "completed" as const,
+        startedAt: "2026-04-11T00:00:00.000Z",
+        completedAt: "2026-04-11T00:03:00.000Z",
+        changedFiles: ["src/cycle-eleven.ts"],
+        commandLog: []
+      }
+    ];
+    service.projects.set(project.record.id, project);
+    await service.storage.appendAgentTranscriptEntry(project.record.id, cycleEightAgent, {
+      id: "cycle-8-sidecar",
+      timestamp: "2026-04-08T00:04:00.000Z",
+      kind: "message",
+      title: "Full final output",
+      text: longOutput
+    });
+
+    const firstPage = service.listWorkflowCycles(project.record.id, { limit: 5 });
+    const secondPage = service.listWorkflowCycles(project.record.id, { cursor: firstPage.nextCursor, limit: 5 });
+    const cycleEightAgents = service.listCycleAgents(project.record.id, "8");
+    const fullOutput = await service.getAgentFullOutput(project.record.id, cycleEightAgent.id);
+    const transcript = await service.getAgentTranscript(project.record.id, cycleEightAgent.id);
+
+    expect(firstPage.cycles.map((cycle) => cycle.cycleNumber)).toEqual([12, 11, 10, 9, 8]);
+    expect(firstPage.recentPreloaded).toBe(5);
+    expect(firstPage.nextCursor).toBe("5");
+    expect(JSON.stringify(firstPage)).not.toContain(longOutput);
+    expect(secondPage.cycles.map((cycle) => cycle.cycleNumber)).toEqual([7, 6, 5, 4, 3]);
+    expect(cycleEightAgents.total).toBe(1);
+    expect(cycleEightAgents.agents[0]?.changedFiles).toEqual(["src/cycle-eight.ts"]);
+    expect(fullOutput.fromSidecar).toBe(true);
+    expect(fullOutput.output).toContain(longOutput);
+    expect(transcript.entries[0]?.text).toBe(longOutput);
+  });
+
+  it("reports repository scan truncation and skipped counts without expanding the full tree", async () => {
+    const service = new AppService(await createTempDir("repository-scan-status")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      getRepositoryScanStatus: AppService["getRepositoryScanStatus"];
+    };
+    const project = makeAppServiceLoadedProject("repo-scan-project");
+    const stats: ProjectStats = {
+      projectRoot: "/repo",
+      kind: "git",
+      createdAt: "2026-04-07T00:00:00.000Z",
+      totalFiles: 1_250,
+      totalFolders: 120,
+      totalSizeBytes: 8_000_000,
+      includedFiles: 500,
+      includedFolders: 80,
+      includedSizeBytes: 2_000_000,
+      excludedFiles: 700,
+      excludedFolders: 40,
+      excludedSizeBytes: 6_000_000,
+      excludedPaths: [{
+        path: "node_modules",
+        kind: "directory",
+        rule: "default",
+        fileCount: 700,
+        totalSizeBytes: 6_000_000
+      }],
+      fileTypeBreakdown: { ".ts": 300 },
+      languageBreakdown: { TypeScript: 300 },
+      entryPoints: ["src/index.ts"],
+      manifestFiles: ["package.json"],
+      testsPresent: true,
+      primaryManagers: ["npm"],
+      explanation: "Repository scan was bounded.",
+      truncated: true,
+      truncationReason: "included_file_limit",
+      truncationReasons: ["included_file_limit"],
+      includedFileLimit: 500,
+      includedDirectoryLimit: 80,
+      maxDepth: 12,
+      maxScanDurationMs: 1_500,
+      maxManifestFileSizeBytes: 256_000,
+      excludedPathLimit: 25,
+      omittedFilesEstimate: 50,
+      omittedDirectoriesEstimate: 5,
+      skippedManifestFiles: 2
+    };
+    project.record.stats = stats;
+    project.scan = { ...project.scan, files: [] };
+    service.projects.set(project.record.id, project);
+
+    const status = service.getRepositoryScanStatus(project.record.id);
+
+    expect(status.status).toBe("truncated");
+    expect(status.truncated).toBe(true);
+    expect(status.filesIndexed).toBe(500);
+    expect(status.skippedCount).toBeGreaterThanOrEqual(742);
+    expect(status.skippedReasons.map((entry) => entry.reason)).toContain("Oversized manifest skipped");
+    expect(status.limits.includedFileLimit).toBe(500);
+    expect(status.excludedPaths[0]?.path).toBe("node_modules");
+  });
+
+  it("skips Codex readiness and update checks in mock mode", async () => {
+    const service = new AppService(await createTempDir("mock-codex-readiness")) as unknown as {
+      settings: { mockMode: boolean };
+      refreshCodexReadiness: AppService["refreshCodexReadiness"];
+      checkCodexUpdate: AppService["checkCodexUpdate"];
+    };
+    service.settings.mockMode = true;
+
+    const readiness = await service.refreshCodexReadiness("test mock readiness");
+    const update = await service.checkCodexUpdate();
+
+    expect(readiness.status).toBe("skipped");
+    expect(readiness.message).toContain("Mock mode");
+    expect(update.status).toBe("skipped");
+    expect(update.updateAvailable).toBe(false);
+  });
+
   it("coalesces duplicate workflow automation schedules for one project", async () => {
     const service = new AppService(await createTempDir("automation-schedule")) as unknown as {
       projects: Map<string, unknown>;

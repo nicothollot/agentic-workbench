@@ -11,6 +11,7 @@ import {
   advanceWorkflowStageRequestSchema,
   agentDetailRequestSchema,
   agentListRequestSchema,
+  agentTranscriptRequestSchema,
   approveRecommendationRequestSchema,
   approvalDecisionRequestSchema,
   createScopedGoalRequestSchema,
@@ -28,6 +29,7 @@ import {
   importInterfaceRequestSchema,
   layoutUpdateRequestSchema,
   openProjectShellRequestSchema,
+  cycleAgentListRequestSchema,
   projectLoadRequestSchema,
   projectLogFeedRequestSchema,
   projectOpenRequestSchema,
@@ -35,6 +37,7 @@ import {
   projectRepositorySearchRequestSchema,
   projectRepositorySummaryRequestSchema,
   projectRepositoryViewRequestSchema,
+  repositoryRescanRequestSchema,
   projectSelectionDecisionSchema,
   refreshOverviewRequestSchema,
   manageUserInputRequestAttachmentsSchema,
@@ -48,6 +51,8 @@ import {
   resolveHumanInterventionRequestSchema,
   updateUltimateGoalRequestSchema,
   uiStateUpdateRequestSchema,
+  workflowCycleDetailRequestSchema,
+  workflowCycleListRequestSchema,
   workflowPreviewCheckpointRequestSchema,
   visualExportCaptureRequestSchema,
   visualExportSessionRequestSchema,
@@ -355,6 +360,9 @@ const registerIpc = (): void => {
     return true;
   });
   ipcMain.handle("app:checkRuntimeReadiness", async () => await appService?.refreshRuntimeReadiness("manual runtime readiness check"));
+  ipcMain.handle("app:getCodexReadiness", () => appService?.getCodexReadiness());
+  ipcMain.handle("app:checkCodexUpdate", async () => await appService?.checkCodexUpdate());
+  ipcMain.handle("app:runCodexUpdate", async () => await appService?.runCodexUpdate());
   ipcMain.handle("project:load", async (_event, payload) => {
     const parsed = projectLoadRequestSchema.parse(payload);
     return await appService?.loadProject(parsed.inputPath, parsed.intent);
@@ -536,6 +544,14 @@ const registerIpc = (): void => {
     const parsed = projectRepositorySearchRequestSchema.parse(payload);
     return appService?.searchRepositoryFiles(parsed.projectId, parsed.query, { limit: parsed.limit });
   });
+  ipcMain.handle("project:getRepositoryScanStatus", (_event, payload) => {
+    const parsed = projectRepositoryViewRequestSchema.parse(payload);
+    return appService?.getRepositoryScanStatus(parsed.projectId);
+  });
+  ipcMain.handle("project:rescanRepository", async (_event, payload) => {
+    const parsed = repositoryRescanRequestSchema.parse(payload);
+    return await appService?.rescanRepository(parsed.projectId, parsed.options);
+  });
   ipcMain.handle("project:listAgents", (_event, payload) => {
     const parsed = agentListRequestSchema.parse(payload);
     return appService?.listAgents(parsed.projectId, parsed.scope, parsed.offset, parsed.limit);
@@ -543,6 +559,26 @@ const registerIpc = (): void => {
   ipcMain.handle("project:getAgent", (_event, payload) => {
     const parsed = agentDetailRequestSchema.parse(payload);
     return appService?.getAgent(parsed.projectId, parsed.agentId);
+  });
+  ipcMain.handle("project:listWorkflowCycles", (_event, payload) => {
+    const parsed = workflowCycleListRequestSchema.parse(payload);
+    return appService?.listWorkflowCycles(parsed.projectId, { cursor: parsed.cursor, limit: parsed.limit });
+  });
+  ipcMain.handle("project:getWorkflowCycle", (_event, payload) => {
+    const parsed = workflowCycleDetailRequestSchema.parse(payload);
+    return appService?.getWorkflowCycle(parsed.projectId, parsed.cycleId);
+  });
+  ipcMain.handle("project:listCycleAgents", (_event, payload) => {
+    const parsed = cycleAgentListRequestSchema.parse(payload);
+    return appService?.listCycleAgents(parsed.projectId, parsed.cycleId);
+  });
+  ipcMain.handle("project:getAgentTranscript", async (_event, payload) => {
+    const parsed = agentTranscriptRequestSchema.parse(payload);
+    return await appService?.getAgentTranscript(parsed.projectId, parsed.agentId);
+  });
+  ipcMain.handle("project:getAgentFullOutput", async (_event, payload) => {
+    const parsed = agentTranscriptRequestSchema.parse(payload);
+    return await appService?.getAgentFullOutput(parsed.projectId, parsed.agentId);
   });
   ipcMain.handle("project:getLogFeed", (_event, payload) => {
     const parsed = projectLogFeedRequestSchema.parse(payload);

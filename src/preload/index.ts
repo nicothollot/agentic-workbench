@@ -1,12 +1,18 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   AgentCategory,
+  AgentFullOutputResponse,
   AgentHistoryScope,
   AgentListResponse,
   AgentReasoningMode,
   AgentState,
+  AgentTranscriptResponse,
   AutopilotPolicy,
   ApprovalDecision,
+  CodexReadinessReport,
+  CodexUpdateCheckResult,
+  CodexUpdateRunResult,
+  CycleAgentListResponse,
   CredentialEntryMetadata,
   CredentialEntryStatus,
   CredentialRequestRecord,
@@ -22,6 +28,7 @@ import type {
   ProjectRepositoryView,
   ProjectRepositorySummary,
   ProjectWorkflowState,
+  RepositoryScanStatus,
   RepositoryChildrenResponse,
   RepositorySearchResponse,
   RuntimeReadinessReport,
@@ -31,6 +38,8 @@ import type {
   VisualExportCaptureTarget,
   VisualExportSessionStart,
   VisualExportTab,
+  WorkflowCycleDetail,
+  WorkflowCycleListResponse,
   WorkbenchState
 } from "@shared/types";
 
@@ -47,6 +56,9 @@ export interface WorkbenchApi {
   showLauncher(): Promise<void>;
   openDevTools(): Promise<boolean>;
   checkRuntimeReadiness(): Promise<RuntimeReadinessReport>;
+  getCodexReadiness(): Promise<CodexReadinessReport>;
+  checkCodexUpdate(): Promise<CodexUpdateCheckResult>;
+  runCodexUpdate(): Promise<CodexUpdateRunResult>;
   quit(): Promise<void>;
   loadProject(inputPath: string, intent?: "open" | "create"): Promise<ProjectLoadResult>;
   openProject(projectId: string): Promise<LoadedProjectView>;
@@ -61,8 +73,15 @@ export interface WorkbenchApi {
     options?: { cursor?: string; limit?: number }
   ): Promise<RepositoryChildrenResponse>;
   searchRepositoryFiles(projectId: string, query: string, options?: { limit?: number }): Promise<RepositorySearchResponse>;
+  getRepositoryScanStatus(projectId: string): Promise<RepositoryScanStatus>;
+  rescanRepository(projectId: string, options?: { mode?: "normal" | "deep" }): Promise<ProjectRepositorySummary>;
   listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
+  listWorkflowCycles(projectId: string, options?: { cursor?: string; limit?: number }): Promise<WorkflowCycleListResponse>;
+  getWorkflowCycle(projectId: string, cycleId: string): Promise<WorkflowCycleDetail>;
+  listCycleAgents(projectId: string, cycleId: string): Promise<CycleAgentListResponse>;
+  getAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptResponse>;
+  getAgentFullOutput(projectId: string, agentId: string): Promise<AgentFullOutputResponse>;
   getLogFeed(
     projectId: string,
     options?: {
@@ -182,6 +201,9 @@ const api: WorkbenchApi = {
   showLauncher: async () => await invoke<void>("app:showLauncher"),
   openDevTools: async () => await invoke<boolean>("app:openDevTools"),
   checkRuntimeReadiness: async () => await invoke<RuntimeReadinessReport>("app:checkRuntimeReadiness"),
+  getCodexReadiness: async () => await invoke<CodexReadinessReport>("app:getCodexReadiness"),
+  checkCodexUpdate: async () => await invoke<CodexUpdateCheckResult>("app:checkCodexUpdate"),
+  runCodexUpdate: async () => await invoke<CodexUpdateRunResult>("app:runCodexUpdate"),
   quit: async () => await invoke<void>("app:quit"),
   loadProject: async (inputPath, intent = "open") => await invoke<ProjectLoadResult>("project:load", { inputPath, intent }),
   openProject: async (projectId) => await invoke<LoadedProjectView>("project:open", { projectId }),
@@ -195,6 +217,10 @@ const api: WorkbenchApi = {
     await invoke<RepositoryChildrenResponse>("project:listRepositoryChildren", { projectId, parentPath, ...options }),
   searchRepositoryFiles: async (projectId, query, options = {}) =>
     await invoke<RepositorySearchResponse>("project:searchRepositoryFiles", { projectId, query, ...options }),
+  getRepositoryScanStatus: async (projectId) =>
+    await invoke<RepositoryScanStatus>("project:getRepositoryScanStatus", { projectId }),
+  rescanRepository: async (projectId, options = {}) =>
+    await invoke<ProjectRepositorySummary>("project:rescanRepository", { projectId, options }),
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),
@@ -249,6 +275,16 @@ const api: WorkbenchApi = {
     await invoke<AgentListResponse>("project:listAgents", { projectId, scope, offset, limit }),
   getAgent: async (projectId, agentId) =>
     await invoke<AgentState>("project:getAgent", { projectId, agentId }),
+  listWorkflowCycles: async (projectId, options = {}) =>
+    await invoke<WorkflowCycleListResponse>("project:listWorkflowCycles", { projectId, ...options }),
+  getWorkflowCycle: async (projectId, cycleId) =>
+    await invoke<WorkflowCycleDetail>("project:getWorkflowCycle", { projectId, cycleId }),
+  listCycleAgents: async (projectId, cycleId) =>
+    await invoke<CycleAgentListResponse>("project:listCycleAgents", { projectId, cycleId }),
+  getAgentTranscript: async (projectId, agentId) =>
+    await invoke<AgentTranscriptResponse>("project:getAgentTranscript", { projectId, agentId }),
+  getAgentFullOutput: async (projectId, agentId) =>
+    await invoke<AgentFullOutputResponse>("project:getAgentFullOutput", { projectId, agentId }),
   getLogFeed: async (projectId, options = {}) =>
     await invoke<ProjectLogFeedResponse>("project:getLogFeed", { projectId, ...options }),
   createAgent: async (projectId, category, name, prompt, model, reasoningMode, reasoningEffort) =>

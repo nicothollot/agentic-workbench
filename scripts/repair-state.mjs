@@ -33,7 +33,7 @@ const fileExists = async (filePath) => {
   }
 };
 
-const loadSanitizer = async () => {
+export const loadSanitizer = async () => {
   const sourcePath = path.join(repoRoot, "src", "runtime", "stateSanitizer.ts");
   const source = await readFile(sourcePath, "utf8");
   const output = ts.transpileModule(source, {
@@ -75,7 +75,7 @@ const resolveDefaultProjectsDir = async () => {
   return undefined;
 };
 
-const findStateFiles = async (targetPath) => {
+export const findStateFiles = async (targetPath) => {
   const absolute = path.resolve(targetPath);
   const targetStat = await stat(absolute);
   if (targetStat.isFile()) {
@@ -117,15 +117,122 @@ const backupIfNeeded = async (statePath, version) => {
   return backupPath;
 };
 
-const repairFile = async (statePath, sanitizer) => {
+export const parseJsonObjectPrefix = (raw) => {
+  const trimmed = raw.trimStart();
+  if (!trimmed.startsWith("{")) {
+    return undefined;
+  }
+
+  const startOffset = raw.length - trimmed.length;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = startOffset; index < raw.length; index += 1) {
+    const char = raw[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return raw.slice(startOffset, index + 1);
+      }
+    }
+  }
+  return undefined;
+};
+
+export const parseStateText = (raw) => {
+  try {
+    return {
+      ok: true,
+      parsed: JSON.parse(raw),
+      repairedMalformedJson: false,
+      parseMessage: undefined
+    };
+  } catch (error) {
+    const parseMessage = error instanceof Error ? error.message : String(error);
+    const prefix = parseJsonObjectPrefix(raw);
+    if (!prefix) {
+      return {
+        ok: false,
+        parseMessage
+      };
+    }
+
+    try {
+      return {
+        ok: true,
+        parsed: JSON.parse(prefix),
+        repairedMalformedJson: true,
+        parseMessage
+      };
+    } catch {
+      return {
+        ok: false,
+        parseMessage
+      };
+    }
+  }
+};
+
+const quarantineFile = async (statePath) => {
+  const quarantinePath = path.join(path.dirname(statePath), `state.json.quarantine.repair-${timestampForFile()}.json`);
+  await rename(statePath, quarantinePath);
+  return quarantinePath;
+};
+
+export const repairFile = async (statePath, sanitizer) => {
   const beforeText = await readFile(statePath, "utf8");
   const beforeBytes = Buffer.byteLength(beforeText);
-  const parsed = JSON.parse(beforeText);
-  const { record, report } = sanitizer.sanitizeProjectRecord(parsed);
+  const parsedState = parseStateText(beforeText);
+  if (!parsedState.ok) {
+    const quarantinePath = await quarantineFile(statePath);
+    return {
+      statePath,
+      changed: true,
+      beforeBytes,
+      afterBytes: 0,
+      bytesSaved: beforeBytes,
+      backupPath: undefined,
+      quarantinePath,
+      action: "quarantined",
+      message: `Malformed JSON could not be repaired: ${parsedState.parseMessage}`,
+      report: {
+        checklistItemsSanitized: 0,
+        evidenceFieldsTruncated: 0,
+        evidenceHistoryEntriesRemoved: 0,
+        duplicateEvidenceLinesRemoved: 0,
+        consolidationNotesRemoved: 0,
+        activityEventsRemoved: 0,
+        agentEventsRemoved: 0,
+        commandRecordsRemoved: 0,
+        agentsCompacted: 0
+      }
+    };
+  }
+
+  const { record, report } = sanitizer.sanitizeProjectRecord(parsedState.parsed);
   const afterText = JSON.stringify(record);
   const afterBytes = Buffer.byteLength(afterText);
 
-  if (!report.changed) {
+  if (!report.changed && !parsedState.repairedMalformedJson) {
     return {
       statePath,
       changed: false,
@@ -133,6 +240,9 @@ const repairFile = async (statePath, sanitizer) => {
       afterBytes: beforeBytes,
       bytesSaved: 0,
       backupPath: undefined,
+      quarantinePath: undefined,
+      action: "unchanged",
+      message: "State JSON parsed and no sanitizer changes were needed.",
       report
     };
   }
@@ -148,20 +258,27 @@ const repairFile = async (statePath, sanitizer) => {
     afterBytes,
     bytesSaved: beforeBytes - afterBytes,
     backupPath,
+    quarantinePath: undefined,
+    action: parsedState.repairedMalformedJson ? "repaired-malformed-json" : "sanitized",
+    message: parsedState.repairedMalformedJson
+      ? `Kept the first complete JSON object after parse error: ${parsedState.parseMessage}`
+      : "Sanitized oversized or duplicated state fields.",
     report
   };
 };
 
 const formatBytes = (value) => `${value} bytes`;
 
-const printResult = (result) => {
-  console.log(JSON.stringify({
+export const buildPrintableResult = (result) => ({
     statePath: result.statePath,
     changed: result.changed,
     before: formatBytes(result.beforeBytes),
     after: formatBytes(result.afterBytes),
     bytesSaved: result.bytesSaved,
     backupPath: result.backupPath,
+    quarantinePath: result.quarantinePath,
+    action: result.action,
+    message: result.message,
     checklistItemsSanitized: result.report.checklistItemsSanitized,
     evidenceFieldsTruncated: result.report.evidenceFieldsTruncated,
     evidenceHistoryEntriesRemoved: result.report.evidenceHistoryEntriesRemoved,
@@ -171,10 +288,13 @@ const printResult = (result) => {
     agentEventsRemoved: result.report.agentEventsRemoved,
     commandRecordsRemoved: result.report.commandRecordsRemoved,
     agentsCompacted: result.report.agentsCompacted
-  }));
+  });
+
+const printResult = (result) => {
+  console.log(JSON.stringify(buildPrintableResult(result)));
 };
 
-const main = async () => {
+export const main = async () => {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
     console.log(usage);
@@ -195,11 +315,20 @@ const main = async () => {
   let changed = 0;
   let totalBytesSaved = 0;
   for (const statePath of stateFiles) {
-    const result = await repairFile(statePath, sanitizer);
-    printResult(result);
-    if (result.changed) {
-      changed += 1;
-      totalBytesSaved += result.bytesSaved;
+    try {
+      const result = await repairFile(statePath, sanitizer);
+      printResult(result);
+      if (result.changed) {
+        changed += 1;
+        totalBytesSaved += result.bytesSaved;
+      }
+    } catch (error) {
+      console.log(JSON.stringify({
+        statePath,
+        changed: false,
+        action: "failed",
+        message: error instanceof Error ? error.message : String(error)
+      }));
     }
   }
 
@@ -210,7 +339,9 @@ const main = async () => {
   }));
 };
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

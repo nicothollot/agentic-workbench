@@ -18,6 +18,17 @@ export interface CodexUpdateResult {
   supportedProtocolVersion?: string;
 }
 
+export interface CodexUpdateCheck {
+  status: "up-to-date" | "outdated" | "unavailable" | "skipped";
+  message: string;
+  currentVersion?: string;
+  latestVersion?: string;
+  targetVersion?: string;
+  updateAvailable: boolean;
+  updateCommand?: string;
+  supportedProtocolVersion?: string;
+}
+
 export interface CodexUpdateOptions {
   supportedProtocolVersion?: string;
 }
@@ -125,6 +136,8 @@ export const assessCodexProtocolCompatibility = (
 
 const quoteForPosixShell = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 
+const quoteForPowerShell = (value: string): string => `"${value.replace(/`/g, "``").replace(/"/g, "`\"")}"`;
+
 const formatFailure = (message: string, error: unknown): string => {
   const detail = error instanceof Error ? error.message : String(error);
   return `${message} ${detail}`.trim();
@@ -201,18 +214,31 @@ const runNpmCommand = async (
   return `${result.stdout}\n${result.stderr}`;
 };
 
-export const updateCodexCliIfAvailable = async (
+export const buildCodexUpdateCommand = (
+  settings: AppSettings,
+  platform: NodeJS.Platform = process.platform,
+  targetVersion = "latest"
+): string => {
+  const packageSpec = `${CODEX_PACKAGE_NAME}@${targetVersion}`;
+  const mode = resolveExecutionMode(settings, platform);
+  if (mode === "wsl" && platform === "win32") {
+    return `wsl -d ${quoteForPowerShell(settings.distroName)} -- npm install -g ${packageSpec}`;
+  }
+  return `npm install -g ${packageSpec}`;
+};
+
+export const checkCodexCliUpdate = async (
   settings: AppSettings,
   platform: NodeJS.Platform = process.platform,
   options: CodexUpdateOptions = {}
-): Promise<CodexUpdateResult> => {
+): Promise<CodexUpdateCheck> => {
   const executor = new RuntimeCommandExecutor(settings, platform);
-
   try {
     const currentVersion = parseCodexCliVersion(await runCodexVersion(executor, settings, platform));
     if (!currentVersion) {
       return {
-        status: "failed",
+        status: "unavailable",
+        updateAvailable: false,
         message: "Could not determine the installed Codex CLI version."
       };
     }
@@ -227,73 +253,106 @@ export const updateCodexCliIfAvailable = async (
     const latestVersion = parseNpmPackageVersion(latestOutput);
     if (!latestVersion) {
       return {
-        status: "failed",
+        status: "unavailable",
         currentVersion,
+        updateAvailable: false,
         message: "Could not determine the latest Codex CLI version from npm."
       };
     }
 
     const supportedProtocolVersion = options.supportedProtocolVersion;
-    if (supportedProtocolVersion) {
-      if (compareCodexVersions(currentVersion, supportedProtocolVersion) > 0) {
-        return {
-          status: "skipped",
-          currentVersion,
-          latestVersion,
-          supportedProtocolVersion,
-          message: `Codex CLI auto-update skipped because installed Codex CLI ${currentVersion} is newer than the Workbench app-server protocol ${supportedProtocolVersion}. Update Codex Agent Workbench before running live agents, or install Codex CLI ${supportedProtocolVersion}.`
-        };
-      }
+    const targetVersion = supportedProtocolVersion && compareCodexVersions(latestVersion, supportedProtocolVersion) >= 0
+      ? supportedProtocolVersion
+      : latestVersion;
+    const updateAvailable = compareCodexVersions(currentVersion, targetVersion) < 0;
 
-      if (compareCodexVersions(latestVersion, supportedProtocolVersion) < 0) {
-        return {
-          status: "failed",
-          currentVersion,
-          latestVersion,
-          supportedProtocolVersion,
-          message: `Codex CLI ${supportedProtocolVersion} is required by this Workbench build, but npm latest is ${latestVersion}.`
-        };
-      }
-
-      if (compareCodexVersions(currentVersion, supportedProtocolVersion) === 0) {
-        return {
-          status: "up-to-date",
-          currentVersion,
-          latestVersion,
-          supportedProtocolVersion,
-          message: compareCodexVersions(latestVersion, supportedProtocolVersion) > 0
-            ? `Codex CLI ${latestVersion} is available, but auto-update was skipped because this Workbench build supports app-server protocol ${supportedProtocolVersion}.`
-            : `Codex CLI is up to date at ${currentVersion}.`
-        };
-      }
-
-      await runNpmCommand(
-        executor,
-        settings,
-        platform,
-        ["install", "-g", `${CODEX_PACKAGE_NAME}@${supportedProtocolVersion}`],
-        NPM_INSTALL_TIMEOUT_MS
-      );
-      const updatedVersion = parseCodexCliVersion(await runCodexVersion(executor, settings, platform));
-
+    if (supportedProtocolVersion && compareCodexVersions(currentVersion, supportedProtocolVersion) > 0) {
       return {
-        status: updatedVersion === supportedProtocolVersion ? "updated" : "failed",
+        status: "skipped",
         currentVersion,
         latestVersion,
-        updatedVersion,
+        targetVersion: supportedProtocolVersion,
+        updateAvailable: false,
         supportedProtocolVersion,
-        message: updatedVersion === supportedProtocolVersion
-          ? `Updated Codex CLI from ${currentVersion} to the Workbench-compatible version ${updatedVersion}.`
-          : `Tried to install Codex CLI ${supportedProtocolVersion}, but detected ${updatedVersion ?? "an unknown version"} afterward.`
+        message: `Installed Codex CLI ${currentVersion} is newer than this Workbench app-server protocol (${supportedProtocolVersion}). Update Workbench before changing the CLI.`
       };
     }
 
-    if (compareCodexVersions(currentVersion, latestVersion) >= 0) {
+    if (supportedProtocolVersion && compareCodexVersions(latestVersion, supportedProtocolVersion) > 0) {
+      return {
+        status: updateAvailable ? "outdated" : "up-to-date",
+        currentVersion,
+        latestVersion,
+        targetVersion,
+        updateAvailable,
+        updateCommand: updateAvailable ? buildCodexUpdateCommand(settings, platform, targetVersion) : undefined,
+        supportedProtocolVersion,
+        message: updateAvailable
+          ? `Codex CLI ${latestVersion} is available, and this Workbench build can safely update to its compatible app-server protocol ${targetVersion}.`
+          : `Codex CLI ${latestVersion} is available, but this Workbench build already has compatible CLI ${currentVersion}. Update Workbench to use newer protocol ${latestVersion}.`
+      };
+    }
+
+    if (!updateAvailable) {
       return {
         status: "up-to-date",
         currentVersion,
         latestVersion,
+        targetVersion,
+        updateAvailable: false,
+        supportedProtocolVersion,
         message: `Codex CLI is up to date at ${currentVersion}.`
+      };
+    }
+
+    return {
+      status: "outdated",
+      currentVersion,
+      latestVersion,
+      targetVersion,
+      updateAvailable: true,
+      updateCommand: buildCodexUpdateCommand(settings, platform, targetVersion),
+      supportedProtocolVersion,
+      message: `Codex CLI ${currentVersion} can be updated to ${targetVersion}.`
+    };
+  } catch (error) {
+    return {
+      status: "unavailable",
+      updateAvailable: false,
+      message: formatFailure("Codex CLI update check failed.", error)
+    };
+  }
+};
+
+export const updateCodexCliIfAvailable = async (
+  settings: AppSettings,
+  platform: NodeJS.Platform = process.platform,
+  options: CodexUpdateOptions = {}
+): Promise<CodexUpdateResult> => {
+  const executor = new RuntimeCommandExecutor(settings, platform);
+
+  try {
+    const check = await checkCodexCliUpdate(settings, platform, options);
+    if (!check.currentVersion) {
+      return {
+        status: "failed",
+        message: check.message
+      };
+    }
+    if (!check.latestVersion || !check.targetVersion) {
+      return {
+        status: "failed",
+        currentVersion: check.currentVersion,
+        message: check.message
+      };
+    }
+    if (!check.updateAvailable) {
+      return {
+        status: check.status === "skipped" ? "skipped" : "up-to-date",
+        currentVersion: check.currentVersion,
+        latestVersion: check.latestVersion,
+        supportedProtocolVersion: check.supportedProtocolVersion,
+        message: check.message
       };
     }
 
@@ -301,19 +360,20 @@ export const updateCodexCliIfAvailable = async (
       executor,
       settings,
       platform,
-      ["install", "-g", `${CODEX_PACKAGE_NAME}@latest`],
+      ["install", "-g", `${CODEX_PACKAGE_NAME}@${check.targetVersion}`],
       NPM_INSTALL_TIMEOUT_MS
     );
     const updatedVersion = parseCodexCliVersion(await runCodexVersion(executor, settings, platform));
 
     return {
-      status: "updated",
-      currentVersion,
-      latestVersion,
+      status: updatedVersion && compareCodexVersions(updatedVersion, check.targetVersion) >= 0 ? "updated" : "failed",
+      currentVersion: check.currentVersion,
+      latestVersion: check.latestVersion,
       updatedVersion,
+      supportedProtocolVersion: check.supportedProtocolVersion,
       message: updatedVersion
-        ? `Updated Codex CLI from ${currentVersion} to ${updatedVersion}.`
-        : `Updated Codex CLI from ${currentVersion}; latest available is ${latestVersion}.`
+        ? `Updated Codex CLI from ${check.currentVersion} to ${updatedVersion}.`
+        : `Tried to update Codex CLI from ${check.currentVersion} to ${check.targetVersion}, but could not detect the version afterward.`
     };
   } catch (error) {
     return {

@@ -27,6 +27,10 @@ import { SummaryCache } from "@shared/summaryCache";
 import type {
   AgentCategory,
   AgentHistoryScope,
+  AgentFullOutputResponse,
+  AgentHistorySummary,
+  AgentTranscriptEntry,
+  AgentTranscriptResponse,
   AgentReasoningMode,
   AgentState,
   AgentListResponse,
@@ -37,6 +41,10 @@ import type {
   ApprovalDecision,
   ApprovalRequestRecord,
   CodexAvailability,
+  CodexReadinessReport,
+  CodexUpdateCheckResult,
+  CodexUpdateRunResult,
+  CycleAgentListResponse,
   CredentialEntryMetadata,
   CredentialEntryStatus,
   CredentialRequestRecord,
@@ -54,6 +62,8 @@ import type {
   ProjectLogFeedResponse,
   ProjectRepositoryView,
   ProjectRepositorySummary,
+  RepositoryRescanOptions,
+  RepositoryScanStatus,
   ProjectWorkflowState,
   ProjectLoadResult,
   RepositoryChildrenResponse,
@@ -70,11 +80,15 @@ import type {
   UltimateGoal,
   ValidationStatus,
   WorkflowMode,
+  WorkflowCycleDetail,
+  WorkflowCycleListResponse,
+  WorkflowCycleStatus,
+  WorkflowCycleSummaryView,
   WorkflowStepId,
   WorkPackage,
   WorkbenchState
 } from "@shared/types";
-import { nowIso } from "@shared/utils";
+import { nowIso, unique } from "@shared/utils";
 import { calculateValidationStatus } from "@shared/validation";
 import {
   createScopedGoalFromWorkPackage,
@@ -115,6 +129,8 @@ import { CodexAppServerTransport, type CodexTransport } from "./codexTransport";
 import {
   GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION,
   assessCodexProtocolCompatibility,
+  buildCodexUpdateCommand,
+  checkCodexCliUpdate,
   readInstalledCodexCliVersion,
   updateCodexCliIfAvailable
 } from "./codexUpdate";
@@ -140,7 +156,7 @@ import {
   assertProjectRelativeHostPath,
   resolveExecutionPathWithinProjectRoot
 } from "./projectBoundary";
-import { hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult } from "./repoScanner";
+import { DEFAULT_REPOSITORY_SCAN_LIMITS, hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult } from "./repoScanner";
 import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
 import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
 import { sanitizeWorkflowState } from "./stateSanitizer";
@@ -193,6 +209,7 @@ interface PendingLoad {
 
 type AppServiceInitializeOptions = {
   deferStartupWork?: boolean;
+  safeMode?: boolean;
 };
 type InterfaceCreationParseFailure = Exclude<InterfaceCreationParseResult, { ok: true }>;
 type ProjectSaveMode = "immediate" | "deferred" | false;
@@ -295,6 +312,24 @@ const compactText = (value: string, maxLength: number): string => {
   return normalized.length <= maxLength
     ? normalized
     : `${normalized.slice(0, Math.max(0, maxLength - 24)).trimEnd()}...[truncated]`;
+};
+
+const toTime = (value?: string): number => {
+  if (!value) {
+    return 0;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const formatBytesForStatus = (value: number): string => {
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${Math.round(value / 1024)} KB`;
+  }
+  return `${value} bytes`;
 };
 
 const compactRawForRenderer = (value: unknown): unknown => {
@@ -423,6 +458,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private transport?: CodexTransport;
   private availableModels: DiscoveredModel[] = [];
   private codexAvailability: CodexAvailability = { source: "unavailable", message: "Codex model discovery has not run yet." };
+  private codexReadiness: CodexReadinessReport = {
+    executionMode: this.settings.executionMode,
+    distroName: this.settings.distroName,
+    codexBinaryPath: this.settings.codexBinaryPath,
+    updateAvailable: false,
+    status: "skipped",
+    message: "Codex readiness has not run yet."
+  };
+  private codexUpdateCheck?: CodexUpdateCheckResult;
   private readonly diagnostics: string[] = [];
   private readonly interfaceCreationRepairAttempts = new Map<string, number>();
   private readonly workflowAutomationInFlight = new Set<string>();
@@ -441,11 +485,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly projectSaveQueuedOptions = new Map<string, ProjectSaveOptions>();
   private readonly registeredProjectIds = new Set<string>();
   private readonly structuredOutputApplicationsInFlight = new Set<string>();
+  private readonly commandOutputBuffers = new Map<string, {
+    command?: string;
+    cwd?: string;
+    startedAt?: string;
+    output: string;
+  }>();
   private suppressTransportExitHandling = false;
   private transportInitialization?: Promise<void>;
   private runtimeReadinessChecking = false;
   private runtimeReadinessLastCheckedAt?: string;
   private disposed = false;
+  private safeMode = false;
   private disposePromise?: Promise<void>;
   private deferredStartupWork?: Promise<void>;
   private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
@@ -862,6 +913,188 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.resumeAgentBackedWorkForActiveProject(reason);
     }
     return report;
+  }
+
+  getCodexReadiness(): CodexReadinessReport {
+    return this.codexReadiness;
+  }
+
+  async checkCodexUpdate(): Promise<CodexUpdateCheckResult> {
+    if (this.settings.mockMode) {
+      const skipped: CodexUpdateCheckResult = {
+        checkedAt: nowIso(),
+        updateAvailable: false,
+        status: "skipped",
+        message: "Mock mode is enabled, so Codex CLI update checks are skipped."
+      };
+      this.codexUpdateCheck = skipped;
+      this.codexReadiness = {
+        ...this.codexReadiness,
+        checkedAt: skipped.checkedAt,
+        updateAvailable: false,
+        status: "skipped",
+        message: skipped.message
+      };
+      this.emitState();
+      return skipped;
+    }
+
+    const result = await checkCodexCliUpdate(this.settings, process.platform, {
+      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION
+    });
+    const checked: CodexUpdateCheckResult = {
+      checkedAt: nowIso(),
+      currentVersion: result.currentVersion,
+      latestVersion: result.latestVersion,
+      updateAvailable: result.updateAvailable,
+      updateCommand: result.updateCommand,
+      status: result.status,
+      message: result.message
+    };
+    this.codexUpdateCheck = checked;
+    this.codexReadiness = {
+      ...this.codexReadiness,
+      checkedAt: checked.checkedAt,
+      codexVersion: checked.currentVersion ?? this.codexReadiness.codexVersion,
+      latestCodexVersion: checked.latestVersion,
+      updateAvailable: checked.updateAvailable,
+      updateCommand: checked.updateCommand,
+      status: checked.updateAvailable
+        ? "outdated"
+        : checked.status === "unavailable"
+          ? "unavailable"
+          : checked.status === "skipped"
+            ? "skipped"
+            : this.codexReadiness.status === "unavailable"
+              ? "unavailable"
+              : "ready",
+      message: checked.message
+    };
+    this.emitState();
+    return checked;
+  }
+
+  async runCodexUpdate(): Promise<CodexUpdateRunResult> {
+    if (this.settings.mockMode) {
+      const skipped: CodexUpdateRunResult = {
+        checkedAt: nowIso(),
+        status: "skipped",
+        message: "Mock mode is enabled, so Codex CLI updates are skipped."
+      };
+      return skipped;
+    }
+
+    const before = this.codexUpdateCheck ?? await this.checkCodexUpdate();
+    if (!before.updateAvailable) {
+      return {
+        checkedAt: nowIso(),
+        status: before.status === "skipped" ? "skipped" : "up-to-date",
+        previousVersion: before.currentVersion,
+        currentVersion: before.currentVersion,
+        latestVersion: before.latestVersion,
+        command: before.updateCommand,
+        message: before.message
+      };
+    }
+
+    const result = await updateCodexCliIfAvailable(this.settings, process.platform, {
+      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION
+    });
+    const updateResult: CodexUpdateRunResult = {
+      checkedAt: nowIso(),
+      status: result.status === "updated" ? "updated" : result.status === "up-to-date" ? "up-to-date" : result.status === "skipped" ? "skipped" : "failed",
+      previousVersion: result.currentVersion,
+      currentVersion: result.updatedVersion ?? result.currentVersion,
+      latestVersion: result.latestVersion,
+      command: before.updateCommand,
+      message: result.message
+    };
+    await this.refreshCodexReadiness("Codex CLI update completed");
+    await this.checkCodexUpdate();
+    return updateResult;
+  }
+
+  async refreshCodexReadiness(reason = "Codex readiness check"): Promise<CodexReadinessReport> {
+    const checkedAt = nowIso();
+    const mode = resolveExecutionMode(this.settings, process.platform);
+    if (this.settings.mockMode) {
+      this.codexReadiness = {
+        checkedAt,
+        executionMode: this.settings.executionMode,
+        distroName: this.settings.distroName,
+        codexBinaryPath: this.settings.codexBinaryPath,
+        codexPath: this.settings.codexBinaryPath,
+        nodePath: process.execPath,
+        updateAvailable: false,
+        status: "skipped",
+        message: "Mock mode is enabled. Codex detection is skipped until a live agent-backed action needs it."
+      };
+      this.emitState();
+      return this.codexReadiness;
+    }
+
+    this.codexReadiness = {
+      checkedAt,
+      executionMode: this.settings.executionMode,
+      distroName: this.settings.distroName,
+      codexBinaryPath: this.settings.codexBinaryPath,
+      updateAvailable: this.codexUpdateCheck?.updateAvailable ?? false,
+      updateCommand: this.codexUpdateCheck?.updateCommand,
+      status: "checking",
+      message: "Checking Codex CLI, Node.js, runtime path, and available update."
+    };
+    this.emitState();
+
+    try {
+      const executor = new RuntimeCommandExecutor(this.settings, process.platform);
+      let codexPath = this.settings.codexBinaryPath;
+      let nodePath = process.execPath;
+      if (mode === "wsl") {
+        const runtime = await executor.resolveWslCodexRuntime({
+          command: this.settings.codexBinaryPath
+        });
+        codexPath = runtime.resolvedCodexCommand ?? this.settings.codexBinaryPath;
+        nodePath = runtime.resolvedNodeCommand ?? nodePath;
+      } else {
+        codexPath = (await executor.resolveWslCommand({ command: this.settings.codexBinaryPath })).resolvedCommand ?? this.settings.codexBinaryPath;
+        nodePath = (await executor.resolveWslCommand({ command: "node" })).resolvedCommand ?? process.execPath;
+      }
+
+      const codexVersion = await readInstalledCodexCliVersion(this.settings);
+      const update = await this.checkCodexUpdate();
+      this.codexReadiness = {
+        checkedAt: nowIso(),
+        executionMode: this.settings.executionMode,
+        distroName: mode === "wsl" ? this.settings.distroName : undefined,
+        codexBinaryPath: this.settings.codexBinaryPath,
+        codexPath,
+        nodePath,
+        codexVersion,
+        latestCodexVersion: update.latestVersion,
+        updateAvailable: update.updateAvailable,
+        updateCommand: update.updateCommand ?? buildCodexUpdateCommand(this.settings, process.platform),
+        status: update.updateAvailable ? "outdated" : codexVersion ? "ready" : "unavailable",
+        message: update.updateAvailable
+          ? update.message
+          : codexVersion
+            ? `Codex CLI ${codexVersion} is available at ${codexPath}.`
+            : "Codex CLI exists could not be verified."
+      };
+    } catch (error) {
+      this.codexReadiness = {
+        checkedAt: nowIso(),
+        executionMode: this.settings.executionMode,
+        distroName: mode === "wsl" ? this.settings.distroName : undefined,
+        codexBinaryPath: this.settings.codexBinaryPath,
+        updateAvailable: false,
+        status: "unavailable",
+        message: `${reason} failed. ${error instanceof Error ? error.message : String(error)}`
+      };
+      this.diagnostics.unshift(this.codexReadiness.message);
+    }
+
+    this.emitState();
+    return this.codexReadiness;
   }
 
   private startRuntimeReadinessCheck(reason: string): void {
@@ -3556,6 +3789,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       activeProjectId: this.activeProjectId,
       availableModels: this.availableModels,
       codexAvailability: this.codexAvailability,
+      codexReadiness: this.codexReadiness,
+      codexUpdate: this.codexUpdateCheck,
       runtimeReadiness: this.buildRuntimeReadinessReport(this.getActiveProject()),
       diagnostics: [...this.diagnostics]
     };
@@ -3574,6 +3809,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       activeProjectId: this.activeProjectId,
       availableModels: this.availableModels,
       codexAvailability: this.codexAvailability,
+      codexReadiness: this.codexReadiness,
+      codexUpdate: this.codexUpdateCheck,
       runtimeReadiness: this.buildRuntimeReadinessReport(this.getActiveProject()),
       diagnostics: [...this.diagnostics]
     };
@@ -3593,6 +3830,35 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ...this.settings,
         ...persistedSettings
       };
+    }
+    this.codexReadiness = {
+      ...this.codexReadiness,
+      executionMode: this.settings.executionMode,
+      distroName: this.settings.distroName,
+      codexBinaryPath: this.settings.codexBinaryPath
+    };
+    this.safeMode = Boolean(
+      options.safeMode ||
+      process.env.AWB_SAFE_MODE === "1" ||
+      process.argv.includes("--safe-mode")
+    );
+
+    if (this.safeMode) {
+      this.codexAvailability = {
+        source: "unavailable",
+        message: "Safe mode is active. Saved projects, Codex detection, bootstrap, resume, and workflow automation were skipped."
+      };
+      this.codexReadiness = {
+        checkedAt: nowIso(),
+        executionMode: this.settings.executionMode,
+        distroName: this.settings.distroName,
+        codexBinaryPath: this.settings.codexBinaryPath,
+        updateAvailable: false,
+        status: "skipped",
+        message: "Safe mode is active. Codex readiness checks were skipped."
+      };
+      this.diagnostics.unshift("Safe mode startup active. Saved projects and workflow automation were not loaded.");
+      return;
     }
 
     if (options.deferStartupWork) {
@@ -3622,6 +3888,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private async runStartupWork(options: { emitState: boolean }): Promise<void> {
+    if (this.safeMode) {
+      return;
+    }
     await this.refreshGitHubStatus(false);
     if (this.settings.mockMode) {
       await this.initializeTransport();
@@ -3630,6 +3899,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         source: "unavailable",
         message: "Codex app-server will start when an agent-backed action runs."
       };
+      void this.refreshCodexReadiness("startup Codex readiness check").catch((error) => {
+        this.diagnostics.unshift(`Startup Codex readiness check failed. ${error instanceof Error ? error.message : String(error)}`);
+        this.emitState();
+      });
     }
 
     await this.loadStoredProjects();
@@ -3640,6 +3913,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private async loadStoredProjects(): Promise<void> {
     const records = await this.storage.loadAllProjects();
+    for (const issue of this.storage.consumeLoadIssues()) {
+      const destination = issue.quarantinePath ? ` -> ${issue.quarantinePath}` : "";
+      this.diagnostics.unshift(`Saved state ${issue.action}: ${issue.statePath}${destination}. ${issue.message}`);
+    }
     for (const storedRecord of records) {
       const record = this.normalizeStoredProjectRecord(storedRecord);
       this.registeredProjectIds.add(record.id);
@@ -4225,6 +4502,118 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.logWorkflowPerf(`repo ${apiName}: payload ${payloadSize} bytes, ${details}${warning}`);
   }
 
+  getRepositoryScanStatus(projectId: string): RepositoryScanStatus {
+    const project = this.findProject(projectId);
+    const stats = project.record.stats;
+    const skippedReasons = [
+      stats?.excludedFiles || stats?.excludedFolders
+        ? {
+          reason: "Excluded by scanner rules",
+          count: (stats.excludedFiles ?? 0) + (stats.excludedFolders ?? 0),
+          detail: "Built-in excludes and project .gitignore rules."
+        }
+        : undefined,
+      stats?.skippedManifestFiles
+        ? {
+          reason: "Oversized manifest skipped",
+          count: stats.skippedManifestFiles,
+          detail: `Manifest size limit ${formatBytesForStatus(stats.maxManifestFileSizeBytes ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes)}.`
+        }
+        : undefined,
+      stats?.omittedFilesEstimate || stats?.omittedDirectoriesEstimate
+        ? {
+          reason: stats.truncationReason ?? "Scan limit reached",
+          count: (stats.omittedFilesEstimate ?? 0) + (stats.omittedDirectoriesEstimate ?? 0),
+          detail: "Use Deep Scan to raise limits for this project."
+        }
+        : undefined
+    ].filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    const truncated = Boolean(stats?.truncated);
+    return {
+      projectId,
+      status: !stats
+        ? "failed"
+        : truncated
+          ? "truncated"
+          : project.scan.files.length < (stats.includedFiles ?? 0)
+            ? "partially_indexed"
+            : "indexed",
+      lastScanAt: stats ? project.record.validation.lastValidatedAt ?? project.record.overview?.generatedAt ?? project.record.localState.lastOpenedAt : undefined,
+      filesIndexed: stats?.includedFiles ?? project.scan.files.length,
+      foldersIndexed: stats?.includedFolders ?? 0,
+      filesTotal: stats?.totalFiles ?? project.scan.files.length,
+      foldersTotal: stats?.totalFolders ?? 0,
+      skippedCount: skippedReasons.reduce((sum, entry) => sum + entry.count, 0),
+      skippedReasons,
+      truncated,
+      truncationReason: stats?.truncationReason,
+      limits: {
+        includedFileLimit: stats?.includedFileLimit,
+        includedDirectoryLimit: stats?.includedDirectoryLimit,
+        maxDepth: stats?.maxDepth,
+        maxScanDurationMs: stats?.maxScanDurationMs,
+        maxManifestFileSizeBytes: stats?.maxManifestFileSizeBytes,
+        excludedPathLimit: stats?.excludedPathLimit
+      },
+      searchScope: "full_index",
+      excludedPaths: stats?.excludedPaths ?? [],
+      deepScanAvailable: true
+    };
+  }
+
+  async rescanRepository(projectId: string, options: RepositoryRescanOptions = {}): Promise<ProjectRepositorySummary> {
+    const existing = this.findProject(projectId);
+    const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
+    const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
+    const projectRoot = gitMetadata.gitRoot ?? existing.record.projectRoot;
+    const projectHostPath = gitMetadata.gitRoot
+      ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
+      : existing.record.hostPath ?? existing.record.projectRoot;
+    const deep = options.mode === "deep";
+    const scan = await scanRepository(projectHostPath, gitMetadata, projectRoot, deep
+      ? {
+        maxIncludedFiles: DEFAULT_REPOSITORY_SCAN_LIMITS.maxIncludedFiles * 4,
+        maxIncludedDirectories: DEFAULT_REPOSITORY_SCAN_LIMITS.maxIncludedDirectories * 4,
+        maxDepth: DEFAULT_REPOSITORY_SCAN_LIMITS.maxDepth * 2,
+        maxManifestFileSizeBytes: DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes * 2,
+        maxScanDurationMs: DEFAULT_REPOSITORY_SCAN_LIMITS.maxScanDurationMs * 4,
+        maxExcludedPathRecords: DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords * 2
+      }
+      : undefined);
+    const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
+    existing.scan = scan;
+    existing.tree = scan.tree;
+    existing.gitMetadata = gitMetadata;
+    existing.record.projectRoot = projectRoot;
+    existing.record.hostPath = projectHostPath;
+    existing.record.identity = createProjectIdentity({
+      kind: scan.kind,
+      projectRoot,
+      projectName: path.basename(projectRoot),
+      repositoryName: path.basename(gitMetadata.gitRoot ?? projectRoot),
+      gitRoot: gitMetadata.gitRoot,
+      normalizedRemotes: gitMetadata.normalizedRemotes,
+      rootCommit: gitMetadata.rootCommit,
+      manifestSignature: scan.manifestHash,
+      treeSignature: scan.treeHash
+    });
+    existing.record.validation = this.buildValidationSnapshot(scan, gitMetadata, projectAccess);
+    existing.record.stats = scan.stats;
+    existing.record.dependencies = scan.dependencies;
+    existing.record.overview = buildDeterministicOverview({
+      projectName: existing.record.identity.projectName,
+      explanation: hasMeaningfulRepositoryContent(scan)
+        ? scan.stats.explanation
+        : "This project folder is effectively empty and ready for initial setup.",
+      entryPoints: scan.stats.entryPoints,
+      manifestFiles: scan.stats.manifestFiles,
+      primaryManagers: scan.stats.primaryManagers
+    });
+    await this.saveProject(existing);
+    this.emitState();
+    return this.getRepositorySummary(projectId);
+  }
+
   getRepositoryView(projectId: string): ProjectRepositoryView {
     const project = this.findProject(projectId);
     const tree = compactRepoTreePreview(project.tree);
@@ -4375,6 +4764,316 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
     this.logRepositoryPayload("searchRepositoryFiles", response, `query=${normalizedQuery}, returned=${results.length}, total=${matchedFiles.length}`);
     return response;
+  }
+
+  private agentHistorySummary(agent: AgentState): AgentHistorySummary {
+    const errors = [
+      agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected" ? 1 : 0,
+      ...agent.events.map((event) => event.status === "failed" ? 1 : 0),
+      ...(agent.integrityReport?.checks.map((check) => check.status === "failed" ? 1 : 0) ?? [])
+    ].reduce((sum, value) => sum + value, 0);
+    const commands = agent.commandLog
+      .slice(0, 6)
+      .map((command) => command.command);
+    const preview = agent.recommendationReport?.summary
+      ?? agent.integrityReport?.summary
+      ?? agent.mergeReport?.summary
+      ?? agent.lastMessageSnippet
+      ?? agent.currentSubtask
+      ?? agent.currentPhase
+      ?? "No output summary captured yet.";
+
+    return {
+      id: agent.id,
+      name: agent.name,
+      category: agent.category,
+      status: agent.status,
+      model: agent.model,
+      reasoningEffort: agent.reasoningEffort,
+      reasoningEffortSource: agent.reasoningEffortSource,
+      taskPrompt: compactText(agent.taskPrompt, 700),
+      workflowCycleNumber: agent.workflowCycleNumber,
+      createdAt: agent.createdAt,
+      startedAt: agent.startedAt,
+      completedAt: agent.completedAt,
+      lastActivityAt: agent.lastActivityAt,
+      currentPhase: agent.currentPhase,
+      currentSubtask: agent.currentSubtask,
+      preview: compactText(preview, 1_200),
+      changedFiles: agent.changedFiles.slice(0, 80),
+      commandCount: agent.commandLog.length,
+      commands,
+      approvalCount: agent.approvals.length,
+      pendingApprovalCount: agent.approvals.filter((approval) => approval.status === "pending").length,
+      errorCount: errors,
+      tokenUsage: this.extractTokenUsage(agent)
+    };
+  }
+
+  private extractTokenUsage(agent: AgentState): string | undefined {
+    const tokenEvent = agent.events.find((event) => {
+      const raw = typeof event.raw === "string" ? event.raw : event.raw ? JSON.stringify(event.raw) : "";
+      return /token/i.test(`${event.title} ${event.detail ?? ""} ${raw}`);
+    });
+    if (!tokenEvent) {
+      return undefined;
+    }
+    return compactText(tokenEvent.detail ?? tokenEvent.title, 160);
+  }
+
+  private cycleAgents(project: LoadedProject, cycleNumber: number): AgentState[] {
+    return project.record.agents.filter((agent) => {
+      if (agent.category === "manual") {
+        return false;
+      }
+      return (agent.workflowCycleNumber ?? project.record.workflow.workflowCycle.cycleNumber) === cycleNumber;
+    });
+  }
+
+  private knownWorkflowCycleNumbers(project: LoadedProject): number[] {
+    const numbers = new Set<number>();
+    numbers.add(project.record.workflow.workflowCycle.cycleNumber);
+    for (const agent of project.record.agents) {
+      if (agent.category !== "manual" && agent.workflowCycleNumber) {
+        numbers.add(agent.workflowCycleNumber);
+      }
+    }
+    for (const summary of project.record.workflow.memory.perCycleSummaries) {
+      numbers.add(summary.cycleNumber);
+    }
+    for (const decision of project.record.workflow.memory.lastAcceptedDecisions) {
+      if (decision.cycleNumber) {
+        numbers.add(decision.cycleNumber);
+      }
+    }
+    return [...numbers].filter((value) => Number.isFinite(value) && value > 0).sort((left, right) => right - left);
+  }
+
+  private summarizeCycleStatus(project: LoadedProject, cycleNumber: number, agents: AgentState[]): WorkflowCycleStatus | "manual" {
+    if (cycleNumber === project.record.workflow.workflowCycle.cycleNumber) {
+      return project.record.workflow.workflowCycle.status;
+    }
+    if (agents.some((agent) => agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected")) {
+      return "blocked_human";
+    }
+    if (agents.some((agent) => isAgentActive(agent))) {
+      return "coding";
+    }
+    return "completed";
+  }
+
+  private buildCycleHumanSummary(project: LoadedProject, cycleNumber: number, agents: AgentState[], status: WorkflowCycleStatus | "manual"): string {
+    const memorySummary = project.record.workflow.memory.perCycleSummaries.find((summary) => summary.cycleNumber === cycleNumber)?.summary;
+    if (memorySummary) {
+      return compactText(memorySummary, 600);
+    }
+    const completedAgents = agents.filter((agent) => agent.status === "completed").length;
+    const failedAgents = agents.filter((agent) => agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected").length;
+    const changedFiles = unique(agents.flatMap((agent) => agent.changedFiles)).length;
+    const commandCount = agents.reduce((sum, agent) => sum + agent.commandLog.length, 0);
+    if (agents.length === 0) {
+      return status === "completed"
+        ? "The cycle is recorded as complete, but no retained agent summaries are attached to it."
+        : "The current cycle has not started any retained agent run yet.";
+    }
+    if (failedAgents > 0) {
+      return `${agents.length} agent run${agents.length === 1 ? "" : "s"} participated; ${failedAgents} need review. ${changedFiles} file${changedFiles === 1 ? "" : "s"} changed and ${commandCount} command${commandCount === 1 ? "" : "s"} were recorded.`;
+    }
+    return `${completedAgents} of ${agents.length} agent run${agents.length === 1 ? "" : "s"} completed. The cycle touched ${changedFiles} file${changedFiles === 1 ? "" : "s"} and recorded ${commandCount} command${commandCount === 1 ? "" : "s"}.`;
+  }
+
+  private workflowCycleSummary(project: LoadedProject, cycleNumber: number): WorkflowCycleSummaryView {
+    const workflow = project.record.workflow;
+    const agents = this.cycleAgents(project, cycleNumber);
+    const cycle = cycleNumber === workflow.workflowCycle.cycleNumber ? workflow.workflowCycle : undefined;
+    const agentTimes = agents.flatMap((agent) => [agent.startedAt, agent.createdAt, agent.lastActivityAt, agent.completedAt].filter((value): value is string => Boolean(value)));
+    const startedAt = cycle?.startedAt ?? agentTimes.sort((left, right) => toTime(left) - toTime(right))[0];
+    const completedAt = cycle?.completedAt ?? agents
+      .map((agent) => agent.completedAt)
+      .filter((value): value is string => Boolean(value))
+      .sort((left, right) => toTime(right) - toTime(left))[0];
+    const status = this.summarizeCycleStatus(project, cycleNumber, agents);
+    const commandsRun = unique(agents.flatMap((agent) => agent.commandLog.map((command) => command.command))).slice(0, 16);
+    const filesChanged = unique(agents.flatMap((agent) => agent.changedFiles)).slice(0, 80);
+    const approvals = agents.flatMap((agent) => agent.approvals);
+    const userInputRequests = project.record.userInputRequests.filter((request) =>
+      agents.some((agent) => agent.id === request.agentId)
+    );
+    const goalPrompt = cycle?.scopedGoalSummary
+      ?? cycle?.approvedRecommendationTitle
+      ?? workflow.memory.lastAcceptedDecisions.find((decision) => decision.cycleNumber === cycleNumber)?.title
+      ?? agents.find((agent) => agent.taskPrompt.trim())?.taskPrompt
+      ?? workflow.ultimateGoal.summary
+      ?? `Cycle ${cycleNumber}`;
+    const durationMs = startedAt
+      ? Math.max(0, (completedAt ? toTime(completedAt) : Date.now()) - toTime(startedAt))
+      : undefined;
+
+    return {
+      id: String(cycleNumber),
+      projectId: project.record.id,
+      cycleNumber,
+      goalPrompt: compactText(goalPrompt, 700),
+      status,
+      startedAt,
+      completedAt,
+      durationMs,
+      modelsUsed: unique(agents.map((agent) => agent.model)).slice(0, 12),
+      filesChanged,
+      commandsRun,
+      hasErrors: agents.some((agent) =>
+        agent.status === "failed" ||
+        agent.status === "conflicted" ||
+        agent.status === "disconnected" ||
+        agent.events.some((event) => event.status === "failed")
+      ),
+      hasApprovals: approvals.length > 0,
+      hasUserInputRequests: userInputRequests.length > 0,
+      agentCount: agents.length,
+      summary: this.buildCycleHumanSummary(project, cycleNumber, agents, status)
+    };
+  }
+
+  listWorkflowCycles(projectId: string, options: { cursor?: string; limit?: number } = {}): WorkflowCycleListResponse {
+    const project = this.findProject(projectId);
+    const cycleNumbers = this.knownWorkflowCycleNumbers(project);
+    const offset = this.repositoryPageOffset(options.cursor);
+    const limit = Math.max(1, Math.min(50, Math.floor(options.limit ?? 20)));
+    const page = cycleNumbers.slice(offset, offset + limit).map((cycleNumber) => this.workflowCycleSummary(project, cycleNumber));
+    return {
+      projectId,
+      cursor: options.cursor,
+      nextCursor: offset + limit < cycleNumbers.length ? String(offset + limit) : undefined,
+      limit,
+      total: cycleNumbers.length,
+      cycles: page,
+      recentPreloaded: Math.min(5, cycleNumbers.length)
+    };
+  }
+
+  getWorkflowCycle(projectId: string, cycleId: string): WorkflowCycleDetail {
+    const project = this.findProject(projectId);
+    const cycleNumber = Number.parseInt(cycleId, 10);
+    if (!Number.isFinite(cycleNumber) || cycleNumber <= 0) {
+      throw new Error(`Unknown workflow cycle: ${cycleId}`);
+    }
+    const summary = this.workflowCycleSummary(project, cycleNumber);
+    const agents = this.cycleAgents(project, cycleNumber);
+    const agentIds = new Set(agents.map((agent) => agent.id));
+    return {
+      ...summary,
+      activity: project.record.workflow.activityLog
+        .filter((event) => event.agentId ? agentIds.has(event.agentId) : event.title.includes(`Cycle ${cycleNumber}`))
+        .slice(0, 80),
+      openIssues: project.record.workflow.memory.knownOpenIssues
+        .filter((issue) => issue.status === "open")
+        .slice(0, 24),
+      decisions: project.record.workflow.memory.lastAcceptedDecisions
+        .filter((decision) => decision.cycleNumber === cycleNumber)
+        .slice(0, 24)
+    };
+  }
+
+  listCycleAgents(projectId: string, cycleId: string): CycleAgentListResponse {
+    const project = this.findProject(projectId);
+    const cycleNumber = Number.parseInt(cycleId, 10);
+    if (!Number.isFinite(cycleNumber) || cycleNumber <= 0) {
+      throw new Error(`Unknown workflow cycle: ${cycleId}`);
+    }
+    const agents = this.sortAgentsForHistory(this.cycleAgents(project, cycleNumber));
+    return {
+      projectId,
+      cycleId,
+      cycleNumber,
+      total: agents.length,
+      agents: agents.map((agent) => this.agentHistorySummary(agent))
+    };
+  }
+
+  private fallbackTranscriptEntries(projectId: string, agent: AgentState): AgentTranscriptEntry[] {
+    const commandEntries: AgentTranscriptEntry[] = agent.commandLog.map((command, index) => ({
+      id: `${agent.id}:command:${command.itemId ?? index}`,
+      timestamp: command.completedAt ?? command.startedAt,
+      kind: "command",
+      itemId: command.itemId,
+      title: command.command,
+      text: command.output,
+      metadata: {
+        status: command.status,
+        exitCode: command.exitCode ?? null,
+        cwd: command.cwd ?? null
+      }
+    }));
+    const approvalEntries: AgentTranscriptEntry[] = agent.approvals.map((approval) => ({
+      id: `${agent.id}:approval:${approval.id}`,
+      timestamp: approval.createdAt,
+      kind: "approval",
+      itemId: approval.itemId,
+      title: "Approval requested",
+      text: [approval.summary, approval.reason, approval.command].filter(Boolean).join("\n\n"),
+      metadata: {
+        status: approval.status,
+        kind: approval.kind
+      }
+    }));
+    const eventEntries: AgentTranscriptEntry[] = agent.events.map((event) => ({
+      id: `${agent.id}:event:${event.id}`,
+      timestamp: event.timestamp,
+      kind: event.type === "message" ? "message" : event.type === "raw" ? "raw" : "event",
+      itemId: event.itemId,
+      title: event.title,
+      text: event.detail,
+      raw: event.raw,
+      metadata: {
+        status: event.status ?? null,
+        type: event.type,
+        projectId
+      }
+    }));
+    return [...eventEntries, ...commandEntries, ...approvalEntries]
+      .filter((entry) => entry.text?.trim() || entry.raw !== undefined || entry.title.trim())
+      .sort((left, right) => toTime(left.timestamp) - toTime(right.timestamp));
+  }
+
+  async getAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptResponse> {
+    const project = this.findProject(projectId);
+    const agent = project.record.agents.find((entry) => entry.id === agentId);
+    if (!agent) {
+      throw new Error(`Unknown agent: ${agentId}`);
+    }
+    const sidecar = await this.storage.readAgentTranscript(projectId, agentId);
+    const entries = sidecar ?? this.fallbackTranscriptEntries(projectId, agent);
+    return {
+      projectId,
+      agentId,
+      agentName: agent.name,
+      generatedAt: nowIso(),
+      entries,
+      fromSidecar: Boolean(sidecar)
+    };
+  }
+
+  async getAgentFullOutput(projectId: string, agentId: string): Promise<AgentFullOutputResponse> {
+    const transcript = await this.getAgentTranscript(projectId, agentId);
+    const output = transcript.entries
+      .map((entry) => {
+        const heading = `[${entry.timestamp}] ${entry.kind.toUpperCase()} - ${entry.title}`;
+        const body = entry.text?.trim()
+          ? entry.text
+          : entry.raw !== undefined
+            ? JSON.stringify(entry.raw, null, 2)
+            : "";
+        return body ? `${heading}\n${body}` : heading;
+      })
+      .join("\n\n");
+    return {
+      projectId,
+      agentId,
+      agentName: transcript.agentName,
+      generatedAt: transcript.generatedAt,
+      output,
+      fromSidecar: transcript.fromSidecar
+    };
   }
 
   listAgents(
@@ -10855,6 +11554,60 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
   }
 
+  private transcriptBufferKey(projectId: string, agentId: string, itemId: string): string {
+    return `${projectId}:${agentId}:${itemId}`;
+  }
+
+  private appendAgentTranscriptEntry(project: LoadedProject, agent: AgentState, entry: AgentTranscriptEntry): void {
+    void this.storage.appendAgentTranscriptEntry(project.record.id, agent, entry).catch((error) => {
+      this.diagnostics.unshift(
+        `Failed to save full output for ${agent.name}. ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+  }
+
+  private rememberCommandTranscriptStart(project: LoadedProject, agent: AgentState, itemId: string, command: string, cwd?: string): void {
+    this.commandOutputBuffers.set(this.transcriptBufferKey(project.record.id, agent.id, itemId), {
+      command,
+      cwd,
+      startedAt: nowIso(),
+      output: ""
+    });
+  }
+
+  private appendCommandTranscriptDelta(project: LoadedProject, agent: AgentState, itemId: string, delta: string): void {
+    const key = this.transcriptBufferKey(project.record.id, agent.id, itemId);
+    const existing = this.commandOutputBuffers.get(key) ?? {
+      startedAt: nowIso(),
+      output: ""
+    };
+    existing.output += delta;
+    this.commandOutputBuffers.set(key, existing);
+  }
+
+  private flushCommandTranscript(project: LoadedProject, agent: AgentState, itemId: string, status: string, exitCode?: number | null): void {
+    const key = this.transcriptBufferKey(project.record.id, agent.id, itemId);
+    const existing = this.commandOutputBuffers.get(key);
+    if (!existing) {
+      return;
+    }
+    this.commandOutputBuffers.delete(key);
+    this.appendAgentTranscriptEntry(project, agent, {
+      id: `${agent.id}:command:${itemId}:${Date.now()}`,
+      timestamp: nowIso(),
+      kind: "command",
+      itemId,
+      title: existing.command ?? "Command output",
+      text: existing.output,
+      metadata: {
+        status,
+        exitCode: exitCode ?? null,
+        cwd: existing.cwd ?? null,
+        startedAt: existing.startedAt ?? null
+      }
+    });
+  }
+
   private handleTransportNotification(notification: ServerNotification): void {
     if (this.disposed) {
       return;
@@ -10990,6 +11743,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         const item = notification.params.item;
         if (item.type === "commandExecution") {
           const sanitizedCommand = this.sanitizeTextToProjectBoundary(project, item.command, item.cwd ?? project.record.projectRoot) ?? item.command;
+          this.rememberCommandTranscriptStart(project, agent, item.id, sanitizedCommand, item.cwd);
           reduceAgentRuntimeEvent(agent, {
             kind: "item-started",
             threadId,
@@ -11039,6 +11793,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               "item/completed"
             ).catch(() => undefined);
           }
+          this.appendAgentTranscriptEntry(project, agent, {
+            id: `${agent.id}:message:${notification.params.item.id}`,
+            timestamp: nowIso(),
+            kind: "message",
+            itemId: notification.params.item.id,
+            title: "Agent output",
+            text: this.sanitizeTextToProjectBoundary(project, redactedMessageText) ?? redactedMessageText
+          });
           reduceAgentRuntimeEvent(agent, {
             kind: "item-completed",
             threadId,
@@ -11054,6 +11816,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             notification.params.item.command,
             notification.params.item.cwd ?? project.record.projectRoot
           ) ?? notification.params.item.command;
+          this.flushCommandTranscript(
+            project,
+            agent,
+            notification.params.item.id,
+            notification.params.item.status,
+            notification.params.item.exitCode
+          );
           reduceAgentRuntimeEvent(agent, {
             kind: "item-completed",
             threadId,
@@ -11129,6 +11898,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               "rawResponseItem/completed"
             ).catch(() => undefined);
         }
+        if (rawResponseText) {
+          this.appendAgentTranscriptEntry(project, agent, {
+            id: `${agent.id}:raw-response:${Date.now()}`,
+            timestamp: nowIso(),
+            kind: "message",
+            title: "Agent output",
+            text: this.sanitizeTextToProjectBoundary(project, redactedResponseText ?? rawResponseText) ?? redactedResponseText ?? rawResponseText,
+            raw: redactedItem
+          });
+        }
         reduceAgentRuntimeEvent(agent, {
           kind: "raw",
           title: "rawResponseItem/completed",
@@ -11190,6 +11969,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         break;
       }
       case "command/exec/outputDelta":
+        this.appendCommandTranscriptDelta(
+          project,
+          agent,
+          notification.params.processId,
+          this.sanitizeTextToProjectBoundary(
+            project,
+            Buffer.from(notification.params.deltaBase64, "base64").toString("utf8")
+          ) ?? Buffer.from(notification.params.deltaBase64, "base64").toString("utf8")
+        );
         reduceAgentRuntimeEvent(agent, {
           kind: "command-output",
           threadId,
@@ -11201,6 +11989,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         });
         break;
       case "item/commandExecution/outputDelta":
+        this.appendCommandTranscriptDelta(
+          project,
+          agent,
+          notification.params.itemId,
+          this.sanitizeTextToProjectBoundary(project, notification.params.delta) ?? notification.params.delta
+        );
         reduceAgentRuntimeEvent(agent, {
           kind: "command-output",
           threadId,

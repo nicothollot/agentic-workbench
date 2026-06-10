@@ -6,6 +6,7 @@ import { localProjectRecordSchema, portableInterfaceSchema, projectReviewLogBund
 import type {
   AgentCategory,
   AgentLifecycleStatus,
+  AgentTranscriptEntry,
   AppSettings,
   LocalProjectRecord,
   PortableProjectInterface,
@@ -47,6 +48,27 @@ type CredentialSecretStore = {
     secretKey?: StoredSecretValue;
     updatedAt: string;
   }>;
+};
+
+type ProjectStateParseResult =
+  | { ok: true; value: unknown; repairedMalformedJson: boolean; message?: string }
+  | { ok: false; message: string };
+
+export interface StateLoadIssue {
+  projectId: string;
+  statePath: string;
+  action: "repaired" | "quarantined" | "ignored";
+  message: string;
+  quarantinePath?: string;
+}
+
+type AgentTranscriptStore = {
+  version: 1;
+  projectId: string;
+  agentId: string;
+  agentName: string;
+  updatedAt: string;
+  entries: AgentTranscriptEntry[];
 };
 
 const buildReviewLogRuntimeContext = (settings: AppSettings): ReviewLogRuntimeContext => ({
@@ -252,6 +274,7 @@ const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
 
 export class WorkbenchStorage {
   private readonly writeQueues = new Map<string, Promise<void>>();
+  private readonly loadIssues: StateLoadIssue[] = [];
   private readonly debugState = process.env.AWB_DEBUG_STATE === "1";
   private readonly debugPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
 
@@ -325,6 +348,14 @@ export class WorkbenchStorage {
     return path.join(this.projectDir(projectId), "credentials.secrets.json");
   }
 
+  private projectAgentTranscriptDir(projectId: string): string {
+    return path.join(this.projectDir(projectId), "agent-transcripts");
+  }
+
+  private projectAgentTranscriptPath(projectId: string, agentId: string): string {
+    return path.join(this.projectAgentTranscriptDir(projectId), `${agentId}.json`);
+  }
+
   private registryPath(): string {
     return path.join(this.appDataDir, "registry.json");
   }
@@ -335,6 +366,18 @@ export class WorkbenchStorage {
 
   async ensureBaseDirs(): Promise<void> {
     await mkdir(path.join(this.appDataDir, "projects"), { recursive: true });
+  }
+
+  consumeLoadIssues(): StateLoadIssue[] {
+    const issues = [...this.loadIssues];
+    this.loadIssues.length = 0;
+    return issues;
+  }
+
+  private recordLoadIssue(issue: StateLoadIssue): void {
+    this.loadIssues.push(issue);
+    const detail = issue.quarantinePath ? ` -> ${issue.quarantinePath}` : "";
+    console.warn(`[storage] ${issue.action} ${issue.statePath}${detail}: ${issue.message}`);
   }
 
   private isRetryableAtomicWriteError(error: unknown): boolean {
@@ -436,6 +479,81 @@ export class WorkbenchStorage {
     await this.writeJsonAtomically(this.projectStatePath(record.id), sanitized.record);
   }
 
+  private parseProjectStateText(raw: string): ProjectStateParseResult {
+    try {
+      return { ok: true, value: JSON.parse(raw), repairedMalformedJson: false };
+    } catch (error) {
+      const parseMessage = error instanceof Error ? error.message : String(error);
+      const trimmed = raw.trimStart();
+      if (!trimmed.startsWith("{")) {
+        return {
+          ok: false,
+          message: parseMessage
+        };
+      }
+
+      const startOffset = raw.length - trimmed.length;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let index = startOffset; index < raw.length; index += 1) {
+        const char = raw[index];
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (char === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (char === "\"") {
+          inString = !inString;
+          continue;
+        }
+        if (inString) {
+          continue;
+        }
+        if (char === "{") {
+          depth += 1;
+        } else if (char === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            const candidate = raw.slice(startOffset, index + 1);
+            try {
+              return {
+                ok: true,
+                value: JSON.parse(candidate),
+                repairedMalformedJson: true,
+                message: `Parsed the first complete JSON object and discarded ${raw.length - index - 1} trailing character(s). Original parse error: ${parseMessage}`
+              };
+            } catch {
+              break;
+            }
+          }
+        }
+      }
+
+      return {
+        ok: false,
+        message: parseMessage
+      };
+    }
+  }
+
+  private async quarantineProjectState(projectId: string, statePath: string, message: string): Promise<string> {
+    const timestamp = nowIso().replace(/[:.]/g, "-");
+    const quarantinePath = path.join(this.projectDir(projectId), `state.json.quarantine.${timestamp}.json`);
+    await rename(statePath, quarantinePath);
+    this.recordLoadIssue({
+      projectId,
+      statePath,
+      action: "quarantined",
+      message,
+      quarantinePath
+    });
+    return quarantinePath;
+  }
+
   private encodeSecretValue(value: string): StoredSecretValue {
     if (this.secretCodec?.isEncryptionAvailable()) {
       return {
@@ -519,19 +637,44 @@ export class WorkbenchStorage {
   }
 
   async loadProject(projectId: string): Promise<LocalProjectRecord | null> {
+    const statePath = this.projectStatePath(projectId);
     try {
-      const statePath = this.projectStatePath(projectId);
       const raw = await readFile(statePath, "utf8");
-      const parsedJson = JSON.parse(raw) as LocalProjectRecord;
+      const parsed = this.parseProjectStateText(raw);
+      if (!parsed.ok) {
+        await this.quarantineProjectState(projectId, statePath, `Malformed JSON. ${parsed.message}`);
+        return null;
+      }
+      const parsedJson = parsed.value as LocalProjectRecord;
       const sanitized = sanitizeProjectRecord(parsedJson);
       const record = localProjectRecordSchema.parse(sanitized.record) as LocalProjectRecord;
-      if (sanitized.report.changed) {
+      if (sanitized.report.changed || parsed.repairedMalformedJson) {
         await this.backupProjectStateBeforeMigration(projectId, statePath);
         await this.writeJsonAtomically(statePath, record);
+        if (parsed.repairedMalformedJson) {
+          this.recordLoadIssue({
+            projectId,
+            statePath,
+            action: "repaired",
+            message: parsed.message ?? "Malformed JSON was repaired by keeping the first complete JSON object."
+          });
+        }
         this.logSanitizerReport(projectId, raw.length, JSON.stringify(record).length, sanitized.report);
       }
       return record;
-    } catch {
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return null;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      await this.quarantineProjectState(projectId, statePath, `State validation failed. ${message}`).catch((quarantineError) => {
+        this.recordLoadIssue({
+          projectId,
+          statePath,
+          action: "ignored",
+          message: `State validation failed (${message}) and quarantine failed: ${quarantineError instanceof Error ? quarantineError.message : String(quarantineError)}`
+        });
+      });
       return null;
     }
   }
@@ -571,6 +714,50 @@ export class WorkbenchStorage {
       records.push(await this.loadProject(projectId));
     }
     return records.filter((record): record is LocalProjectRecord => record !== null);
+  }
+
+  async appendAgentTranscriptEntry(projectId: string, agent: Pick<LocalProjectRecord["agents"][number], "id" | "name">, entry: AgentTranscriptEntry): Promise<void> {
+    await this.ensureBaseDirs();
+    await mkdir(this.projectAgentTranscriptDir(projectId), { recursive: true });
+    const transcriptPath = this.projectAgentTranscriptPath(projectId, agent.id);
+    let store: AgentTranscriptStore = {
+      version: 1,
+      projectId,
+      agentId: agent.id,
+      agentName: agent.name,
+      updatedAt: nowIso(),
+      entries: []
+    };
+    try {
+      const existing = JSON.parse(await readFile(transcriptPath, "utf8")) as AgentTranscriptStore;
+      store = {
+        version: 1,
+        projectId,
+        agentId: agent.id,
+        agentName: agent.name,
+        updatedAt: nowIso(),
+        entries: Array.isArray(existing.entries) ? existing.entries : []
+      };
+    } catch {
+      // Missing or malformed transcript sidecars should not affect the primary project state.
+    }
+
+    store.entries.push(entry);
+    if (store.entries.length > 2_000) {
+      store.entries = store.entries.slice(-2_000);
+    }
+    store.updatedAt = nowIso();
+    await this.writeJsonAtomically(transcriptPath, store);
+  }
+
+  async readAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptEntry[] | null> {
+    try {
+      const transcriptPath = this.projectAgentTranscriptPath(projectId, agentId);
+      const store = JSON.parse(await readFile(transcriptPath, "utf8")) as AgentTranscriptStore;
+      return Array.isArray(store.entries) ? store.entries : [];
+    } catch {
+      return null;
+    }
   }
 
   async writePortableInterface(projectRoot: string, record: LocalProjectRecord, destinationPath?: string): Promise<string> {
