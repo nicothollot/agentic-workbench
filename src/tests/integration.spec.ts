@@ -1191,6 +1191,40 @@ describe("integration flows", () => {
     expect(await readFile(path.join(root, "src/index.ts"), "utf8")).toContain("merged");
   });
 
+  it("pushes the opened checkout after a successful merge when not in mock mode", async () => {
+    const root = await createSampleRepo("merge-push-success");
+    const appData = await createTempDir("appdata-merge-push-success");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    (service as any).settings.mockMode = false;
+
+    const remote = await createTempDir("merge-push-success-remote.git");
+    await execFileAsync("git", ["init", "--bare"], { cwd: remote });
+    await execFileAsync("git", ["remote", "set-url", "origin", remote], { cwd: root });
+    await execFileAsync("git", ["push", "-u", "origin", "main"], { cwd: root });
+
+    await execFileAsync("git", ["checkout", "-b", "feature-push"], { cwd: root });
+    await writeFile(path.join(root, "src/index.ts"), "export const value = 'pushed merge';\n");
+    await commitAll(root, "feature push");
+    await execFileAsync("git", ["checkout", "main"], { cwd: root });
+
+    project.record.agents.push({
+      ...createAgentSkeleton("coding", "Agent Push", "Task Push", "gpt-5.4"),
+      worktree: { baseDir: appData, worktreePath: root, branch: "feature-push", targetBranch: "main" }
+    });
+
+    await (service as any).runMergeInternal(selected.record.id);
+
+    const mergeAgent = getProjectRecord(service, selected.record.id)?.agents.find((entry) => entry.category === "merge");
+    const localHead = (await execFileAsync("git", ["rev-parse", "main"], { cwd: root })).stdout.trim();
+    const remoteHead = (await execFileAsync("git", ["--git-dir", remote, "rev-parse", "main"])).stdout.trim();
+    expect(mergeAgent?.status).toBe("completed");
+    expect(mergeAgent?.mergeReport?.summary).toContain("Pushed main to origin");
+    expect(remoteHead).toBe(localHead);
+  });
+
   it("keeps a successful merge completed when the post-merge project refresh fails", async () => {
     const root = await createSampleRepo("merge-refresh-failure");
     const appData = await createTempDir("appdata-merge-refresh-failure");

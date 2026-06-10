@@ -344,6 +344,24 @@ export const applyBranchToProjectCheckout = async (
   return currentBranch;
 };
 
+export const pushBranchToOrigin = async (
+  projectRoot: string,
+  branch: string,
+  settings: RuntimeSettings
+): Promise<{ branch: string; remote: string; output: string }> => {
+  if (!branch.trim()) {
+    throw new Error("Cannot push because the opened project checkout is not on a named branch.");
+  }
+
+  await execGit(settings, projectRoot, ["remote", "get-url", "origin"]);
+  const output = await execGit(settings, projectRoot, ["push", "origin", branch]);
+  return {
+    branch,
+    remote: "origin",
+    output
+  };
+};
+
 export const attemptMerge = async (
   integrationWorktreePath: string,
   targetBranch: string,

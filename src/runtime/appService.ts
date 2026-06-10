@@ -107,6 +107,7 @@ import {
   listBranchesMissingFromHead,
   listUnmergedWorktreeFiles,
   pruneManagedWorktrees,
+  pushBranchToOrigin,
   readGitMetadata
 } from "./git";
 import { shouldAutoApproveApproval } from "./approvalPolicy";
@@ -9326,6 +9327,85 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return appliedBranch;
   }
 
+  private async publishMergedCheckoutToOrigin(
+    project: LoadedProject,
+    mergeAgent: AgentState,
+    workflow: ProjectWorkflowState,
+    branch: string,
+    operation: string
+  ): Promise<boolean> {
+    if (this.settings.mockMode) {
+      return true;
+    }
+    const baseReport = mergeAgent.mergeReport ?? {
+      summary: operation,
+      mergedBranches: [],
+      conflicts: [],
+      conflictCycleCount: 0,
+      generatedAt: nowIso()
+    };
+
+    try {
+      const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
+      const result = await pushBranchToOrigin(project.record.projectRoot, branch, runtimeSettings);
+      mergeAgent.mergeReport = {
+        ...baseReport,
+        summary: `${baseReport.summary} Pushed ${result.branch} to ${result.remote}.`,
+        targetBranch: result.branch
+      };
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "completed",
+        title: "GitHub push completed",
+        detail: `Pushed ${result.branch} to ${result.remote}.`,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      mergeAgent.mergeReport = {
+        ...baseReport,
+        summary: `${baseReport.summary} GitHub push failed. ${detail}`,
+        targetBranch: branch
+      };
+      mergeAgent.status = "failed";
+      mergeAgent.completedAt = nowIso();
+      mergeAgent.currentPhase = "GitHub push failed";
+      mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+      this.recordWorkflowOpenIssue(workflow, "GitHub push failed", detail, "merge");
+      if (!workflow.humanInterventions.some((entry) => entry.status === "pending" && entry.title === "GitHub publish failed")) {
+        await this.createHumanInterventionRecord(project, {
+          kind: "external_setup",
+          title: "GitHub publish failed",
+          description: `The local merge completed, but Codex Agent Workbench could not push ${branch} to origin.`,
+          reason: detail,
+          requestedByAgentCategory: "merge",
+          severity: "high",
+          blocking: true
+        }, { persist: false, stepId: "merge" });
+      }
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "failed",
+        title: "GitHub push failed",
+        detail,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        currentActivity: "GitHub push failed",
+        latestProgressNote: detail,
+        message: mergeAgent.mergeReport.summary,
+        warning: "The opened checkout was updated locally, but the merged branch was not pushed to GitHub.",
+        agentCategory: "merge"
+      }, { status: "failed" });
+      return false;
+    }
+  }
+
   private async tryFinalizeResolvedMergeConflictWorktree(project: LoadedProject): Promise<boolean> {
     if (project.scan.kind !== "git") {
       return false;
@@ -9397,6 +9477,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     mergeAgent.currentPhase = "Resolved merge conflicts applied";
     mergeAgent.changedFiles = checkpoint.changedFiles;
     mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+
+    const published = await this.publishMergedCheckoutToOrigin(
+      project,
+      mergeAgent,
+      workflow,
+      appliedCheckoutBranch || targetBranch,
+      "Merge conflict retry"
+    );
+    if (!published) {
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, false);
+      return true;
+    }
 
     this.resetWorkflowRepairState(workflow);
     this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
@@ -9657,6 +9750,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : "All selected coding-agent branches merged cleanly and the opened checkout was updated.";
       if (appliedCheckoutBranch) {
         mergeAgent.mergeReport.targetBranch = appliedCheckoutBranch;
+      }
+      const published = await this.publishMergedCheckoutToOrigin(
+        project,
+        mergeAgent,
+        workflow,
+        appliedCheckoutBranch ?? targetBranch,
+        "Merge finalization"
+      );
+      if (!published) {
+        this.syncWorkflowState(project);
+        await this.persistProjectUpdate(project, false);
+        return;
       }
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
       workflow.workflowCycle.status = "merged";
