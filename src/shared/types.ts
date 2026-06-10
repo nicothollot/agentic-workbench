@@ -237,6 +237,25 @@ export interface CodexAvailability {
   protocolCompatibility?: "compatible" | "installed-newer" | "installed-older" | "unknown";
 }
 
+export type RuntimeDependencyCheckStatus = "checking" | "passed" | "warning" | "failed";
+
+export interface RuntimeDependencyCheck {
+  id: string;
+  label: string;
+  status: RuntimeDependencyCheckStatus;
+  message: string;
+  fixInApp?: string;
+  manualCommand?: string;
+}
+
+export interface RuntimeReadinessReport {
+  status: "checking" | "ready" | "blocked";
+  checkedAt?: string;
+  summary: string;
+  blockAgentActions: boolean;
+  checks: RuntimeDependencyCheck[];
+}
+
 export interface UltimateGoal {
   summary: string;
   detailedIntent: string;
@@ -1233,5 +1252,6 @@ export interface WorkbenchState {
   activeProjectId?: string;
   availableModels: DiscoveredModel[];
   codexAvailability: CodexAvailability;
+  runtimeReadiness: RuntimeReadinessReport;
   diagnostics: string[];
 }

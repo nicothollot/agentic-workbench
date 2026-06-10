@@ -56,6 +56,8 @@ import type {
   ProjectWorkflowState,
   ProjectLoadResult,
   RepoTreeNode,
+  RuntimeDependencyCheck,
+  RuntimeReadinessReport,
   ScopedGoal,
   UserInputRequestQuestion,
   UserInputRequestRecord,
@@ -399,6 +401,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly structuredOutputApplicationsInFlight = new Set<string>();
   private suppressTransportExitHandling = false;
   private transportInitialization?: Promise<void>;
+  private runtimeReadinessChecking = false;
+  private runtimeReadinessLastCheckedAt?: string;
   private disposed = false;
   private disposePromise?: Promise<void>;
   private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
@@ -572,6 +576,273 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       );
     }
     return state;
+  }
+
+  private quotePowerShellArgument(value: string): string {
+    return `"${value.replace(/`/g, "``").replace(/"/g, "`\"")}"`;
+  }
+
+  private quoteBashArgument(value: string): string {
+    return `'${value.replace(/'/g, "'\\''")}'`;
+  }
+
+  private buildCodexDiagnosticCommand(): string {
+    const codexCommand = this.settings.codexBinaryPath || "codex";
+    if (process.platform === "win32" && this.settings.executionMode === "wsl") {
+      const bashCommand = [
+        "set -e",
+        "echo WSL runtime:",
+        "uname -a",
+        "echo Node:",
+        "command -v node",
+        "node --version",
+        "echo Codex:",
+        `command -v ${this.quoteBashArgument(codexCommand)}`,
+        `${this.quoteBashArgument(codexCommand)} --version`
+      ].join(" && ");
+      return `wsl -d ${this.quotePowerShellArgument(this.settings.distroName)} -- bash -lc ${this.quotePowerShellArgument(bashCommand)}`;
+    }
+
+    if (process.platform === "win32") {
+      const powerShellCommand = [
+        "$ErrorActionPreference = 'Stop'",
+        "Write-Host 'Node:'",
+        "Get-Command node | Select-Object -ExpandProperty Source",
+        "node --version",
+        "Write-Host 'Codex:'",
+        `Get-Command ${this.quotePowerShellArgument(codexCommand)} | Select-Object -ExpandProperty Source`,
+        `& ${this.quotePowerShellArgument(codexCommand)} --version`
+      ].join("; ");
+      return `powershell -NoProfile -Command ${this.quotePowerShellArgument(powerShellCommand)}`;
+    }
+
+    const shellCommand = [
+      "command -v node",
+      "node --version",
+      `command -v ${this.quoteBashArgument(codexCommand)}`,
+      `${this.quoteBashArgument(codexCommand)} --version`
+    ].join(" && ");
+    return `bash -lc ${this.quoteBashArgument(shellCommand)}`;
+  }
+
+  private buildCodexInstallCommand(): string | undefined {
+    const version = this.codexAvailability.generatedProtocolVersion ?? GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION;
+    if (!version) {
+      return undefined;
+    }
+    if (process.platform === "win32" && this.settings.executionMode === "wsl") {
+      return `wsl -d ${this.quotePowerShellArgument(this.settings.distroName)} -- npm install -g @openai/codex@${version}`;
+    }
+    return `npm install -g @openai/codex@${version}`;
+  }
+
+  private buildRuntimeReadinessReport(project?: LoadedProject): RuntimeReadinessReport {
+    const checks: RuntimeDependencyCheck[] = [];
+    const addCheck = (check: RuntimeDependencyCheck): void => {
+      checks.push(check);
+    };
+
+    addCheck({
+      id: "github",
+      label: "GitHub account",
+      status: this.isGitHubLinked() ? "passed" : "failed",
+      message: this.githubStatus.message,
+      fixInApp: "Open Settings and refresh GitHub status after completing the GitHub link command.",
+      manualCommand: "gh auth login --hostname github.com --git-protocol ssh --web"
+    });
+
+    const mode = resolveExecutionMode(this.settings, process.platform);
+    addCheck({
+      id: "runtime-target",
+      label: mode === "wsl" ? "Windows to WSL runtime" : "Local runtime",
+      status: "passed",
+      message: mode === "wsl"
+        ? `Workbench is configured to run Codex and project commands through WSL distro "${this.settings.distroName}".`
+        : "Workbench is configured to run Codex and project commands in the native process environment.",
+      fixInApp: "Open Settings to change execution mode, WSL distro, Codex binary, CODEX_HOME, or worktree base."
+    });
+
+    const projectAccess = project?.record.validation.projectAccess;
+    if (projectAccess) {
+      addCheck({
+        id: "project-access",
+        label: "Project write access",
+        status: projectAccess.status === "passed" ? "passed" : "failed",
+        message: projectAccess.status === "passed"
+          ? projectAccess.message
+          : projectAccess.error ?? projectAccess.message,
+        fixInApp: "Reopen the project after fixing filesystem permissions or moving it to a writable WSL/Git checkout."
+      });
+    }
+
+    if (project && this.isWindowsMountedWslProject(project)) {
+      addCheck({
+        id: "windows-mounted-wsl-path",
+        label: "Project path performance",
+        status: "warning",
+        message: "This project is under /mnt/*. Windows-mounted WSL paths can make Git, npm, and Codex startup much slower.",
+        fixInApp: "Move or clone the project inside the WSL filesystem, then open that WSL path from the launcher."
+      });
+    }
+
+    if (this.runtimeReadinessChecking) {
+      addCheck({
+        id: "codex-model-discovery",
+        label: "Codex model discovery",
+        status: "checking",
+        message: "Checking Codex CLI, app-server startup, and model discovery.",
+        fixInApp: "Wait for the check to finish, or open Settings to verify the runtime target.",
+        manualCommand: this.buildCodexDiagnosticCommand()
+      });
+    } else if (this.codexAvailability.source !== "unavailable" && this.availableModels.length > 0) {
+      addCheck({
+        id: "codex-model-discovery",
+        label: "Codex model discovery",
+        status: "passed",
+        message: `Model discovery is available with ${this.availableModels.length} model${this.availableModels.length === 1 ? "" : "s"}.`,
+        manualCommand: this.buildCodexDiagnosticCommand()
+      });
+    } else {
+      const installCommand = this.buildCodexInstallCommand();
+      addCheck({
+        id: "codex-model-discovery",
+        label: "Codex model discovery",
+        status: "failed",
+        message: this.codexAvailability.message ?? "Codex app-server and model discovery are not available.",
+        fixInApp: "Open Settings, confirm the execution mode, WSL distro, Codex binary, and CODEX_HOME, save, then run readiness checks again.",
+        manualCommand: installCommand
+          ? `${this.buildCodexDiagnosticCommand()}\n${installCommand}`
+          : this.buildCodexDiagnosticCommand()
+      });
+    }
+
+    const hasFailure = checks.some((check) => check.status === "failed");
+    const checking = checks.some((check) => check.status === "checking");
+    const status: RuntimeReadinessReport["status"] = checking ? "checking" : hasFailure ? "blocked" : "ready";
+    const failedLabels = checks.filter((check) => check.status === "failed").map((check) => check.label);
+    return {
+      status,
+      checkedAt: this.runtimeReadinessLastCheckedAt,
+      summary: status === "ready"
+        ? "Runtime checks passed. Agent-backed workflow actions are available."
+        : status === "checking"
+          ? "Runtime checks are running. Agent-backed workflow actions are blocked until model discovery passes."
+          : `Agent-backed workflow actions are blocked: ${failedLabels.join(", ")}.`,
+      blockAgentActions: status !== "ready",
+      checks
+    };
+  }
+
+  private getActiveProject(): LoadedProject | undefined {
+    return this.activeProjectId ? this.projects.get(this.activeProjectId) : undefined;
+  }
+
+  private canRunAgentBackedActions(project?: LoadedProject): boolean {
+    const report = this.buildRuntimeReadinessReport(project ?? this.getActiveProject());
+    return !report.blockAgentActions;
+  }
+
+  private hasNonCodexRuntimeFailure(project?: LoadedProject): boolean {
+    return this.buildRuntimeReadinessReport(project ?? this.getActiveProject()).checks.some((check) =>
+      check.status === "failed" && check.id !== "codex-model-discovery"
+    );
+  }
+
+  private runtimeReadinessErrorMessage(project?: LoadedProject): string {
+    const report = this.buildRuntimeReadinessReport(project ?? this.getActiveProject());
+    const detail = report.checks
+      .filter((check) => check.status === "failed")
+      .map((check) => `${check.label}: ${check.message}`)
+      .join(" ");
+    return `${report.summary}${detail ? ` ${detail}` : ""}`;
+  }
+
+  private async ensureAgentBackedRuntimeReady(project: LoadedProject, reason: string): Promise<void> {
+    if (this.hasNonCodexRuntimeFailure(project)) {
+      throw new Error(this.runtimeReadinessErrorMessage(project));
+    }
+    if (!this.canRunAgentBackedActions(project)) {
+      await this.refreshRuntimeReadiness(reason);
+    }
+    if (!this.canRunAgentBackedActions(project)) {
+      throw new Error(this.runtimeReadinessErrorMessage(project));
+    }
+  }
+
+  async refreshRuntimeReadiness(reason = "runtime readiness check"): Promise<RuntimeReadinessReport> {
+    if (this.runtimeReadinessChecking) {
+      if (this.transportInitialization) {
+        await this.transportInitialization;
+      }
+      return this.buildRuntimeReadinessReport(this.getActiveProject());
+    }
+
+    const reusableTransport = this.transport;
+    const hasReusableTransport = Boolean(reusableTransport && this.codexAvailability.source !== "unavailable");
+    this.runtimeReadinessChecking = true;
+    this.codexAvailability = {
+      ...this.codexAvailability,
+      message: "Checking Codex CLI, app-server startup, and model discovery."
+    };
+    this.emitStateNow(`${reason} started`);
+    try {
+      if (hasReusableTransport && reusableTransport && this.transport === reusableTransport) {
+        this.availableModels = buildDiscoveredModels((await reusableTransport.listModels()).data);
+        if (this.availableModels.length === 0) {
+          this.codexAvailability = {
+            source: "unavailable",
+            message: "Codex app-server started, but model discovery returned no available models."
+          };
+        }
+      } else {
+        await this.initializeTransport();
+        if (this.codexAvailability.source !== "unavailable" && this.availableModels.length === 0) {
+          this.codexAvailability = {
+            source: "unavailable",
+            message: "Codex app-server started, but model discovery returned no available models."
+          };
+        }
+      }
+    } catch (error) {
+      this.transport = undefined;
+      this.availableModels = [];
+      this.codexAvailability = {
+        source: "unavailable",
+        message: error instanceof Error ? error.message : String(error)
+      };
+      this.diagnostics.unshift(`Runtime readiness check failed. ${this.codexAvailability.message}`);
+    } finally {
+      this.runtimeReadinessChecking = false;
+      this.runtimeReadinessLastCheckedAt = nowIso();
+    }
+
+    const report = this.buildRuntimeReadinessReport(this.getActiveProject());
+    this.emitStateNow(`${reason} completed`);
+    if (!report.blockAgentActions) {
+      this.resumeAgentBackedWorkForActiveProject(reason);
+    }
+    return report;
+  }
+
+  private startRuntimeReadinessCheck(reason: string): void {
+    void this.refreshRuntimeReadiness(reason).catch((error) => {
+      this.diagnostics.unshift(`Runtime readiness check failed. ${error instanceof Error ? error.message : String(error)}`);
+      this.runtimeReadinessChecking = false;
+      this.runtimeReadinessLastCheckedAt = nowIso();
+      this.emitState();
+    });
+  }
+
+  private resumeAgentBackedWorkForActiveProject(reason: string): void {
+    const project = this.getActiveProject();
+    if (!project || !this.canRunAgentBackedActions(project)) {
+      return;
+    }
+    this.logWorkflowPerf(`agent-backed work resumed for ${project.record.identity.projectName}: ${reason}`);
+    void this.runBootstrapIfNeeded(project);
+    if (this.shouldScheduleWorkflowAutomation(project)) {
+      this.scheduleWorkflowAutomation(project.record.id, reason);
+    }
   }
 
   private emitStateNow(label = "state emit"): void {
@@ -2150,6 +2421,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private shouldScheduleWorkflowAutomation(project: LoadedProject): boolean {
+    if (!this.canRunAgentBackedActions(project)) {
+      this.logWorkflowPerf(`automation blocked for ${project.record.identity.projectName}: ${this.runtimeReadinessErrorMessage(project)}`);
+      return false;
+    }
+
     const workflow = this.ensureWorkflowState(project.record);
     const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
     const action = getNextWorkflowAutomationAction(
@@ -3214,6 +3490,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       activeProjectId: this.activeProjectId,
       availableModels: this.availableModels,
       codexAvailability: this.codexAvailability,
+      runtimeReadiness: this.buildRuntimeReadinessReport(this.getActiveProject()),
       diagnostics: [...this.diagnostics]
     };
   }
@@ -3231,6 +3508,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       activeProjectId: this.activeProjectId,
       availableModels: this.availableModels,
       codexAvailability: this.codexAvailability,
+      runtimeReadiness: this.buildRuntimeReadinessReport(this.getActiveProject()),
       diagnostics: [...this.diagnostics]
     };
   }
@@ -3416,6 +3694,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.attachTransportListeners(this.transport);
       await this.transport.initialize();
       this.availableModels = buildDiscoveredModels((await this.transport.listModels()).data);
+      if (this.availableModels.length === 0) {
+        const transport = this.transport;
+        this.transport = undefined;
+        this.suppressTransportExitHandling = true;
+        try {
+          await transport.dispose();
+        } catch {
+          // The zero-model readiness failure is reported below; dispose failures do not change the operator fix.
+        } finally {
+          this.suppressTransportExitHandling = false;
+        }
+        this.codexAvailability = {
+          source: "unavailable",
+          message: "Mock transport started, but model discovery returned no available models."
+        };
+        return;
+      }
       this.codexAvailability = { source: "mock", message: "Mock mode is enabled, so interface creation uses mock model metadata and outputs." };
       return;
     }
@@ -3431,6 +3726,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           generatedProtocolVersion: compatibility.generatedProtocolVersion,
           protocolCompatibility: compatibility.status
         };
+        this.availableModels = [];
         this.diagnostics.unshift(compatibility.message);
         return;
       }
@@ -3440,6 +3736,26 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.attachTransportListeners(this.transport);
       await this.transport.initialize();
       this.availableModels = buildDiscoveredModels((await this.transport.listModels()).data);
+      if (this.availableModels.length === 0) {
+        const transport = this.transport;
+        this.transport = undefined;
+        this.suppressTransportExitHandling = true;
+        try {
+          await transport.dispose();
+        } catch {
+          // The zero-model readiness failure is reported below; dispose failures do not change the operator fix.
+        } finally {
+          this.suppressTransportExitHandling = false;
+        }
+        this.codexAvailability = {
+          source: "unavailable",
+          message: "Codex app-server started, but model discovery returned no available models.",
+          installedCodexVersion: compatibility.installedVersion,
+          generatedProtocolVersion: compatibility.generatedProtocolVersion,
+          protocolCompatibility: compatibility.status
+        };
+        return;
+      }
       this.codexAvailability = {
         source: "live",
         installedCodexVersion: compatibility.installedVersion,
@@ -4033,6 +4349,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.activeProjectId = projectId;
     await this.resumeSavedAgents(project);
     this.emitState();
+    this.startRuntimeReadinessCheck("project reopened");
     return this.toRendererLoadedProjectView(project);
   }
 
@@ -4451,10 +4768,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       await this.resumeSavedAgents(project);
     }
     this.emitState();
-    void this.runBootstrapIfNeeded(project);
-    if (this.shouldScheduleWorkflowAutomation(project)) {
-      this.scheduleWorkflowAutomation(projectId);
-    }
+    this.startRuntimeReadinessCheck("project opened");
     return this.toRendererLoadedProjectView(project);
   }
 
@@ -6412,6 +6726,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     approvedRecommendation: ApprovedRecommendation
   ): ScopedGoal | undefined {
     const workflow = this.ensureWorkflowState(project.record);
+    const recommendation = workflow.recommendations.find((entry) => entry.id === approvedRecommendation.recommendationId);
+    if (recommendation && isPreviewRecommendation(recommendation)) {
+      return sanitizeScopedGoalForSingleAgent(createScopedGoalFromRecommendation(recommendation, workflow.ultimateGoal));
+    }
+
     const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
     const modeConfig = getWorkflowModeConfig(workflow.workflowMode, autopilotPolicy);
     if (!modeConfig.useDeterministicScopingWhenClear) {
@@ -6563,6 +6882,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (!recommendation) {
       throw new Error(`Unknown recommendation: ${recommendationId}`);
     }
+    await this.ensureAgentBackedRuntimeReady(project, "recommendation approval runtime check");
     this.prepareWorkflowForNextRecommendationCycle(project);
     const workflow = this.ensureWorkflowState(project.record);
 
@@ -6665,6 +6985,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       throw new Error("Approve a recommendation before creating a scoped goal.");
     }
 
+    await this.ensureAgentBackedRuntimeReady(project, "goal planning runtime check");
+
     const deterministicScopedGoal = this.createDeterministicScopedGoalForApprovedRecommendation(project, approvedRecommendation);
     if (deterministicScopedGoal) {
       this.recordWorkflowActivity(workflow, {
@@ -6697,11 +7019,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
     this.syncWorkflowState(project);
     await this.persistProjectUpdate(project);
-
-    if (!this.transport || this.codexAvailability.source === "unavailable") {
-      await this.applyFallbackScopedGoal(project, approvedRecommendation, undefined, automate);
-      return project.record.workflow.scopedGoal;
-    }
 
     try {
       await this.createAgent(
@@ -7618,6 +7935,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   async advanceWorkflowStage(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
     const project = this.findProject(projectId);
     this.syncWorkflowState(project);
+    await this.ensureAgentBackedRuntimeReady(project, "workflow advance runtime check");
     if (!this.hasActiveWorkflowAgent(project) && this.requeueStaleRunningWorkflowSteps(project)) {
       this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
         source: "system",
@@ -7733,11 +8051,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     try {
       let project = this.findProject(projectId);
       this.logWorkflowPerf(`workflow recovery entered for ${project.record.identity.projectName}`);
-      if (!this.transport || this.codexAvailability.source === "unavailable") {
-        const transportStartedAt = performance.now();
-        await this.initializeTransport();
-        this.logWorkflowPerf(`app-server/session startup ${Math.round(performance.now() - transportStartedAt)}ms`);
-      }
+      const transportStartedAt = performance.now();
+      await this.ensureAgentBackedRuntimeReady(project, "workflow recovery runtime check");
+      this.logWorkflowPerf(`runtime readiness check ${Math.round(performance.now() - transportStartedAt)}ms`);
 
       project = this.findProject(projectId);
       this.markWorkflowStartupProgress(
@@ -7814,18 +8130,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       persistOnCreate?: boolean;
     }
   ): Promise<AgentState> {
+    const project = this.findProject(projectId);
     const launchThread = options?.launchThread !== false;
     if (launchThread) {
       this.assertGitHubLinked();
-    }
-    if (launchThread && (!this.transport || this.codexAvailability.source === "unavailable")) {
-      await this.initializeTransport();
-    }
-    if (launchThread && (!this.transport || this.codexAvailability.source === "unavailable")) {
-      throw new Error("Codex app-server is unavailable, so agent creation is currently disabled.");
+      await this.ensureAgentBackedRuntimeReady(project, "agent creation runtime check");
     }
 
-    const project = this.findProject(projectId);
     const accessProbe = project.record.validation.projectAccess;
     if (isWriteEnabledAgentCategory(category) && accessProbe?.status === "failed") {
       throw new Error(
@@ -8412,6 +8723,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   async runIntegrity(projectId: string, automate = false): Promise<void> {
     const project = this.findProject(projectId);
+    await this.ensureAgentBackedRuntimeReady(project, "integrity runtime check");
     this.assertResolvedPathCompatible(project.record.distroName);
     const runner = new RuntimeCommandExecutor(this.getRuntimeSettings(project.record.distroName));
     const integrityModel = this.getDefaultAgentModel();
@@ -8838,6 +9150,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     this.workflowMergeInFlight.add(projectId);
     try {
+      const project = this.findProject(projectId);
+      await this.ensureAgentBackedRuntimeReady(project, "merge runtime check");
       await this.runMergeInternal(projectId, automate);
     } finally {
       this.workflowMergeInFlight.delete(projectId);
@@ -9127,6 +9441,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (automate && !normalizedCustomFocus && workflow.recommendations.length > 0 && !workflow.approvedRecommendation) {
       return;
     }
+
+    await this.ensureAgentBackedRuntimeReady(project, "recommendation runtime check");
+
     if (normalizedCustomFocus && !workflow.approvedRecommendation && workflow.recommendations.length > 0) {
       workflow.recommendations = [];
     }
@@ -9173,6 +9490,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.syncWorkflowState(project);
     await this.persistProjectUpdate(project);
 
+    if (previewMode) {
+      await this.applyFallbackRecommendations(project, undefined, automate, normalizedCustomFocus);
+      return;
+    }
+
     const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
     if (
       !previewMode &&
@@ -9196,11 +9518,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
     }
 
-    if (!this.transport || this.codexAvailability.source === "unavailable") {
-      await this.applyFallbackRecommendations(project, undefined, automate, normalizedCustomFocus);
-      return;
-    }
-
     await this.createAgent(
       projectId,
       "recommendation",
@@ -9220,6 +9537,26 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (!bootstrapAgent) {
       return;
     }
+
+    if (!this.canRunAgentBackedActions(project)) {
+      const report = this.buildRuntimeReadinessReport(project);
+      project.record.interfaceCreation ??= createQueuedInterfaceCreationState(
+        bootstrapAgent.model,
+        bootstrapAgent.reasoningEffort,
+        bootstrapAgent.reasoningEffortSource === "manual" ? "user" : "recommended"
+      );
+      project.record.interfaceCreation.status = "queued";
+      project.record.interfaceCreation.phase = "Runtime checks required";
+      project.record.interfaceCreation.message = report.summary;
+      project.record.interfaceCreation.lastError = undefined;
+      bootstrapAgent.status = "idle";
+      bootstrapAgent.currentPhase = "Waiting for runtime readiness checks";
+      await this.saveProject(project);
+      this.emitState();
+      return;
+    }
+
+    await this.ensureAgentBackedRuntimeReady(project, "interface creation runtime check");
 
     const interfaceConfig = this.resolveInterfaceCreationConfig();
     bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
@@ -9272,27 +9609,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.saveProject(project);
     this.emitState();
 
-    if (!this.transport || this.codexAvailability.source === "unavailable") {
-      await this.initializeTransport();
-    }
-
     if (!this.transport || !bootstrapAgent.model || this.availableModels.length === 0 || this.codexAvailability.source === "unavailable") {
-      bootstrapAgent.status = "failed";
-      bootstrapAgent.currentPhase = "Codex unavailable";
-      project.record.overview = buildDeterministicOverview({
-        projectName: project.record.identity.projectName,
-        explanation: project.scan.stats.explanation,
-        entryPoints: project.scan.stats.entryPoints,
-        manifestFiles: project.scan.stats.manifestFiles,
-        primaryManagers: project.scan.stats.primaryManagers
-      });
-      project.record.interfaceCreation.status = "failed";
-      project.record.interfaceCreation.phase = "Codex unavailable";
-      project.record.interfaceCreation.message =
-        "Codex model access is unavailable. The interface is showing deterministic scan data only.";
+      bootstrapAgent.status = "idle";
+      bootstrapAgent.currentPhase = "Waiting for runtime readiness checks";
+      project.record.interfaceCreation.status = "queued";
+      project.record.interfaceCreation.phase = "Runtime checks required";
+      project.record.interfaceCreation.message = this.runtimeReadinessErrorMessage(project);
       project.record.interfaceCreation.lastError = this.codexAvailability.message ?? "Model discovery failed.";
-      project.record.interfaceCreation.completedAt = nowIso();
-      project.record.interfaceCreation.outputSource = "deterministic";
       await this.saveProject(project);
       this.emitState();
       return;

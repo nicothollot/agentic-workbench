@@ -5929,12 +5929,123 @@ describe("AppService workflow performance guards", () => {
     expect(inactiveRecord.workflow.activityLog).toHaveLength(0);
   });
 
+  it("reports runtime readiness as blocked when model discovery is unavailable", async () => {
+    const service = new AppService(await createTempDir("readiness-blocked")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      activeProjectId?: string;
+      settings: { githubAccount?: { username: string; linkedAt: string } };
+      githubStatus: { state: string; username?: string; sshReady: boolean; message: string };
+      codexAvailability: { source: "live" | "mock" | "unavailable"; message?: string };
+      availableModels: DiscoveredModel[];
+      getRendererState: () => { runtimeReadiness: { status: string; blockAgentActions: boolean; summary: string; checks: Array<{ id: string; status: string; message: string; manualCommand?: string }> } };
+    };
+    const project = makeAppServiceLoadedProject("readiness-project");
+    service.projects.set(project.record.id, project);
+    service.activeProjectId = project.record.id;
+    service.settings.githubAccount = { username: "awb-tests", linkedAt: "2026-04-07T00:00:00.000Z" };
+    service.githubStatus = {
+      state: "linked",
+      username: "awb-tests",
+      sshReady: true,
+      message: "GitHub account linked."
+    };
+    service.codexAvailability = {
+      source: "unavailable",
+      message: "Model discovery is not available."
+    };
+    service.availableModels = [];
+
+    const report = service.getRendererState().runtimeReadiness;
+    const codexCheck = report.checks.find((check) => check.id === "codex-model-discovery");
+
+    expect(report.status).toBe("blocked");
+    expect(report.blockAgentActions).toBe(true);
+    expect(report.summary).toContain("Codex model discovery");
+    expect(codexCheck?.status).toBe("failed");
+    expect(codexCheck?.message).toContain("Model discovery is not available");
+    expect(codexCheck?.manualCommand).toContain("codex");
+  });
+
+  it("does not create fallback recommendations when model discovery is unavailable", async () => {
+    const service = new AppService(await createTempDir("recommendation-readiness-blocked")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      activeProjectId?: string;
+      settings: { githubAccount?: { username: string; linkedAt: string } };
+      githubStatus: { state: string; username?: string; sshReady: boolean; message: string };
+      codexAvailability: { source: "live" | "mock" | "unavailable"; message?: string };
+      availableModels: DiscoveredModel[];
+      refreshRuntimeReadiness: () => Promise<unknown>;
+      getRendererState: () => { runtimeReadiness: unknown };
+      runRecommendation: (projectId: string, automate?: boolean, customFocus?: string) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("recommendation-blocked-project");
+    service.projects.set(project.record.id, project);
+    service.activeProjectId = project.record.id;
+    service.settings.githubAccount = { username: "awb-tests", linkedAt: "2026-04-07T00:00:00.000Z" };
+    service.githubStatus = {
+      state: "linked",
+      username: "awb-tests",
+      sshReady: true,
+      message: "GitHub account linked."
+    };
+    service.codexAvailability = {
+      source: "unavailable",
+      message: "Codex app-server and model discovery are unavailable."
+    };
+    service.availableModels = [];
+    service.refreshRuntimeReadiness = async () => service.getRendererState().runtimeReadiness;
+
+    await expect(service.runRecommendation(project.record.id)).rejects.toThrow(/Agent-backed workflow actions are blocked|Codex model discovery/);
+
+    expect(project.record.workflow.recommendations).toHaveLength(0);
+    expect(project.record.workflow.activityLog.some((event) => event.title.includes("Recommendation generation started"))).toBe(false);
+  });
+
+  it("does not create deterministic scoped goals when model discovery is unavailable", async () => {
+    const service = new AppService(await createTempDir("goal-readiness-blocked")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      activeProjectId?: string;
+      settings: { githubAccount?: { username: string; linkedAt: string } };
+      githubStatus: { state: string; username?: string; sshReady: boolean; message: string };
+      codexAvailability: { source: "live" | "mock" | "unavailable"; message?: string };
+      availableModels: DiscoveredModel[];
+      refreshRuntimeReadiness: () => Promise<unknown>;
+      getRendererState: () => { runtimeReadiness: unknown };
+      createScopedGoal: (projectId: string, automate?: boolean) => Promise<unknown>;
+    };
+    const project = makeAppServiceLoadedProject("goal-blocked-project");
+    const recommendation = makeRecommendation();
+    project.record.workflow.recommendations = [recommendation];
+    project.record.workflow.approvedRecommendation = approveRecommendation(recommendation);
+    service.projects.set(project.record.id, project);
+    service.activeProjectId = project.record.id;
+    service.settings.githubAccount = { username: "awb-tests", linkedAt: "2026-04-07T00:00:00.000Z" };
+    service.githubStatus = {
+      state: "linked",
+      username: "awb-tests",
+      sshReady: true,
+      message: "GitHub account linked."
+    };
+    service.codexAvailability = {
+      source: "unavailable",
+      message: "Codex app-server and model discovery are unavailable."
+    };
+    service.availableModels = [];
+    service.refreshRuntimeReadiness = async () => service.getRendererState().runtimeReadiness;
+
+    await expect(service.createScopedGoal(project.record.id)).rejects.toThrow(/Agent-backed workflow actions are blocked|Codex model discovery/);
+
+    expect(project.record.workflow.scopedGoal).toBeUndefined();
+    expect(project.record.workflow.activityLog.some((event) => event.title.includes("Deterministic scoped plan selected"))).toBe(false);
+  });
+
   it("does not await slow project saves when advancing workflow from the UI", async () => {
     const service = new AppService(await createTempDir("advance-nonblocking")) as unknown as {
       projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
       saveProject: () => Promise<void>;
       shouldScheduleWorkflowAutomation: () => boolean;
       scheduleWorkflowAutomation: (projectId: string, reason?: string) => void;
+      ensureAgentBackedRuntimeReady: () => Promise<void>;
       advanceWorkflowStage: (projectId: string) => Promise<string>;
       dispose: (options?: { flush?: boolean }) => Promise<void>;
     };
@@ -5946,6 +6057,7 @@ describe("AppService workflow performance guards", () => {
     service.scheduleWorkflowAutomation = () => {
       automationScheduled = true;
     };
+    service.ensureAgentBackedRuntimeReady = async () => undefined;
     let saveStarted = false;
     service.saveProject = async () => {
       saveStarted = true;

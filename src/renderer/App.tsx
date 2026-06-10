@@ -45,6 +45,7 @@ import type {
   ProjectRepositoryView,
   ProjectWorkflowState,
   RepoTreeNode,
+  RuntimeReadinessReport,
   RuntimeEventRecord,
   SummarySource,
   UserInputRequestQuestion,
@@ -163,6 +164,18 @@ const WORKSPACE_VISUAL_TABS: VisualExportTab[] = [
 ];
 const WORKSPACE_TAB_IDS = new Set<WorkspaceVisualTabId>(WORKSPACE_VISUAL_TABS.map((tab) => tab.id));
 const VISUAL_EXPORT_READY_TIMEOUT_MS = 5_000;
+const AGENT_BACKED_WORKFLOW_COMMANDS = new Set([
+  "run-recommendation",
+  "complete-preview",
+  "continue",
+  "recover",
+  "retry-goal",
+  "approve-recommendation",
+  "create-scoped-goal",
+  "advance-stage",
+  "run-integrity",
+  "run-merge"
+]);
 
 type VisualExportReadiness = {
   activeProjectId?: string;
@@ -370,6 +383,30 @@ const availabilityMessage = (state: WorkbenchState): string => {
   }
 
   return `Codex model access is unavailable. ${availability.message ?? ""}`.trim();
+};
+
+const runtimeReadinessStatusChip = (report: RuntimeReadinessReport): { label: string; tone: StatusChipTone } => {
+  switch (report.status) {
+    case "ready":
+      return { label: "Ready", tone: "success" };
+    case "checking":
+      return { label: "Checking", tone: "running" };
+    case "blocked":
+      return { label: "Blocked", tone: "error" };
+  }
+};
+
+const runtimeDependencyStatusChip = (status: RuntimeReadinessReport["checks"][number]["status"]): { label: string; tone: StatusChipTone } => {
+  switch (status) {
+    case "passed":
+      return { label: "Passed", tone: "success" };
+    case "warning":
+      return { label: "Warning", tone: "warning" };
+    case "checking":
+      return { label: "Checking", tone: "running" };
+    case "failed":
+      return { label: "Failed", tone: "error" };
+  }
 };
 
 const formatDateTime = (value?: string): string => {
@@ -2271,6 +2308,7 @@ const RunsReviewPage = ({
   availableModels,
   modelOptionsByName,
   manualPendingApprovalCount,
+  agentActionsBlocked = false,
   onSelectAgent,
   onWorkflowPageChange,
   onManualPageChange,
@@ -2298,6 +2336,7 @@ const RunsReviewPage = ({
   availableModels: DiscoveredModel[];
   modelOptionsByName: Map<string, DiscoveredModel>;
   manualPendingApprovalCount: number;
+  agentActionsBlocked?: boolean;
   onSelectAgent: (agentId: string) => void;
   onWorkflowPageChange: (pageIndex: number) => void;
   onManualPageChange: (pageIndex: number) => void;
@@ -2412,7 +2451,7 @@ const RunsReviewPage = ({
             value={manualAgentPrompt}
             onChange={(event) => onManualPromptChange(event.target.value)}
           />
-          <select className="input" value={manualAgentModel} onChange={(event) => onManualModelChange(event.target.value)}>
+          <select className="input" value={manualAgentModel} onChange={(event) => onManualModelChange(event.target.value)} disabled={agentActionsBlocked}>
             {availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
           </select>
           <AgentReasoningPicker
@@ -2425,7 +2464,7 @@ const RunsReviewPage = ({
             onEffortChange={onManualReasoningEffortChange}
           />
           <div className="actions-row">
-            <button className="primary-button" disabled={!manualAgentPrompt.trim() || !manualAgentModel} onClick={onCreateManualAgent}>
+            <button className="primary-button" disabled={agentActionsBlocked || !manualAgentPrompt.trim() || !manualAgentModel} onClick={onCreateManualAgent}>
               Run manual agent
             </button>
             <span className="agent-card__subtle">Manual runs stay outside the workflow cycle.</span>
@@ -4594,6 +4633,63 @@ const ModelOptionCard = ({
   </button>
 );
 
+const RuntimeReadinessPanel = ({
+  report,
+  onRunChecks,
+  onOpenSettings,
+  busy = false,
+  compact = false
+}: {
+  report: RuntimeReadinessReport;
+  onRunChecks: () => void;
+  onOpenSettings?: () => void;
+  busy?: boolean;
+  compact?: boolean;
+}) => {
+  const statusChip = runtimeReadinessStatusChip(report);
+  const failedOrCheckingCommands = report.checks
+    .filter((check) => check.manualCommand && (check.status === "failed" || check.status === "checking"))
+    .map((check) => check.manualCommand as string);
+
+  return (
+    <section className={`runtime-readiness-panel ${report.blockAgentActions ? "runtime-readiness-panel--blocked" : "runtime-readiness-panel--ready"} ${compact ? "runtime-readiness-panel--compact" : ""}`}>
+      <div className="candidate-card__title-row">
+        <strong>Runtime readiness</strong>
+        <StatusChip {...statusChip} />
+      </div>
+      <p>{report.summary}</p>
+      {report.checkedAt ? <div className="agent-card__subtle">Last checked {formatDateTime(report.checkedAt)}</div> : null}
+      <div className="runtime-readiness-grid">
+        {report.checks.map((check) => {
+          const checkChip = runtimeDependencyStatusChip(check.status);
+          return (
+            <div key={check.id} className={`runtime-readiness-check runtime-readiness-check--${check.status}`}>
+              <div className="candidate-card__title-row">
+                <strong>{check.label}</strong>
+                <StatusChip {...checkChip} />
+              </div>
+              <p>{check.message}</p>
+              {check.fixInApp && check.status !== "passed" ? <div className="lane-note"><strong>App fix</strong><span>{check.fixInApp}</span></div> : null}
+              {!compact && check.manualCommand && check.status !== "passed" ? (
+                <pre className="runtime-readiness-command"><code>{check.manualCommand}</code></pre>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+      {failedOrCheckingCommands.length > 0 && compact ? (
+        <pre className="runtime-readiness-command runtime-readiness-command--summary"><code>{failedOrCheckingCommands[0]}</code></pre>
+      ) : null}
+      <div className="actions-row">
+        <button className="primary-button" disabled={busy || report.status === "checking"} onClick={onRunChecks}>
+          {busy || report.status === "checking" ? "Checking..." : "Run Readiness Checks"}
+        </button>
+        {onOpenSettings ? <button className="secondary-button" onClick={onOpenSettings}>Open Settings</button> : null}
+      </div>
+    </section>
+  );
+};
+
 const SettingsDialog = ({
   state,
   settingsDraft,
@@ -4603,6 +4699,8 @@ const SettingsDialog = ({
   onClose,
   onOpenDevTools,
   onRefreshGitHubStatus,
+  onCheckRuntimeReadiness,
+  runtimeCheckBusy = false,
   mode = "modal"
 }: {
   state: WorkbenchState;
@@ -4613,6 +4711,8 @@ const SettingsDialog = ({
   onClose: () => void;
   onOpenDevTools: () => void;
   onRefreshGitHubStatus: () => void;
+  onCheckRuntimeReadiness: () => void;
+  runtimeCheckBusy?: boolean;
   mode?: "modal" | "page";
 }) => {
   const selectedModel = state.availableModels.find((model) => model.model === settingsDraft.interfaceCreationModel);
@@ -4636,6 +4736,12 @@ const SettingsDialog = ({
           Tune agent run defaults and open diagnostics only when you need them. Developer Tools no longer open automatically on launch.
         </p>
         <div className="notice">{availabilityMessage(state)}</div>
+        <RuntimeReadinessPanel
+          report={state.runtimeReadiness}
+          onRunChecks={onCheckRuntimeReadiness}
+          busy={runtimeCheckBusy}
+          compact={mode === "modal"}
+        />
         <div className="settings-section">
           <div className="settings-card">
             <div className="settings-section__heading">
@@ -4658,6 +4764,9 @@ const SettingsDialog = ({
             </div>
             <div className="actions-row">
               <button className="secondary-button" onClick={onRefreshGitHubStatus}>Refresh GitHub Status</button>
+              <button className="secondary-button" disabled={runtimeCheckBusy || state.runtimeReadiness.status === "checking"} onClick={onCheckRuntimeReadiness}>
+                {runtimeCheckBusy || state.runtimeReadiness.status === "checking" ? "Checking..." : "Run Readiness Checks"}
+              </button>
             </div>
           </div>
         </div>
@@ -4757,7 +4866,16 @@ const SettingsDialog = ({
                 selected={settingsDraft.interfaceCreationModel === model.model}
                 onSelect={(selectedModelName) => onChange({ interfaceCreationModel: selectedModelName })}
               />
-            )) : <div className="overview-card"><p>No models are currently available.</p></div>}
+            )) : (
+              <div className="overview-card">
+                <p>No models are currently available.</p>
+                <div className="actions-row">
+                  <button className="secondary-button" disabled={runtimeCheckBusy || state.runtimeReadiness.status === "checking"} onClick={onCheckRuntimeReadiness}>
+                    {runtimeCheckBusy || state.runtimeReadiness.status === "checking" ? "Checking..." : "Check Model Discovery"}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
         <div className="settings-section">
@@ -5141,6 +5259,7 @@ export const App = () => {
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [shellLaunchBusy, setShellLaunchBusy] = useState(false);
   const [workflowCommandBusyKey, setWorkflowCommandBusyKey] = useState<string>();
+  const [runtimeCheckBusy, setRuntimeCheckBusy] = useState(false);
   const [overviewRefreshBusy, setOverviewRefreshBusy] = useState(false);
   const [visualExtractBusy, setVisualExtractBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
@@ -5263,8 +5382,15 @@ export const App = () => {
   const launcherActionsLocked = !githubLinked;
   const createWorkspaceLocked = !githubSshReady;
   const activeProjectId = activeProject?.record.id;
-  const workflowCommandBusy = Boolean(activeProjectId && workflowCommandBusyKey?.startsWith(`${activeProjectId}:`));
-  const workflowCommandBusyReason = workflowCommandBusy ? "Workflow command is already running." : undefined;
+  const runtimeReadiness = state?.runtimeReadiness;
+  const agentActionsBlocked = Boolean(runtimeReadiness?.blockAgentActions);
+  const activeWorkflowCommandBusy = Boolean(activeProjectId && workflowCommandBusyKey?.startsWith(`${activeProjectId}:`));
+  const workflowCommandBusy = activeWorkflowCommandBusy || agentActionsBlocked;
+  const workflowCommandBusyReason = activeWorkflowCommandBusy
+    ? "Workflow command is already running."
+    : agentActionsBlocked
+      ? runtimeReadiness?.summary ?? "Runtime checks are required before agent-backed workflow actions can run."
+      : undefined;
   const selectedFileFromState = activeProject?.record.localState.selectedFile;
   const storedTreeFilter = activeProject?.record.localState.treeFilter ?? "";
   const storedActiveAgentId = activeProject?.record.localState.activeAgentId;
@@ -6363,6 +6489,12 @@ export const App = () => {
       return;
     }
 
+    if (state?.runtimeReadiness.blockAgentActions) {
+      setNotice({ message: state.runtimeReadiness.summary, tone: "error" });
+      setWorkspaceTab("settings");
+      return;
+    }
+
     try {
       setNotice(undefined);
       await window.workbench.createAgent(
@@ -6382,6 +6514,12 @@ export const App = () => {
 
   const createManualAgent = async () => {
     if (!activeProject) {
+      return;
+    }
+
+    if (state?.runtimeReadiness.blockAgentActions) {
+      setNotice({ message: state.runtimeReadiness.summary, tone: "error" });
+      setWorkspaceTab("settings");
       return;
     }
 
@@ -6409,6 +6547,12 @@ export const App = () => {
     }
 
     if (workflowCommandBusyRef.current?.startsWith(`${projectId}:`)) {
+      return false;
+    }
+
+    if (AGENT_BACKED_WORKFLOW_COMMANDS.has(command) && state?.runtimeReadiness.blockAgentActions) {
+      setNotice({ message: state.runtimeReadiness.summary, tone: "error" });
+      setWorkspaceTab("settings");
       return false;
     }
 
@@ -6975,6 +7119,22 @@ export const App = () => {
     }
   };
 
+  const checkRuntimeReadiness = async () => {
+    try {
+      setRuntimeCheckBusy(true);
+      setNotice(undefined);
+      const report = await window.workbench.checkRuntimeReadiness();
+      setNotice({
+        message: report.summary,
+        tone: report.blockAgentActions ? "error" : "info"
+      });
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setRuntimeCheckBusy(false);
+    }
+  };
+
   const openDevTools = async () => {
     try {
       const opened = await window.workbench.openDevTools();
@@ -7057,6 +7217,8 @@ export const App = () => {
       onClose={() => setShowSettings(false)}
       onOpenDevTools={() => void openDevTools()}
       onRefreshGitHubStatus={() => void refreshGitHubStatus()}
+      onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
+      runtimeCheckBusy={runtimeCheckBusy}
     />
   ) : null;
 
@@ -7118,6 +7280,15 @@ export const App = () => {
             </div>
           </section>
           {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
+          {state.runtimeReadiness.blockAgentActions ? (
+            <RuntimeReadinessPanel
+              report={state.runtimeReadiness}
+              onRunChecks={() => void checkRuntimeReadiness()}
+              onOpenSettings={() => setShowSettings(true)}
+              busy={runtimeCheckBusy}
+              compact
+            />
+          ) : null}
           {hasCandidates ? (
             <div className="loader-grid">
               {pendingLoad.interfaceCandidates.map((candidate) => (
@@ -7216,6 +7387,15 @@ export const App = () => {
                 <span>{recentProjects.length ? "Ready to reopen in this window" : "No saved workspaces yet"}</span>
               </div>
               <div className="notice">{availabilityMessage(state)}</div>
+              {state.runtimeReadiness.blockAgentActions ? (
+                <RuntimeReadinessPanel
+                  report={state.runtimeReadiness}
+                  onRunChecks={() => void checkRuntimeReadiness()}
+                  onOpenSettings={() => setShowSettings(true)}
+                  busy={runtimeCheckBusy}
+                  compact
+                />
+              ) : null}
             </div>
           </section>
           {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
@@ -7542,6 +7722,14 @@ export const App = () => {
       <ProjectStatusStrip items={projectStatusItems} />
 
       {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
+      {state.runtimeReadiness.blockAgentActions ? (
+        <RuntimeReadinessPanel
+          report={state.runtimeReadiness}
+          onRunChecks={() => void checkRuntimeReadiness()}
+          onOpenSettings={() => void setWorkspaceTab("settings")}
+          busy={runtimeCheckBusy}
+        />
+      ) : null}
       {activeProject.record.validation.projectAccess ? (
         <section
           className={
@@ -8242,7 +8430,7 @@ export const App = () => {
                       value={manualAgentPrompt}
                       onChange={(event) => setManualAgentPrompt(event.target.value)}
                     />
-                    <select className="input" value={manualAgentModel} onChange={(event) => setManualAgentModel(event.target.value)}>
+                    <select className="input" value={manualAgentModel} onChange={(event) => setManualAgentModel(event.target.value)} disabled={agentActionsBlocked}>
                       {state.availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
                     </select>
                     <AgentReasoningPicker
@@ -8255,7 +8443,7 @@ export const App = () => {
                       onEffortChange={setManualAgentReasoningEffort}
                     />
                     <div className="actions-row">
-                      <button className="primary-button" disabled={!manualAgentPrompt.trim() || !manualAgentModel} onClick={() => void createManualAgent()}>
+                      <button className="primary-button" disabled={agentActionsBlocked || !manualAgentPrompt.trim() || !manualAgentModel} onClick={() => void createManualAgent()}>
                         Run manual agent
                       </button>
                       <span className="agent-card__subtle">{manualPendingApprovalCount} manual approvals pending</span>
@@ -8691,7 +8879,7 @@ export const App = () => {
                   <div className="agent-form card-surface">
                     <input className="input" value={codingAgentForm.name} onChange={(event) => setCodingAgentForm({ ...codingAgentForm, name: event.target.value })} />
                     <textarea className="textarea" placeholder="Describe the coding task" value={codingAgentForm.prompt} onChange={(event) => setCodingAgentForm({ ...codingAgentForm, prompt: event.target.value })} />
-                    <select className="input" value={codingAgentForm.model} onChange={(event) => setCodingAgentForm({ ...codingAgentForm, model: event.target.value })}>
+                    <select className="input" value={codingAgentForm.model} onChange={(event) => setCodingAgentForm({ ...codingAgentForm, model: event.target.value })} disabled={agentActionsBlocked}>
                       {state.availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
                     </select>
                     <AgentReasoningPicker
@@ -8703,7 +8891,7 @@ export const App = () => {
                       onModeChange={(reasoningMode) => setCodingAgentForm({ ...codingAgentForm, reasoningMode })}
                       onEffortChange={(reasoningEffort) => setCodingAgentForm({ ...codingAgentForm, reasoningEffort })}
                     />
-                    <button className="primary-button" disabled={!codingAgentForm.prompt.trim() || !codingAgentForm.model} onClick={() => void createCodingAgent()}>
+                    <button className="primary-button" disabled={agentActionsBlocked || !codingAgentForm.prompt.trim() || !codingAgentForm.model} onClick={() => void createCodingAgent()}>
                       Create manual coding agent
                     </button>
                   </div>
@@ -8790,6 +8978,7 @@ export const App = () => {
               availableModels={state.availableModels}
               modelOptionsByName={modelOptionsByName}
               manualPendingApprovalCount={manualPendingApprovalCount}
+              agentActionsBlocked={agentActionsBlocked}
               onSelectAgent={(agentId) => void selectAgent(agentId)}
               onWorkflowPageChange={setWorkflowAgentPageIndex}
               onManualPageChange={setManualAgentPageIndex}
@@ -8819,6 +9008,8 @@ export const App = () => {
             onClose={() => void setWorkspaceTab("overview")}
             onOpenDevTools={() => void openDevTools()}
             onRefreshGitHubStatus={() => void refreshGitHubStatus()}
+            onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
+            runtimeCheckBusy={runtimeCheckBusy}
           />
         ) : null}
       </main>

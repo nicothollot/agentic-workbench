@@ -1825,7 +1825,7 @@ p {
   gap: 10px;
   align-items: center;
   padding: 12px 14px;
-  border-radius: 14px;
+  border-radius: 8px;
   background: rgba(25, 40, 68, 0.06);
   color: var(--accent-strong);
 }
@@ -2180,7 +2180,7 @@ p {
 }
 
 .notice--compact {
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 10px 12px;
   font-size: 0.86rem;
 }
@@ -2206,6 +2206,76 @@ p {
 
 .notice--failed {
   border-color: rgba(160, 68, 62, 0.24);
+}
+
+.runtime-readiness-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid rgba(31, 54, 92, 0.16);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: 0 12px 26px rgba(21, 35, 58, 0.06);
+}
+
+.runtime-readiness-panel--blocked {
+  border-color: rgba(160, 68, 62, 0.24);
+  background: rgba(160, 68, 62, 0.08);
+}
+
+.runtime-readiness-panel--ready {
+  border-color: rgba(63, 106, 77, 0.22);
+  background: rgba(63, 106, 77, 0.07);
+}
+
+.runtime-readiness-panel--compact {
+  box-shadow: none;
+}
+
+.runtime-readiness-panel p,
+.runtime-readiness-check p {
+  margin: 0;
+}
+
+.runtime-readiness-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.runtime-readiness-check {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(31, 54, 92, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.runtime-readiness-check--failed {
+  border-color: rgba(160, 68, 62, 0.24);
+}
+
+.runtime-readiness-check--warning {
+  border-color: rgba(206, 137, 59, 0.26);
+}
+
+.runtime-readiness-command {
+  max-width: 100%;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 8px;
+  background: rgba(7, 24, 45, 0.92);
+  color: #f7f2ea;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.runtime-readiness-command code {
+  color: inherit;
 }
 
 .approval-row,

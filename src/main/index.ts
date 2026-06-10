@@ -351,6 +351,7 @@ const registerIpc = (): void => {
     mainWindow.webContents.openDevTools({ mode: "detach", activate: true });
     return true;
   });
+  ipcMain.handle("app:checkRuntimeReadiness", async () => await appService?.refreshRuntimeReadiness("manual runtime readiness check"));
   ipcMain.handle("project:load", async (_event, payload) => {
     const parsed = projectLoadRequestSchema.parse(payload);
     return await appService?.loadProject(parsed.inputPath, parsed.intent);

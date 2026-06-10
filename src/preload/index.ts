@@ -21,6 +21,7 @@ import type {
   ProjectLoadResult,
   ProjectRepositoryView,
   ProjectWorkflowState,
+  RuntimeReadinessReport,
   UserInputRequestRecord,
   UltimateGoalImportPreview,
   UltimateGoal,
@@ -42,6 +43,7 @@ export interface WorkbenchApi {
   importInterfaceBundle(): Promise<LoadedProjectView | null>;
   showLauncher(): Promise<void>;
   openDevTools(): Promise<boolean>;
+  checkRuntimeReadiness(): Promise<RuntimeReadinessReport>;
   quit(): Promise<void>;
   loadProject(inputPath: string, intent?: "open" | "create"): Promise<ProjectLoadResult>;
   openProject(projectId: string): Promise<LoadedProjectView>;
@@ -169,6 +171,7 @@ const api: WorkbenchApi = {
   importInterfaceBundle: async () => await invoke<LoadedProjectView | null>("app:importInterfaceBundle"),
   showLauncher: async () => await invoke<void>("app:showLauncher"),
   openDevTools: async () => await invoke<boolean>("app:openDevTools"),
+  checkRuntimeReadiness: async () => await invoke<RuntimeReadinessReport>("app:checkRuntimeReadiness"),
   quit: async () => await invoke<void>("app:quit"),
   loadProject: async (inputPath, intent = "open") => await invoke<ProjectLoadResult>("project:load", { inputPath, intent }),
   openProject: async (projectId) => await invoke<LoadedProjectView>("project:open", { projectId }),

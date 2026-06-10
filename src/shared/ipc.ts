@@ -299,6 +299,20 @@ export const rendererStateSchema = z.object({
     generatedProtocolVersion: z.string().optional(),
     protocolCompatibility: z.enum(["compatible", "installed-newer", "installed-older", "unknown"]).optional()
   }).optional(),
+  runtimeReadiness: z.object({
+    status: z.enum(["checking", "ready", "blocked"]),
+    checkedAt: z.string().optional(),
+    summary: z.string(),
+    blockAgentActions: z.boolean(),
+    checks: z.array(z.object({
+      id: z.string().min(1),
+      label: z.string().min(1),
+      status: z.enum(["checking", "passed", "warning", "failed"]),
+      message: z.string(),
+      fixInApp: z.string().optional(),
+      manualCommand: z.string().optional()
+    }))
+  }),
   diagnostics: z.array(z.string()).default([])
 });
 
@@ -310,6 +324,7 @@ export type IpcChannel =
   | "app:importInterfaceBundle"
   | "app:showLauncher"
   | "app:openDevTools"
+  | "app:checkRuntimeReadiness"
   | "app:quit"
   | "settings:get"
   | "settings:update"
