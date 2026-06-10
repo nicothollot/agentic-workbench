@@ -240,7 +240,28 @@ export const projectStatsSchema = z.object({
   manifestFiles: z.array(z.string()),
   testsPresent: z.boolean(),
   primaryManagers: z.array(z.string()),
-  explanation: z.string()
+  explanation: z.string(),
+  truncated: z.boolean().optional(),
+  truncationReason: z.string().optional(),
+  truncationReasons: z.array(z.enum([
+    "included_file_limit",
+    "included_directory_limit",
+    "depth_limit",
+    "scan_duration_limit",
+    "manifest_file_size",
+    "excluded_path_record_limit"
+  ])).optional(),
+  includedFileLimit: z.number().int().positive().optional(),
+  includedDirectoryLimit: z.number().int().positive().optional(),
+  maxDepth: z.number().int().positive().optional(),
+  maxScanDurationMs: z.number().int().positive().optional(),
+  maxManifestFileSizeBytes: z.number().int().positive().optional(),
+  excludedPathLimit: z.number().int().positive().optional(),
+  excludedPathRecordsTruncated: z.boolean().optional(),
+  omittedFilesEstimate: z.number().int().nonnegative().optional(),
+  omittedDirectoriesEstimate: z.number().int().nonnegative().optional(),
+  skippedManifestFiles: z.number().int().nonnegative().optional(),
+  scanDurationMs: z.number().nonnegative().optional()
 });
 
 export const repoTreeNodeSchema: z.ZodType<{

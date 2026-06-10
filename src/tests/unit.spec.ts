@@ -142,6 +142,7 @@ import {
   pruneWorkflowContextDescriptors,
   selectRelevantWorkflowContext
 } from "@runtime/contextSelector";
+import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows } from "@renderer/repositoryTree";
 import { buildDiscoveredModels } from "@runtime/modelCatalog";
 import type { Model } from "@generated/app-server/v2";
 
@@ -676,6 +677,112 @@ describe("repo stats", () => {
     expect(scan.files.some((file) => file.relativePath.startsWith("node_modules/"))).toBe(false);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === "node_modules" && entry.rule === "default")).toBe(true);
     expect(scan.stats.entryPoints).toContain("src/index.ts");
+  });
+
+  it("caps large scans and records truncation metadata", async () => {
+    const root = await createTempDir("scan-large-cap");
+    await mkdir(path.join(root, "src"), { recursive: true });
+    for (let index = 0; index < 20; index += 1) {
+      await writeFile(path.join(root, "src", `file-${index}.ts`), `export const value${index} = ${index};\n`);
+    }
+
+    const scan = await scanRepository(root, {
+      isGit: false,
+      normalizedRemotes: []
+    }, root, {
+      maxIncludedFiles: 5,
+      maxIncludedDirectories: 20,
+      maxDepth: 10,
+      maxScanDurationMs: 10_000
+    });
+
+    expect(scan.files).toHaveLength(5);
+    expect(scan.stats.truncated).toBe(true);
+    expect(scan.stats.truncationReasons).toContain("included_file_limit");
+    expect(scan.stats.includedFileLimit).toBe(5);
+    expect(scan.stats.totalFiles).toBeGreaterThan(scan.stats.includedFiles);
+    expect(scan.stats.omittedFilesEstimate).toBeGreaterThan(0);
+  });
+
+  it("ignores common generated and cache directories by default", async () => {
+    const root = await createTempDir("scan-expanded-ignores");
+    const ignoredDirectories = [".gradle", ".idea", ".vscode", ".yarn", ".pnpm-store", ".pytest_cache", ".mypy_cache", ".ruff_cache", "vendor", "Pods", "DerivedData", ".terraform"];
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src/index.ts"), "export const value = 1;\n");
+    for (const directory of ignoredDirectories) {
+      await mkdir(path.join(root, directory), { recursive: true });
+      await writeFile(path.join(root, directory, "generated.txt"), "generated\n");
+    }
+
+    const scan = await scanRepository(root, {
+      isGit: false,
+      normalizedRemotes: []
+    }, root);
+
+    for (const directory of ignoredDirectories) {
+      expect(scan.files.some((file) => file.relativePath.startsWith(`${directory}/`))).toBe(false);
+      expect(scan.stats.excludedPaths.some((entry) => entry.path === directory && entry.rule === "default")).toBe(true);
+    }
+    expect(scan.stats.entryPoints).toContain("src/index.ts");
+  });
+
+  it("skips dependency parsing for oversized manifests", async () => {
+    const root = await createTempDir("scan-huge-manifest");
+    await writeFile(path.join(root, "package.json"), "{".repeat(128));
+
+    const scan = await scanRepository(root, {
+      isGit: false,
+      normalizedRemotes: []
+    }, root, {
+      maxManifestFileSizeBytes: 16
+    });
+
+    expect(scan.stats.manifestFiles).toContain("package.json");
+    expect(scan.dependencies).toHaveLength(0);
+    expect(scan.stats.skippedManifestFiles).toBe(1);
+    expect(scan.stats.truncationReasons).toContain("manifest_file_size");
+  });
+});
+
+describe("repository tree rows", () => {
+  it("builds rows only from loaded and expanded repository pages", () => {
+    const childrenByParent = {
+      [REPOSITORY_ROOT_PARENT]: {
+        projectId: "project",
+        parentPath: REPOSITORY_ROOT_PARENT,
+        limit: 2,
+        total: 2,
+        children: [
+          { path: "src", name: "src", type: "directory" as const, childCount: 3 },
+          { path: "README.md", name: "README.md", type: "file" as const, size: 200, language: "Markdown" }
+        ],
+        truncated: false
+      },
+      src: {
+        projectId: "project",
+        parentPath: "src",
+        limit: 3,
+        total: 3,
+        children: [
+          { path: "src/a.ts", name: "a.ts", type: "file" as const, size: 10, language: "TypeScript" },
+          { path: "src/b.ts", name: "b.ts", type: "file" as const, size: 10, language: "TypeScript" },
+          { path: "src/c.ts", name: "c.ts", type: "file" as const, size: 10, language: "TypeScript" }
+        ],
+        truncated: false
+      }
+    };
+
+    expect(buildRepositoryTreeRows({ childrenByParent, expandedPaths: [] }).map((row) => row.path)).toEqual([
+      "src",
+      "README.md"
+    ]);
+    expect(buildRepositoryTreeRows({ childrenByParent, expandedPaths: ["src"] }).map((row) => row.path)).toEqual([
+      "src",
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+      "README.md"
+    ]);
   });
 });
 

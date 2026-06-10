@@ -824,6 +824,20 @@ export interface ProjectStats {
   testsPresent: boolean;
   primaryManagers: string[];
   explanation: string;
+  truncated?: boolean;
+  truncationReason?: string;
+  truncationReasons?: Array<"included_file_limit" | "included_directory_limit" | "depth_limit" | "scan_duration_limit" | "manifest_file_size" | "excluded_path_record_limit">;
+  includedFileLimit?: number;
+  includedDirectoryLimit?: number;
+  maxDepth?: number;
+  maxScanDurationMs?: number;
+  maxManifestFileSizeBytes?: number;
+  excludedPathLimit?: number;
+  excludedPathRecordsTruncated?: boolean;
+  omittedFilesEstimate?: number;
+  omittedDirectoriesEstimate?: number;
+  skippedManifestFiles?: number;
+  scanDurationMs?: number;
 }
 
 export interface DependencyRecord {
@@ -840,8 +854,11 @@ export interface RepoTreeNode {
   type: "file" | "directory";
   size?: number;
   language?: string;
+  childCount?: number;
   children?: RepoTreeNode[];
 }
+
+export type RepositoryTreeEntry = Omit<RepoTreeNode, "children">;
 
 export interface FileSummary {
   relativePath: string;
@@ -1220,6 +1237,45 @@ export interface ProjectRepositoryView {
   tree: RepoTreeNode[];
   dependencies: DependencyRecord[];
   summaryCache: FileSummary[];
+  treeTruncated?: boolean;
+  dependencyTotal?: number;
+  summaryCacheTotal?: number;
+}
+
+export interface RepositoryChildrenResponse {
+  projectId: string;
+  parentPath: string;
+  cursor?: string;
+  nextCursor?: string;
+  limit: number;
+  total: number;
+  children: RepositoryTreeEntry[];
+  truncated: boolean;
+  scanTruncated?: boolean;
+  scanTruncationReason?: string;
+}
+
+export interface RepositorySearchResponse {
+  projectId: string;
+  query: string;
+  limit: number;
+  total: number;
+  results: RepositoryTreeEntry[];
+  truncated: boolean;
+  scanTruncated?: boolean;
+  scanTruncationReason?: string;
+}
+
+export interface ProjectRepositorySummary {
+  projectId: string;
+  stats?: ProjectStats;
+  dependencies: DependencyRecord[];
+  dependencyTotal: number;
+  summaryCache: FileSummary[];
+  summaryCacheTotal: number;
+  rootChildren: RepositoryChildrenResponse;
+  scanTruncated?: boolean;
+  scanTruncationReason?: string;
 }
 
 export interface OpenProjectShellResult {

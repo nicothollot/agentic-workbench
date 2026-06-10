@@ -1,11 +1,11 @@
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import path from "node:path";
 import { setImmediate as yieldImmediate } from "node:timers/promises";
 import ignore from "ignore";
 import { DEFAULT_IGNORES } from "@shared/constants";
 import type { DependencyRecord, ProjectKind, ProjectStats, RepoTreeNode } from "@shared/types";
-import { stableStringify } from "@shared/utils";
-import { sha256 } from "./hashUtils";
 import { detectPrimaryManagers, parseManifestFile } from "./manifestParser";
 
 export interface GitMetadata {
@@ -37,8 +37,28 @@ export interface RepoScanResult {
 }
 
 type ExclusionRule = "default" | "gitignore";
+type ScanTruncationReason = NonNullable<ProjectStats["truncationReasons"]>[number];
+
+export interface RepositoryScanLimits {
+  maxIncludedFiles: number;
+  maxIncludedDirectories: number;
+  maxDepth: number;
+  maxManifestFileSizeBytes: number;
+  maxScanDurationMs: number;
+  maxExcludedPathRecords: number;
+}
+
+export const DEFAULT_REPOSITORY_SCAN_LIMITS: RepositoryScanLimits = {
+  maxIncludedFiles: 12_000,
+  maxIncludedDirectories: 6_000,
+  maxDepth: 32,
+  maxManifestFileSizeBytes: 1_000_000,
+  maxScanDurationMs: 10_000,
+  maxExcludedPathRecords: 500
+};
 
 const SCAN_EVENT_LOOP_YIELD_INTERVAL = 100;
+const debugRepoScanPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
 
 const isSkippableScanError = (error: unknown): boolean => {
   const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
@@ -257,25 +277,34 @@ const findEntryPoints = (files: ScannedFile[]): string[] =>
     .slice(0, 12);
 
 const toTree = (files: ScannedFile[]): RepoTreeNode[] => {
-  const root: RepoTreeNode[] = [];
+  type IndexedRepoTreeNode = Omit<RepoTreeNode, "children"> & {
+    children?: IndexedRepoTreeNode[];
+    childIndex?: Map<string, IndexedRepoTreeNode>;
+  };
+  const root: IndexedRepoTreeNode[] = [];
+  const rootIndex = new Map<string, IndexedRepoTreeNode>();
 
   for (const file of files) {
     const parts = file.relativePath.split("/");
     let currentChildren = root;
+    let currentIndex = rootIndex;
     let currentPath = "";
 
     parts.forEach((part, index) => {
       currentPath = currentPath ? `${currentPath}/${part}` : part;
       const isLeaf = index === parts.length - 1;
-      let node = currentChildren.find((entry) => entry.name === part && entry.type === (isLeaf ? "file" : "directory"));
+      const nodeKey = `${isLeaf ? "file" : "directory"}:${part}`;
+      let node = currentIndex.get(nodeKey);
       if (!node) {
         node = {
           path: currentPath,
           name: part,
           type: isLeaf ? "file" : "directory",
-          children: isLeaf ? undefined : []
+          children: isLeaf ? undefined : [],
+          childIndex: isLeaf ? undefined : new Map<string, IndexedRepoTreeNode>()
         };
         currentChildren.push(node);
+        currentIndex.set(nodeKey, node);
       }
 
       if (isLeaf) {
@@ -286,13 +315,19 @@ const toTree = (files: ScannedFile[]): RepoTreeNode[] => {
 
       node.children ??= [];
       currentChildren = node.children;
+      node.childIndex ??= new Map<string, IndexedRepoTreeNode>();
+      currentIndex = node.childIndex;
     });
   }
 
-  const sortNodes = (nodes: RepoTreeNode[]): RepoTreeNode[] =>
+  const sortNodes = (nodes: IndexedRepoTreeNode[]): RepoTreeNode[] =>
     nodes
       .map((node) => ({
-        ...node,
+        path: node.path,
+        name: node.name,
+        type: node.type,
+        size: node.size,
+        language: node.language,
         children: node.children ? sortNodes(node.children) : undefined
       }))
       .sort((left, right) =>
@@ -302,32 +337,115 @@ const toTree = (files: ScannedFile[]): RepoTreeNode[] => {
   return sortNodes(root);
 };
 
+const mergeScanLimits = (limits: Partial<RepositoryScanLimits> = {}): RepositoryScanLimits => ({
+  maxIncludedFiles: Math.max(1, Math.floor(limits.maxIncludedFiles ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxIncludedFiles)),
+  maxIncludedDirectories: Math.max(1, Math.floor(limits.maxIncludedDirectories ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxIncludedDirectories)),
+  maxDepth: Math.max(1, Math.floor(limits.maxDepth ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxDepth)),
+  maxManifestFileSizeBytes: Math.max(1, Math.floor(limits.maxManifestFileSizeBytes ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes)),
+  maxScanDurationMs: Math.max(1, Math.floor(limits.maxScanDurationMs ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxScanDurationMs)),
+  maxExcludedPathRecords: Math.max(1, Math.floor(limits.maxExcludedPathRecords ?? DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords))
+});
+
+const truncationReasonLabels: Record<ScanTruncationReason, string> = {
+  included_file_limit: "included file limit reached",
+  included_directory_limit: "included directory limit reached",
+  depth_limit: "maximum scan depth reached",
+  scan_duration_limit: "scan duration limit reached",
+  manifest_file_size: "oversized manifest file skipped",
+  excluded_path_record_limit: "excluded path record limit reached"
+};
+
+const summarizeTruncationReasons = (reasons: ScanTruncationReason[]): string | undefined =>
+  reasons.length ? reasons.map((reason) => truncationReasonLabels[reason]).join("; ") : undefined;
+
+const hashScannedFiles = (files: ScannedFile[]): string => {
+  const hash = createHash("sha256");
+  for (const file of [...files].sort((left, right) => left.relativePath.localeCompare(right.relativePath))) {
+    hash.update(file.relativePath);
+    hash.update("\0");
+    hash.update(String(file.size));
+    hash.update("\0");
+    hash.update(file.language);
+    hash.update("\n");
+  }
+  return hash.digest("hex");
+};
+
+const hashDependencies = (dependencies: DependencyRecord[]): string => {
+  const hash = createHash("sha256");
+  for (const dependency of [...dependencies].sort((left, right) =>
+    `${left.manifest}:${left.ecosystem}:${left.name}:${left.version}:${left.dev ? "1" : "0"}`
+      .localeCompare(`${right.manifest}:${right.ecosystem}:${right.name}:${right.version}:${right.dev ? "1" : "0"}`)
+  )) {
+    hash.update(dependency.manifest);
+    hash.update("\0");
+    hash.update(dependency.ecosystem);
+    hash.update("\0");
+    hash.update(dependency.name);
+    hash.update("\0");
+    hash.update(dependency.version);
+    hash.update("\0");
+    hash.update(dependency.dev ? "1" : "0");
+    hash.update("\n");
+  }
+  return hash.digest("hex");
+};
+
 export const scanRepository = async (
   projectRootHostPath: string,
   gitMetadata: GitMetadata,
-  executionProjectRoot = projectRootHostPath
+  executionProjectRoot = projectRootHostPath,
+  scanLimits: Partial<RepositoryScanLimits> = {}
 ): Promise<RepoScanResult> => {
+  const limits = mergeScanLimits(scanLimits);
+  const scanStartedAt = performance.now();
   const matcher = await buildIgnoreMatcher(projectRootHostPath);
   const files: ScannedFile[] = [];
   const folders = new Set<string>();
   const manifestFiles = new Set<string>();
   const dependencies: DependencyRecord[] = [];
   const excludedPaths: ProjectStats["excludedPaths"] = [];
+  const truncationReasons = new Set<ScanTruncationReason>();
   const languageBreakdown: Record<string, number> = {};
   const fileTypeBreakdown: Record<string, number> = {};
   let includedSizeBytes = 0;
   let excludedFiles = 0;
   let excludedFolders = 0;
   let excludedSizeBytes = 0;
+  let omittedFilesEstimate = 0;
+  let omittedDirectoriesEstimate = 0;
+  let skippedManifestFiles = 0;
+  let excludedPathRecordsTruncated = false;
   let scannedEntriesSinceYield = 0;
+  let stopScan = false;
+
+  const markTruncated = (
+    reason: ScanTruncationReason,
+    estimates: { files?: number; directories?: number } = {}
+  ): void => {
+    truncationReasons.add(reason);
+    omittedFilesEstimate += estimates.files ?? 0;
+    omittedDirectoriesEstimate += estimates.directories ?? 0;
+  };
+
+  const hasExceededScanDuration = (): boolean => {
+    if (performance.now() - scanStartedAt <= limits.maxScanDurationMs) {
+      return false;
+    }
+    markTruncated("scan_duration_limit");
+    stopScan = true;
+    return true;
+  };
 
   const yieldDuringLargeScan = async (): Promise<void> => {
     scannedEntriesSinceYield += 1;
     if (scannedEntriesSinceYield < SCAN_EVENT_LOOP_YIELD_INTERVAL) {
+      hasExceededScanDuration();
       return;
     }
     scannedEntriesSinceYield = 0;
     await yieldImmediate();
+    hasExceededScanDuration();
   };
 
   const summarizeExcludedPath = async (absolutePath: string): Promise<{ fileCount: number; folderCount: number; totalSizeBytes: number }> => {
@@ -374,7 +492,25 @@ export const scanRepository = async (
     };
   };
 
-  const walk = async (currentDir: string): Promise<void> => {
+  const recordExcludedPath = (entry: {
+    path: string;
+    kind: "directory" | "file";
+    rule: ExclusionRule;
+    fileCount: number;
+    totalSizeBytes: number;
+  }): void => {
+    if (excludedPaths.length < limits.maxExcludedPathRecords) {
+      excludedPaths.push(entry);
+      return;
+    }
+    excludedPathRecordsTruncated = true;
+    truncationReasons.add("excluded_path_record_limit");
+  };
+
+  const walk = async (currentDir: string, depth: number): Promise<void> => {
+    if (stopScan || hasExceededScanDuration()) {
+      return;
+    }
     let entries;
     try {
       entries = await readdir(currentDir, { withFileTypes: true });
@@ -384,11 +520,27 @@ export const scanRepository = async (
       }
       throw error;
     }
-    for (const entry of entries) {
+    for (let index = 0; index < entries.length; index += 1) {
+      if (stopScan) {
+        return;
+      }
+      const entry = entries[index];
       await yieldDuringLargeScan();
+      if (stopScan) {
+        return;
+      }
       const absolutePath = path.join(currentDir, entry.name);
       const relativePath = path.relative(projectRootHostPath, absolutePath).split(path.sep).join("/");
       if (!relativePath) {
+        continue;
+      }
+
+      const entryDepth = depth + 1;
+      if (entryDepth > limits.maxDepth) {
+        markTruncated("depth_limit", {
+          files: entry.isFile() ? 1 : 0,
+          directories: entry.isDirectory() ? 1 : 0
+        });
         continue;
       }
 
@@ -398,7 +550,7 @@ export const scanRepository = async (
         excludedFiles += summary.fileCount;
         excludedFolders += summary.folderCount;
         excludedSizeBytes += summary.totalSizeBytes;
-        excludedPaths.push({
+        recordExcludedPath({
           path: relativePath,
           kind: entry.isDirectory() ? "directory" : "file",
           rule: exclusionRule,
@@ -409,13 +561,23 @@ export const scanRepository = async (
       }
 
       if (entry.isDirectory()) {
+        if (folders.size >= limits.maxIncludedDirectories) {
+          markTruncated("included_directory_limit", { directories: 1 });
+          continue;
+        }
         folders.add(relativePath);
-        await walk(absolutePath);
+        await walk(absolutePath, entryDepth);
         continue;
       }
 
       if (!entry.isFile()) {
         continue;
+      }
+
+      if (files.length >= limits.maxIncludedFiles) {
+        markTruncated("included_file_limit", { files: Math.max(1, entries.length - index) });
+        stopScan = true;
+        return;
       }
 
       let fileStats;
@@ -441,17 +603,24 @@ export const scanRepository = async (
       const baseName = path.basename(relativePath);
       if (manifestCandidates.has(baseName)) {
         manifestFiles.add(relativePath);
+        if (fileStats.size > limits.maxManifestFileSizeBytes) {
+          skippedManifestFiles += 1;
+          markTruncated("manifest_file_size");
+          continue;
+        }
         dependencies.push(...(await parseManifestFile(projectRootHostPath, relativePath)));
       }
     }
   };
 
-  await walk(projectRootHostPath);
+  await walk(projectRootHostPath, 0);
 
   const entryPoints = findEntryPoints(files);
-  const totalFiles = files.length + excludedFiles;
-  const totalFolders = folders.size + excludedFolders;
+  const totalFiles = files.length + excludedFiles + omittedFilesEstimate;
+  const totalFolders = folders.size + excludedFolders + omittedDirectoriesEstimate;
   const totalSizeBytes = includedSizeBytes + excludedSizeBytes;
+  const scanDurationMs = performance.now() - scanStartedAt;
+  const sortedTruncationReasons = [...truncationReasons].sort();
   const stats: ProjectStats = {
     projectRoot: executionProjectRoot,
     kind: gitMetadata.isGit ? "git" : "folder",
@@ -473,19 +642,41 @@ export const scanRepository = async (
     manifestFiles: [...manifestFiles].sort(),
     testsPresent: files.some((file) => /(^|\/)(test|tests|__tests__)\//.test(file.relativePath) || /\.(test|spec)\./.test(file.relativePath)),
     primaryManagers: detectPrimaryManagers([...manifestFiles]),
-    explanation: summarizeProjectPurpose([...manifestFiles], entryPoints, languageBreakdown)
+    explanation: summarizeProjectPurpose([...manifestFiles], entryPoints, languageBreakdown),
+    truncated: sortedTruncationReasons.length > 0,
+    truncationReasons: sortedTruncationReasons,
+    truncationReason: summarizeTruncationReasons(sortedTruncationReasons),
+    includedFileLimit: limits.maxIncludedFiles,
+    includedDirectoryLimit: limits.maxIncludedDirectories,
+    maxDepth: limits.maxDepth,
+    maxScanDurationMs: limits.maxScanDurationMs,
+    maxManifestFileSizeBytes: limits.maxManifestFileSizeBytes,
+    excludedPathLimit: limits.maxExcludedPathRecords,
+    excludedPathRecordsTruncated,
+    omittedFilesEstimate,
+    omittedDirectoriesEstimate,
+    skippedManifestFiles,
+    scanDurationMs
   };
 
-  const treeHash = sha256(stableStringify(files.map((file) => [file.relativePath, file.size])));
-  const manifestHash = sha256(stableStringify(dependencies));
+  const sortedDependencies = dependencies.sort((left, right) => `${left.manifest}:${left.name}`.localeCompare(`${right.manifest}:${right.name}`));
+  const tree = toTree(files);
+
+  if (debugRepoScanPerf) {
+    console.info(
+      `[repo-scan-perf] scan ${projectRootHostPath}: ${Math.round(scanDurationMs)}ms, ` +
+      `files=${files.length}, directories=${folders.size}, excludedPaths=${excludedPaths.length}, ` +
+      `excludedFiles=${excludedFiles}, truncated=${stats.truncated ? stats.truncationReason : "false"}`
+    );
+  }
 
   return {
     kind: gitMetadata.isGit ? "git" : "folder",
-    tree: toTree(files),
+    tree,
     files,
     stats,
-    dependencies: dependencies.sort((left, right) => `${left.manifest}:${left.name}`.localeCompare(`${right.manifest}:${right.name}`)),
-    manifestHash,
-    treeHash
+    dependencies: sortedDependencies,
+    manifestHash: hashDependencies(sortedDependencies),
+    treeHash: hashScannedFiles(files)
   };
 };

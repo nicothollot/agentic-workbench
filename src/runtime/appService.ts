@@ -53,8 +53,12 @@ import type {
   ProjectAccessProbe,
   ProjectLogFeedResponse,
   ProjectRepositoryView,
+  ProjectRepositorySummary,
   ProjectWorkflowState,
   ProjectLoadResult,
+  RepositoryChildrenResponse,
+  RepositorySearchResponse,
+  RepositoryTreeEntry,
   RepoTreeNode,
   RuntimeDependencyCheck,
   RuntimeReadinessReport,
@@ -236,6 +240,13 @@ const RENDERER_COMMAND_OUTPUT_LIMIT = 6_000;
 const RENDERER_RAW_EVENT_LIMIT = 4_000;
 const RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT = 32;
 const RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT = 8;
+const RENDERER_REPOSITORY_DEPENDENCY_LIMIT = 80;
+const RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT = 80;
+const REPOSITORY_CHILDREN_DEFAULT_LIMIT = 120;
+const REPOSITORY_CHILDREN_MAX_LIMIT = 500;
+const REPOSITORY_SEARCH_DEFAULT_LIMIT = 120;
+const REPOSITORY_SEARCH_MAX_LIMIT = 500;
+const REPOSITORY_PAYLOAD_WARNING_BYTES = 750_000;
 const STATE_EMIT_THROTTLE_MS = 350;
 const LIVE_PROJECT_SAVE_THROTTLE_MS = 3_000;
 const LIVE_DELTA_REDUCE_THROTTLE_MS = 1_500;
@@ -309,7 +320,8 @@ const compactRepoTreePreview = (nodes: RepoTreeNode[]): RepoTreeNode[] => {
       name: node.name,
       type: node.type,
       size: node.size,
-      language: node.language
+      language: node.language,
+      childCount: node.type === "directory" ? node.children?.length ?? node.childCount : undefined
     };
     if (node.type === "directory" && node.children && depth === 0) {
       preview.children = node.children
@@ -323,6 +335,28 @@ const compactRepoTreePreview = (nodes: RepoTreeNode[]): RepoTreeNode[] => {
     .slice(0, RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT)
     .map((node) => compactNode(node, 0));
 };
+
+const countRepoTreeNodes = (nodes: RepoTreeNode[]): number => {
+  let count = 0;
+  const stack = [...nodes];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node) {
+      continue;
+    }
+    count += 1;
+    if (node.children?.length) {
+      stack.push(...node.children);
+    }
+  }
+  return count;
+};
+
+const isRepoTreePreviewTruncated = (nodes: RepoTreeNode[]): boolean =>
+  nodes.length > RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT ||
+  nodes
+    .slice(0, RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT)
+    .some((node) => node.type === "directory" && (node.children?.length ?? 0) > RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT);
 
 interface AgentCredentialCapture {
   providerName: string;
@@ -3479,8 +3513,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     return {
       ...record,
-      dependencies: record.dependencies.slice(0, 80),
-      summaryCache: record.summaryCache.slice(0, 80),
+      dependencies: record.dependencies.slice(0, RENDERER_REPOSITORY_DEPENDENCY_LIMIT),
+      summaryCache: record.summaryCache.slice(0, RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT),
       agents: previewAgents.map((agent) => this.compactRendererAgent(agent, {
         summaryOnly: !previewAgentIds.has(agent.id)
       })),
@@ -4143,14 +4177,203 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     project.gitMetadata = scannedProject.gitMetadata;
   }
 
+  private normalizeRepositoryRelativePath(input: string): string {
+    const trimmed = input.trim().replace(/\\/g, "/");
+    if (!trimmed) {
+      return "";
+    }
+    const normalized = path.posix.normalize(trimmed);
+    if (normalized === ".") {
+      return "";
+    }
+    if (path.posix.isAbsolute(normalized) || normalized === ".." || normalized.startsWith("../")) {
+      throw new Error("Repository path must stay inside the project.");
+    }
+    return normalized;
+  }
+
+  private repositoryPageOffset(cursor?: string): number {
+    if (!cursor) {
+      return 0;
+    }
+    const offset = Number.parseInt(cursor, 10);
+    return Number.isFinite(offset) && offset > 0 ? offset : 0;
+  }
+
+  private capRepositoryLimit(limit: number | undefined, fallback: number, max: number): number {
+    return Math.max(1, Math.min(max, Math.floor(limit ?? fallback)));
+  }
+
+  private sortRepositoryEntries(entries: RepositoryTreeEntry[]): RepositoryTreeEntry[] {
+    return entries.sort((left, right) =>
+      left.type === right.type ? left.name.localeCompare(right.name) : left.type === "directory" ? -1 : 1
+    );
+  }
+
+  private logRepositoryPayload(apiName: string, payload: unknown, details: string): void {
+    if (!this.debugWorkflowPerf) {
+      return;
+    }
+    let payloadSize = 0;
+    try {
+      payloadSize = JSON.stringify(payload).length;
+    } catch {
+      payloadSize = -1;
+    }
+    const warning = payloadSize > REPOSITORY_PAYLOAD_WARNING_BYTES ? " WARNING payload exceeds repository threshold" : "";
+    this.logWorkflowPerf(`repo ${apiName}: payload ${payloadSize} bytes, ${details}${warning}`);
+  }
+
   getRepositoryView(projectId: string): ProjectRepositoryView {
     const project = this.findProject(projectId);
-    return {
+    const tree = compactRepoTreePreview(project.tree);
+    const view: ProjectRepositoryView = {
       projectId,
-      tree: project.tree,
-      dependencies: project.record.dependencies,
-      summaryCache: project.record.summaryCache
+      tree,
+      dependencies: project.record.dependencies.slice(0, RENDERER_REPOSITORY_DEPENDENCY_LIMIT),
+      summaryCache: project.record.summaryCache.slice(0, RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT),
+      treeTruncated: isRepoTreePreviewTruncated(project.tree) || Boolean(project.record.stats?.truncated),
+      dependencyTotal: project.record.dependencies.length,
+      summaryCacheTotal: project.record.summaryCache.length
     };
+    this.logRepositoryPayload("getRepositoryView", view, `treeNodes=${countRepoTreeNodes(tree)}`);
+    return view;
+  }
+
+  getRepositorySummary(projectId: string): ProjectRepositorySummary {
+    const project = this.findProject(projectId);
+    const rootChildren = this.listRepositoryChildren(projectId, "", { limit: REPOSITORY_CHILDREN_DEFAULT_LIMIT });
+    const summary: ProjectRepositorySummary = {
+      projectId,
+      stats: project.record.stats,
+      dependencies: project.record.dependencies.slice(0, RENDERER_REPOSITORY_DEPENDENCY_LIMIT),
+      dependencyTotal: project.record.dependencies.length,
+      summaryCache: project.record.summaryCache.slice(0, RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT),
+      summaryCacheTotal: project.record.summaryCache.length,
+      rootChildren,
+      scanTruncated: project.record.stats?.truncated,
+      scanTruncationReason: project.record.stats?.truncationReason
+    };
+    this.logRepositoryPayload(
+      "getRepositorySummary",
+      summary,
+      `rootChildren=${rootChildren.children.length}, dependencies=${summary.dependencies.length}, summaries=${summary.summaryCache.length}`
+    );
+    return summary;
+  }
+
+  listRepositoryChildren(
+    projectId: string,
+    parentPath = "",
+    options: { cursor?: string; limit?: number } = {}
+  ): RepositoryChildrenResponse {
+    const project = this.findProject(projectId);
+    const safeParentPath = this.normalizeRepositoryRelativePath(parentPath);
+    const prefix = safeParentPath ? `${safeParentPath}/` : "";
+    const childEntries = new Map<string, { entry: RepositoryTreeEntry; childNames: Set<string> }>();
+
+    for (const file of project.scan.files) {
+      if (safeParentPath && !file.relativePath.startsWith(prefix)) {
+        continue;
+      }
+      const remainder = safeParentPath ? file.relativePath.slice(prefix.length) : file.relativePath;
+      if (!remainder) {
+        continue;
+      }
+      const parts = remainder.split("/");
+      const childName = parts[0];
+      if (!childName) {
+        continue;
+      }
+      const childPath = safeParentPath ? `${safeParentPath}/${childName}` : childName;
+      const isDirectFile = parts.length === 1;
+      let bucket = childEntries.get(childPath);
+      if (!bucket) {
+        bucket = {
+          entry: {
+            path: childPath,
+            name: childName,
+            type: isDirectFile ? "file" : "directory"
+          },
+          childNames: new Set<string>()
+        };
+        childEntries.set(childPath, bucket);
+      }
+
+      if (isDirectFile) {
+        bucket.entry.size = file.size;
+        bucket.entry.language = file.language;
+        continue;
+      }
+
+      bucket.entry.type = "directory";
+      bucket.entry.size = undefined;
+      bucket.entry.language = undefined;
+      const directChildName = parts[1];
+      if (directChildName) {
+        bucket.childNames.add(directChildName);
+      }
+    }
+
+    const children = this.sortRepositoryEntries([...childEntries.values()].map(({ entry, childNames }) => ({
+      ...entry,
+      childCount: entry.type === "directory" ? childNames.size : undefined
+    })));
+    const limit = this.capRepositoryLimit(options.limit, REPOSITORY_CHILDREN_DEFAULT_LIMIT, REPOSITORY_CHILDREN_MAX_LIMIT);
+    const offset = this.repositoryPageOffset(options.cursor);
+    const page = children.slice(offset, offset + limit);
+    const response: RepositoryChildrenResponse = {
+      projectId,
+      parentPath: safeParentPath,
+      cursor: options.cursor,
+      nextCursor: offset + limit < children.length ? String(offset + limit) : undefined,
+      limit,
+      total: children.length,
+      children: page,
+      truncated: offset + limit < children.length,
+      scanTruncated: project.record.stats?.truncated,
+      scanTruncationReason: project.record.stats?.truncationReason
+    };
+    this.logRepositoryPayload(
+      "listRepositoryChildren",
+      response,
+      `parent=${safeParentPath || "."}, returned=${page.length}, total=${children.length}`
+    );
+    return response;
+  }
+
+  searchRepositoryFiles(
+    projectId: string,
+    query: string,
+    options: { limit?: number } = {}
+  ): RepositorySearchResponse {
+    const project = this.findProject(projectId);
+    const normalizedQuery = query.trim().toLowerCase();
+    const limit = this.capRepositoryLimit(options.limit, REPOSITORY_SEARCH_DEFAULT_LIMIT, REPOSITORY_SEARCH_MAX_LIMIT);
+    const matchedFiles = normalizedQuery
+      ? project.scan.files
+        .filter((file) => file.relativePath.toLowerCase().includes(normalizedQuery))
+        .sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+      : [];
+    const results: RepositoryTreeEntry[] = matchedFiles.slice(0, limit).map((file) => ({
+      path: file.relativePath,
+      name: path.posix.basename(file.relativePath),
+      type: "file",
+      size: file.size,
+      language: file.language
+    }));
+    const response: RepositorySearchResponse = {
+      projectId,
+      query,
+      limit,
+      total: matchedFiles.length,
+      results,
+      truncated: matchedFiles.length > results.length,
+      scanTruncated: project.record.stats?.truncated,
+      scanTruncationReason: project.record.stats?.truncationReason
+    };
+    this.logRepositoryPayload("searchRepositoryFiles", response, `query=${normalizedQuery}, returned=${results.length}, total=${matchedFiles.length}`);
+    return response;
   }
 
   listAgents(
@@ -4330,7 +4553,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     return {
       ...result,
-      dependencies: result.dependencies.slice(0, 80),
+      dependencies: result.dependencies.slice(0, RENDERER_REPOSITORY_DEPENDENCY_LIMIT),
       tree: compactRepoTreePreview(result.tree)
     };
   }
@@ -4378,6 +4601,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       validation,
       stats: scan.stats,
       dependencies: scan.dependencies,
+      layout: {
+        ...existing.record.layout,
+        activeCenterTab: "overview"
+      },
       localState: {
         ...existing.record.localState,
         lastOpenedAt: nowIso()
@@ -4807,6 +5034,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       bootstrapAgent.reasoningEffortSource = selectedConfig.reasoningMode;
       record.agents.unshift(bootstrapAgent);
     }
+
+    record.layout = {
+      ...record.layout,
+      activeCenterTab: "overview"
+    };
 
     const project: LoadedProject = {
       record,

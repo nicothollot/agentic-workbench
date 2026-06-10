@@ -21,6 +21,7 @@ import {
   workflowStatusSummary
 } from "@shared/workflowView";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
+import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
 import type {
   AgentCategory,
   AgentListResponse,
@@ -42,9 +43,11 @@ import type {
   ProjectLoadResult,
   ProjectCommandLogEntry,
   ProjectLogFeedResponse,
-  ProjectRepositoryView,
+  ProjectRepositorySummary,
   ProjectWorkflowState,
-  RepoTreeNode,
+  RepositoryChildrenResponse,
+  RepositorySearchResponse,
+  RepositoryTreeEntry,
   RuntimeReadinessReport,
   RuntimeEventRecord,
   SummarySource,
@@ -75,8 +78,74 @@ type LogFeedView = ProjectLogFeedResponse & {
   loading: boolean;
 };
 
-type RepositoryDataView = ProjectRepositoryView & {
+type RepositoryDataView = ProjectRepositorySummary & {
   loading: boolean;
+  childrenByParent: RepositoryChildrenByParent;
+  expandedPaths: string[];
+  loadingParents: Record<string, boolean>;
+  searchResults: RepositorySearchResponse | null;
+  searchLoading: boolean;
+  treeError?: string;
+};
+
+const emptyRepositoryData = (): RepositoryDataView => ({
+  projectId: "",
+  stats: undefined,
+  dependencies: [],
+  dependencyTotal: 0,
+  summaryCache: [],
+  summaryCacheTotal: 0,
+  rootChildren: {
+    projectId: "",
+    parentPath: REPOSITORY_ROOT_PARENT,
+    limit: 0,
+    total: 0,
+    children: [],
+    truncated: false
+  },
+  scanTruncated: false,
+  scanTruncationReason: undefined,
+  loading: false,
+  childrenByParent: {},
+  expandedPaths: [],
+  loadingParents: {},
+  searchResults: null,
+  searchLoading: false,
+  treeError: undefined
+});
+
+const mergeRepositoryChildrenPage = (
+  current: RepositoryDataView,
+  page: RepositoryChildrenResponse,
+  append: boolean
+): RepositoryDataView => {
+  const existing = current.childrenByParent[page.parentPath];
+  const childrenByPath = new Map<string, RepositoryTreeEntry>();
+  if (append && existing) {
+    for (const child of existing.children) {
+      childrenByPath.set(child.path, child);
+    }
+  }
+  for (const child of page.children) {
+    childrenByPath.set(child.path, child);
+  }
+  const nextPage = {
+    ...page,
+    children: [...childrenByPath.values()]
+  };
+  return {
+    ...current,
+    rootChildren: page.parentPath === REPOSITORY_ROOT_PARENT ? nextPage : current.rootChildren,
+    childrenByParent: {
+      ...current.childrenByParent,
+      [page.parentPath]: nextPage
+    },
+    loadingParents: {
+      ...current.loadingParents,
+      [page.parentPath]: false
+    },
+    treeError: undefined
+  };
 };
 
 type WorkflowPrimaryActionView = ReturnType<typeof workflowActionGuide> | {
@@ -1420,15 +1489,29 @@ const CandidateCard = ({
 );
 
 const RepoTree = ({
-  nodes,
+  projectId,
+  childrenByParent,
+  expandedPaths,
+  loadingParents,
+  searchResults,
+  searchLoading,
   filter,
   selected,
-  onSelect
+  onSelect,
+  onToggleDirectory,
+  onLoadMore
 }: {
-  nodes: LoadedProjectView["tree"];
+  projectId: string;
+  childrenByParent: RepositoryChildrenByParent;
+  expandedPaths: string[];
+  loadingParents: Record<string, boolean>;
+  searchResults: RepositorySearchResponse | null;
+  searchLoading: boolean;
   filter: string;
   selected?: string;
   onSelect: (path: string) => void;
+  onToggleDirectory: (path: string) => void;
+  onLoadMore: (parentPath: string) => void;
 }) => {
   const treeRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -1436,54 +1519,23 @@ const RepoTree = ({
   const rowHeight = 40;
   const overscan = 10;
 
-  const rows = useMemo(() => {
-    const query = filter.trim().toLowerCase();
-    const flattened: Array<{ path: string; name: string; type: "file" | "directory"; depth: number }> = [];
+  const rows = useMemo(
+    () => buildRepositoryTreeRows({
+      childrenByParent,
+      expandedPaths,
+      loadingParents,
+      searchResults,
+      query: filter
+    }),
+    [childrenByParent, expandedPaths, filter, loadingParents, searchResults]
+  );
 
-    const pushTree = (entries: LoadedProjectView["tree"], depth: number): void => {
-      for (const entry of entries) {
-        flattened.push({
-          path: entry.path,
-          name: entry.name,
-          type: entry.type,
-          depth
-        });
-        if (entry.children?.length) {
-          pushTree(entry.children, depth + 1);
-        }
-      }
-    };
-
-    if (!query) {
-      pushTree(nodes, 0);
-    } else {
-      const collectFilteredTree = (
-        entries: LoadedProjectView["tree"],
-        depth: number
-      ): Array<{ path: string; name: string; type: "file" | "directory"; depth: number }> => {
-        const branchRows: Array<{ path: string; name: string; type: "file" | "directory"; depth: number }> = [];
-        for (const entry of entries) {
-          const childRows = entry.children?.length ? collectFilteredTree(entry.children, depth + 1) : [];
-          const selfMatched = entry.path.toLowerCase().includes(query);
-          if (!selfMatched && childRows.length === 0) {
-            continue;
-          }
-          branchRows.push({
-            path: entry.path,
-            name: entry.name,
-            type: entry.type,
-            depth
-          });
-          branchRows.push(...childRows);
-        }
-        return branchRows;
-      };
-
-      flattened.push(...collectFilteredTree(nodes, 0));
-    }
-
-    return flattened;
-  }, [filter, nodes]);
+  const loadMorePages = useMemo(() => {
+    const expanded = new Set(expandedPaths);
+    return Object.values(childrenByParent)
+      .filter((page) => page.nextCursor && (page.parentPath === REPOSITORY_ROOT_PARENT || expanded.has(page.parentPath)))
+      .sort((left, right) => left.parentPath.localeCompare(right.parentPath));
+  }, [childrenByParent, expandedPaths]);
 
   useEffect(() => {
     const node = treeRef.current;
@@ -1505,7 +1557,7 @@ const RepoTree = ({
   useEffect(() => {
     setScrollTop(0);
     treeRef.current?.scrollTo({ top: 0 });
-  }, [filter]);
+  }, [filter, projectId]);
 
   const totalHeight = rows.length * rowHeight;
   const visibleStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
@@ -1519,24 +1571,45 @@ const RepoTree = ({
       onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
     >
       {rows.length ? (
-        <div className="tree__spacer" style={{ height: `${totalHeight}px` }}>
-          <div className="tree__window" style={{ transform: `translateY(${visibleStart * rowHeight}px)` }}>
-            {visibleRows.map((row) => (
-              <button
-                key={row.path}
-                className={`tree-row ${selected === row.path ? "tree-row--selected" : ""}`}
-                style={{ paddingLeft: `${row.depth * 16 + 14}px` }}
-                type="button"
-                onClick={() => row.type === "file" && onSelect(row.path)}
-              >
-                <span className="tree-row__marker">{row.type === "directory" ? "▸" : "•"}</span>
-                <span className="tree-row__label">{row.name}</span>
-              </button>
-            ))}
+        <>
+          <div className="tree__spacer" style={{ height: `${totalHeight}px` }}>
+            <div className="tree__window" style={{ transform: `translateY(${visibleStart * rowHeight}px)` }}>
+              {visibleRows.map((row) => (
+                <button
+                  key={row.path}
+                  className={`tree-row ${selected === row.path ? "tree-row--selected" : ""}`}
+                  style={{ paddingLeft: `${row.depth * 16 + 14}px` }}
+                  type="button"
+                  aria-expanded={row.type === "directory" ? row.expanded : undefined}
+                  title={row.path}
+                  onClick={() => row.type === "directory" ? onToggleDirectory(row.path) : onSelect(row.path)}
+                >
+                  <span className="tree-row__marker">
+                    {row.type === "directory" ? row.expanded ? "▾" : "▸" : "•"}
+                  </span>
+                  <span className="tree-row__label">{row.name}</span>
+                  {row.loading ? <span className="tree-row__meta">Loading</span> : null}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+          {!filter.trim() && loadMorePages.length ? (
+            <div className="tree__load-more">
+              {loadMorePages.slice(0, 3).map((page) => (
+                <button
+                  key={page.parentPath || "root"}
+                  className="secondary-button secondary-button--compact"
+                  type="button"
+                  onClick={() => onLoadMore(page.parentPath)}
+                >
+                  Load more {page.parentPath || "root"} items
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </>
       ) : (
-        <div className="empty-copy">No files match the current filter.</div>
+        <div className="empty-copy">{searchLoading ? "Searching repository." : "No files match the current filter."}</div>
       )}
     </div>
   );
@@ -2995,7 +3068,7 @@ const CredentialsPanel = ({
   );
 };
 
-const topLevelDirectories = (nodes: RepoTreeNode[]): RepoTreeNode[] =>
+const topLevelDirectories = (nodes: RepositoryTreeEntry[]): RepositoryTreeEntry[] =>
   nodes.filter((node) => node.type === "directory").slice(0, 10);
 
 const dependencyEcosystemSummary = (dependencies: LoadedProjectView["record"]["dependencies"]): Array<{ ecosystem: string; count: number }> => {
@@ -3033,7 +3106,9 @@ const RepositoryPanel = ({
   fileSummary,
   importantPathSummaries,
   onTreeFilterChange,
-  onSelectFile
+  onSelectFile,
+  onToggleDirectory,
+  onLoadMoreRepositoryChildren
 }: {
   project: LoadedProjectView;
   repositoryData: RepositoryDataView;
@@ -3044,13 +3119,17 @@ const RepositoryPanel = ({
   importantPathSummaries: FileSummary[];
   onTreeFilterChange: (value: string) => void;
   onSelectFile: (relativePath: string) => void;
+  onToggleDirectory: (relativePath: string) => void;
+  onLoadMoreRepositoryChildren: (relativePath: string) => void;
 }) => {
   const { record } = project;
   const stats = record.stats;
   const overview = record.overview;
   const dependencies = repositoryData.projectId === record.id ? repositoryData.dependencies : [];
   const summaryCache = repositoryData.projectId === record.id ? repositoryData.summaryCache : [];
-  const repositoryTree = repositoryData.projectId === record.id ? repositoryData.tree : [];
+  const rootChildren = repositoryData.projectId === record.id
+    ? repositoryData.childrenByParent[REPOSITORY_ROOT_PARENT]?.children ?? []
+    : [];
   const scanStatus = interfaceCreationStatusChip(record.interfaceCreation);
   const validationStatus = validationStatusChip(project.validationStatus);
   const accessProbe = record.validation.projectAccess;
@@ -3061,9 +3140,14 @@ const RepositoryPanel = ({
     : { label: "Pending", tone: "pending" };
   const deterministicScanReady = record.interfaceCreation?.deterministicScanReady ?? Boolean(stats);
   const agentAnalysisReady = record.interfaceCreation?.agentAnalysisReady ?? Boolean(overview);
-  const directories = topLevelDirectories(repositoryTree);
+  const directories = topLevelDirectories(rootChildren);
   const dependencySummary = dependencyEcosystemSummary(dependencies);
   const excludedPathEntries = getExcludedPathEntries(stats?.excludedPaths);
+  const dependencyTotal = repositoryData.projectId === record.id ? repositoryData.dependencyTotal : record.dependencies.length;
+  const summaryCacheTotal = repositoryData.projectId === record.id ? repositoryData.summaryCacheTotal : record.summaryCache.length;
+  const scanTruncationMessage = stats?.truncated
+    ? stats.truncationReason ?? "Repository scan was truncated."
+    : undefined;
   const rawRepositoryAnalysis = [
     overview?.summary,
     overview?.architecture,
@@ -3112,7 +3196,7 @@ const RepositoryPanel = ({
         </article>
         <article className="repository-fact-card">
           <span>Dependencies</span>
-          <strong>{dependencies.length}</strong>
+          <strong>{dependencyTotal}</strong>
           <p>{stats?.primaryManagers.join(", ") || "Package manager not detected"}</p>
         </article>
         <article className="repository-fact-card">
@@ -3164,7 +3248,7 @@ const RepositoryPanel = ({
           </article>
 
           <article className="repository-section">
-            <SectionTitle eyebrow="Dependencies" title="Runtime and package map" meta={<span className="badge">{dependencies.length}</span>} />
+            <SectionTitle eyebrow="Dependencies" title="Runtime and package map" meta={<span className="badge">{dependencyTotal}</span>} />
             <div className="repository-two-column">
               <div>
                 <span className="workflow-option__label">Package manager</span>
@@ -3184,6 +3268,9 @@ const RepositoryPanel = ({
             </div>
             <details className="workflow-inline-details">
               <summary>View dependency list</summary>
+              {dependencyTotal > dependencies.length ? (
+                <p>Showing first {dependencies.length} of {dependencyTotal} dependencies.</p>
+              ) : null}
               <div className="tag-row">
                 {dependencies.length ? dependencies.slice(0, 80).map((dependency) => (
                   <span key={`${dependency.manifest}:${dependency.name}`} className="tag">
@@ -3214,6 +3301,11 @@ const RepositoryPanel = ({
                 <strong>{agentAnalysisReady ? "Ready" : "Pending"}</strong>
               </div>
             </div>
+            {scanTruncationMessage ? (
+              <div className="notice notice--compact">
+                Showing a bounded repository scan: {scanTruncationMessage}.
+              </div>
+            ) : null}
             <div className="tag-row">
               {getTopFileTypes(stats?.fileTypeBreakdown).map(([label, count]) => (
                 <span key={label} className="tag">{label}: {count}</span>
@@ -3253,6 +3345,9 @@ const RepositoryPanel = ({
             <LongTextDisclosure title="Full repository analysis" value={rawRepositoryAnalysis || "No full repository analysis is available yet."} code />
             <details className="workflow-inline-details">
               <summary>File/path details</summary>
+              {summaryCacheTotal > summaryCache.length ? (
+                <p>Showing first {summaryCache.length} of {summaryCacheTotal} file summaries.</p>
+              ) : null}
               <div className="path-summary-list">
                 {summaryCache.length ? summaryCache.slice(0, 80).map((summary) => (
                   <div key={summary.relativePath} className="path-summary path-summary--compact">
@@ -3287,7 +3382,28 @@ const RepositoryPanel = ({
             {repositoryData.loading ? (
               <LoadingIndicator label="Loading repository tree" compact />
             ) : (
-              <RepoTree key={record.id} nodes={repositoryTree} filter={deferredTreeFilter} selected={selectedFile} onSelect={onSelectFile} />
+              <>
+                {repositoryData.treeError ? <div className="notice notice--compact notice--error">{repositoryData.treeError}</div> : null}
+                {deferredTreeFilter.trim() && repositoryData.searchResults?.truncated ? (
+                  <div className="notice notice--compact">
+                    Showing first {repositoryData.searchResults.results.length} of {repositoryData.searchResults.total} matching files.
+                  </div>
+                ) : null}
+                <RepoTree
+                  key={record.id}
+                  projectId={record.id}
+                  childrenByParent={repositoryData.childrenByParent}
+                  expandedPaths={repositoryData.expandedPaths}
+                  loadingParents={repositoryData.loadingParents}
+                  searchResults={repositoryData.searchResults}
+                  searchLoading={repositoryData.searchLoading}
+                  filter={deferredTreeFilter}
+                  selected={selectedFile}
+                  onSelect={onSelectFile}
+                  onToggleDirectory={onToggleDirectory}
+                  onLoadMore={onLoadMoreRepositoryChildren}
+                />
+              </>
             )}
           </article>
 
@@ -5286,13 +5402,7 @@ export const App = () => {
   const [activeWorkspaceTabOverride, setActiveWorkspaceTabOverride] = useState<WorkspaceVisualTabId>();
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
-  const [repositoryData, setRepositoryData] = useState<RepositoryDataView>({
-    projectId: "",
-    tree: [],
-    dependencies: [],
-    summaryCache: [],
-    loading: false
-  });
+  const [repositoryData, setRepositoryData] = useState<RepositoryDataView>(() => emptyRepositoryData());
   const [logFeed, setLogFeed] = useState<LogFeedView>({
     projectId: "",
     activity: {
@@ -5721,6 +5831,9 @@ export const App = () => {
     workflow.workflowCycle.status !== "merged"
   );
   const overviewRefreshRunning = overviewRefreshBusy || activeProject?.record.interfaceCreation?.status === "running";
+  const repositoryTreeBusy = repositoryData.loading ||
+    repositoryData.searchLoading ||
+    Object.values(repositoryData.loadingParents).some(Boolean);
 
   const scheduleWorkspaceTabPersist = (projectId: string, tab: WorkspaceVisualTabId) => {
     tabLayoutPersistRequestRef.current = { projectId, tab };
@@ -5756,7 +5869,7 @@ export const App = () => {
       logFeedProjectId: logFeed.projectId,
       logFeedLoading: logFeed.loading,
       repositoryProjectId: repositoryData.projectId,
-      repositoryLoading: repositoryData.loading,
+      repositoryLoading: repositoryTreeBusy,
       workflowAgentPageLoading: workflowAgentPage.loading,
       manualAgentPageLoading: manualAgentPage.loading
     };
@@ -5765,8 +5878,8 @@ export const App = () => {
     activeWorkspaceTab,
     logFeed.loading,
     logFeed.projectId,
-    repositoryData.loading,
     repositoryData.projectId,
+    repositoryTreeBusy,
     manualAgentPage.loading,
     workflowAgentPage.loading
   ]);
@@ -5915,13 +6028,7 @@ export const App = () => {
       setCommandLogPageIndex(0);
       setAgentDetail(undefined);
       setActiveWorkspaceTabOverride(undefined);
-      setRepositoryData({
-        projectId: "",
-        tree: [],
-        dependencies: [],
-        summaryCache: [],
-        loading: false
-      });
+      setRepositoryData(emptyRepositoryData());
       return;
     }
 
@@ -5940,14 +6047,8 @@ export const App = () => {
     setActivityLogPageIndex(0);
     setCommandLogPageIndex(0);
     setAgentDetail(undefined);
-    setActiveWorkspaceTabOverride(undefined);
-    setRepositoryData({
-      projectId: "",
-      tree: [],
-      dependencies: [],
-      summaryCache: [],
-      loading: false
-    });
+    setActiveWorkspaceTabOverride(activeProjectId ? "overview" : undefined);
+    setRepositoryData(emptyRepositoryData());
   }, [activeProjectId]);
 
   useEffect(() => {
@@ -6027,21 +6128,32 @@ export const App = () => {
 
     let cancelled = false;
     setRepositoryData((current) => ({
+      ...emptyRepositoryData(),
       projectId: activeProjectId,
-      tree: current.projectId === activeProjectId ? current.tree : [],
-      dependencies: current.projectId === activeProjectId ? current.dependencies : [],
-      summaryCache: current.projectId === activeProjectId ? current.summaryCache : [],
+      childrenByParent: current.projectId === activeProjectId ? current.childrenByParent : {},
+      expandedPaths: current.projectId === activeProjectId ? current.expandedPaths : [],
       loading: true
     }));
-    void window.workbench.getRepositoryView(activeProjectId)
-      .then((view) => {
+    void window.workbench.getRepositorySummary(activeProjectId)
+      .then((summary) => {
         if (!cancelled) {
-          setRepositoryData({ ...view, loading: false });
+          setRepositoryData({
+            ...summary,
+            childrenByParent: {
+              [REPOSITORY_ROOT_PARENT]: summary.rootChildren
+            },
+            expandedPaths: [],
+            loadingParents: {},
+            searchResults: null,
+            searchLoading: false,
+            treeError: undefined,
+            loading: false
+          });
         }
       })
       .catch((error) => {
         if (!cancelled) {
-          setRepositoryData((current) => ({ ...current, loading: false }));
+          setRepositoryData((current) => ({ ...current, loading: false, treeError: error instanceof Error ? error.message : String(error) }));
         }
         handleError(error);
       });
@@ -6050,6 +6162,111 @@ export const App = () => {
       cancelled = true;
     };
   }, [activeProjectId, activeWorkspaceTab, repositoryData.projectId]);
+
+  const loadRepositoryChildren = (parentPath: string, cursor?: string) => {
+    if (!activeProjectId) {
+      return;
+    }
+    const projectId = activeProjectId;
+    setRepositoryData((current) => ({
+      ...current,
+      loadingParents: {
+        ...current.loadingParents,
+        [parentPath]: true
+      },
+      treeError: undefined
+    }));
+    void window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: 120 })
+      .then((page) => {
+        setRepositoryData((current) =>
+          current.projectId === projectId
+            ? mergeRepositoryChildrenPage(current, page, Boolean(cursor))
+            : current
+        );
+      })
+      .catch((error) => {
+        setRepositoryData((current) => ({
+          ...current,
+          loadingParents: {
+            ...current.loadingParents,
+            [parentPath]: false
+          },
+          treeError: error instanceof Error ? error.message : String(error)
+        }));
+        handleError(error);
+      });
+  };
+
+  const toggleRepositoryDirectory = (relativePath: string) => {
+    const isExpanded = repositoryData.expandedPaths.includes(relativePath);
+    setRepositoryData((current) => ({
+      ...current,
+      expandedPaths: isExpanded
+        ? current.expandedPaths.filter((pathName) => pathName !== relativePath)
+        : [...current.expandedPaths, relativePath]
+    }));
+    if (!isExpanded && !repositoryData.childrenByParent[relativePath] && !repositoryData.loadingParents[relativePath]) {
+      loadRepositoryChildren(relativePath);
+    }
+  };
+
+  const loadMoreRepositoryChildren = (relativePath: string) => {
+    const page = repositoryData.childrenByParent[relativePath];
+    if (!page?.nextCursor || repositoryData.loadingParents[relativePath]) {
+      return;
+    }
+    loadRepositoryChildren(relativePath, page.nextCursor);
+  };
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "repository") {
+      return;
+    }
+
+    const query = deferredTreeFilter.trim();
+    if (!query) {
+      setRepositoryData((current) => ({
+        ...current,
+        searchResults: null,
+        searchLoading: false
+      }));
+      return;
+    }
+
+    const projectId = activeProjectId;
+    let cancelled = false;
+    setRepositoryData((current) => ({
+      ...current,
+      searchLoading: true,
+      searchResults: current.searchResults?.query === query ? current.searchResults : null,
+      treeError: undefined
+    }));
+    const timeoutId = window.setTimeout(() => {
+      void window.workbench.searchRepositoryFiles(projectId, query, { limit: 120 })
+        .then((results) => {
+          if (!cancelled) {
+            setRepositoryData((current) => current.projectId === projectId
+              ? { ...current, searchResults: results, searchLoading: false }
+              : current);
+          }
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setRepositoryData((current) => ({
+              ...current,
+              searchLoading: false,
+              treeError: error instanceof Error ? error.message : String(error)
+            }));
+          }
+          handleError(error);
+        });
+    }, 220);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [activeProjectId, activeWorkspaceTab, deferredTreeFilter]);
 
   useEffect(() => {
     if (!activeProjectId || activeWorkspaceTab !== "logs") {
@@ -7940,6 +8157,8 @@ export const App = () => {
             importantPathSummaries={importantPathSummaries}
             onTreeFilterChange={setTreeFilterDraft}
             onSelectFile={(relativePath) => void loadSummary(relativePath)}
+            onToggleDirectory={toggleRepositoryDirectory}
+            onLoadMoreRepositoryChildren={loadMoreRepositoryChildren}
           />
         ) : null}
 

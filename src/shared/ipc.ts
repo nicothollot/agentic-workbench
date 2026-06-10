@@ -137,6 +137,23 @@ export const projectRepositoryViewRequestSchema = z.object({
   projectId: z.string().min(1)
 });
 
+export const projectRepositorySummaryRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
+export const projectRepositoryChildrenRequestSchema = z.object({
+  projectId: z.string().min(1),
+  parentPath: z.string().default(""),
+  cursor: z.string().optional(),
+  limit: z.number().int().min(1).max(500).default(120)
+});
+
+export const projectRepositorySearchRequestSchema = z.object({
+  projectId: z.string().min(1),
+  query: z.string().default(""),
+  limit: z.number().int().min(1).max(500).default(120)
+});
+
 export const agentListRequestSchema = z.object({
   projectId: z.string().min(1),
   scope: z.enum(["all", "workflow", "manual"]).default("all"),
@@ -341,6 +358,9 @@ export type IpcChannel =
   | "project:importInterface"
   | "project:getFileSummary"
   | "project:getRepositoryView"
+  | "project:getRepositorySummary"
+  | "project:listRepositoryChildren"
+  | "project:searchRepositoryFiles"
   | "project:listAgents"
   | "project:getAgent"
   | "project:getLogFeed"

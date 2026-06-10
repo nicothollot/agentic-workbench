@@ -737,6 +737,13 @@ p {
   white-space: nowrap;
 }
 
+.tree-row__meta {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .tree {
   position: relative;
   overflow: auto;
@@ -753,6 +760,12 @@ p {
   position: absolute;
   inset: 0 auto auto 0;
   width: 100%;
+}
+
+.tree__load-more {
+  display: grid;
+  gap: 8px;
+  padding: 8px 0 0;
 }
 
 .agent-card {

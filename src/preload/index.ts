@@ -20,7 +20,10 @@ import type {
   ProjectLogFeedResponse,
   ProjectLoadResult,
   ProjectRepositoryView,
+  ProjectRepositorySummary,
   ProjectWorkflowState,
+  RepositoryChildrenResponse,
+  RepositorySearchResponse,
   RuntimeReadinessReport,
   UserInputRequestRecord,
   UltimateGoalImportPreview,
@@ -51,6 +54,13 @@ export interface WorkbenchApi {
   updateSettings(payload: Record<string, unknown>): Promise<unknown>;
   getFileSummary(projectId: string, relativePath: string): Promise<FileSummary>;
   getRepositoryView(projectId: string): Promise<ProjectRepositoryView>;
+  getRepositorySummary(projectId: string): Promise<ProjectRepositorySummary>;
+  listRepositoryChildren(
+    projectId: string,
+    parentPath: string,
+    options?: { cursor?: string; limit?: number }
+  ): Promise<RepositoryChildrenResponse>;
+  searchRepositoryFiles(projectId: string, query: string, options?: { limit?: number }): Promise<RepositorySearchResponse>;
   listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
   getLogFeed(
@@ -180,6 +190,11 @@ const api: WorkbenchApi = {
   updateSettings: async (payload) => await invoke<unknown>("settings:update", payload),
   getFileSummary: async (projectId, relativePath) => await invoke<FileSummary>("project:getFileSummary", { projectId, relativePath }),
   getRepositoryView: async (projectId) => await invoke<ProjectRepositoryView>("project:getRepositoryView", { projectId }),
+  getRepositorySummary: async (projectId) => await invoke<ProjectRepositorySummary>("project:getRepositorySummary", { projectId }),
+  listRepositoryChildren: async (projectId, parentPath, options = {}) =>
+    await invoke<RepositoryChildrenResponse>("project:listRepositoryChildren", { projectId, parentPath, ...options }),
+  searchRepositoryFiles: async (projectId, query, options = {}) =>
+    await invoke<RepositorySearchResponse>("project:searchRepositoryFiles", { projectId, query, ...options }),
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),

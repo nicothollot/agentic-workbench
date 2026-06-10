@@ -31,6 +31,9 @@ import {
   projectLoadRequestSchema,
   projectLogFeedRequestSchema,
   projectOpenRequestSchema,
+  projectRepositoryChildrenRequestSchema,
+  projectRepositorySearchRequestSchema,
+  projectRepositorySummaryRequestSchema,
   projectRepositoryViewRequestSchema,
   projectSelectionDecisionSchema,
   refreshOverviewRequestSchema,
@@ -517,6 +520,21 @@ const registerIpc = (): void => {
   ipcMain.handle("project:getRepositoryView", (_event, payload) => {
     const parsed = projectRepositoryViewRequestSchema.parse(payload);
     return appService?.getRepositoryView(parsed.projectId);
+  });
+  ipcMain.handle("project:getRepositorySummary", (_event, payload) => {
+    const parsed = projectRepositorySummaryRequestSchema.parse(payload);
+    return appService?.getRepositorySummary(parsed.projectId);
+  });
+  ipcMain.handle("project:listRepositoryChildren", (_event, payload) => {
+    const parsed = projectRepositoryChildrenRequestSchema.parse(payload);
+    return appService?.listRepositoryChildren(parsed.projectId, parsed.parentPath, {
+      cursor: parsed.cursor,
+      limit: parsed.limit
+    });
+  });
+  ipcMain.handle("project:searchRepositoryFiles", (_event, payload) => {
+    const parsed = projectRepositorySearchRequestSchema.parse(payload);
+    return appService?.searchRepositoryFiles(parsed.projectId, parsed.query, { limit: parsed.limit });
   });
   ipcMain.handle("project:listAgents", (_event, payload) => {
     const parsed = agentListRequestSchema.parse(payload);

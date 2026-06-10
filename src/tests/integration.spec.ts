@@ -350,6 +350,44 @@ describe("integration flows", () => {
     expect(activeProject?.record.localState.lastOpenedAt).toBeTruthy();
   });
 
+  it("serves repository data through bounded lazy pages", async () => {
+    const root = await createSampleRepo("lazy-repository-api");
+    for (let index = 0; index < 45; index += 1) {
+      const directory = path.join(root, `module-${String(index).padStart(2, "0")}`);
+      await mkdir(directory, { recursive: true });
+      await writeFile(path.join(directory, "index.ts"), `export const module${index} = ${index};\n`);
+    }
+
+    const appData = await createTempDir("appdata-lazy-repository-api");
+    const service = await createService(appData);
+    await service.loadProject(root);
+    const selected = await service.selectPendingInterface("fresh");
+
+    const legacyView = service.getRepositoryView(selected.record.id);
+    expect(legacyView.tree.length).toBeLessThanOrEqual(32);
+    expect(legacyView.treeTruncated).toBe(true);
+
+    const summary = service.getRepositorySummary(selected.record.id);
+    expect(summary.rootChildren.total).toBeGreaterThan(32);
+    expect(summary.rootChildren.children.some((entry) => entry.path === "src")).toBe(true);
+
+    const firstPage = service.listRepositoryChildren(selected.record.id, "", { limit: 10 });
+    expect(firstPage.children).toHaveLength(10);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const secondPage = service.listRepositoryChildren(selected.record.id, "", { cursor: firstPage.nextCursor, limit: 10 });
+    expect(secondPage.children).toHaveLength(10);
+    expect(secondPage.children[0]?.path).not.toBe(firstPage.children[0]?.path);
+
+    const moduleChildren = service.listRepositoryChildren(selected.record.id, "module-00", { limit: 10 });
+    expect(moduleChildren.children.map((entry) => entry.path)).toContain("module-00/index.ts");
+
+    const search = service.searchRepositoryFiles(selected.record.id, "index.ts", { limit: 5 });
+    expect(search.results).toHaveLength(5);
+    expect(search.truncated).toBe(true);
+    expect(search.total).toBeGreaterThan(5);
+  });
+
   it("exports and imports a portable interface roundtrip", async () => {
     const root = await createSampleRepo("roundtrip");
     const appDataA = await createTempDir("appdata-roundtrip-a");
