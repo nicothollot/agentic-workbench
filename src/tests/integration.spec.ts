@@ -3286,7 +3286,7 @@ describe("integration flows", () => {
     expect(command.cwd).toBe(root);
   });
 
-  it("coalesces streaming agent deltas into a single workflow activity row", async () => {
+  it("keeps streaming agent deltas out of workflow activity until the message completes", async () => {
     const root = await createSampleFolder("streaming-activity-coalesce");
     const appData = await createTempDir("appdata-streaming-activity-coalesce");
     const service = await createService(appData);
@@ -3309,6 +3309,7 @@ describe("integration flows", () => {
       method: "item/agentMessage/delta",
       params: {
         threadId: agent.threadId,
+        turnId: "turn-streaming",
         itemId: "message-1",
         delta: "First "
       }
@@ -3317,18 +3318,39 @@ describe("integration flows", () => {
       method: "item/agentMessage/delta",
       params: {
         threadId: agent.threadId,
+        turnId: "turn-streaming",
         itemId: "message-1",
         delta: "second"
       }
     });
 
-    const record = getProjectRecord(service, selected.record.id);
-    const streamingRows = record?.workflow.activityLog.filter((event) =>
+    const recordAfterDeltas = getProjectRecord(service, selected.record.id);
+    const streamingRows = recordAfterDeltas?.workflow.activityLog.filter((event) =>
       event.agentId === agent.id && event.title === "Agent message"
     ) ?? [];
-    expect(streamingRows).toHaveLength(1);
-    expect(streamingRows[0].detail).toContain("First");
-    expect(streamingRows[0].detail).toContain("second");
+    expect(streamingRows).toHaveLength(0);
+
+    (service as any).handleTransportNotification({
+      method: "item/completed",
+      params: {
+        threadId: agent.threadId,
+        turnId: "turn-streaming",
+        item: {
+          type: "agentMessage",
+          id: "message-1",
+          text: "First second",
+          phase: null,
+          memoryCitation: null
+        }
+      }
+    });
+
+    const recordAfterCompletion = getProjectRecord(service, selected.record.id);
+    const completedRows = recordAfterCompletion?.workflow.activityLog.filter((event) =>
+      event.agentId === agent.id && event.title === "Agent message"
+    ) ?? [];
+    expect(completedRows).toHaveLength(1);
+    expect(completedRows[0].detail).toContain("First second");
   });
 
   it("acknowledges stale workflow recovery before slow transport startup completes", async () => {

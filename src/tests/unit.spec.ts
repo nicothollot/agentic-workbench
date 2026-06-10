@@ -5929,6 +5929,60 @@ describe("AppService workflow performance guards", () => {
     expect(inactiveRecord.workflow.activityLog).toHaveLength(0);
   });
 
+  it("coalesces live project saves without repeating workflow sync", async () => {
+    const service = new AppService(await createTempDir("save-live-coalesce")) as unknown as {
+      storage: {
+        saveProject: () => Promise<void>;
+        loadRegistry: () => Promise<string[]>;
+        saveRegistry: () => Promise<void>;
+      };
+      compactProjectRuntimeHistory: () => void;
+      recordAgentContextDescriptor: () => void;
+      syncWorkflowState: () => void;
+      projectSaveQueued: Map<string, Promise<void>>;
+      saveProject: (
+        project: ReturnType<typeof makeAppServiceLoadedProject>,
+        options?: { force?: boolean; syncWorkflow?: boolean }
+      ) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("live-save-project");
+    let writes = 0;
+    let syncs = 0;
+    let releaseFirstWrite: (() => void) | undefined;
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      service.storage.saveProject = async () => {
+        writes += 1;
+        if (writes === 1) {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseFirstWrite = release;
+          });
+        }
+      };
+    });
+    service.compactProjectRuntimeHistory = () => undefined;
+    service.recordAgentContextDescriptor = () => undefined;
+    service.syncWorkflowState = () => {
+      syncs += 1;
+    };
+    service.storage.loadRegistry = async () => [project.record.id];
+    service.storage.saveRegistry = async () => undefined;
+
+    const firstSave = service.saveProject(project, { syncWorkflow: false });
+    await firstWriteStarted;
+    project.record.localState.workflowPauseRequested = true;
+    const secondSave = service.saveProject(project, { syncWorkflow: false });
+    const thirdSave = service.saveProject(project, { syncWorkflow: false });
+    await Promise.resolve();
+
+    expect(service.projectSaveQueued.size).toBe(1);
+    releaseFirstWrite?.();
+    await Promise.all([firstSave, secondSave, thirdSave]);
+
+    expect(writes).toBe(2);
+    expect(syncs).toBe(0);
+  });
+
   it("reports runtime readiness as blocked when model discovery is unavailable", async () => {
     const service = new AppService(await createTempDir("readiness-blocked")) as unknown as {
       projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;

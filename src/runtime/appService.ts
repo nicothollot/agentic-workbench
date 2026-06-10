@@ -195,6 +195,14 @@ type PersistProjectUpdateOptions = {
   automate?: boolean;
   reason?: string;
 };
+type ProjectSaveOptions = {
+  force?: boolean;
+  syncWorkflow?: boolean;
+};
+type ProjectSaveTimer = {
+  timer: ReturnType<typeof setTimeout>;
+  syncWorkflow: boolean;
+};
 type WorkflowAutomationTimer = {
   timer: ReturnType<typeof setTimeout>;
   generation: number;
@@ -226,41 +234,31 @@ const RENDERER_RAW_EVENT_LIMIT = 4_000;
 const RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT = 32;
 const RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT = 8;
 const STATE_EMIT_THROTTLE_MS = 350;
-const LIVE_PROJECT_SAVE_THROTTLE_MS = 100;
+const LIVE_PROJECT_SAVE_THROTTLE_MS = 3_000;
 const LIVE_DELTA_REDUCE_THROTTLE_MS = 1_500;
+const WORKFLOW_PERF_COUNTER_LOG_INTERVAL_MS = 5_000;
 const WORKFLOW_AUTOMATION_SCHEDULE_DELAY_MS = 25;
 const WORKFLOW_AUTOMATION_NO_PROGRESS_LIMIT = 2;
 const WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT = 20;
 const STRUCTURED_OUTPUT_HISTORY_LIMIT = 24;
 const WSL_WINDOWS_MOUNT_PATH = /^\/mnt\/[a-z](?:\/|$)/i;
-const liveTransportUpdateMethods = new Set<string>([
-  "thread/tokenUsage/updated",
-  "turn/plan/updated",
-  "rawResponseItem/completed",
-  "item/reasoning/summaryPartAdded",
-  "item/agentMessage/delta",
-  "item/plan/delta",
-  "item/reasoning/summaryTextDelta",
-  "item/reasoning/textDelta",
-  "command/exec/outputDelta",
-  "item/commandExecution/outputDelta",
-  "item/fileChange/outputDelta"
-]);
 const throttledTransportDeltaMethods = new Set<string>([
+  "turn/diff/updated",
   "item/agentMessage/delta",
   "item/plan/delta",
   "item/reasoning/summaryTextDelta",
   "item/reasoning/textDelta",
   "command/exec/outputDelta",
   "item/commandExecution/outputDelta",
-  "item/fileChange/outputDelta"
+  "item/fileChange/outputDelta",
+  "item/fileChange/patchUpdated"
 ]);
 const workflowActivitySuppressedTransportMethods = new Set<string>([
   "thread/tokenUsage/updated",
   "turn/plan/updated",
   "rawResponseItem/completed",
   "item/reasoning/summaryPartAdded",
-  ...[...throttledTransportDeltaMethods].filter((method) => method !== "item/agentMessage/delta")
+  ...throttledTransportDeltaMethods
 ]);
 const ignoredRendererUpdateMethods = new Set<string>([
   "thread/tokenUsage/updated",
@@ -268,6 +266,11 @@ const ignoredRendererUpdateMethods = new Set<string>([
   ...throttledTransportDeltaMethods
 ]);
 const immediateTransportFlushMethods = new Set<string>([
+  "turn/completed",
+  "error"
+]);
+const workflowAutomationTriggerMethods = new Set<string>([
+  "thread/status/changed",
   "turn/completed",
   "error"
 ]);
@@ -393,10 +396,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly workflowMergeRetryInFlight = new Set<string>();
   private readonly liveDeltaLastReducedAt = new Map<string, number>();
   private pendingStateEmitTimer?: ReturnType<typeof setTimeout>;
-  private readonly pendingProjectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pendingProjectSaveTimers = new Map<string, ProjectSaveTimer>();
   private readonly projectSaveFingerprints = new Map<string, string>();
   private readonly projectSaveInFlight = new Map<string, Promise<void>>();
   private readonly projectSaveQueued = new Map<string, Promise<void>>();
+  private readonly projectSaveQueuedOptions = new Map<string, ProjectSaveOptions>();
   private readonly registeredProjectIds = new Set<string>();
   private readonly structuredOutputApplicationsInFlight = new Set<string>();
   private suppressTransportExitHandling = false;
@@ -430,7 +434,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const now = performance.now();
     const counter = this.workflowPerfCounters.get(name) ?? { count: 0, startedAt: now, lastLoggedAt: now };
     counter.count += 1;
-    if (now - counter.lastLoggedAt >= 1_000) {
+    if (now - counter.lastLoggedAt >= WORKFLOW_PERF_COUNTER_LOG_INTERVAL_MS) {
       const elapsedSeconds = Math.max(0.001, (now - counter.startedAt) / 1_000);
       this.logWorkflowPerf(`${name}: ${counter.count} total, ${(counter.count / elapsedSeconds).toFixed(1)}/s${detail ? `, ${detail}` : ""}`);
       counter.lastLoggedAt = now;
@@ -541,9 +545,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private shouldReduceLiveTransportDelta(projectId: string, agentId: string, notification: ServerNotification): boolean {
     if (!throttledTransportDeltaMethods.has(notification.method)) {
-      return true;
-    }
-    if (notification.method === "item/agentMessage/delta") {
       return true;
     }
 
@@ -873,26 +874,61 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.pendingStateEmitTimer.unref?.();
   }
 
-  private scheduleProjectSave(project: LoadedProject): void {
+  private mergeProjectSaveOptions(existing?: ProjectSaveOptions, incoming?: ProjectSaveOptions): ProjectSaveOptions {
+    const existingSyncWorkflow = existing ? existing.syncWorkflow !== false : false;
+    const incomingSyncWorkflow = incoming ? incoming.syncWorkflow !== false : true;
+    return {
+      force: Boolean(existing?.force || incoming?.force),
+      syncWorkflow: existingSyncWorkflow || incomingSyncWorkflow
+    };
+  }
+
+  private scheduleProjectSave(project: LoadedProject, options?: ProjectSaveOptions): void {
     if (this.disposed) {
       return;
     }
     const projectId = project.record.id;
-    this.recordWorkflowPerfCounter("project save schedules", project.record.identity.projectName);
-    if (this.pendingProjectSaveTimers.has(projectId)) {
+    const syncWorkflow = options?.syncWorkflow !== false;
+    const queuedSaveOptions = this.projectSaveQueuedOptions.get(projectId);
+    if (this.projectSaveInFlight.has(projectId) && this.projectSaveQueued.has(projectId)) {
+      this.projectSaveQueuedOptions.set(projectId, this.mergeProjectSaveOptions(queuedSaveOptions, options));
+      this.recordWorkflowPerfCounter("project save coalesces", project.record.identity.projectName);
       return;
     }
 
-    const timer = setTimeout(() => {
+    const pending = this.pendingProjectSaveTimers.get(projectId);
+    if (pending) {
+      pending.syncWorkflow = pending.syncWorkflow || syncWorkflow;
+      this.recordWorkflowPerfCounter("project save coalesces", project.record.identity.projectName);
+      return;
+    }
+
+    const scheduled: ProjectSaveTimer = {
+      syncWorkflow,
+      timer: setTimeout(() => {
+        const current = this.pendingProjectSaveTimers.get(projectId);
+        this.pendingProjectSaveTimers.delete(projectId);
+        void this.saveProject(project, {
+          syncWorkflow: current?.syncWorkflow ?? syncWorkflow
+        }).catch((error) => {
+          this.diagnostics.unshift(
+            `Failed to save live project state for ${project.record.identity.projectName}. ${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      }, LIVE_PROJECT_SAVE_THROTTLE_MS)
+    };
+    scheduled.timer.unref?.();
+    this.pendingProjectSaveTimers.set(projectId, scheduled);
+    this.recordWorkflowPerfCounter("project save schedules", project.record.identity.projectName);
+  }
+
+  private cancelScheduledProjectSave(projectId: string): ProjectSaveTimer | undefined {
+    const scheduled = this.pendingProjectSaveTimers.get(projectId);
+    if (scheduled) {
+      clearTimeout(scheduled.timer);
       this.pendingProjectSaveTimers.delete(projectId);
-      void this.saveProject(project).catch((error) => {
-        this.diagnostics.unshift(
-          `Failed to save live project state for ${project.record.identity.projectName}. ${error instanceof Error ? error.message : String(error)}`
-        );
-      });
-    }, LIVE_PROJECT_SAVE_THROTTLE_MS);
-    timer.unref?.();
-    this.pendingProjectSaveTimers.set(projectId, timer);
+    }
+    return scheduled;
   }
 
   private flushProjectSaveNow(project: LoadedProject, reason: string): void {
@@ -900,11 +936,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
     const projectId = project.record.id;
-    const timer = this.pendingProjectSaveTimers.get(projectId);
-    if (timer) {
-      clearTimeout(timer);
-      this.pendingProjectSaveTimers.delete(projectId);
-    }
+    this.cancelScheduledProjectSave(projectId);
     const startedAt = performance.now();
     void this.saveProject(project)
       .then(() => {
@@ -920,14 +952,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private async flushScheduledProjectSaves(force = false): Promise<void> {
     const pendingProjectIds = [...this.pendingProjectSaveTimers.keys()];
     for (const projectId of pendingProjectIds) {
-      const timer = this.pendingProjectSaveTimers.get(projectId);
-      if (timer) {
-        clearTimeout(timer);
-        this.pendingProjectSaveTimers.delete(projectId);
-      }
+      const scheduled = this.cancelScheduledProjectSave(projectId);
       const project = this.projects.get(projectId);
       if (project) {
-        await this.saveProject(project, { force });
+        await this.saveProject(project, { force, syncWorkflow: scheduled?.syncWorkflow ?? true });
       }
     }
   }
@@ -2364,7 +2392,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     const project = this.projects.get(projectId);
     if (!project || !this.shouldScheduleWorkflowAutomation(project)) {
-      this.logWorkflowPerf(`automation not scheduled for ${project?.record.identity.projectName ?? projectId}: ${reason}`);
       return;
     }
     if (this.workflowAutomationInFlight.has(projectId)) {
@@ -3640,13 +3667,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.workflowAutomationTimers.clear();
     this.structuredOutputApplicationsInFlight.clear();
     this.projectSaveQueued.clear();
+    this.projectSaveQueuedOptions.clear();
     if (this.pendingStateEmitTimer) {
       clearTimeout(this.pendingStateEmitTimer);
       this.pendingStateEmitTimer = undefined;
     }
     if (options?.flush === false) {
-      for (const timer of this.pendingProjectSaveTimers.values()) {
-        clearTimeout(timer);
+      for (const scheduled of this.pendingProjectSaveTimers.values()) {
+        clearTimeout(scheduled.timer);
       }
       this.pendingProjectSaveTimers.clear();
     } else {
@@ -4772,13 +4800,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return this.toRendererLoadedProjectView(project);
   }
 
-  private async saveProject(project: LoadedProject, options?: { force?: boolean }): Promise<void> {
+  private async saveProject(project: LoadedProject, options?: ProjectSaveOptions): Promise<void> {
     if (this.disposed && !options?.force) {
       return;
     }
     const projectId = project.record.id;
     const inFlight = this.projectSaveInFlight.get(projectId);
     if (inFlight) {
+      this.projectSaveQueuedOptions.set(
+        projectId,
+        this.mergeProjectSaveOptions(this.projectSaveQueuedOptions.get(projectId), options)
+      );
       const existingQueued = this.projectSaveQueued.get(projectId);
       if (existingQueued) {
         await existingQueued;
@@ -4791,15 +4823,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           if (this.projectSaveQueued.get(projectId) !== queuedPromise) {
             return;
           }
+          const queuedOptions = this.projectSaveQueuedOptions.get(projectId);
           this.projectSaveQueued.delete(projectId);
-          await this.saveProject(project, options);
+          this.projectSaveQueuedOptions.delete(projectId);
+          await this.saveProject(project, queuedOptions);
         });
       this.projectSaveQueued.set(projectId, queuedPromise);
       await queuedPromise;
       return;
     }
 
-    const savePromise = this.writeProjectToStorage(project).finally(() => {
+    const savePromise = this.writeProjectToStorage(project, options).finally(() => {
       if (this.projectSaveInFlight.get(projectId) === savePromise) {
         this.projectSaveInFlight.delete(projectId);
       }
@@ -4808,16 +4842,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await savePromise;
   }
 
-  private async writeProjectToStorage(project: LoadedProject): Promise<void> {
+  private async writeProjectToStorage(project: LoadedProject, options?: ProjectSaveOptions): Promise<void> {
     const startedAt = performance.now();
     let payloadSize: number | undefined;
     this.compactProjectRuntimeHistory(project);
     for (const agent of project.record.agents) {
       this.recordAgentContextDescriptor(project, agent);
     }
-    const syncStartedAt = performance.now();
-    this.syncWorkflowState(project);
-    this.logWorkflowPerf(`syncWorkflowState before save ${project.record.identity.projectName}: ${Math.round(performance.now() - syncStartedAt)}ms`);
+    if (options?.syncWorkflow !== false) {
+      const syncStartedAt = performance.now();
+      this.syncWorkflowState(project);
+      this.logWorkflowPerf(`syncWorkflowState before save ${project.record.identity.projectName}: ${Math.round(performance.now() - syncStartedAt)}ms`);
+    }
     project.record.summaryCache = project.summaryCache.list();
     let serializedRecord: string | undefined;
     try {
@@ -10833,7 +10869,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       if (immediateTransportFlushMethods.has(notification.method)) {
         this.flushProjectSaveNow(project, notification.method);
       } else {
-        this.scheduleProjectSave(project);
+        this.scheduleProjectSave(project, { syncWorkflow: false });
       }
     }
     if (shouldEmitRendererUpdate) {
@@ -10843,7 +10879,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         this.emitState();
       }
     }
-    if (!liveTransportUpdateMethods.has(notification.method)) {
+    if (workflowAutomationTriggerMethods.has(notification.method)) {
       this.scheduleWorkflowAutomation(project.record.id);
     }
   }
