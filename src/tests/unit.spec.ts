@@ -621,11 +621,16 @@ describe("repo stats", () => {
     const root = await createTempDir("scan");
     await mkdir(path.join(root, "src"), { recursive: true });
     await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true });
+    await mkdir(path.join(root, "release", "win"), { recursive: true });
+    await mkdir(path.join(root, ".electron-builder", "out"), { recursive: true });
     await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "scan-project" }, null, 2));
+    await writeFile(path.join(root, "package-lock.json"), "{ this lockfile is intentionally not parsed during scans");
     await writeFile(path.join(root, "src/index.ts"), "export function hello() { return 'hi'; }\n");
     await writeFile(path.join(root, ".gitignore"), "ignored.log\n");
     await writeFile(path.join(root, "ignored.log"), "do not index\n");
     await writeFile(path.join(root, "node_modules/pkg/index.js"), "module.exports = 1;\n");
+    await writeFile(path.join(root, "release", "win", "app.exe"), "binary output\n");
+    await writeFile(path.join(root, ".electron-builder", "out", "builder.json"), "{}\n");
     await initGitRepo(root);
     await commitAll(root, "initial");
 
@@ -643,6 +648,8 @@ describe("repo stats", () => {
     expect(scan.stats.excludedFiles).toBeGreaterThanOrEqual(1);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === ".git" && entry.kind === "directory")).toBe(true);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === "node_modules" && entry.rule === "default")).toBe(true);
+    expect(scan.stats.excludedPaths.some((entry) => entry.path === "release" && entry.rule === "default")).toBe(true);
+    expect(scan.stats.excludedPaths.some((entry) => entry.path === ".electron-builder" && entry.rule === "default")).toBe(true);
     expect(scan.stats.excludedPaths.some((entry) => entry.path === "ignored.log" && entry.rule === "gitignore")).toBe(true);
     expect(scan.stats.fileTypeBreakdown.TypeScript).toBe(1);
     expect(scan.stats.entryPoints).toContain("src/index.ts");

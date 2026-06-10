@@ -23,13 +23,18 @@ const createdServices = new Set<AppService>();
 const createService = async (appDataDir: string): Promise<AppService> => {
   await writeMockSettings(appDataDir);
   const service = new AppService(appDataDir);
+  trackService(service);
+  await service.initialize();
+  return service;
+};
+
+const trackService = (service: AppService): AppService => {
   const dispose = service.dispose.bind(service);
   service.dispose = async () => {
     createdServices.delete(service);
     await dispose();
   };
   createdServices.add(service);
-  await service.initialize();
   return service;
 };
 
@@ -257,6 +262,27 @@ describe("integration flows", () => {
     expect(state.activeProjectId).toBeUndefined();
   });
 
+  it("defers saved project hydration until after the launcher can render", async () => {
+    const root = await createSampleRepo("launcher-deferred-startup");
+    const appData = await createTempDir("appdata-launcher-deferred-startup");
+    const serviceA = await createService(appData);
+
+    await serviceA.loadProject(root, "create");
+    const selected = await serviceA.selectPendingInterface("fresh");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const serviceB = trackService(new AppService(appData));
+    await serviceB.initialize({ deferStartupWork: true });
+
+    expect(serviceB.getState().projects.some((project) => project.record.id === selected.record.id)).toBe(false);
+
+    await serviceB.runDeferredStartupWork();
+
+    const state = serviceB.getState();
+    expect(state.projects.some((project) => project.record.id === selected.record.id)).toBe(true);
+    expect(state.activeProjectId).toBeUndefined();
+  });
+
   it("ignores partial saved records that only contain stats or agents", async () => {
     const root = await createSampleRepo("partial-record");
     const appData = await createTempDir("appdata-partial-record");
@@ -309,10 +335,16 @@ describe("integration flows", () => {
     service.showLauncher();
     expect(service.getState().activeProjectId).toBeUndefined();
 
+    let activeProjectIdDuringOpen: string | undefined;
+    service.once("stateChanged", (state) => {
+      activeProjectIdDuringOpen = state.activeProjectId;
+    });
+
     const reopened = await service.openProject(created.record.id);
     const state = service.getState();
     const activeProject = state.projects.find((project) => project.record.id === reopened.record.id);
 
+    expect(activeProjectIdDuringOpen).toBe(created.record.id);
     expect(state.activeProjectId).toBe(created.record.id);
     expect(reopened.tree.length).toBeGreaterThan(0);
     expect(activeProject?.record.localState.lastOpenedAt).toBeTruthy();

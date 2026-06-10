@@ -186,6 +186,9 @@ interface PendingLoad {
   gitMetadata: GitMetadata;
 }
 
+type AppServiceInitializeOptions = {
+  deferStartupWork?: boolean;
+};
 type InterfaceCreationParseFailure = Exclude<InterfaceCreationParseResult, { ok: true }>;
 type ProjectSaveMode = "immediate" | "deferred" | false;
 type StateEmitMode = "immediate" | "coalesced" | false;
@@ -409,6 +412,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private runtimeReadinessLastCheckedAt?: string;
   private disposed = false;
   private disposePromise?: Promise<void>;
+  private deferredStartupWork?: Promise<void>;
   private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
   private readonly workflowPerfCounters = new Map<string, { count: number; startedAt: number; lastLoggedAt: number }>();
 
@@ -3540,7 +3544,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
   }
 
-  async initialize(): Promise<void> {
+  async initialize(options: AppServiceInitializeOptions = {}): Promise<void> {
     const existingService = AppService.activeServicesByAppDataDir.get(this.appDataDir);
     if (existingService && existingService !== this) {
       await existingService.dispose();
@@ -3556,6 +3560,33 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       };
     }
 
+    if (options.deferStartupWork) {
+      this.codexAvailability = {
+        source: "unavailable",
+        message: "Codex app-server will start when an agent-backed action runs."
+      };
+      return;
+    }
+
+    await this.runStartupWork({ emitState: false });
+  }
+
+  async runDeferredStartupWork(): Promise<void> {
+    if (this.deferredStartupWork) {
+      return this.deferredStartupWork;
+    }
+    this.deferredStartupWork = this.runStartupWork({ emitState: true })
+      .catch((error) => {
+        this.diagnostics.unshift(`Startup background initialization failed. ${error instanceof Error ? error.message : String(error)}`);
+        this.emitState();
+      })
+      .finally(() => {
+        this.deferredStartupWork = undefined;
+      });
+    return this.deferredStartupWork;
+  }
+
+  private async runStartupWork(options: { emitState: boolean }): Promise<void> {
     await this.refreshGitHubStatus(false);
     if (this.settings.mockMode) {
       await this.initializeTransport();
@@ -3566,6 +3597,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       };
     }
 
+    await this.loadStoredProjects();
+    if (options.emitState) {
+      this.emitState();
+    }
+  }
+
+  private async loadStoredProjects(): Promise<void> {
     const records = await this.storage.loadAllProjects();
     for (const storedRecord of records) {
       const record = this.normalizeStoredProjectRecord(storedRecord);
@@ -3619,8 +3657,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       };
       this.projects.set(record.id, project);
     }
-
-    this.emitState();
   }
 
   private async updateCodexCliOnStartup(): Promise<void> {
@@ -4307,6 +4343,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   async openProject(projectId: string): Promise<LoadedProjectView> {
     this.assertGitHubLinked();
     const existing = this.findProject(projectId);
+    this.activeProjectId = projectId;
+    existing.record.localState.lastOpenedAt = nowIso();
+    this.emitState();
     this.assertResolvedPathCompatible(existing.record.distroName);
     const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
     const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
@@ -4584,9 +4623,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   ): Promise<InterfaceCandidate[]> {
     const candidates: InterfaceCandidate[] = [];
 
-    const localProjects = await this.storage.loadAllProjects();
-    for (const storedProject of localProjects.filter((entry) => entry.identity.fingerprint === identity.fingerprint && this.hasMeaningfulInterfaceContent(entry))) {
-      const project = this.normalizeStoredProjectRecord(storedProject);
+    const localProjects = [...this.projects.values()]
+      .map((project) => project.record)
+      .filter((entry) => entry.identity.fingerprint === identity.fingerprint && this.hasMeaningfulInterfaceContent(entry));
+    for (const project of localProjects) {
       const status = calculateValidationStatus(identity, project.identity, validation, project.validation);
       candidates.push({
         source: "local",

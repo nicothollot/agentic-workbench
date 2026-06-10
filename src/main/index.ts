@@ -750,11 +750,12 @@ const registerIpc = (): void => {
 
 void app.whenReady().then(async () => {
   appService = new AppService(app.getPath("userData"), safeStorage);
-  await appService.initialize();
+  await appService.initialize({ deferStartupWork: true });
   appService.on("stateChanged", (state) => sendState(state));
   registerIpc();
   await createMainWindow();
   sendState(appService.getRendererState());
+  void appService.runDeferredStartupWork();
 
   app.on("activate", async () => {
     if (BrowserWindow.getAllWindows().length === 0) {

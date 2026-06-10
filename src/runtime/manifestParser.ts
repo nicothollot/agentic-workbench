@@ -9,6 +9,20 @@ const xmlParser = new XMLParser({
   attributeNamePrefix: ""
 });
 
+const supportedDependencyManifests = new Set([
+  "package.json",
+  "requirements.txt",
+  "pyproject.toml",
+  "Pipfile",
+  "Cargo.toml",
+  "go.mod",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "Gemfile",
+  "composer.json"
+]);
+
 const splitRequirementsLine = (line: string): { name: string; version: string } | null => {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("-")) {
@@ -187,6 +201,10 @@ const parseComposerJson = (manifestPath: string, raw: string): DependencyRecord[
 };
 
 export const parseManifestFile = async (projectRoot: string, relativePath: string): Promise<DependencyRecord[]> => {
+  if (!supportedDependencyManifests.has(path.basename(relativePath))) {
+    return [];
+  }
+
   const absolutePath = path.join(projectRoot, relativePath);
   const raw = await readFile(absolutePath, "utf8");
 

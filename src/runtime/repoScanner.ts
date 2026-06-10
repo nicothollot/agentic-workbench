@@ -1,5 +1,6 @@
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { setImmediate as yieldImmediate } from "node:timers/promises";
 import ignore from "ignore";
 import { DEFAULT_IGNORES } from "@shared/constants";
 import type { DependencyRecord, ProjectKind, ProjectStats, RepoTreeNode } from "@shared/types";
@@ -36,6 +37,8 @@ export interface RepoScanResult {
 }
 
 type ExclusionRule = "default" | "gitignore";
+
+const SCAN_EVENT_LOOP_YIELD_INTERVAL = 100;
 
 const isSkippableScanError = (error: unknown): boolean => {
   const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
@@ -316,6 +319,16 @@ export const scanRepository = async (
   let excludedFiles = 0;
   let excludedFolders = 0;
   let excludedSizeBytes = 0;
+  let scannedEntriesSinceYield = 0;
+
+  const yieldDuringLargeScan = async (): Promise<void> => {
+    scannedEntriesSinceYield += 1;
+    if (scannedEntriesSinceYield < SCAN_EVENT_LOOP_YIELD_INTERVAL) {
+      return;
+    }
+    scannedEntriesSinceYield = 0;
+    await yieldImmediate();
+  };
 
   const summarizeExcludedPath = async (absolutePath: string): Promise<{ fileCount: number; folderCount: number; totalSizeBytes: number }> => {
     let entryStats;
@@ -372,6 +385,7 @@ export const scanRepository = async (
       throw error;
     }
     for (const entry of entries) {
+      await yieldDuringLargeScan();
       const absolutePath = path.join(currentDir, entry.name);
       const relativePath = path.relative(projectRootHostPath, absolutePath).split(path.sep).join("/");
       if (!relativePath) {
