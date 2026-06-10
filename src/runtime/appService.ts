@@ -5014,8 +5014,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }, partial.autopilotEnabled);
       project.record.localState.autopilotEnabled = workflow.autopilotPolicy.enabled;
     }
+    const previousAutopilotPauseReason = workflow.autopilotStatus?.pausedReason;
     const nextPauseRequested = project.record.localState.workflowPauseRequested;
-    if (partial.workflowPauseRequested !== undefined && previousPauseRequested !== nextPauseRequested) {
+    const acknowledgedAutopilotCheckpoint =
+      partial.workflowPauseRequested !== undefined &&
+      !previousPauseRequested &&
+      !nextPauseRequested &&
+      Boolean(previousAutopilotPauseReason);
+    if (
+      partial.workflowPauseRequested !== undefined &&
+      (previousPauseRequested !== nextPauseRequested || acknowledgedAutopilotCheckpoint)
+    ) {
       if (!nextPauseRequested) {
         this.completeWorkflowPreviewCheckpoint(project, "Workflow resumed after preview inspection");
         this.reconcileWorkflowResumeState(project);
@@ -5023,10 +5032,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
         status: nextPauseRequested ? "waiting" : "running",
-        title: nextPauseRequested ? "Automation pause requested" : "Workflow automation resumed",
+        title: nextPauseRequested
+          ? "Automation pause requested"
+          : acknowledgedAutopilotCheckpoint
+            ? "Autopilot checkpoint acknowledged"
+            : "Workflow automation resumed",
         detail: nextPauseRequested
           ? "The current workflow agent can finish, but no new automatic step will start until you continue."
-          : "Automatic workflow progression can start again.",
+          : acknowledgedAutopilotCheckpoint
+            ? "The saved autopilot checkpoint was acknowledged; automatic workflow progression can start again."
+            : "Automatic workflow progression can start again.",
         stepId: getWorkflowActiveStepId(workflow)
       });
     }

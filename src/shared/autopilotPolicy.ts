@@ -298,6 +298,10 @@ export const hasRepeatedAutopilotFailure = (
   workflow: ProjectWorkflowState,
   agents: AgentState[] = []
 ): boolean => {
+  if (workflow.workflowCycle.status === "completed" || workflow.workflowCycle.status === "merged") {
+    return false;
+  }
+
   const signatures = agents
     .filter((agent) =>
       agent.category !== "manual" &&

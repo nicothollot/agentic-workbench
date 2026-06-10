@@ -7322,7 +7322,7 @@ export const App = () => {
     ? {
       label: workflowContinueActionLabel,
       disabled: workflowCommandBusy,
-      onClick: () => void toggleWorkflowPause()
+      onClick: () => void continueWorkflow()
     }
     : workflowAction?.kind === "recover_workflow"
       ? {

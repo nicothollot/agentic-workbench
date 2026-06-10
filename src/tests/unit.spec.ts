@@ -49,6 +49,7 @@ import {
   getWorkflowModeConfig,
   getWorkflowPreviewRequest,
   getNextWorkflowAutomationAction,
+  hasRepeatedAutopilotFailure,
   isHighRiskAutopilotRecommendation,
   isPreviewRecommendation,
   pickAutopilotRecommendation,
@@ -1988,6 +1989,83 @@ describe("workflow state", () => {
       highRiskPackageRequiresApproval: true
     });
     expect(shouldAutopilotPause({ workflow, projectAccessStatus: "failed" }, policy).reason).toBe("project_access_validation_failed");
+  });
+
+  it("does not let resolved historical failures pause a completed cycle", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Keep workflow automation moving after resolved merge retries.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.workflowCycle = {
+      cycleNumber: 17,
+      acceptanceCriteria: [],
+      status: "ready_to_merge"
+    };
+
+    const firstConflict: AgentState = {
+      ...createAgentSkeleton("merge", "Merge Agent", "Merge prompt", "gpt-5.4-mini"),
+      status: "conflicted",
+      workflowCycleNumber: 17,
+      mergeReport: {
+        summary: "Merge conflicts were detected and require follow-up.",
+        mergedBranches: [],
+        conflicts: ["CONFLICT (content): Merge conflict in smoke/question-bank.spec.ts"],
+        conflictCycleCount: 1,
+        generatedAt: "2026-04-07T00:01:00.000Z"
+      }
+    };
+    const secondConflict: AgentState = {
+      ...createAgentSkeleton("merge", "Merge Agent", "Merge prompt", "gpt-5.4-mini"),
+      status: "conflicted",
+      workflowCycleNumber: 17,
+      mergeReport: {
+        summary: "Merge conflicts were detected and require follow-up.",
+        mergedBranches: [],
+        conflicts: ["CONFLICT (content): Merge conflict in smoke/question-bank.spec.ts"],
+        conflictCycleCount: 2,
+        generatedAt: "2026-04-07T00:02:00.000Z"
+      }
+    };
+    const successfulMerge: AgentState = {
+      ...createAgentSkeleton("merge", "Merge Agent", "Merge prompt", "gpt-5.4-mini"),
+      status: "completed",
+      workflowCycleNumber: 17,
+      mergeReport: {
+        summary: "All selected coding-agent branches merged cleanly.",
+        mergedBranches: ["awb/example"],
+        conflicts: [],
+        conflictCycleCount: 0,
+        generatedAt: "2026-04-07T00:03:00.000Z"
+      }
+    };
+    const policy = validateAutopilotPolicy({ enabled: true, profile: "balanced" });
+
+    expect(hasRepeatedAutopilotFailure(workflow, [firstConflict, secondConflict, successfulMerge])).toBe(true);
+    expect(shouldAutopilotPause({
+      workflow,
+      agents: [firstConflict, secondConflict, successfulMerge]
+    }, policy).reason).toBe("repeated_failure");
+
+    workflow.workflowCycle.status = "completed";
+    workflow.workflowStage = "cycle_complete";
+    workflow.workflowStopReason = "cycle_completed";
+
+    expect(hasRepeatedAutopilotFailure(workflow, [firstConflict, secondConflict, successfulMerge])).toBe(false);
+    expect(shouldAutopilotPause({
+      workflow,
+      agents: [firstConflict, secondConflict, successfulMerge],
+      nextAction: "generate_recommendations"
+    }, policy).shouldPause).toBe(false);
+    expect(getNextWorkflowAutomationAction(
+      workflow,
+      [firstConflict, secondConflict, successfulMerge],
+      "git",
+      policy,
+      false,
+      "deliver"
+    )).toBe("generate_recommendations");
   });
 
   it("applies autopilot policy to work-package selection, Fast Mode, and deterministic scoping", () => {
@@ -5914,6 +5992,62 @@ describe("AppService workflow performance guards", () => {
     expect(performance.now() - startedAt).toBeLessThan(100);
     expect(project.record.localState.workflowPauseRequested).toBe(false);
     expect(project.record.workflow.activityLog[0]?.title).toBe("Workflow automation resumed");
+    expect(automationScheduled).toBe(true);
+    expect(saveStarted).toBe(false);
+    await service.dispose({ flush: false });
+  });
+
+  it("acknowledges autopilot checkpoints even when the manual pause flag is already clear", async () => {
+    const service = new AppService(await createTempDir("resume-autopilot-checkpoint")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      saveProject: () => Promise<void>;
+      shouldScheduleWorkflowAutomation: () => boolean;
+      scheduleWorkflowAutomation: (projectId: string, reason?: string) => void;
+      updateUiState: (projectId: string, partial: Partial<ReturnType<typeof makeAppServiceLoadedProject>["record"]["localState"]>) => Promise<void>;
+      dispose: (options?: { flush?: boolean }) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("resume-autopilot-checkpoint-project");
+    project.record.localState.autopilotEnabled = true;
+    project.record.localState.workflowPauseRequested = false;
+    project.record.workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Keep background workflow responsive.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    project.record.workflow.workflowCycle.status = "completed";
+    project.record.workflow.workflowStage = "cycle_complete";
+    project.record.workflow.workflowStopReason = "cycle_completed";
+    project.record.workflow.autopilotStatus = {
+      enabled: true,
+      profile: "balanced",
+      workflowMode: "normal",
+      stage: "cycle_complete",
+      cycleNumber: project.record.workflow.workflowCycle.cycleNumber,
+      lastCompletedAction: "run_merge",
+      nextPlannedAction: "generate_recommendations",
+      pausedReason: "repeated_failure",
+      pausedDetail: "The same workflow failure repeated in this cycle.",
+      highRiskPackageRequiresApproval: false,
+      updatedAt: "2026-04-07T00:01:00.000Z"
+    };
+    service.projects.set(project.record.id, project);
+    service.shouldScheduleWorkflowAutomation = () => true;
+    let automationScheduled = false;
+    service.scheduleWorkflowAutomation = () => {
+      automationScheduled = true;
+    };
+    let saveStarted = false;
+    service.saveProject = async () => {
+      saveStarted = true;
+      await new Promise(() => undefined);
+    };
+
+    const startedAt = performance.now();
+    await service.updateUiState(project.record.id, { workflowPauseRequested: false });
+
+    expect(performance.now() - startedAt).toBeLessThan(100);
+    expect(project.record.workflow.activityLog[0]?.title).toBe("Autopilot checkpoint acknowledged");
+    expect(project.record.workflow.autopilotStatus?.pausedReason).toBeUndefined();
     expect(automationScheduled).toBe(true);
     expect(saveStarted).toBe(false);
     await service.dispose({ flush: false });
