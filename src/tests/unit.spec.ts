@@ -184,6 +184,8 @@ type RepoHygieneScript = {
     files: Array<string | { path: string; sizeBytes?: number }>,
     options?: { largeFileLimitBytes?: number }
   ) => Array<{ path: string; reason: string }>;
+  analyzeGitignoreContent: (content: string) => Array<{ path: string; reason: string }>;
+  gitignoreArtifactSamples: string[];
 };
 
 const loadPackageAppScript = async (): Promise<PackageAppScript> => {
@@ -620,26 +622,30 @@ describe("repo hygiene guardrails", () => {
     expect(issues.some((issue) => issue.path === "assets/branding/interface_icon.png")).toBe(false);
   });
 
-  it("ignores generated target-project export patterns before they can be added", () => {
+  it("keeps .gitignore newline-separated", async () => {
+    const repoHygiene = await loadRepoHygieneScript();
+    const content = await readFile(path.resolve(".gitignore"), "utf8");
+
+    expect(repoHygiene.analyzeGitignoreContent(content)).toEqual([]);
+    expect(content.split(/\r?\n/).length).toBeGreaterThan(20);
+    expect(content).toContain("\nnode_modules/");
+  });
+
+  it("ignores generated target-project export patterns before they can be added", async () => {
+    const repoHygiene = await loadRepoHygieneScript();
     const ignored = runGitText(
       [
         "check-ignore",
         "--no-index",
-        "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json",
-        "quant_interview_prep-interface-visuals-2026-06-10T17-54-19-586Z.pdf",
-        "quant-interview-prep-cycle-2-repair-report-2026-05-07T20-46-41-218Z.md",
-        ".agent-workbench/interface.json",
-        "agent-outputs/coding-agent.txt"
+        "-v",
+        ...repoHygiene.gitignoreArtifactSamples
       ]
     ).trim().split(/\r?\n/);
 
-    expect(ignored).toEqual([
-      "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json",
-      "quant_interview_prep-interface-visuals-2026-06-10T17-54-19-586Z.pdf",
-      "quant-interview-prep-cycle-2-repair-report-2026-05-07T20-46-41-218Z.md",
-      ".agent-workbench/interface.json",
-      "agent-outputs/coding-agent.txt"
-    ]);
+    expect(ignored).toHaveLength(repoHygiene.gitignoreArtifactSamples.length);
+    for (const sample of repoHygiene.gitignoreArtifactSamples) {
+      expect(ignored.some((line) => line.endsWith(`\t${sample}`))).toBe(true);
+    }
   });
 });
 
