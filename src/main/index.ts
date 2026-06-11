@@ -14,6 +14,7 @@ import {
   agentTranscriptRequestSchema,
   approveRecommendationRequestSchema,
   approvalDecisionRequestSchema,
+  codexUpdateRunRequestSchema,
   createScopedGoalRequestSchema,
   createAgentRequestSchema,
   credentialEntryDeleteRequestSchema,
@@ -25,6 +26,8 @@ import {
   detectUltimateGoalRequestSchema,
   exportInterfaceRequestSchema,
   fileSummaryRequestSchema,
+  autopilotStrategyRequestSchema,
+  goalCharterRequestSchema,
   importUltimateGoalTextRequestSchema,
   importInterfaceRequestSchema,
   layoutUpdateRequestSchema,
@@ -34,21 +37,29 @@ import {
   projectLogFeedRequestSchema,
   projectOpenRequestSchema,
   projectRepositoryChildrenRequestSchema,
+  projectRepositoryExcludedPathsRequestSchema,
   projectRepositorySearchRequestSchema,
   projectRepositorySummaryRequestSchema,
   projectRepositoryViewRequestSchema,
   repositoryRescanRequestSchema,
+  repositoryScanSettingsRequestSchema,
   projectSelectionDecisionSchema,
   refreshOverviewRequestSchema,
+  goalChangeDecisionRequestSchema,
+  goalChangeProposalRequestSchema,
+  plannerCycleRecordRequestSchema,
   manageUserInputRequestAttachmentsSchema,
   requestWorkflowPreviewRequestSchema,
   retryWorkflowGoalRequestSchema,
   runRecommendationRequestSchema,
   setAutopilotPolicyRequestSchema,
   setWorkflowModeRequestSchema,
+  strategicPlanRequestSchema,
   submitUserInputRequestResponseSchema,
   requestHumanInterventionRequestSchema,
   resolveHumanInterventionRequestSchema,
+  updateAutopilotStrategyRequestSchema,
+  updateGoalCharterRequestSchema,
   updateUltimateGoalRequestSchema,
   uiStateUpdateRequestSchema,
   workflowCycleDetailRequestSchema,
@@ -361,8 +372,13 @@ const registerIpc = (): void => {
   });
   ipcMain.handle("app:checkRuntimeReadiness", async () => await appService?.refreshRuntimeReadiness("manual runtime readiness check"));
   ipcMain.handle("app:getCodexReadiness", () => appService?.getCodexReadiness());
+  ipcMain.handle("app:refreshCodexReadiness", async () => await appService?.refreshCodexReadiness("manual Codex readiness check"));
   ipcMain.handle("app:checkCodexUpdate", async () => await appService?.checkCodexUpdate());
-  ipcMain.handle("app:runCodexUpdate", async () => await appService?.runCodexUpdate());
+  ipcMain.handle("app:runCodexUpdate", async (_event, payload) => {
+    const parsed = codexUpdateRunRequestSchema.parse(payload);
+    return await appService?.runCodexUpdate(parsed);
+  });
+  ipcMain.handle("app:getExecutionEnvironmentStatus", () => appService?.getExecutionEnvironmentStatus());
   ipcMain.handle("project:load", async (_event, payload) => {
     const parsed = projectLoadRequestSchema.parse(payload);
     return await appService?.loadProject(parsed.inputPath, parsed.intent);
@@ -548,6 +564,21 @@ const registerIpc = (): void => {
     const parsed = projectRepositoryViewRequestSchema.parse(payload);
     return appService?.getRepositoryScanStatus(parsed.projectId);
   });
+  ipcMain.handle("project:getRepositoryScanLimits", (_event, payload) => {
+    const parsed = projectRepositoryViewRequestSchema.parse(payload);
+    return appService?.getRepositoryScanLimits(parsed.projectId);
+  });
+  ipcMain.handle("project:updateRepositoryScanSettings", async (_event, payload) => {
+    const parsed = repositoryScanSettingsRequestSchema.parse(payload);
+    return await appService?.updateRepositoryScanSettings(parsed.projectId, parsed.settings);
+  });
+  ipcMain.handle("project:listExcludedPaths", (_event, payload) => {
+    const parsed = projectRepositoryExcludedPathsRequestSchema.parse(payload);
+    return appService?.listExcludedPaths(parsed.projectId, {
+      cursor: parsed.cursor,
+      limit: parsed.limit
+    });
+  });
   ipcMain.handle("project:rescanRepository", async (_event, payload) => {
     const parsed = repositoryRescanRequestSchema.parse(payload);
     return await appService?.rescanRepository(parsed.projectId, parsed.options);
@@ -636,6 +667,55 @@ const registerIpc = (): void => {
       return null;
     }
     return await appService?.importUltimateGoalText(parsed.projectId, fileResult.filePaths[0]);
+  });
+  ipcMain.handle("workflow:getGoalCharter", (_event, payload) => {
+    const parsed = goalCharterRequestSchema.parse(payload);
+    return appService?.getGoalCharter(parsed.projectId);
+  });
+  ipcMain.handle("workflow:updateGoalCharter", async (_event, payload) => {
+    const parsed = updateGoalCharterRequestSchema.parse(payload);
+    return await appService?.updateGoalCharter(parsed.projectId, parsed.patch);
+  });
+  ipcMain.handle("workflow:getAutopilotStrategy", (_event, payload) => {
+    const parsed = autopilotStrategyRequestSchema.parse(payload);
+    return appService?.getAutopilotStrategy(parsed.projectId);
+  });
+  ipcMain.handle("workflow:updateAutopilotStrategy", async (_event, payload) => {
+    const parsed = updateAutopilotStrategyRequestSchema.parse(payload);
+    return await appService?.updateAutopilotStrategy(parsed.projectId, parsed.strategy);
+  });
+  ipcMain.handle("workflow:listAutopilotPresets", () => appService?.listAutopilotPresets());
+  ipcMain.handle("workflow:generateStrategicPlan", (_event, payload) => {
+    const parsed = strategicPlanRequestSchema.parse(payload);
+    return appService?.generateStrategicPlan(parsed.projectId);
+  });
+  ipcMain.handle("workflow:selectNextWorkPackage", (_event, payload) => {
+    const parsed = strategicPlanRequestSchema.parse(payload);
+    return appService?.selectNextWorkPackage(parsed.projectId);
+  });
+  ipcMain.handle("workflow:proposeGoalChange", async (_event, payload) => {
+    const parsed = goalChangeProposalRequestSchema.parse(payload);
+    return await appService?.proposeGoalChange(parsed.projectId, parsed.proposal);
+  });
+  ipcMain.handle("workflow:acceptGoalChange", async (_event, payload) => {
+    const parsed = goalChangeDecisionRequestSchema.parse(payload);
+    return await appService?.acceptGoalChange(parsed.projectId, parsed.proposalId);
+  });
+  ipcMain.handle("workflow:rejectGoalChange", async (_event, payload) => {
+    const parsed = goalChangeDecisionRequestSchema.parse(payload);
+    return await appService?.rejectGoalChange(parsed.projectId, parsed.proposalId, parsed.decisionNotes);
+  });
+  ipcMain.handle("workflow:listChecklistChanges", (_event, payload) => {
+    const parsed = strategicPlanRequestSchema.parse(payload);
+    return appService?.listChecklistChanges(parsed.projectId);
+  });
+  ipcMain.handle("workflow:getPlannerDecision", (_event, payload) => {
+    const parsed = plannerCycleRecordRequestSchema.parse(payload);
+    return appService?.getPlannerDecision(parsed.projectId, parsed.cycleId);
+  });
+  ipcMain.handle("workflow:getCycleRetrospective", (_event, payload) => {
+    const parsed = plannerCycleRecordRequestSchema.parse(payload);
+    return appService?.getCycleRetrospective(parsed.projectId, parsed.cycleId);
   });
   ipcMain.handle("workflow:approveRecommendation", async (_event, payload) => {
     const parsed = approveRecommendationRequestSchema.parse(payload);

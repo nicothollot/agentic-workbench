@@ -22,6 +22,7 @@ import {
 } from "@shared/workflowView";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
+import { createDefaultAutopilotStrategy, goalRestrictivenessMode, listAutopilotPresets as defaultAutopilotPresets } from "@shared/goalCharter";
 import type {
   AgentCategory,
   AgentFullOutputResponse,
@@ -31,14 +32,17 @@ import type {
   AgentReasoningMode,
   AgentState,
   AgentTranscriptResponse,
+  AutopilotPreset,
   AutopilotPolicy,
   AutopilotProfile,
+  AutopilotStrategy,
   ApprovalRequestRecord,
   CredentialEntryMetadata,
   DiscoveredModel,
   ExecutionMode,
   FileSummary,
   GitHubStatus,
+  GoalChangeRecord,
   HumanInterventionRecord,
   InterfaceReasoningEffort,
   InterfaceCandidate,
@@ -49,6 +53,8 @@ import type {
   ProjectRepositorySummary,
   ProjectWorkflowState,
   RepositoryChildrenResponse,
+  RepositoryScanLimitsResponse,
+  RepositoryScanSettings,
   RepositoryScanStatus,
   RepositorySearchResponse,
   RepositoryTreeEntry,
@@ -103,11 +109,13 @@ type AgentOutputViewerState = {
   agentId: string;
   agentName: string;
   loading: boolean;
+  transcriptLoading?: boolean;
   output?: AgentFullOutputResponse;
   transcript?: AgentTranscriptResponse;
   error?: string;
   query: string;
   wrap: boolean;
+  viewMode: "preformatted" | "plain";
 };
 
 type RepositoryDataView = ProjectRepositorySummary & {
@@ -150,7 +158,7 @@ const emptyHistoryData = (): HistoryCycleView => ({
   projectId: "",
   cursor: undefined,
   nextCursor: undefined,
-  limit: 20,
+  limit: HISTORY_RECENT_CYCLE_LIMIT,
   total: 0,
   cycles: [],
   recentPreloaded: 0,
@@ -243,6 +251,29 @@ type SettingsDraftUpdate = {
   considerPaidServices?: boolean;
 };
 
+type GoalCharterDraftState = {
+  currentSummary: string;
+  currentDetailedIntent: string;
+  currentSuccessCriteria: string;
+  currentConstraints: string;
+  currentNonGoals: string;
+  currentTargetAudience: string;
+  currentQualityBar: string;
+  nonNegotiableRequirements: string;
+  flexibleRequirements: string;
+  niceToHaveIdeas: string;
+  explicitNonGoals: string;
+  userConstraints: string;
+  aestheticPreferences: string;
+  technicalPreferences: string;
+  definitionOfDone: string;
+  autopilotStrategy: AutopilotStrategy;
+};
+
+type GoalCharterDraftUpdate = Partial<Omit<GoalCharterDraftState, "autopilotStrategy">> & {
+  autopilotStrategy?: AutopilotStrategy;
+};
+
 type StatusChipTone =
   | "running"
   | "paused"
@@ -266,6 +297,8 @@ type ShellAction = {
 const interfaceIconUrl = new URL("../../assets/branding/interface_icon.png", import.meta.url).href;
 const WORKFLOW_AGENT_STALE_MS = 10 * 60 * 1000;
 const AGENT_HISTORY_PAGE_SIZE = 20;
+const HISTORY_RECENT_CYCLE_LIMIT = 5;
+const HISTORY_OLDER_CYCLE_PAGE_SIZE = 20;
 const LOG_ACTIVITY_PAGE_SIZE = 80;
 const LOG_COMMAND_PAGE_SIZE = 50;
 const RUN_DETAIL_PREVIEW_TEXT_LIMIT = 4_000;
@@ -611,6 +644,17 @@ const formatBytes = (value: number): string => {
   return `${Math.max(1, Math.round(value / 1024))} KB`;
 };
 
+const formatMilliseconds = (value?: number): string => {
+  if (value === undefined) {
+    return "Not recorded";
+  }
+  if (value < 1_000) {
+    return `${Math.max(1, Math.round(value))} ms`;
+  }
+  const seconds = value / 1_000;
+  return seconds < 60 ? `${seconds.toFixed(seconds < 10 ? 1 : 0)}s` : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+};
+
 const getUserInputQuestionSelectValue = (question: UserInputRequestQuestion, answer: string): string => {
   if (!question.options.length) {
     return "";
@@ -656,6 +700,44 @@ const normalizeReasoningMode = (mode?: AgentReasoningMode): AgentReasoningMode =
 
 const exclusionRuleLabel = (rule: "default" | "gitignore"): string =>
   rule === "default" ? "Built-in default exclusion" : ".gitignore exclusion";
+
+const repositorySearchScopeLabel = (scope?: RepositorySearchResponse["searchScope"]): string => {
+  if (scope === "loaded_tree_nodes") {
+    return "Loaded tree nodes";
+  }
+  if (scope === "full_deep_index") {
+    return "Full deep index";
+  }
+  return "Indexed files";
+};
+
+const excludedPathExplanation = (pathName: string): string => {
+  const topLevel = pathName.split("/")[0] ?? pathName;
+  if (topLevel === ".git") {
+    return "Git object database and refs are excluded because they are repository metadata, not source files.";
+  }
+  if (topLevel === "node_modules") {
+    return "Installed dependencies are excluded to keep scans responsive and avoid indexing vendored packages.";
+  }
+  if (topLevel === ".agent-workbench") {
+    return "Workbench state, managed worktrees, logs, and handoff files are excluded from project indexing.";
+  }
+  if (topLevel === "dist" || topLevel === "build" || topLevel === "out" || topLevel === "release") {
+    return "Generated build output is excluded because it can be large and reproducible from source.";
+  }
+  if (topLevel.includes("cache") || topLevel === ".vite" || topLevel === ".next" || topLevel === ".turbo") {
+    return "Cache folders are excluded because they are generated and can change frequently.";
+  }
+  return "Excluded by built-in repository defaults or this project's ignore rules.";
+};
+
+const commonExcludedPathExplanations = [
+  [".git", excludedPathExplanation(".git")],
+  ["node_modules", excludedPathExplanation("node_modules")],
+  [".agent-workbench", excludedPathExplanation(".agent-workbench")],
+  ["dist/build/out", excludedPathExplanation("dist")],
+  ["cache folders", excludedPathExplanation(".cache")]
+] as const;
 
 const getTopFileTypes = (breakdown?: Record<string, number>): Array<[string, number]> =>
   Object.entries(breakdown ?? {})
@@ -787,6 +869,44 @@ const autopilotProfileLabel = (profile: AutopilotProfile): string => {
       return "Balanced";
   }
 };
+
+const strategyPresetLabel = (strategy: AutopilotStrategy, presets: AutopilotPreset[]): string =>
+  strategy.presetId === "custom"
+    ? "Custom"
+    : presets.find((preset) => preset.id === strategy.presetId)?.label ?? strategy.presetId.replace(/_/g, " ");
+
+const goalRestrictivenessLabel = (value: number): string => {
+  switch (goalRestrictivenessMode(value)) {
+    case "very_strict":
+      return "Very strict";
+    case "goal_first":
+      return "Goal-first";
+    case "balanced":
+      return "Balanced";
+    case "exploratory":
+      return "Exploratory";
+    case "highly_creative":
+      return "Highly creative / divergent";
+  }
+};
+
+const goalRestrictivenessDescription = (value: number): string => {
+  switch (goalRestrictivenessMode(value)) {
+    case "very_strict":
+      return "Follow the Ultimate Goal almost exactly and avoid unrequested features.";
+    case "goal_first":
+      return "Treat the Ultimate Goal as mostly fixed while allowing small goal-supporting improvements.";
+    case "balanced":
+      return "Treat the goal as the destination while allowing smarter routing and useful improvements.";
+    case "exploratory":
+      return "Treat the goal as a strong theme and allow meaningful product improvement proposals.";
+    case "highly_creative":
+      return "Treat the goal as inspiration. Major changes may be proposed, but not silently applied.";
+  }
+};
+
+const enumLabel = (value: string): string =>
+  value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 
 const autopilotPauseReasonLabel = (reason?: NonNullable<ProjectWorkflowState["autopilotStatus"]>["pausedReason"]): string =>
   reason ? reason.replace(/_/g, " ") : "None";
@@ -1365,6 +1485,44 @@ const toLineList = (value: string): string[] =>
 
 const fromLineList = (entries: string[] | undefined): string => (entries ?? []).join("\n");
 
+const cloneStrategy = (strategy?: AutopilotStrategy): AutopilotStrategy => {
+  const base = strategy ?? createDefaultAutopilotStrategy();
+  return {
+    ...base,
+    visualPreferences: {
+      ...base.visualPreferences
+    },
+    autonomyBudget: {
+      ...base.autonomyBudget
+    }
+  };
+};
+
+const goalCharterDraftFromWorkflow = (workflow?: ProjectWorkflowState): GoalCharterDraftState => {
+  const charter = workflow?.goalCharter;
+  const currentGoal = charter?.currentEffectiveGoal?.summary
+    ? charter.currentEffectiveGoal
+    : workflow?.ultimateGoal;
+  return {
+    currentSummary: currentGoal?.summary ?? "",
+    currentDetailedIntent: currentGoal?.detailedIntent ?? "",
+    currentSuccessCriteria: fromLineList(currentGoal?.successCriteria),
+    currentConstraints: fromLineList(currentGoal?.constraints),
+    currentNonGoals: fromLineList(currentGoal?.nonGoals),
+    currentTargetAudience: currentGoal?.targetAudience ?? "",
+    currentQualityBar: currentGoal?.qualityBar ?? "",
+    nonNegotiableRequirements: fromLineList(charter?.nonNegotiableRequirements),
+    flexibleRequirements: fromLineList(charter?.flexibleRequirements),
+    niceToHaveIdeas: fromLineList(charter?.niceToHaveIdeas),
+    explicitNonGoals: fromLineList(charter?.explicitNonGoals),
+    userConstraints: fromLineList(charter?.userConstraints),
+    aestheticPreferences: fromLineList(charter?.aestheticPreferences),
+    technicalPreferences: fromLineList(charter?.technicalPreferences),
+    definitionOfDone: fromLineList(charter?.definitionOfDone),
+    autopilotStrategy: cloneStrategy(charter?.autopilotStrategy)
+  };
+};
+
 const interventionSeverityClass = (severity: HumanInterventionRecord["severity"]): string => `badge-severity-${severity}`;
 
 const sortAgentsByActivity = (agents: AgentState[]): AgentState[] =>
@@ -1838,6 +1996,9 @@ const validationStatusChip = (status: ValidationStatus): { label: string; tone: 
   })[status] as { label: string; tone: StatusChipTone };
 
 const repositoryScanStatusChip = (status?: RepositoryScanStatus["status"]): { label: string; tone: StatusChipTone } => {
+  if (status === "not_scanned") {
+    return { label: "Not scanned", tone: "pending" };
+  }
   if (status === "indexed") {
     return { label: "Indexed", tone: "success" };
   }
@@ -2652,12 +2813,57 @@ const formatDurationMs = (durationMs?: number): string =>
         ? `${Math.floor(durationMs / 60_000)}m ${Math.round((durationMs % 60_000) / 1000)}s`
         : `${Math.floor(durationMs / 3_600_000)}h ${Math.round((durationMs % 3_600_000) / 60_000)}m`;
 
+const HistoryMiniList = ({
+  label,
+  items,
+  empty = "None recorded",
+  limit = 6
+}: {
+  label: string;
+  items: string[];
+  empty?: string;
+  limit?: number;
+}) => {
+  const visibleItems = items.slice(0, limit);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+  return (
+    <section className="history-mini-list">
+      <span>{label}</span>
+      {visibleItems.length ? (
+        <div className="tag-row">
+          {visibleItems.map((item, index) => <span key={`${label}:${index}:${item}`} className="tag">{redactSensitiveText(item)}</span>)}
+          {hiddenCount ? <span className="tag">+{hiddenCount} more</span> : null}
+        </div>
+      ) : (
+        <p>{empty}</p>
+      )}
+    </section>
+  );
+};
+
+const HistoryNarrativeField = ({
+  label,
+  value,
+  empty = "Not recorded"
+}: {
+  label: string;
+  value?: string;
+  empty?: string;
+}) => (
+  <div className="history-narrative-field">
+    <span>{label}</span>
+    <p>{redactSensitiveText(value) || empty}</p>
+  </div>
+);
+
 const HistoryAgentCard = ({
   agent,
-  onOpenOutput
+  onOpenOutput,
+  onOpenTranscript
 }: {
   agent: AgentHistorySummary;
   onOpenOutput: (agent: AgentHistorySummary) => void;
+  onOpenTranscript: (agent: AgentHistorySummary) => void;
 }) => {
   const status = agentLifecycleStatusChip(agent.status);
   return (
@@ -2668,38 +2874,37 @@ const HistoryAgentCard = ({
             <strong>{agent.name}</strong>
             <StatusChip label={status.label} tone={status.tone} />
           </div>
-          <p>{agent.preview}</p>
+          <p>{redactSensitiveText(agent.preview)}</p>
         </div>
-        <button className="primary-button" type="button" onClick={() => onOpenOutput(agent)}>
-          View full output
-        </button>
+        <div className="history-agent-card__actions">
+          <button className="primary-button" type="button" onClick={() => onOpenOutput(agent)}>
+            View full output
+          </button>
+          <button className="secondary-button" type="button" onClick={() => onOpenTranscript(agent)}>
+            Open transcript
+          </button>
+        </div>
       </div>
       <div className="history-agent-card__grid">
         <RunDetailField label="Category" value={agentCategoryLabel(agent.category)} />
         <RunDetailField label="Model" value={agent.model} />
         <RunDetailField label="Reasoning" value={agent.reasoningEffort ? reasoningEffortLabel(agent.reasoningEffort) : "Default"} />
-        <RunDetailField label="Phase" value={agent.currentPhase ?? agent.currentSubtask ?? "Not recorded"} />
+        <RunDetailField label="Current/final phase" value={agent.currentPhase ?? agent.currentSubtask ?? agent.status.replace(/_/g, " ")} />
         <RunDetailField label="Started" value={formatDateTime(agent.startedAt)} />
         <RunDetailField label="Ended" value={formatDateTime(agent.completedAt)} />
         <RunDetailField label="Files changed" value={agent.changedFiles.length} />
         <RunDetailField label="Commands run" value={agent.commandCount} />
         <RunDetailField label="Approvals" value={`${agent.pendingApprovalCount} pending / ${agent.approvalCount} total`} />
         <RunDetailField label="Errors" value={agent.errorCount} />
+        <RunDetailField label="Token usage" value={agent.tokenUsage ?? "Not recorded"} />
       </div>
-      <details className="workflow-inline-details">
-        <summary>Task prompt and run details</summary>
-        <p>{redactSensitiveText(agent.taskPrompt)}</p>
-        {agent.commands.length ? (
-          <div className="tag-row">
-            {agent.commands.map((command) => <span key={command} className="tag">{redactSensitiveText(command)}</span>)}
-          </div>
-        ) : <p className="agent-card__subtle">No commands were recorded for this agent.</p>}
-        {agent.changedFiles.length ? (
-          <div className="tag-row">
-            {agent.changedFiles.slice(0, 24).map((file) => <span key={file} className="tag">{file}</span>)}
-          </div>
-        ) : null}
-      </details>
+      <div className="history-agent-card__sections">
+        <HistoryNarrativeField label="Task prompt" value={agent.taskPrompt} />
+        <HistoryMiniList label="Files changed" items={agent.changedFiles} empty="No changed files were recorded." limit={12} />
+        <HistoryMiniList label="Commands run" items={agent.commands} empty="No commands were recorded." limit={8} />
+        <HistoryMiniList label="Approvals requested/granted" items={agent.approvalSummaries} empty="No approvals were requested." limit={6} />
+        <HistoryMiniList label="Errors" items={agent.errorSummaries} empty="No errors were recorded." limit={6} />
+      </div>
     </article>
   );
 };
@@ -2708,26 +2913,61 @@ const AgentOutputViewer = ({
   viewer,
   onClose,
   onQueryChange,
-  onWrapChange
+  onWrapChange,
+  onViewModeChange,
+  onLoadTranscript
 }: {
   viewer?: AgentOutputViewerState;
   onClose: () => void;
   onQueryChange: (value: string) => void;
   onWrapChange: (value: boolean) => void;
+  onViewModeChange: (value: AgentOutputViewerState["viewMode"]) => void;
+  onLoadTranscript: () => void;
 }) => {
+  const [technicalDetailsOpen, setTechnicalDetailsOpen] = useState(false);
+  const [showAllTranscriptEvents, setShowAllTranscriptEvents] = useState(false);
+
+  useEffect(() => {
+    setTechnicalDetailsOpen(false);
+    setShowAllTranscriptEvents(false);
+  }, [viewer?.agentId]);
+
+  const outputText = viewer?.output?.output ?? "";
+  const query = viewer?.query.trim().toLowerCase() ?? "";
+  const visibleOutput = useMemo(
+    () => query
+      ? outputText
+        .split(/\r?\n/)
+        .filter((line) => line.toLowerCase().includes(query))
+        .join("\n")
+      : outputText,
+    [outputText, query]
+  );
+  const transcriptEntries = useMemo(
+    () => {
+      const entries = viewer?.transcript?.entries ?? [];
+      return query
+        ? entries.filter((entry) => [entry.kind, entry.title, entry.text, JSON.stringify(entry.metadata ?? {})]
+          .filter((value): value is string => typeof value === "string")
+          .some((value) => value.toLowerCase().includes(query)))
+        : entries;
+    },
+    [query, viewer?.transcript?.entries]
+  );
+  const displayedTranscriptEntries = showAllTranscriptEvents ? transcriptEntries : transcriptEntries.slice(0, 220);
+  const rawJson = useMemo(
+    () => technicalDetailsOpen && viewer?.transcript ? JSON.stringify(viewer.transcript.entries, null, 2) : "",
+    [technicalDetailsOpen, viewer?.transcript]
+  );
+  const outputClassName = [
+    "agent-output-block",
+    viewer?.wrap ? "agent-output-block--wrap" : "",
+    viewer?.viewMode === "plain" ? "agent-output-block--plain" : ""
+  ].filter(Boolean).join(" ");
+
   if (!viewer) {
     return null;
   }
-
-  const outputText = viewer.output?.output ?? "";
-  const query = viewer.query.trim().toLowerCase();
-  const visibleOutput = query
-    ? outputText
-      .split(/\r?\n/)
-      .filter((line) => line.toLowerCase().includes(query))
-      .join("\n")
-    : outputText;
-  const rawJson = viewer.transcript ? JSON.stringify(viewer.transcript.entries, null, 2) : "";
 
   return (
     <div className="agent-output-modal" role="dialog" aria-modal="true" aria-label="Agent output">
@@ -2740,6 +2980,9 @@ const AgentOutputViewer = ({
           </div>
           <div className="actions-row">
             <CopyButton value={outputText} label="Copy output" />
+            <button className="secondary-button" type="button" disabled={viewer.transcriptLoading || Boolean(viewer.transcript)} onClick={onLoadTranscript}>
+              {viewer.transcript ? "Transcript loaded" : viewer.transcriptLoading ? "Loading transcript..." : "Open transcript"}
+            </button>
             <button className="secondary-button" type="button" onClick={onClose}>Close</button>
           </div>
         </header>
@@ -2750,6 +2993,14 @@ const AgentOutputViewer = ({
             value={viewer.query}
             onChange={(event) => onQueryChange(event.target.value)}
           />
+          <div className="segmented-control" aria-label="Output view">
+            <button className={viewer.viewMode === "preformatted" ? "segmented-control__button segmented-control__button--active" : "segmented-control__button"} type="button" onClick={() => onViewModeChange("preformatted")}>
+              Preformatted
+            </button>
+            <button className={viewer.viewMode === "plain" ? "segmented-control__button segmented-control__button--active" : "segmented-control__button"} type="button" onClick={() => onViewModeChange("plain")}>
+              Plain text
+            </button>
+          </div>
           <label className="checkbox-row">
             <input type="checkbox" checked={viewer.wrap} onChange={(event) => onWrapChange(event.target.checked)} />
             <span>Wrap text</span>
@@ -2761,12 +3012,60 @@ const AgentOutputViewer = ({
           <div className="notice notice--error">{viewer.error}</div>
         ) : (
           <>
-            <pre className={`agent-output-block ${viewer.wrap ? "agent-output-block--wrap" : ""}`}>
+            <pre className={outputClassName}>
               {visibleOutput || "No output text is available for this agent."}
             </pre>
-            <details className="workflow-inline-details">
+            {viewer.transcriptLoading ? <LoadingIndicator label="Loading full transcript" compact /> : null}
+            {viewer.transcript ? (
+              <section className="agent-transcript-panel">
+                <div className="candidate-card__title-row">
+                  <strong>Full transcript</strong>
+                  <span className="badge">{transcriptEntries.length} event{transcriptEntries.length === 1 ? "" : "s"}</span>
+                </div>
+                <div className="agent-transcript-list">
+                  {displayedTranscriptEntries.map((entry) => (
+                    entry.kind === "raw" ? (
+                      <details key={entry.id} className="agent-transcript-row agent-transcript-row--raw">
+                        <summary>
+                          <span>{formatClockTime(entry.timestamp)}</span>
+                          <strong>{entry.title}</strong>
+                          <em>Raw event</em>
+                        </summary>
+                        <pre>{entry.text ?? (entry.raw !== undefined ? JSON.stringify(entry.raw, null, 2) : "No raw payload available.")}</pre>
+                      </details>
+                    ) : (
+                      <article key={entry.id} className="agent-transcript-row">
+                        <div className="agent-transcript-row__meta">
+                          <span>{formatClockTime(entry.timestamp)}</span>
+                          <strong>{entry.kind === "message" ? "Agent output" : entry.kind.replace(/_/g, " ")}</strong>
+                        </div>
+                        <div>
+                          <strong>{entry.title}</strong>
+                          {entry.text ? <p>{entry.text}</p> : null}
+                        </div>
+                      </article>
+                    )
+                  ))}
+                </div>
+                {displayedTranscriptEntries.length < transcriptEntries.length ? (
+                  <button className="secondary-button" type="button" onClick={() => setShowAllTranscriptEvents(true)}>
+                    Show all transcript events
+                  </button>
+                ) : null}
+              </section>
+            ) : null}
+            <details className="workflow-inline-details" onToggle={(event) => setTechnicalDetailsOpen(event.currentTarget.open)}>
               <summary>Technical details</summary>
-              <pre className="agent-output-raw">{rawJson || "No transcript JSON is available."}</pre>
+              {!viewer.transcript ? (
+                <div className="history-technical-placeholder">
+                  <p>Raw transport and debug details are loaded only when the transcript is opened.</p>
+                  <button className="secondary-button" type="button" disabled={viewer.transcriptLoading} onClick={onLoadTranscript}>
+                    {viewer.transcriptLoading ? "Loading transcript..." : "Open transcript"}
+                  </button>
+                </div>
+              ) : (
+                <pre className="agent-output-raw">{rawJson || "No transcript JSON is available."}</pre>
+              )}
             </details>
           </>
         )}
@@ -2779,21 +3078,23 @@ const HistoryPage = ({
   history,
   onLoadMore,
   onToggleCycle,
-  onOpenOutput
+  onOpenOutput,
+  onOpenTranscript
 }: {
   history: HistoryCycleView;
   onLoadMore: () => void;
   onToggleCycle: (cycle: WorkflowCycleSummaryView) => void;
   onOpenOutput: (agent: AgentHistorySummary) => void;
+  onOpenTranscript: (agent: AgentHistorySummary) => void;
 }) => (
   <section className="history-page">
-    <header className="runs-page-header">
+    <header className="history-page-header">
       <div>
         <div className="eyebrow">What happened</div>
         <h2>History</h2>
         <p>Workflow cycles are summarized first. Expand a cycle to load its agents and open full output only when you need it.</p>
       </div>
-      <div className="runs-page-header__stats">
+      <div className="history-page-header__stats">
         <RunDetailField label="Cycles" value={history.total} />
         <RunDetailField label="Loaded" value={history.cycles.length} />
         <RunDetailField label="Ready fast" value={history.recentPreloaded} />
@@ -2806,6 +3107,7 @@ const HistoryPage = ({
       {history.cycles.length ? history.cycles.map((cycle) => {
         const expanded = history.expandedCycleIds.includes(cycle.id);
         const agents = history.agentsByCycleId[cycle.id];
+        const detail = history.detailsByCycleId[cycle.id];
         const statusTone: StatusChipTone = cycle.hasErrors
           ? "error"
           : cycle.status === "completed" || cycle.status === "merged"
@@ -2825,25 +3127,46 @@ const HistoryPage = ({
                 <span className="agent-card__subtle">{redactSensitiveText(cycle.goalPrompt)}</span>
               </div>
               <div className="history-cycle-card__facts">
-                <span>{formatDateTime(cycle.startedAt)} - {formatDateTime(cycle.completedAt)}</span>
-                <span>{formatDurationMs(cycle.durationMs)}</span>
-                <span>{cycle.agentCount} agents</span>
-                <span>{cycle.filesChanged.length} files</span>
-                <span>{cycle.commandsRun.length} commands</span>
+                <RunDetailField label="Started" value={formatDateTime(cycle.startedAt)} />
+                <RunDetailField label="Ended" value={formatDateTime(cycle.completedAt)} />
+                <RunDetailField label="Duration" value={formatDurationMs(cycle.durationMs)} />
+                <RunDetailField label="Agents" value={cycle.agentCount} />
+                <RunDetailField label="Files" value={cycle.filesChanged.length} />
+                <RunDetailField label="Commands/tests" value={cycle.commandsRun.length} />
               </div>
             </button>
-            <div className="history-cycle-card__meta">
-              <span>Models: {cycle.modelsUsed.join(", ") || "Not recorded"}</span>
-              <span>{cycle.hasErrors ? "Errors recorded" : "No errors recorded"}</span>
-              <span>{cycle.hasApprovals ? "Approvals requested" : "No approvals"}</span>
-              <span>{cycle.hasUserInputRequests ? "User input requested" : "No user input request"}</span>
+            <div className="history-cycle-card__insights">
+              <HistoryNarrativeField label="Selected task" value={cycle.selectedTask} />
+              <HistoryNarrativeField label="Why it was selected" value={cycle.selectionReason} />
+              <HistoryNarrativeField label="Validation outcome" value={cycle.validationOutcome} />
+              <HistoryNarrativeField label="Next-step recommendation" value={cycle.nextStepRecommendation} />
             </div>
+            <div className="history-cycle-card__lists">
+              <HistoryMiniList label="Models used" items={cycle.modelsUsed} empty="No model was recorded." />
+              <HistoryMiniList label="Files changed" items={cycle.filesChanged} empty="No files changed." />
+              <HistoryMiniList label="Commands run" items={cycle.commandsRun} empty="No commands were recorded." />
+              <HistoryMiniList label="Strategy settings used" items={cycle.strategySettingsUsed} empty="No planner strategy snapshot was recorded." />
+              <HistoryMiniList label="Checklist/goal items targeted" items={cycle.checklistTargets} empty="No targeted checklist items were recorded." />
+              <HistoryMiniList label="Checklist changes" items={cycle.checklistChanges} empty="No checklist changes were proposed or recorded." />
+              <HistoryMiniList label="Goal proposals" items={cycle.goalChangeProposals} empty="No goal changes were proposed." />
+              <HistoryMiniList label="Errors" items={cycle.errorSummaries} empty="No errors were recorded." />
+              <HistoryMiniList label="Approvals" items={cycle.approvalSummaries} empty="No approvals were requested." />
+              <HistoryMiniList label="User input requests" items={cycle.userInputRequestSummaries} empty="No user input was requested." />
+            </div>
+            {cycle.retrospective ? <HistoryNarrativeField label="Retrospective" value={cycle.retrospective} /> : null}
             {expanded ? (
               <div className="history-cycle-card__details">
+                {detail ? (
+                  <div className="history-cycle-detail-grid">
+                    <HistoryMiniList label="Accepted decisions" items={detail.decisions.map((decision) => `${decision.kind}: ${decision.title}`)} empty="No accepted decisions were retained." limit={8} />
+                    <HistoryMiniList label="Open issues" items={detail.openIssues.map((issue) => `${issue.title}: ${issue.detail}`)} empty="No open issues were attached." limit={8} />
+                    <HistoryMiniList label="Recent activity" items={detail.activity.map((event) => `${formatClockTime(event.timestamp)} ${event.title}${event.detail ? `: ${event.detail}` : ""}`)} empty="No detailed activity was retained." limit={10} />
+                  </div>
+                ) : null}
                 {agents?.loading ? <LoadingIndicator label="Loading cycle agents" compact /> : null}
                 {agents?.error ? <div className="notice notice--error">{agents.error}</div> : null}
                 {agents?.agents.length ? agents.agents.map((agent) => (
-                  <HistoryAgentCard key={agent.id} agent={agent} onOpenOutput={onOpenOutput} />
+                  <HistoryAgentCard key={agent.id} agent={agent} onOpenOutput={onOpenOutput} onOpenTranscript={onOpenTranscript} />
                 )) : !agents?.loading ? <CompactEmptyState>No retained agents are attached to this cycle.</CompactEmptyState> : null}
               </div>
             ) : null}
@@ -3417,6 +3740,7 @@ const RepositoryPanel = ({
   project,
   repositoryData,
   repositoryScanStatus,
+  repositoryScanLimits,
   repositoryRescanBusy,
   treeFilterDraft,
   deferredTreeFilter,
@@ -3433,6 +3757,7 @@ const RepositoryPanel = ({
   project: LoadedProjectView;
   repositoryData: RepositoryDataView;
   repositoryScanStatus: RepositoryScanStatus | null;
+  repositoryScanLimits: RepositoryScanLimitsResponse | null;
   repositoryRescanBusy?: "normal" | "deep";
   treeFilterDraft: string;
   deferredTreeFilter: string;
@@ -3440,12 +3765,13 @@ const RepositoryPanel = ({
   fileSummary: FileSummary | null;
   importantPathSummaries: FileSummary[];
   onRescanRepository: () => void;
-  onDeepScanRepository: () => void;
+  onDeepScanRepository: (settings?: RepositoryScanSettings) => void;
   onTreeFilterChange: (value: string) => void;
   onSelectFile: (relativePath: string) => void;
   onToggleDirectory: (relativePath: string) => void;
   onLoadMoreRepositoryChildren: (relativePath: string) => void;
 }) => {
+  const [deepScanPreset, setDeepScanPreset] = useState<"broader" | "maximum">("broader");
   const { record } = project;
   const stats = record.stats;
   const overview = record.overview;
@@ -3473,6 +3799,11 @@ const RepositoryPanel = ({
   const scanTruncationMessage = stats?.truncated
     ? stats.truncationReason ?? "Repository scan was truncated."
     : undefined;
+  const scanSearchScope = repositoryData.searchResults?.searchScope ?? repositoryScanStatus?.searchScope;
+  const deepScanSettings = deepScanPreset === "maximum"
+    ? repositoryScanLimits?.hardMaximums
+    : repositoryScanLimits?.deepDefaults;
+  const limitHits = repositoryScanStatus?.limitHits ?? [];
   const rawRepositoryAnalysis = [
     overview?.summary,
     overview?.architecture,
@@ -3527,8 +3858,8 @@ const RepositoryPanel = ({
         </article>
         <article className="repository-fact-card">
           <span>Last scan</span>
-          <strong>{formatClockTime(overview?.generatedAt ?? stats?.createdAt ?? record.validation.lastValidatedAt)}</strong>
-          <p>{record.interfaceCreation?.phase || record.interfaceCreation?.message || "Scan state saved locally"}</p>
+          <strong>{formatClockTime(repositoryScanStatus?.lastScanAt ?? stats?.scanCompletedAt ?? record.validation.lastValidatedAt)}</strong>
+          <p>{formatMilliseconds(repositoryScanStatus?.scanDurationMs ?? stats?.scanDurationMs)}</p>
         </article>
       </section>
 
@@ -3545,23 +3876,39 @@ const RepositoryPanel = ({
           </div>
           <div>
             <span>Last scan</span>
-            <strong>{formatDateTime(repositoryScanStatus?.lastScanAt ?? overview?.generatedAt ?? stats?.createdAt)}</strong>
+            <strong>{formatDateTime(repositoryScanStatus?.lastScanAt ?? stats?.scanCompletedAt ?? overview?.generatedAt)}</strong>
           </div>
           <div>
-            <span>Files indexed</span>
-            <strong>{repositoryScanStatus?.filesIndexed ?? stats?.includedFiles ?? 0}</strong>
+            <span>Duration</span>
+            <strong>{formatMilliseconds(repositoryScanStatus?.scanDurationMs ?? stats?.scanDurationMs)}</strong>
           </div>
           <div>
-            <span>Folders indexed</span>
-            <strong>{repositoryScanStatus?.foldersIndexed ?? stats?.includedFolders ?? 0}</strong>
+            <span>Total found</span>
+            <strong>{repositoryScanStatus?.filesTotal ?? stats?.totalFiles ?? 0} files / {repositoryScanStatus?.foldersTotal ?? stats?.totalFolders ?? 0} folders</strong>
           </div>
           <div>
-            <span>Skipped</span>
-            <strong>{repositoryScanStatus?.skippedCount ?? stats?.excludedFiles ?? 0}</strong>
+            <span>Included</span>
+            <strong>{repositoryScanStatus?.includedFiles ?? stats?.includedFiles ?? 0} files / {repositoryScanStatus?.includedFolders ?? stats?.includedFolders ?? 0} folders</strong>
+          </div>
+          <div>
+            <span>Skipped/excluded</span>
+            <strong>{repositoryScanStatus?.excludedFiles ?? stats?.excludedFiles ?? 0} files / {repositoryScanStatus?.excludedFolders ?? stats?.excludedFolders ?? 0} folders</strong>
+          </div>
+          <div>
+            <span>Indexed size</span>
+            <strong>{formatBytes(repositoryScanStatus?.indexedSizeBytes ?? stats?.includedSizeBytes ?? 0)}</strong>
+          </div>
+          <div>
+            <span>Excluded size</span>
+            <strong>{formatBytes(repositoryScanStatus?.excludedSizeBytes ?? stats?.excludedSizeBytes ?? 0)}</strong>
+          </div>
+          <div>
+            <span>Truncation</span>
+            <strong>{repositoryScanStatus?.truncated || stats?.truncated ? "Yes" : "No"}</strong>
           </div>
           <div>
             <span>Search scope</span>
-            <strong>{repositoryScanStatus?.searchScope === "loaded_nodes" ? "Loaded tree" : "Indexed repo"}</strong>
+            <strong>{repositorySearchScopeLabel(scanSearchScope)}</strong>
           </div>
         </div>
         {repositoryScanStatus?.truncated || scanTruncationMessage ? (
@@ -3569,12 +3916,46 @@ const RepositoryPanel = ({
             Scan limits were reached: {repositoryScanStatus?.truncationReason ?? scanTruncationMessage}. Use Deep Scan if you need broader coverage.
           </div>
         ) : null}
-        {repositoryScanStatus?.lastError ? <div className="notice notice--compact notice--error">{repositoryScanStatus.lastError}</div> : null}
+        {limitHits.length ? (
+          <div className="tag-row">
+            {limitHits.map((hit) => (
+              <span key={hit.code} className="tag">
+                {hit.label}{hit.limit !== undefined ? `: ${hit.limit}` : ""}{hit.omittedFilesEstimate || hit.omittedDirectoriesEstimate ? ` · omitted about ${hit.omittedFilesEstimate ?? 0} files / ${hit.omittedDirectoriesEstimate ?? 0} folders` : ""}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {repositoryScanStatus?.lastError ? (
+          <div className="notice notice--compact notice--error">
+            <strong>{repositoryScanStatus.lastError}</strong>
+            {repositoryScanStatus.recoverySteps.length ? (
+              <ul className="workflow-compact-list">
+                {repositoryScanStatus.recoverySteps.map((step) => <li key={step}>{step}</li>)}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="repository-deep-scan-controls">
+          <label className="form-field">
+            <span>Deep scan limits</span>
+            <select
+              className="input"
+              value={deepScanPreset}
+              onChange={(event) => setDeepScanPreset(event.target.value as "broader" | "maximum")}
+            >
+              <option value="broader">Broader index</option>
+              <option value="maximum">Maximum safe index</option>
+            </select>
+          </label>
+          <div className="notice notice--compact">
+            Deep Scan raises file, folder, depth, and time limits and may take longer on large repositories. Generated dependency, build, and cache folders remain excluded.
+          </div>
+        </div>
         <div className="actions-row">
           <button className="secondary-button" type="button" disabled={Boolean(repositoryRescanBusy)} onClick={onRescanRepository}>
             {repositoryRescanBusy === "normal" ? "Rescanning..." : "Rescan Repository"}
           </button>
-          <button className="secondary-button" type="button" disabled={Boolean(repositoryRescanBusy) || repositoryScanStatus?.deepScanAvailable === false} onClick={onDeepScanRepository}>
+          <button className="secondary-button" type="button" disabled={Boolean(repositoryRescanBusy) || repositoryScanStatus?.deepScanAvailable === false} onClick={() => onDeepScanRepository(deepScanSettings)}>
             {repositoryRescanBusy === "deep" ? "Deep scanning..." : "Deep Scan"}
           </button>
         </div>
@@ -3587,7 +3968,11 @@ const RepositoryPanel = ({
               </span>
             )) : <span className="tag">No skipped-path summary is available.</span>}
           </div>
-          <pre className="runtime-readiness-command"><code>{JSON.stringify(repositoryScanStatus?.limits ?? {}, null, 2)}</code></pre>
+          <pre className="runtime-readiness-command"><code>{JSON.stringify({
+            used: repositoryScanStatus?.limits ?? {},
+            deepScanSettings: deepScanSettings ?? {},
+            hardMaximums: repositoryScanLimits?.hardMaximums ?? {}
+          }, null, 2)}</code></pre>
         </details>
       </article>
 
@@ -3674,8 +4059,8 @@ const RepositoryPanel = ({
                 <strong>{record.identity.selectedSubpath ?? "."}</strong>
               </div>
               <div>
-                <span>Ignored folders/files</span>
-                <strong>{stats?.excludedFiles ?? 0}</strong>
+                <span>Excluded files/folders</span>
+                <strong>{repositoryScanStatus?.excludedFiles ?? stats?.excludedFiles ?? 0} / {repositoryScanStatus?.excludedFolders ?? stats?.excludedFolders ?? 0}</strong>
               </div>
               <div>
                 <span>Deterministic scan</span>
@@ -3706,8 +4091,20 @@ const RepositoryPanel = ({
                       <span className="badge">{entry.kind}</span>
                     </div>
                     <p>{exclusionRuleLabel(entry.rule)} · {entry.fileCount} files · {formatBytes(entry.totalSizeBytes)}</p>
+                    <p>{excludedPathExplanation(entry.path)}</p>
                   </div>
                 )) : <CompactEmptyState>No excluded paths were detected by the scanner.</CompactEmptyState>}
+              </div>
+              {stats?.excludedPathRecordsTruncated ? (
+                <div className="notice notice--compact">Excluded path records were capped at {stats.excludedPathLimit ?? "the configured limit"}.</div>
+              ) : null}
+              <div className="path-summary-list">
+                {commonExcludedPathExplanations.map(([label, explanation]) => (
+                  <div key={label} className="path-summary path-summary--compact">
+                    <strong>{label}</strong>
+                    <p>{explanation}</p>
+                  </div>
+                ))}
               </div>
             </details>
           </article>
@@ -3756,7 +4153,7 @@ const RepositoryPanel = ({
               <div className="panel-toolbar__summary">
                 <span>{formatBytes(stats?.includedSizeBytes ?? 0)} indexed</span>
                 <span>{stats?.testsPresent ? "Tests detected" : "No tests detected"}</span>
-                <span>{repositoryScanStatus?.searchScope === "loaded_nodes" ? "Search loaded nodes" : "Search indexed repo"}</span>
+                <span>Search: {repositorySearchScopeLabel(scanSearchScope)}</span>
               </div>
               <input
                 className="input"
@@ -3772,7 +4169,12 @@ const RepositoryPanel = ({
                 {repositoryData.treeError ? <div className="notice notice--compact notice--error">{repositoryData.treeError}</div> : null}
                 {deferredTreeFilter.trim() && repositoryData.searchResults?.truncated ? (
                   <div className="notice notice--compact">
-                    Showing first {repositoryData.searchResults.results.length} of {repositoryData.searchResults.total} matching files.
+                    Search results are capped at {repositoryData.searchResults.resultCap}; showing {repositoryData.searchResults.results.length} of {repositoryData.searchResults.total} matching files from {repositorySearchScopeLabel(repositoryData.searchResults.searchScope)}.
+                  </div>
+                ) : null}
+                {deferredTreeFilter.trim() && repositoryData.searchResults && !repositoryData.searchResults.truncated ? (
+                  <div className="notice notice--compact">
+                    Search checked {repositorySearchScopeLabel(repositoryData.searchResults.searchScope)} and returned {repositoryData.searchResults.results.length} matching files.
                   </div>
                 ) : null}
                 <RepoTree
@@ -5195,19 +5597,32 @@ const RuntimeReadinessPanel = ({
 const CodexReadinessPanel = ({
   state,
   busy,
+  onRefreshReadiness,
   onCheckUpdate,
   onRunUpdate
 }: {
   state: WorkbenchState;
   busy: boolean;
+  onRefreshReadiness: () => void;
   onCheckUpdate: () => void;
-  onRunUpdate: () => void;
+  onRunUpdate: (approvedCommand: string) => void;
 }) => {
   const report = state.codexReadiness;
   const update = state.codexUpdate;
   const statusChip = codexReadinessStatusChip(report.status);
   const updateCommand = update?.updateCommand ?? report.updateCommand;
   const updateAvailable = update?.updateAvailable ?? report.updateAvailable;
+  const warnings = report.warnings ?? [];
+  const errors = report.errors ?? [];
+  const approveUpdate = () => {
+    if (!updateCommand) {
+      return;
+    }
+    const approved = window.confirm(`Update Codex CLI by running this command?\n\n${updateCommand}`);
+    if (approved) {
+      onRunUpdate(updateCommand);
+    }
+  };
 
   return (
     <section className="runtime-readiness-panel codex-readiness-panel">
@@ -5224,6 +5639,10 @@ const CodexReadinessPanel = ({
         <div>
           <span>Latest available</span>
           <strong>{report.latestCodexVersion ?? update?.latestVersion ?? "Unknown"}</strong>
+        </div>
+        <div>
+          <span>CLI exists</span>
+          <strong>{report.codexCliExists === undefined ? "Unknown" : report.codexCliExists ? "Yes" : "No"}</strong>
         </div>
         <div>
           <span>Execution mode</span>
@@ -5243,6 +5662,16 @@ const CodexReadinessPanel = ({
         </div>
       </div>
       {report.checkedAt ? <div className="agent-card__subtle">Last checked {formatDateTime(report.checkedAt)}</div> : null}
+      {warnings.length > 0 ? (
+        <div className="notice">
+          {warnings.map((warning) => <div key={warning}>{warning}</div>)}
+        </div>
+      ) : null}
+      {errors.length > 0 ? (
+        <div className="notice notice--error">
+          {errors.map((error) => <div key={error}>{error}</div>)}
+        </div>
+      ) : null}
       {updateCommand ? (
         <div className="lane-note">
           <strong>Update command preview</strong>
@@ -5250,10 +5679,13 @@ const CodexReadinessPanel = ({
         </div>
       ) : null}
       <div className="actions-row">
+        <button className="secondary-button" type="button" disabled={busy || report.status === "checking"} onClick={onRefreshReadiness}>
+          {report.status === "checking" ? "Refreshing..." : "Refresh Codex Readiness"}
+        </button>
         <button className="secondary-button" type="button" disabled={busy || report.status === "checking"} onClick={onCheckUpdate}>
           {busy ? "Checking..." : "Check Codex Update"}
         </button>
-        <button className="primary-button" type="button" disabled={busy || !updateAvailable || !updateCommand} onClick={onRunUpdate}>
+        <button className="primary-button" type="button" disabled={busy || !updateAvailable || !updateCommand} onClick={approveUpdate}>
           {busy ? "Updating..." : "Update Codex CLI"}
         </button>
       </div>
@@ -5261,16 +5693,476 @@ const CodexReadinessPanel = ({
   );
 };
 
-const SettingsDialog = ({
-  state,
-  settingsDraft,
-  github,
+const GoalCharterOverviewCard = ({
+  workflow,
+  presets,
+  onEditStrategy,
+  onOpenWorkflow,
+  onDetectGoal,
+  onAcceptDetectedGoal,
+  onRejectDetectedGoal,
+  onAcceptGoalProposal,
+  onRejectGoalProposal
+}: {
+  workflow?: ProjectWorkflowState;
+  presets: AutopilotPreset[];
+  onEditStrategy: () => void;
+  onOpenWorkflow: () => void;
+  onDetectGoal: () => void;
+  onAcceptDetectedGoal: () => void;
+  onRejectDetectedGoal: () => void;
+  onAcceptGoalProposal: (proposalId: string) => void;
+  onRejectGoalProposal: (proposalId: string) => void;
+}) => {
+  const charter = workflow?.goalCharter;
+  const originalGoal = charter?.originalUltimateGoal;
+  const currentGoal = charter?.currentEffectiveGoal?.summary ? charter.currentEffectiveGoal : workflow?.ultimateGoal;
+  const strategy = charter?.autopilotStrategy ?? createDefaultAutopilotStrategy();
+  const pendingProposal = charter?.proposedGoalChanges[0];
+  const hasAcceptedGoal = Boolean(currentGoal?.confirmedAt || charter?.currentEffectiveGoal.confirmedAt);
+  return (
+    <article className="goal-charter-card">
+      <SectionTitle eyebrow="Goal Charter" title="Baseline and effective goal" meta={<span className="badge">{strategyPresetLabel(strategy, presets)}</span>} />
+      <div className="goal-charter-card__goals">
+        <div>
+          <span>Original Ultimate Goal</span>
+          <strong>{summarizeText(originalGoal?.summary, "No accepted original goal yet.", 180)}</strong>
+        </div>
+        <div>
+          <span>Current Effective Goal</span>
+          <strong>{summarizeText(currentGoal?.summary, "No effective goal accepted yet.", 180)}</strong>
+        </div>
+      </div>
+      <div className="goal-charter-card__strategy">
+        <div>
+          <span>Goal fidelity</span>
+          <strong>{strategy.goalRestrictiveness} · {goalRestrictivenessLabel(strategy.goalRestrictiveness)}</strong>
+        </div>
+        <div>
+          <span>Planning</span>
+          <strong>{enumLabel(strategy.planningHorizon)} horizon · {enumLabel(strategy.taskBatchingAggressiveness)} batching</strong>
+        </div>
+        <div>
+          <span>Validation</span>
+          <strong>{enumLabel(strategy.validationStrictness)} · {enumLabel(strategy.approvalSensitivity)} approvals</strong>
+        </div>
+      </div>
+      <div className="goal-charter-card__lists">
+        <div>
+          <span>Non-negotiable</span>
+          <p>{summarizeText(charter?.nonNegotiableRequirements.slice(0, 3).join("; "), "Not specified.", 180)}</p>
+        </div>
+        <div>
+          <span>Definition of done</span>
+          <p>{summarizeText(charter?.definitionOfDone.slice(0, 3).join("; "), "Not specified.", 180)}</p>
+        </div>
+      </div>
+      {pendingProposal ? (
+        <div className="goal-charter-card__proposal">
+          <strong>Goal proposal awaiting approval</strong>
+          <span>{summarizeText(pendingProposal.summary || pendingProposal.toGoalSummary, "A proposed goal change is ready.", 180)}</span>
+          <div className="actions-row">
+            <button className="primary-button" type="button" onClick={() => onAcceptGoalProposal(pendingProposal.id)}>Accept proposal</button>
+            <button className="secondary-button" type="button" onClick={() => onRejectGoalProposal(pendingProposal.id)}>Reject proposal</button>
+          </div>
+        </div>
+      ) : null}
+      <div className="actions-row">
+        <button className="secondary-button" type="button" onClick={onEditStrategy}>Edit Strategy</button>
+        <button className="secondary-button" type="button" onClick={onOpenWorkflow}>Edit Goal</button>
+        {!hasAcceptedGoal ? (
+          <button className="secondary-button" type="button" onClick={onDetectGoal}>Auto-detect Ultimate Goal</button>
+        ) : null}
+        {workflow?.ultimateGoalDraft ? (
+          <>
+            <button className="primary-button" type="button" onClick={onAcceptDetectedGoal}>Accept detected goal</button>
+            <button className="secondary-button" type="button" onClick={onRejectDetectedGoal}>Reject detected goal</button>
+          </>
+        ) : null}
+      </div>
+    </article>
+  );
+};
+
+const GoalCharterSettingsPanel = ({
+  project,
+  draft,
+  presets,
   onChange,
   onSave,
+  onApplyPreset,
+  onDetectGoal,
+  onRejectDetectedGoal
+}: {
+  project?: LoadedProjectView;
+  draft: GoalCharterDraftState;
+  presets: AutopilotPreset[];
+  onChange: (next: GoalCharterDraftUpdate) => void;
+  onSave: () => void;
+  onApplyPreset: (preset: AutopilotPreset) => void;
+  onDetectGoal: () => void;
+  onRejectDetectedGoal: () => void;
+}) => {
+  if (!project) {
+    return null;
+  }
+  const charter = project.record.workflow.goalCharter;
+  const strategy = draft.autopilotStrategy;
+  const updateStrategy = (patch: Partial<AutopilotStrategy>) =>
+    onChange({
+      autopilotStrategy: {
+        ...strategy,
+        ...patch,
+        presetId: patch.presetId ?? "custom",
+        visualPreferences: {
+          ...strategy.visualPreferences,
+          ...patch.visualPreferences
+        },
+        autonomyBudget: {
+          ...strategy.autonomyBudget,
+          ...patch.autonomyBudget
+        }
+      }
+    });
+  const updateVisualPreferences = (patch: Partial<AutopilotStrategy["visualPreferences"]>) =>
+    updateStrategy({ visualPreferences: { ...strategy.visualPreferences, ...patch } });
+  const updateBudget = (patch: Partial<AutopilotStrategy["autonomyBudget"]>) =>
+    updateStrategy({ autonomyBudget: { ...strategy.autonomyBudget, ...patch } });
+  const pendingDetectedGoal = project.record.workflow.ultimateGoalDraft;
+  return (
+    <div className="settings-section goal-charter-settings">
+      <div className="settings-section__heading">
+        <strong>Goal Charter and Autopilot Strategy</strong>
+        <span className="badge">{strategyPresetLabel(strategy, presets)}</span>
+      </div>
+      <p className="settings-card__copy">
+        The Original Ultimate Goal is preserved as the baseline charter. The Current Effective Goal is the accepted version the workflow uses now. Lower fidelity means more creative latitude, not lower engineering quality.
+      </p>
+      <div className="settings-section settings-section--split">
+        <div className="settings-card">
+          <div className="settings-section__heading">
+            <strong>Goal Charter</strong>
+            <span className="badge">Project-scoped</span>
+          </div>
+          <div className="goal-charter-original">
+            <span>Original Ultimate Goal</span>
+            <strong>{summarizeText(charter.originalUltimateGoal.summary, "Not accepted yet.", 220)}</strong>
+          </div>
+          {pendingDetectedGoal ? (
+            <div className="lane-note">
+              <strong>Detected goal awaiting approval</strong>
+              <span>{summarizeText(pendingDetectedGoal.summary, "Detected draft ready for review.", 180)}</span>
+              <div className="actions-row">
+                <button className="secondary-button" type="button" onClick={onRejectDetectedGoal}>Reject detected goal</button>
+              </div>
+            </div>
+          ) : null}
+          {!project.record.workflow.ultimateGoal.confirmedAt ? (
+            <div className="actions-row">
+              <button className="secondary-button" type="button" onClick={onDetectGoal}>Auto-detect Ultimate Goal</button>
+            </div>
+          ) : null}
+          <label className="form-field">
+            <span>Current Effective Goal</span>
+            <input className="input" value={draft.currentSummary} onChange={(event) => onChange({ currentSummary: event.target.value })} />
+          </label>
+          <label className="form-field">
+            <span>Detailed intent</span>
+            <textarea className="textarea" value={draft.currentDetailedIntent} onChange={(event) => onChange({ currentDetailedIntent: event.target.value })} />
+          </label>
+          <div className="workflow-two-column">
+            <label className="form-field">
+              <span>Success criteria</span>
+              <textarea className="textarea" value={draft.currentSuccessCriteria} onChange={(event) => onChange({ currentSuccessCriteria: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>Constraints</span>
+              <textarea className="textarea" value={draft.currentConstraints} onChange={(event) => onChange({ currentConstraints: event.target.value })} />
+            </label>
+          </div>
+          <div className="workflow-two-column">
+            <label className="form-field">
+              <span>Explicit non-goals</span>
+              <textarea className="textarea" value={draft.currentNonGoals} onChange={(event) => onChange({ currentNonGoals: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>Definition of done</span>
+              <textarea className="textarea" value={draft.definitionOfDone} onChange={(event) => onChange({ definitionOfDone: event.target.value })} />
+            </label>
+          </div>
+          <div className="workflow-two-column">
+            <label className="form-field">
+              <span>Target audience</span>
+              <input className="input" value={draft.currentTargetAudience} onChange={(event) => onChange({ currentTargetAudience: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>Quality bar</span>
+              <input className="input" value={draft.currentQualityBar} onChange={(event) => onChange({ currentQualityBar: event.target.value })} />
+            </label>
+          </div>
+          <label className="form-field">
+            <span>Non-negotiable requirements</span>
+            <textarea className="textarea" value={draft.nonNegotiableRequirements} onChange={(event) => onChange({ nonNegotiableRequirements: event.target.value })} />
+          </label>
+          <div className="workflow-two-column">
+            <label className="form-field">
+              <span>Flexible requirements</span>
+              <textarea className="textarea" value={draft.flexibleRequirements} onChange={(event) => onChange({ flexibleRequirements: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>Nice-to-have ideas</span>
+              <textarea className="textarea" value={draft.niceToHaveIdeas} onChange={(event) => onChange({ niceToHaveIdeas: event.target.value })} />
+            </label>
+          </div>
+          <div className="workflow-two-column">
+            <label className="form-field">
+              <span>User constraints</span>
+              <textarea className="textarea" value={draft.userConstraints} onChange={(event) => onChange({ userConstraints: event.target.value })} />
+            </label>
+            <label className="form-field">
+              <span>Technical preferences</span>
+              <textarea className="textarea" value={draft.technicalPreferences} onChange={(event) => onChange({ technicalPreferences: event.target.value })} />
+            </label>
+          </div>
+          <label className="form-field">
+            <span>Aesthetic preferences</span>
+            <textarea className="textarea" value={draft.aestheticPreferences} onChange={(event) => onChange({ aestheticPreferences: event.target.value })} />
+          </label>
+        </div>
+        <div className="settings-card">
+          <div className="settings-section__heading">
+            <strong>Autopilot Strategy</strong>
+            <span className="badge">Planner-ready</span>
+          </div>
+          <label className="form-field">
+            <span>Preset</span>
+            <select
+              className="input"
+              value={strategy.presetId}
+              onChange={(event) => {
+                const preset = presets.find((entry) => entry.id === event.target.value);
+                if (preset) {
+                  onApplyPreset(preset);
+                } else {
+                  updateStrategy({ presetId: "custom" });
+                }
+              }}
+            >
+              {presets.map((preset) => (
+                <option key={preset.id} value={preset.id}>{preset.label}</option>
+              ))}
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label className="form-field strategy-slider-field">
+            <span>Goal Restrictiveness / Goal Fidelity: {strategy.goalRestrictiveness}</span>
+            <input type="range" min={0} max={100} value={strategy.goalRestrictiveness} onChange={(event) => updateStrategy({ goalRestrictiveness: Number(event.target.value) })} />
+            <strong>{goalRestrictivenessLabel(strategy.goalRestrictiveness)}</strong>
+            <small>{goalRestrictivenessDescription(strategy.goalRestrictiveness)}</small>
+          </label>
+          <div className="strategy-field-grid">
+            <label className="form-field">
+              <span>Planning Horizon</span>
+              <select className="input" value={strategy.planningHorizon} onChange={(event) => updateStrategy({ planningHorizon: event.target.value as AutopilotStrategy["planningHorizon"] })}>
+                <option value="short">Short: next small safe step</option>
+                <option value="medium">Medium: several cycles ahead</option>
+                <option value="long">Long: multi-phase roadmap</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Task Batching</span>
+              <select className="input" value={strategy.taskBatchingAggressiveness} onChange={(event) => updateStrategy({ taskBatchingAggressiveness: event.target.value as AutopilotStrategy["taskBatchingAggressiveness"] })}>
+                <option value="low">Low: narrow task per cycle</option>
+                <option value="medium">Medium: group related items when safe</option>
+                <option value="high">High: packages satisfy multiple items</option>
+                <option value="very_high">Very High: larger feature batches</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Innovation / Creativity Latitude</span>
+              <input className="input" type="number" min={0} max={100} value={strategy.innovationLatitude} onChange={(event) => updateStrategy({ innovationLatitude: Number(event.target.value) })} />
+            </label>
+            <label className="form-field">
+              <span>Risk Tolerance</span>
+              <select className="input" value={strategy.riskTolerance} onChange={(event) => updateStrategy({ riskTolerance: event.target.value as AutopilotStrategy["riskTolerance"] })}>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Refactor Appetite</span>
+              <select className="input" value={strategy.refactorAppetite} onChange={(event) => updateStrategy({ refactorAppetite: event.target.value as AutopilotStrategy["refactorAppetite"] })}>
+                <option value="low">Low: avoid broad refactors</option>
+                <option value="medium">Medium: refactor for current task</option>
+                <option value="high">High: improve maintainability</option>
+                <option value="very_high">Very High: major restructuring when justified</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Validation Strictness</span>
+              <select className="input" value={strategy.validationStrictness} onChange={(event) => updateStrategy({ validationStrictness: event.target.value as AutopilotStrategy["validationStrictness"] })}>
+                <option value="low">Low: basic checks</option>
+                <option value="medium">Medium: relevant tests/lint/build</option>
+                <option value="high">High: full validation after meaningful change</option>
+                <option value="very_high">Very High: tests/evidence where possible</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Approval Sensitivity</span>
+              <select className="input" value={strategy.approvalSensitivity} onChange={(event) => updateStrategy({ approvalSensitivity: event.target.value as AutopilotStrategy["approvalSensitivity"] })}>
+                <option value="strict">Strict: ask before every code change</option>
+                <option value="normal">Normal: ask before risky changes</option>
+                <option value="relaxed">Relaxed: auto-run safe/medium tasks</option>
+                <option value="autonomous">Autonomous: continue to budget/risk boundary</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Visual / Aesthetic Priority</span>
+              <select className="input" value={strategy.visualPriority} onChange={(event) => updateStrategy({ visualPriority: event.target.value as AutopilotStrategy["visualPriority"] })}>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="very_high">Very High</option>
+              </select>
+            </label>
+          </div>
+          <div className="strategy-field-grid">
+            <label className="form-field">
+              <span>Theme</span>
+              <select className="input" value={strategy.visualPreferences.theme} onChange={(event) => updateVisualPreferences({ theme: event.target.value as AutopilotStrategy["visualPreferences"]["theme"] })}>
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Density</span>
+              <select className="input" value={strategy.visualPreferences.density} onChange={(event) => updateVisualPreferences({ density: event.target.value as AutopilotStrategy["visualPreferences"]["density"] })}>
+                <option value="compact">Compact</option>
+                <option value="balanced">Balanced</option>
+                <option value="spacious">Spacious</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Feel</span>
+              <select className="input" value={strategy.visualPreferences.feel} onChange={(event) => updateVisualPreferences({ feel: event.target.value as AutopilotStrategy["visualPreferences"]["feel"] })}>
+                {["professional", "modern", "playful", "minimal", "premium", "technical", "futuristic", "cozy"].map((value) => <option key={value} value={value}>{enumLabel(value)}</option>)}
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Layout priority</span>
+              <select className="input" value={strategy.visualPreferences.layoutPriority} onChange={(event) => updateVisualPreferences({ layoutPriority: event.target.value as AutopilotStrategy["visualPreferences"]["layoutPriority"] })}>
+                {["dashboard", "document_editor", "command_center", "kanban", "terminal_like", "data_heavy", "visual_first"].map((value) => <option key={value} value={value}>{enumLabel(value)}</option>)}
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Primary color</span>
+              <div className="color-input-row">
+                <span className="color-swatch" style={{ backgroundColor: strategy.visualPreferences.primaryColor }} aria-hidden="true" />
+                <input className="input" value={strategy.visualPreferences.primaryColor} onChange={(event) => updateVisualPreferences({ primaryColor: event.target.value })} />
+              </div>
+            </label>
+            <label className="form-field">
+              <span>Accent color</span>
+              <div className="color-input-row">
+                <span className="color-swatch" style={{ backgroundColor: strategy.visualPreferences.accentColor }} aria-hidden="true" />
+                <input className="input" value={strategy.visualPreferences.accentColor} onChange={(event) => updateVisualPreferences({ accentColor: event.target.value })} />
+              </div>
+            </label>
+            <label className="form-field">
+              <span>Motion</span>
+              <select className="input" value={strategy.visualPreferences.motionPreference} onChange={(event) => updateVisualPreferences({ motionPreference: event.target.value as AutopilotStrategy["visualPreferences"]["motionPreference"] })}>
+                <option value="none">None</option>
+                <option value="subtle">Subtle</option>
+                <option value="polished">Polished</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Accessibility</span>
+              <select className="input" value={strategy.visualPreferences.accessibilityPriority} onChange={(event) => updateVisualPreferences({ accessibilityPriority: event.target.value as AutopilotStrategy["visualPreferences"]["accessibilityPriority"] })}>
+                <option value="normal">Normal</option>
+                <option value="high_contrast">High contrast</option>
+                <option value="keyboard_first">Keyboard-first</option>
+                <option value="screen_reader_conscious">Screen-reader-conscious</option>
+              </select>
+            </label>
+            <label className="form-field">
+              <span>Design strictness</span>
+              <select className="input" value={strategy.visualPreferences.designStrictness} onChange={(event) => updateVisualPreferences({ designStrictness: event.target.value as AutopilotStrategy["visualPreferences"]["designStrictness"] })}>
+                <option value="follow_user_exactly">Follow user aesthetic exactly</option>
+                <option value="allow_model_improvement">Allow model improvement</option>
+              </select>
+            </label>
+          </div>
+          <div className="strategy-budget-grid">
+            <label className="form-field">
+              <span>Max cycles before pause</span>
+              <input className="input" type="number" min={1} max={24} value={strategy.autonomyBudget.maxCyclesBeforePause} onChange={(event) => updateBudget({ maxCyclesBeforePause: Number(event.target.value) })} />
+            </label>
+            <label className="form-field">
+              <span>Max minutes before pause</span>
+              <input className="input" type="number" min={1} max={480} value={strategy.autonomyBudget.maxMinutesBeforePause} onChange={(event) => updateBudget({ maxMinutesBeforePause: Number(event.target.value) })} />
+            </label>
+            <label className="form-field">
+              <span>Max failed repair attempts</span>
+              <input className="input" type="number" min={0} max={10} value={strategy.autonomyBudget.maxFailedRepairAttempts} onChange={(event) => updateBudget({ maxFailedRepairAttempts: Number(event.target.value) })} />
+            </label>
+            <label className="form-field">
+              <span>Max tasks without review</span>
+              <input className="input" type="number" min={1} max={24} value={strategy.autonomyBudget.maxConsecutiveTasksWithoutUserReview} onChange={(event) => updateBudget({ maxConsecutiveTasksWithoutUserReview: Number(event.target.value) })} />
+            </label>
+          </div>
+          <div className="strategy-stop-grid">
+            {([
+              ["stopWhenGoalComplete", "Stop when goal is complete"],
+              ["stopWhenNoSafeNextTaskExists", "Stop when no safe next task exists"],
+              ["stopWhenPlannerWantsToChangeUltimateGoal", "Stop when planner wants to change Ultimate Goal"],
+              ["stopWhenValidationFailsRepeatedly", "Stop when validation fails repeatedly"]
+            ] as const).map(([key, label]) => (
+              <label key={key} className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={strategy.autonomyBudget[key]}
+                  onChange={(event) => updateBudget({ [key]: event.target.checked } as Partial<AutopilotStrategy["autonomyBudget"]>)}
+                />
+                <span>{label}</span>
+              </label>
+            ))}
+          </div>
+          <div className="lane-note">
+            <strong>Always explicit</strong>
+            <span>Destructive actions, secrets, credentials, data loss, major dependency changes, and unclear intent still require a pause unless explicitly allowed later.</span>
+          </div>
+        </div>
+      </div>
+      <div className="actions-row">
+        <button className="primary-button" type="button" onClick={onSave}>Save Goal Charter and Strategy</button>
+      </div>
+    </div>
+  );
+};
+
+const SettingsDialog = ({
+  state,
+  activeProject,
+  settingsDraft,
+  goalCharterDraft,
+  autopilotPresets,
+  github,
+  onChange,
+  onGoalCharterChange,
+  onSave,
+  onSaveGoalCharter,
+  onApplyAutopilotPreset,
+  onDetectGoal,
+  onRejectDetectedGoal,
   onClose,
   onOpenDevTools,
   onRefreshGitHubStatus,
   onCheckRuntimeReadiness,
+  onRefreshCodexReadiness,
   onCheckCodexUpdate,
   onRunCodexUpdate,
   runtimeCheckBusy = false,
@@ -5278,16 +6170,25 @@ const SettingsDialog = ({
   mode = "modal"
 }: {
   state: WorkbenchState;
+  activeProject?: LoadedProjectView;
   settingsDraft: SettingsDraftState;
+  goalCharterDraft: GoalCharterDraftState;
+  autopilotPresets: AutopilotPreset[];
   github: GitHubStatus;
   onChange: (next: SettingsDraftUpdate) => void;
+  onGoalCharterChange: (next: GoalCharterDraftUpdate) => void;
   onSave: () => void;
+  onSaveGoalCharter: () => void;
+  onApplyAutopilotPreset: (preset: AutopilotPreset) => void;
+  onDetectGoal: () => void;
+  onRejectDetectedGoal: () => void;
   onClose: () => void;
   onOpenDevTools: () => void;
   onRefreshGitHubStatus: () => void;
   onCheckRuntimeReadiness: () => void;
+  onRefreshCodexReadiness: () => void;
   onCheckCodexUpdate: () => void;
-  onRunCodexUpdate: () => void;
+  onRunCodexUpdate: (approvedCommand: string) => void;
   runtimeCheckBusy?: boolean;
   codexUpdateBusy?: boolean;
   mode?: "modal" | "page";
@@ -5313,6 +6214,16 @@ const SettingsDialog = ({
           Tune agent run defaults and open diagnostics only when you need them. Developer Tools no longer open automatically on launch.
         </p>
         <div className="notice">{availabilityMessage(state)}</div>
+        <GoalCharterSettingsPanel
+          project={activeProject}
+          draft={goalCharterDraft}
+          presets={autopilotPresets}
+          onChange={onGoalCharterChange}
+          onSave={onSaveGoalCharter}
+          onApplyPreset={onApplyAutopilotPreset}
+          onDetectGoal={onDetectGoal}
+          onRejectDetectedGoal={onRejectDetectedGoal}
+        />
         <RuntimeReadinessPanel
           report={state.runtimeReadiness}
           onRunChecks={onCheckRuntimeReadiness}
@@ -5322,6 +6233,7 @@ const SettingsDialog = ({
         <CodexReadinessPanel
           state={state}
           busy={codexUpdateBusy}
+          onRefreshReadiness={onRefreshCodexReadiness}
           onCheckUpdate={onCheckCodexUpdate}
           onRunUpdate={onRunCodexUpdate}
         />
@@ -5836,6 +6748,8 @@ export const App = () => {
     targetAudience: "",
     qualityBar: ""
   });
+  const [goalCharterDraft, setGoalCharterDraft] = useState<GoalCharterDraftState>(() => goalCharterDraftFromWorkflow());
+  const [autopilotPresets, setAutopilotPresets] = useState<AutopilotPreset[]>(() => defaultAutopilotPresets());
   const [ultimateGoalImportPreview, setUltimateGoalImportPreview] = useState<UltimateGoalImportPreview | null>(null);
   const [interventionNotes, setInterventionNotes] = useState<Record<string, string>>({});
   const [userInputDrafts, setUserInputDrafts] = useState<Record<string, Record<string, string>>>({});
@@ -5872,6 +6786,7 @@ export const App = () => {
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
   const [repositoryData, setRepositoryData] = useState<RepositoryDataView>(() => emptyRepositoryData());
   const [repositoryScanStatus, setRepositoryScanStatus] = useState<RepositoryScanStatus | null>(null);
+  const [repositoryScanLimits, setRepositoryScanLimits] = useState<RepositoryScanLimitsResponse | null>(null);
   const [repositoryRescanBusy, setRepositoryRescanBusy] = useState<"normal" | "deep">();
   const [historyData, setHistoryData] = useState<HistoryCycleView>(() => emptyHistoryData());
   const [agentOutputViewer, setAgentOutputViewer] = useState<AgentOutputViewerState>();
@@ -5910,6 +6825,9 @@ export const App = () => {
     void window.workbench.getState()
       .then((result) => startTransition(() => setState(result)))
       .finally(() => setInitialStateLoading(false));
+    void window.workbench.listAutopilotPresets()
+      .then((presets) => setAutopilotPresets(presets))
+      .catch(() => setAutopilotPresets(defaultAutopilotPresets()));
     return window.workbench.onStateUpdated((nextState) => {
       startTransition(() => setState(nextState));
     });
@@ -5990,6 +6908,24 @@ export const App = () => {
   const workflow = activeProject?.record.workflow;
   const autopilotPolicy = workflow?.autopilotPolicy;
   const autopilotStatus = workflow?.autopilotStatus;
+  const currentPlannerDecision = useMemo(() => {
+    if (!workflow?.plannerDecisions.length) {
+      return undefined;
+    }
+    return workflow.plannerDecisions.find((decision) => decision.cycleNumber === workflow.workflowCycle.cycleNumber) ?? workflow.plannerDecisions[0];
+  }, [workflow]);
+  const currentStrategicPlan = useMemo(() =>
+    currentPlannerDecision && workflow
+      ? workflow.strategicPlans.find((plan) => plan.id === currentPlannerDecision.planId)
+      : undefined,
+  [currentPlannerDecision, workflow]);
+  const currentPlannerTargets = useMemo(() => {
+    if (!workflow || !currentPlannerDecision?.targetedChecklistIds.length) {
+      return [];
+    }
+    const byId = new Map(workflow.goalChecklist.map((check) => [check.id, check.title]));
+    return currentPlannerDecision.targetedChecklistIds.map((id) => byId.get(id) ?? id);
+  }, [currentPlannerDecision, workflow]);
   const autopilotEnabled = autopilotPolicy?.enabled ?? activeProject?.record.localState.autopilotEnabled ?? false;
   const autopilotProfile = autopilotPolicy?.profile ?? "balanced";
   const workflowMode = workflow?.workflowMode ?? "normal";
@@ -6388,6 +7324,10 @@ export const App = () => {
   }, [activeProject?.record.id, activeProject?.record.workflow.ultimateGoal]);
 
   useEffect(() => {
+    setGoalCharterDraft(goalCharterDraftFromWorkflow(activeProject?.record.workflow));
+  }, [activeProject?.record.id, activeProject?.record.workflow]);
+
+  useEffect(() => {
     if (!stateLoaded) {
       return;
     }
@@ -6508,6 +7448,7 @@ export const App = () => {
       setActiveWorkspaceTabOverride(undefined);
       setRepositoryData(emptyRepositoryData());
       setRepositoryScanStatus(null);
+      setRepositoryScanLimits(null);
       setHistoryData(emptyHistoryData());
       setAgentOutputViewer(undefined);
       return;
@@ -6531,6 +7472,7 @@ export const App = () => {
     setActiveWorkspaceTabOverride(activeProjectId ? "overview" : undefined);
     setRepositoryData(emptyRepositoryData());
     setRepositoryScanStatus(null);
+    setRepositoryScanLimits(null);
     setHistoryData(emptyHistoryData());
     setAgentOutputViewer(undefined);
   }, [activeProjectId]);
@@ -6653,10 +7595,14 @@ export const App = () => {
     }
 
     let cancelled = false;
-    void window.workbench.getRepositoryScanStatus(activeProjectId)
-      .then((status) => {
+    void Promise.all([
+      window.workbench.getRepositoryScanStatus(activeProjectId),
+      window.workbench.getRepositoryScanLimits(activeProjectId)
+    ])
+      .then(([status, limits]) => {
         if (!cancelled) {
           setRepositoryScanStatus(status);
+          setRepositoryScanLimits(limits);
         }
       })
       .catch(handleError);
@@ -6807,7 +7753,7 @@ export const App = () => {
       loading: true,
       error: undefined
     }));
-    void window.workbench.listWorkflowCycles(projectId, { limit: 20 })
+    void window.workbench.listWorkflowCycles(projectId, { limit: HISTORY_RECENT_CYCLE_LIMIT })
       .then((page) => {
         if (!cancelled) {
           setHistoryData((current) => ({
@@ -6897,7 +7843,7 @@ export const App = () => {
     const projectId = activeProjectId;
     const cursor = historyData.nextCursor;
     setHistoryData((current) => ({ ...current, loading: true, error: undefined }));
-    void window.workbench.listWorkflowCycles(projectId, { cursor, limit: historyData.limit })
+    void window.workbench.listWorkflowCycles(projectId, { cursor, limit: HISTORY_OLDER_CYCLE_PAGE_SIZE })
       .then((page) => {
         setHistoryData((current) => current.projectId === projectId
           ? {
@@ -6983,7 +7929,39 @@ export const App = () => {
       });
   };
 
-  const openAgentOutput = (agent: AgentHistorySummary) => {
+  const loadAgentTranscript = () => {
+    if (!agentOutputViewer || agentOutputViewer.transcript || agentOutputViewer.transcriptLoading) {
+      return;
+    }
+
+    const { projectId, agentId } = agentOutputViewer;
+    setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agentId
+      ? { ...current, transcriptLoading: true, error: undefined }
+      : current);
+    void window.workbench.getAgentTranscript(projectId, agentId)
+      .then((transcript) => {
+        setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agentId
+          ? {
+            ...current,
+            transcript,
+            transcriptLoading: false,
+            error: undefined
+          }
+          : current);
+      })
+      .catch((error) => {
+        setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agentId
+          ? {
+            ...current,
+            transcriptLoading: false,
+            error: error instanceof Error ? error.message : String(error)
+          }
+          : current);
+        handleError(error);
+      });
+  };
+
+  const openAgentOutput = (agent: AgentHistorySummary, options: { loadTranscript?: boolean } = {}) => {
     if (!activeProjectId) {
       return;
     }
@@ -6994,20 +7972,18 @@ export const App = () => {
       agentId: agent.id,
       agentName: agent.name,
       loading: true,
+      transcriptLoading: Boolean(options.loadTranscript),
       query: "",
-      wrap: true
+      wrap: true,
+      viewMode: "preformatted"
     });
-    void Promise.all([
-      window.workbench.getAgentFullOutput(projectId, agent.id),
-      window.workbench.getAgentTranscript(projectId, agent.id)
-    ])
-      .then(([output, transcript]) => {
+    void window.workbench.getAgentFullOutput(projectId, agent.id)
+      .then((output) => {
         setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agent.id
           ? {
             ...current,
             loading: false,
             output,
-            transcript,
             error: undefined
           }
           : current);
@@ -7022,9 +7998,32 @@ export const App = () => {
           : current);
         handleError(error);
       });
+    if (options.loadTranscript) {
+      void window.workbench.getAgentTranscript(projectId, agent.id)
+        .then((transcript) => {
+          setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agent.id
+            ? {
+              ...current,
+              transcript,
+              transcriptLoading: false,
+              error: undefined
+            }
+            : current);
+        })
+        .catch((error) => {
+          setAgentOutputViewer((current) => current?.projectId === projectId && current.agentId === agent.id
+            ? {
+              ...current,
+              transcriptLoading: false,
+              error: error instanceof Error ? error.message : String(error)
+            }
+            : current);
+          handleError(error);
+        });
+    }
   };
 
-  const rescanRepository = async (mode: "normal" | "deep") => {
+  const rescanRepository = async (mode: "normal" | "deep", settings?: RepositoryScanSettings) => {
     if (!activeProject) {
       return;
     }
@@ -7033,7 +8032,10 @@ export const App = () => {
     try {
       setRepositoryRescanBusy(mode);
       setNotice(undefined);
-      const summary = await window.workbench.rescanRepository(projectId, { mode });
+      if (mode === "deep" && settings) {
+        setRepositoryScanLimits(await window.workbench.updateRepositoryScanSettings(projectId, settings));
+      }
+      const summary = await window.workbench.rescanRepository(projectId, { mode, settings });
       setRepositoryData({
         ...summary,
         childrenByParent: {
@@ -7047,6 +8049,7 @@ export const App = () => {
         loading: false
       });
       setRepositoryScanStatus(await window.workbench.getRepositoryScanStatus(projectId));
+      setRepositoryScanLimits(await window.workbench.getRepositoryScanLimits(projectId));
       showInfoNotice(mode === "deep" ? "Deep repository scan completed." : "Repository rescan completed.");
     } catch (error) {
       handleError(error);
@@ -7071,11 +8074,27 @@ export const App = () => {
     }
   };
 
-  const runCodexUpdate = async () => {
+  const refreshCodexReadiness = async () => {
     try {
       setCodexUpdateBusy(true);
       setNotice(undefined);
-      const result = await window.workbench.runCodexUpdate();
+      const result = await window.workbench.refreshCodexReadiness();
+      setNotice({
+        message: result.message,
+        tone: result.status === "unavailable" ? "error" : "info"
+      });
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setCodexUpdateBusy(false);
+    }
+  };
+
+  const runCodexUpdate = async (approvedCommand?: string) => {
+    try {
+      setCodexUpdateBusy(true);
+      setNotice(undefined);
+      const result = await window.workbench.runCodexUpdate(approvedCommand);
       setNotice({
         message: result.message,
         tone: result.status === "failed" ? "error" : "info"
@@ -7821,6 +8840,138 @@ export const App = () => {
     }
   };
 
+  const updateGoalCharterDraft = (next: GoalCharterDraftUpdate) => setGoalCharterDraft((current) => ({
+    ...current,
+    ...next,
+    autopilotStrategy: next.autopilotStrategy ? cloneStrategy(next.autopilotStrategy) : current.autopilotStrategy
+  }));
+
+  const applyAutopilotPreset = (preset: AutopilotPreset) => {
+    setGoalCharterDraft((current) => ({
+      ...current,
+      autopilotStrategy: cloneStrategy(preset.strategy)
+    }));
+  };
+
+  const saveGoalCharter = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    const projectId = activeProject.record.id;
+    const draft = goalCharterDraft;
+    const goalSummary = draft.currentSummary.trim();
+    try {
+      setNotice(undefined);
+      if (goalSummary) {
+        await window.workbench.updateUltimateGoal(
+          projectId,
+          {
+            summary: goalSummary,
+            detailedIntent: draft.currentDetailedIntent.trim(),
+            successCriteria: toLineList(draft.currentSuccessCriteria),
+            constraints: toLineList(draft.currentConstraints),
+            nonGoals: toLineList(draft.currentNonGoals),
+            targetAudience: draft.currentTargetAudience.trim(),
+            qualityBar: draft.currentQualityBar.trim(),
+            source: "user"
+          },
+          true
+        );
+      }
+      await window.workbench.updateGoalCharter(projectId, {
+        nonNegotiableRequirements: toLineList(draft.nonNegotiableRequirements),
+        flexibleRequirements: toLineList(draft.flexibleRequirements),
+        niceToHaveIdeas: toLineList(draft.niceToHaveIdeas),
+        explicitNonGoals: toLineList(draft.explicitNonGoals),
+        userConstraints: toLineList(draft.userConstraints),
+        aestheticPreferences: toLineList(draft.aestheticPreferences),
+        technicalPreferences: toLineList(draft.technicalPreferences),
+        definitionOfDone: toLineList(draft.definitionOfDone),
+        autopilotStrategy: draft.autopilotStrategy
+      });
+      setUltimateGoalImportPreview(null);
+      showInfoNotice("Goal Charter and Autopilot Strategy saved.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const acceptGoalProposal = async (proposalId: string) => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.acceptGoalChange(activeProject.record.id, proposalId);
+      setUltimateGoalImportPreview(null);
+      showInfoNotice("Goal proposal accepted.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const rejectGoalProposal = async (proposalId: string) => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      await window.workbench.rejectGoalChange(activeProject.record.id, proposalId, "Rejected by the user.");
+      setUltimateGoalImportPreview(null);
+      showInfoNotice("Goal proposal rejected.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const rejectDetectedGoal = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    const workflowState = activeProject.record.workflow;
+    const draft = workflowState.ultimateGoalDraft;
+    const charter = workflowState.goalCharter;
+    const detectedProposal = charter.proposedGoalChanges.find((change) => change.source === "detected");
+    if (!draft && !detectedProposal) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const rejected: GoalChangeRecord = detectedProposal
+      ? {
+        ...detectedProposal,
+        decidedAt: now,
+        decisionNotes: "Rejected by the user."
+      }
+      : {
+        id: `detected-goal-rejected-${Date.now()}`,
+        title: "Rejected detected Ultimate Goal",
+        summary: draft?.summary ?? "Detected Ultimate Goal rejected",
+        rationale: "Auto-detected from repository evidence and rejected before confirmation.",
+        source: "detected",
+        proposedGoal: draft,
+        toGoalSummary: draft?.summary,
+        createdAt: draft?.lastUpdatedAt ?? now,
+        decidedAt: now,
+        decisionNotes: "Rejected by the user."
+      };
+
+    try {
+      await window.workbench.updateGoalCharter(activeProject.record.id, {
+        proposedGoalChanges: charter.proposedGoalChanges.filter((change) => change.id !== detectedProposal?.id && change.source !== "detected"),
+        rejectedGoalChanges: [rejected, ...charter.rejectedGoalChanges].slice(0, 50)
+      });
+      setUltimateGoalImportPreview(null);
+      showInfoNotice("Detected Ultimate Goal rejected.");
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
   const detectUltimateGoal = async () => {
     if (!activeProject) {
       return;
@@ -8175,16 +9326,25 @@ export const App = () => {
   const settingsDialog = showSettings && state ? (
     <SettingsDialog
       state={state}
+      activeProject={activeProject}
       github={state.github}
       settingsDraft={settingsDraft}
+      goalCharterDraft={goalCharterDraft}
+      autopilotPresets={autopilotPresets}
       onChange={updateSettingsDraft}
+      onGoalCharterChange={updateGoalCharterDraft}
       onSave={saveSettings}
+      onSaveGoalCharter={() => void saveGoalCharter()}
+      onApplyAutopilotPreset={applyAutopilotPreset}
+      onDetectGoal={() => void detectUltimateGoal()}
+      onRejectDetectedGoal={() => void rejectDetectedGoal()}
       onClose={() => setShowSettings(false)}
       onOpenDevTools={() => void openDevTools()}
       onRefreshGitHubStatus={() => void refreshGitHubStatus()}
       onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
+      onRefreshCodexReadiness={() => void refreshCodexReadiness()}
       onCheckCodexUpdate={() => void checkCodexUpdate()}
-      onRunCodexUpdate={() => void runCodexUpdate()}
+      onRunCodexUpdate={(approvedCommand) => void runCodexUpdate(approvedCommand)}
       runtimeCheckBusy={runtimeCheckBusy}
       codexUpdateBusy={codexUpdateBusy}
     />
@@ -8610,6 +9770,10 @@ export const App = () => {
                   }
                   : undefined;
   const workflowSecondaryActions: ShellAction[] = [
+    ...(workflow?.workflowCycle.status === "completed" || workflow?.workflowCycle.status === "merged" ? [{
+      label: "Open cycle history",
+      onClick: () => void setWorkspaceTab("history")
+    }] : []),
     {
       label: "Create scoped goal",
       disabled: workflowCommandBusy || !workflow?.approvedRecommendation,
@@ -8802,6 +9966,18 @@ export const App = () => {
               </section>
             ) : null}
 
+            <GoalCharterOverviewCard
+              workflow={workflow}
+              presets={autopilotPresets}
+              onEditStrategy={() => void setWorkspaceTab("settings")}
+              onOpenWorkflow={() => void setWorkspaceTab("workflow")}
+              onDetectGoal={() => void detectUltimateGoal()}
+              onAcceptDetectedGoal={() => void saveUltimateGoal()}
+              onRejectDetectedGoal={() => void rejectDetectedGoal()}
+              onAcceptGoalProposal={(proposalId) => void acceptGoalProposal(proposalId)}
+              onRejectGoalProposal={(proposalId) => void rejectGoalProposal(proposalId)}
+            />
+
             <section className="overview-health-grid" aria-label="Health snapshot">
               <OverviewMetricCard
                 label="Workflow status"
@@ -8908,6 +10084,7 @@ export const App = () => {
             project={activeProject}
             repositoryData={repositoryData}
             repositoryScanStatus={repositoryScanStatus}
+            repositoryScanLimits={repositoryScanLimits}
             repositoryRescanBusy={repositoryRescanBusy}
             treeFilterDraft={treeFilterDraft}
             deferredTreeFilter={deferredTreeFilter}
@@ -8915,7 +10092,7 @@ export const App = () => {
             fileSummary={fileSummary}
             importantPathSummaries={importantPathSummaries}
             onRescanRepository={() => void rescanRepository("normal")}
-            onDeepScanRepository={() => void rescanRepository("deep")}
+            onDeepScanRepository={(settings) => void rescanRepository("deep", settings)}
             onTreeFilterChange={setTreeFilterDraft}
             onSelectFile={(relativePath) => void loadSummary(relativePath)}
             onToggleDirectory={toggleRepositoryDirectory}
@@ -8929,6 +10106,7 @@ export const App = () => {
             onLoadMore={loadMoreHistoryCycles}
             onToggleCycle={toggleHistoryCycle}
             onOpenOutput={openAgentOutput}
+            onOpenTranscript={(agent) => openAgentOutput(agent, { loadTranscript: true })}
           />
         ) : null}
 
@@ -9062,6 +10240,23 @@ export const App = () => {
               canContinueWorkflow={!workflowCommandBusy && (workflowRuntimeStatus?.canContinue ?? false)}
               continueDisabledReason={workflowCommandBusyReason ?? workflowRuntimeStatus?.continueDisabledReason}
             />
+
+            {currentPlannerDecision ? (
+              <article className="workflow-planner-card card-surface">
+                <SectionTitle
+                  eyebrow="Strategic planner"
+                  title={currentPlannerDecision.selectedTaskTitle ?? "Planner decision"}
+                  meta={<span className="badge">{currentStrategicPlan?.mode?.replace(/_/g, " ") ?? "strategy"}</span>}
+                />
+                <HistoryNarrativeField label="Why this task?" value={currentPlannerDecision.whySelected} />
+                <div className="history-cycle-card__lists">
+                  <HistoryMiniList label="Strategy highlights" items={currentPlannerDecision.strategySettingsUsed} empty="No strategy snapshot recorded." limit={6} />
+                  <HistoryMiniList label="Checklist items targeted" items={currentPlannerTargets} empty="No checklist targets recorded." limit={8} />
+                  <HistoryMiniList label="Expected files/areas" items={currentPlannerDecision.expectedFiles} empty="No expected files recorded." limit={8} />
+                  <HistoryMiniList label="Expected validations" items={currentPlannerDecision.expectedValidationCommands} empty="No expected validations recorded." limit={6} />
+                </div>
+              </article>
+            ) : null}
 
             <section className="workflow-operator-grid workflow-operator-grid--history">
               <WorkflowContextCards selections={workflow?.memory.lastRelevantContext ?? []} />
@@ -9991,16 +11186,25 @@ export const App = () => {
             <SettingsDialog
               mode="page"
               state={state}
+              activeProject={activeProject}
               github={state.github}
               settingsDraft={settingsDraft}
+              goalCharterDraft={goalCharterDraft}
+              autopilotPresets={autopilotPresets}
               onChange={updateSettingsDraft}
+              onGoalCharterChange={updateGoalCharterDraft}
               onSave={saveSettings}
+              onSaveGoalCharter={() => void saveGoalCharter()}
+              onApplyAutopilotPreset={applyAutopilotPreset}
+              onDetectGoal={() => void detectUltimateGoal()}
+              onRejectDetectedGoal={() => void rejectDetectedGoal()}
               onClose={() => void setWorkspaceTab("overview")}
               onOpenDevTools={() => void openDevTools()}
               onRefreshGitHubStatus={() => void refreshGitHubStatus()}
               onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
+              onRefreshCodexReadiness={() => void refreshCodexReadiness()}
               onCheckCodexUpdate={() => void checkCodexUpdate()}
-              onRunCodexUpdate={() => void runCodexUpdate()}
+              onRunCodexUpdate={(approvedCommand) => void runCodexUpdate(approvedCommand)}
               runtimeCheckBusy={runtimeCheckBusy}
               codexUpdateBusy={codexUpdateBusy}
             />
@@ -10014,6 +11218,8 @@ export const App = () => {
         onClose={() => setAgentOutputViewer(undefined)}
         onQueryChange={(query) => setAgentOutputViewer((current) => current ? { ...current, query } : current)}
         onWrapChange={(wrap) => setAgentOutputViewer((current) => current ? { ...current, wrap } : current)}
+        onViewModeChange={(viewMode) => setAgentOutputViewer((current) => current ? { ...current, viewMode } : current)}
+        onLoadTranscript={loadAgentTranscript}
       />
 
       {settingsDialog}

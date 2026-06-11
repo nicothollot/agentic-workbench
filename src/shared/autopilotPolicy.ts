@@ -255,6 +255,7 @@ export interface AutopilotPauseState {
   recommendation?: WorkflowRecommendationOption;
   previewReady?: boolean;
   repeatedFailure?: boolean;
+  goalChangeRequiresApproval?: boolean;
   unsafeScopeBroadening?: boolean;
   promotedRequiredCheckCount?: number;
 }
@@ -370,6 +371,9 @@ export const shouldAutopilotPause = (
   }
   if (state.repeatedFailure || hasRepeatedAutopilotFailure(workflow, agents)) {
     return pauseDecision("repeated_failure", "The same workflow failure repeated in this cycle.", highRiskPackageRequiresApproval);
+  }
+  if (state.goalChangeRequiresApproval) {
+    return pauseDecision("goal_change_requires_approval", "The planner proposed a goal or checklist change that needs explicit user approval.", highRiskPackageRequiresApproval);
   }
   if (
     workflow.workflowStopReason === "integrity_failed" &&

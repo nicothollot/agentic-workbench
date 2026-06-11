@@ -29,6 +29,27 @@ export type WorkflowMode = "normal" | "fast";
 export type WorkflowPreviewStatus = "none" | "queued" | "active" | "ready" | "completed" | "cancelled";
 export type AutopilotProfile = "balanced" | "conservative" | "aggressive" | "custom";
 export type AutopilotIntegrityFailurePolicy = "repair" | "pause" | "policy";
+export type AutopilotPresetId =
+  | "exact_builder"
+  | "goal_focused"
+  | "balanced_autopilot"
+  | "creative_builder"
+  | "experimental_moonshot";
+export type GoalRestrictivenessMode = "very_strict" | "goal_first" | "balanced" | "exploratory" | "highly_creative";
+export type PlanningHorizon = "short" | "medium" | "long";
+export type TaskBatchingAggressiveness = "low" | "medium" | "high" | "very_high";
+export type RiskTolerance = "low" | "medium" | "high";
+export type RefactorAppetite = "low" | "medium" | "high" | "very_high";
+export type ValidationStrictness = "low" | "medium" | "high" | "very_high";
+export type ApprovalSensitivity = "strict" | "normal" | "relaxed" | "autonomous";
+export type VisualThemePreference = "light" | "dark" | "system" | "custom";
+export type VisualDensityPreference = "compact" | "balanced" | "spacious";
+export type VisualFeelPreference = "professional" | "modern" | "playful" | "minimal" | "premium" | "technical" | "futuristic" | "cozy";
+export type VisualLayoutPriority = "dashboard" | "document_editor" | "command_center" | "kanban" | "terminal_like" | "data_heavy" | "visual_first";
+export type MotionPreference = "none" | "subtle" | "polished";
+export type AccessibilityPriority = "normal" | "high_contrast" | "keyboard_first" | "screen_reader_conscious";
+export type DesignStrictness = "follow_user_exactly" | "allow_model_improvement";
+export type VisualPriority = "low" | "medium" | "high" | "very_high";
 export type AutopilotPauseReason =
   | "disabled"
   | "manual_pause_requested"
@@ -42,6 +63,7 @@ export type AutopilotPauseReason =
   | "no_safe_recommendation"
   | "project_access_validation_failed"
   | "repeated_failure"
+  | "goal_change_requires_approval"
   | "high_risk_package_requires_approval"
   | "unsafe_scope_broadening"
   | "required_check_promotion_cap"
@@ -69,6 +91,234 @@ export interface AutopilotPolicy {
   highRiskAreas: string[];
   stopWhenGoalSatisfied: boolean;
   stopWhenNoSafeRecommendation: boolean;
+}
+
+export interface VisualPreferenceProfile {
+  theme: VisualThemePreference;
+  primaryColor: string;
+  accentColor: string;
+  density: VisualDensityPreference;
+  feel: VisualFeelPreference;
+  layoutPriority: VisualLayoutPriority;
+  motionPreference: MotionPreference;
+  accessibilityPriority: AccessibilityPriority;
+  designStrictness: DesignStrictness;
+}
+
+export interface AutonomyBudget {
+  maxCyclesBeforePause: number;
+  maxMinutesBeforePause: number;
+  maxFailedRepairAttempts: number;
+  maxConsecutiveTasksWithoutUserReview: number;
+  stopWhenGoalComplete: boolean;
+  stopWhenNoSafeNextTaskExists: boolean;
+  stopWhenPlannerWantsToChangeUltimateGoal: boolean;
+  stopWhenValidationFailsRepeatedly: boolean;
+}
+
+export interface AutopilotStrategy {
+  presetId: AutopilotPresetId | "custom";
+  goalRestrictiveness: number;
+  planningHorizon: PlanningHorizon;
+  taskBatchingAggressiveness: TaskBatchingAggressiveness;
+  innovationLatitude: number;
+  riskTolerance: RiskTolerance;
+  refactorAppetite: RefactorAppetite;
+  visualPriority: VisualPriority;
+  visualPreferences: VisualPreferenceProfile;
+  validationStrictness: ValidationStrictness;
+  autonomyBudget: AutonomyBudget;
+  approvalSensitivity: ApprovalSensitivity;
+}
+
+export interface AutopilotPreset {
+  id: AutopilotPresetId;
+  label: string;
+  description: string;
+  strategy: AutopilotStrategy;
+}
+
+export interface GoalChangeRecord {
+  id: string;
+  title: string;
+  summary: string;
+  rationale: string;
+  source: "user" | "detected" | "planner";
+  proposedGoal?: UltimateGoal;
+  fromGoalSummary?: string;
+  toGoalSummary?: string;
+  createdAt: string;
+  decidedAt?: string;
+  decisionNotes?: string;
+}
+
+export interface GoalCharter {
+  originalUltimateGoal: UltimateGoal;
+  currentEffectiveGoal: UltimateGoal;
+  nonNegotiableRequirements: string[];
+  flexibleRequirements: string[];
+  niceToHaveIdeas: string[];
+  explicitNonGoals: string[];
+  userConstraints: string[];
+  aestheticPreferences: string[];
+  technicalPreferences: string[];
+  definitionOfDone: string[];
+  autopilotStrategy: AutopilotStrategy;
+  acceptedGoalChanges: GoalChangeRecord[];
+  rejectedGoalChanges: GoalChangeRecord[];
+  proposedGoalChanges: GoalChangeRecord[];
+  createdAt: string;
+  updatedAt: string;
+}
+export type ChecklistChangeAction =
+  | "add"
+  | "remove"
+  | "split"
+  | "merge"
+  | "reprioritize"
+  | "mark_obsolete"
+  | "mark_blocked"
+  | "mark_complete"
+  | "link_evidence"
+  | "link_changed_files"
+  | "link_validation_commands"
+  | "link_cycle_ids"
+  | "link_agent_ids";
+export type PlannerApprovalStatus = "not_required" | "pending" | "accepted" | "rejected";
+export type CandidateTaskKind =
+  | "goal_check"
+  | "work_package"
+  | "blocker"
+  | "validation"
+  | "stabilization"
+  | "visual_polish"
+  | "goal_evolution"
+  | "custom"
+  | "fallback";
+export type StrategicAutopilotMode =
+  | "manual"
+  | "guided"
+  | "autopilot_safe"
+  | "autopilot_balanced"
+  | "autopilot_creative"
+  | "autopilot_aggressive";
+
+export interface GoalChangeProposal extends GoalChangeRecord {
+  approvalStatus: PlannerApprovalStatus;
+  requiredByStrategy: boolean;
+  risk: RecommendationRiskLevel;
+  affectedGoalArea: string;
+}
+
+export interface ChecklistChange {
+  id: string;
+  action: ChecklistChangeAction;
+  checklistItemIds: string[];
+  title?: string;
+  rationale: string;
+  sourceCycle: number;
+  sourceAgent?: string;
+  userApprovalStatus: PlannerApprovalStatus;
+  confidence: number;
+  risk: RecommendationRiskLevel;
+  affectedGoalArea: string;
+  linkedEvidence: string[];
+  linkedChangedFiles: string[];
+  linkedValidationCommands: string[];
+  linkedCycleIds: number[];
+  linkedAgentIds: string[];
+  createdAt: string;
+}
+
+export interface CandidateTask {
+  id: string;
+  kind: CandidateTaskKind;
+  title: string;
+  summary: string;
+  recommendationId?: string;
+  sourceWorkPackageId?: string;
+  targetedCheckIds: string[];
+  expectedChecklistImpact: string;
+  expectedFiles: string[];
+  expectedValidationCommands: string[];
+  riskLevel: RecommendationRiskLevel;
+  whyNext: string;
+  approvalRequired: boolean;
+  goalChangeProposalIds: string[];
+  checklistChangeIds: string[];
+  visualDesignImpact: boolean;
+  shouldSplit: boolean;
+  score: number;
+  scoreBreakdown: Record<string, number>;
+  confidence: number;
+}
+
+export interface StrategicPlan {
+  id: string;
+  projectId: string;
+  cycleNumber: number;
+  createdAt: string;
+  originalGoalSummary: string;
+  currentEffectiveGoalSummary: string;
+  mode: StrategicAutopilotMode;
+  strategySnapshot: AutopilotStrategy;
+  strategyHighlights: string[];
+  repoScanStatus: string;
+  previousCycleOutcomes: string[];
+  failedCommands: string[];
+  changedFiles: string[];
+  openBlockers: string[];
+  userFeedback: string[];
+  recentAgentOutputs: string[];
+  architectureNotes: string[];
+  candidateTasks: CandidateTask[];
+  candidateWorkPackages: WorkPackage[];
+  proposedGoalChanges: GoalChangeProposal[];
+  proposedChecklistChanges: ChecklistChange[];
+  recommendedTaskId?: string;
+  requiresApproval: boolean;
+  plannerSummary: string;
+  continueRecommendation: "continue" | "pause" | "ask_user";
+  pauseReason?: string;
+}
+
+export interface PlannerDecision {
+  id: string;
+  planId: string;
+  cycleNumber: number;
+  selectedTaskId?: string;
+  selectedRecommendationId?: string;
+  selectedTaskTitle?: string;
+  whySelected: string;
+  score: number;
+  scoreBreakdown: Record<string, number>;
+  strategySettingsUsed: string[];
+  targetedChecklistIds: string[];
+  expectedFiles: string[];
+  expectedValidationCommands: string[];
+  approvalRequired: boolean;
+  goalChangeProposalIds: string[];
+  checklistChangeIds: string[];
+  visualDesignImpact: boolean;
+  createdAt: string;
+}
+
+export interface CycleRetrospective {
+  id: string;
+  cycleNumber: number;
+  createdAt: string;
+  triedToDo: string;
+  whyChosen: string;
+  changedFiles: string[];
+  commandsRun: string[];
+  passed: string[];
+  failed: string[];
+  learned: string[];
+  checklistItemsAdvanced: string[];
+  goalChecklistChangeRecommendation: string;
+  nextRecommendedTasks: string[];
+  shouldContinue: boolean;
+  pauseReason?: string;
 }
 export type UltimateGoalCompletionState = "needs_more_work" | "goal_satisfied";
 export type WorkflowAppealStatus = "not_started" | "not_applicable" | "pending" | "running" | "completed";
@@ -262,6 +512,7 @@ export interface CodexReadinessReport {
   executionMode: ExecutionMode;
   distroName?: string;
   codexBinaryPath: string;
+  codexCliExists?: boolean;
   codexPath?: string;
   nodePath?: string;
   codexVersion?: string;
@@ -270,6 +521,8 @@ export interface CodexReadinessReport {
   updateCommand?: string;
   status: "checking" | "ready" | "outdated" | "unavailable" | "skipped";
   message: string;
+  warnings?: string[];
+  errors?: string[];
 }
 
 export interface CodexUpdateCheckResult {
@@ -290,6 +543,16 @@ export interface CodexUpdateRunResult {
   latestVersion?: string;
   command?: string;
   message: string;
+}
+
+export interface ExecutionEnvironmentStatus {
+  checkedAt: string;
+  executionMode: ExecutionMode;
+  distroName?: string;
+  platform: NodeJS.Platform;
+  mockMode: boolean;
+  safeMode: boolean;
+  codexReadiness: CodexReadinessReport;
 }
 
 export interface UltimateGoal {
@@ -744,6 +1007,7 @@ export interface UltimateGoalCompletionAssessment {
 export interface ProjectWorkflowState {
   ultimateGoal: UltimateGoal;
   ultimateGoalDraft?: UltimateGoal;
+  goalCharter: GoalCharter;
   workflowMode: WorkflowMode;
   previewRequest?: WorkflowPreviewRequest;
   autopilotPolicy: AutopilotPolicy;
@@ -753,6 +1017,10 @@ export interface ProjectWorkflowState {
   goalChecklist: GoalAttainmentCheck[];
   taskMap: WorkflowTaskMap;
   workPackages: WorkPackage[];
+  strategicPlans: StrategicPlan[];
+  plannerDecisions: PlannerDecision[];
+  checklistChanges: ChecklistChange[];
+  cycleRetrospectives: CycleRetrospective[];
   workflowCycle: WorkflowCycle;
   approvedRecommendation?: ApprovedRecommendation;
   scopedGoal?: ScopedGoal;
@@ -835,6 +1103,9 @@ export interface InterfacePreview {
 export interface ProjectStats {
   projectRoot: string;
   kind: ProjectKind;
+  scanStartedAt?: string;
+  scanCompletedAt?: string;
+  scanMode?: "normal" | "deep";
   createdAt?: string;
   lastCommitAt?: string;
   totalFiles: number;
@@ -1068,6 +1339,14 @@ export interface StructuredOutputApplication {
   source?: string;
 }
 
+export interface AgentOutputReference {
+  agentId: string;
+  workflowCycleNumber?: number;
+  transcriptAvailable: boolean;
+  fullOutputAvailable: boolean;
+  updatedAt: string;
+}
+
 export interface AgentState {
   id: string;
   category: AgentCategory;
@@ -1097,6 +1376,7 @@ export interface AgentState {
   mergeReport?: MergeReport;
   recommendationReport?: RecommendationReport;
   appliedStructuredOutputs?: StructuredOutputApplication[];
+  outputReference?: AgentOutputReference;
 }
 
 export type AgentHistoryScope = "all" | "workflow" | "manual";
@@ -1123,8 +1403,12 @@ export interface AgentHistorySummary {
   commands: string[];
   approvalCount: number;
   pendingApprovalCount: number;
+  approvalSummaries: string[];
   errorCount: number;
+  errorSummaries: string[];
   tokenUsage?: string;
+  transcriptAvailable: boolean;
+  fullOutputAvailable: boolean;
 }
 
 export interface AgentListResponse {
@@ -1151,8 +1435,20 @@ export interface WorkflowCycleSummaryView {
   hasErrors: boolean;
   hasApprovals: boolean;
   hasUserInputRequests: boolean;
+  errorSummaries: string[];
+  approvalSummaries: string[];
+  userInputRequestSummaries: string[];
   agentCount: number;
   summary: string;
+  selectedTask?: string;
+  selectionReason?: string;
+  strategySettingsUsed: string[];
+  checklistTargets: string[];
+  checklistChanges: string[];
+  goalChangeProposals: string[];
+  validationOutcome?: string;
+  retrospective?: string;
+  nextStepRecommendation?: string;
 }
 
 export interface WorkflowCycleListResponse {
@@ -1169,6 +1465,10 @@ export interface WorkflowCycleDetail extends WorkflowCycleSummaryView {
   activity: WorkflowActivityEvent[];
   openIssues: WorkflowOpenIssue[];
   decisions: WorkflowAcceptedDecision[];
+  plannerDecision?: PlannerDecision;
+  retrospectiveRecord?: CycleRetrospective;
+  checklistChangeRecords: ChecklistChange[];
+  goalChangeProposalRecords: GoalChangeProposal[];
 }
 
 export interface CycleAgentListResponse {
@@ -1271,6 +1571,7 @@ export interface LocalProjectRecord {
   interfaceCreation?: InterfaceCreationState;
   overview?: ProjectOverview;
   stats?: ProjectStats;
+  repositoryScanSettings?: RepositoryScanSettings;
   dependencies: DependencyRecord[];
   summaryCache: FileSummary[];
   agents: AgentState[];
@@ -1376,6 +1677,24 @@ export interface ProjectRepositoryView {
   summaryCacheTotal?: number;
 }
 
+export interface RepositoryScanSettings {
+  maxIncludedFiles?: number;
+  maxIncludedDirectories?: number;
+  maxDepth?: number;
+  maxManifestFileSizeBytes?: number;
+  maxScanDurationMs?: number;
+  maxExcludedPathRecords?: number;
+}
+
+export interface RepositoryScanLimitsResponse {
+  projectId: string;
+  defaults: Required<RepositoryScanSettings>;
+  deepDefaults: Required<RepositoryScanSettings>;
+  hardMaximums: Required<RepositoryScanSettings>;
+  settings: RepositoryScanSettings;
+  effective: Required<RepositoryScanSettings>;
+}
+
 export interface RepositoryChildrenResponse {
   projectId: string;
   parentPath: string;
@@ -1396,6 +1715,8 @@ export interface RepositorySearchResponse {
   total: number;
   results: RepositoryTreeEntry[];
   truncated: boolean;
+  searchScope: "loaded_tree_nodes" | "indexed_files" | "full_deep_index";
+  resultCap: number;
   scanTruncated?: boolean;
   scanTruncationReason?: string;
 }
@@ -1414,13 +1735,22 @@ export interface ProjectRepositorySummary {
 
 export interface RepositoryScanStatus {
   projectId: string;
-  status: "scanning" | "indexed" | "partially_indexed" | "truncated" | "failed";
+  status: "not_scanned" | "scanning" | "indexed" | "partially_indexed" | "truncated" | "failed";
   lastScanAt?: string;
+  scanStartedAt?: string;
+  scanDurationMs?: number;
   lastError?: string;
+  recoverySteps: string[];
   filesIndexed: number;
   foldersIndexed: number;
   filesTotal: number;
   foldersTotal: number;
+  includedFiles: number;
+  includedFolders: number;
+  excludedFiles: number;
+  excludedFolders: number;
+  indexedSizeBytes: number;
+  excludedSizeBytes?: number;
   skippedCount: number;
   skippedReasons: Array<{
     reason: string;
@@ -1429,6 +1759,14 @@ export interface RepositoryScanStatus {
   }>;
   truncated: boolean;
   truncationReason?: string;
+  truncationReasons: NonNullable<ProjectStats["truncationReasons"]>;
+  limitHits: Array<{
+    code: NonNullable<ProjectStats["truncationReasons"]>[number];
+    label: string;
+    limit?: number;
+    omittedFilesEstimate?: number;
+    omittedDirectoriesEstimate?: number;
+  }>;
   limits: {
     includedFileLimit?: number;
     includedDirectoryLimit?: number;
@@ -1437,13 +1775,24 @@ export interface RepositoryScanStatus {
     maxManifestFileSizeBytes?: number;
     excludedPathLimit?: number;
   };
-  searchScope: "full_index" | "loaded_nodes";
+  searchScope: "loaded_tree_nodes" | "indexed_files" | "full_deep_index";
   excludedPaths: ProjectStats["excludedPaths"];
   deepScanAvailable: boolean;
 }
 
 export interface RepositoryRescanOptions {
   mode?: "normal" | "deep";
+  settings?: RepositoryScanSettings;
+}
+
+export interface RepositoryExcludedPathsResponse {
+  projectId: string;
+  total: number;
+  paths: ProjectStats["excludedPaths"];
+  truncated: boolean;
+  excludedFiles: number;
+  excludedFolders: number;
+  excludedSizeBytes?: number;
 }
 
 export interface OpenProjectShellResult {
@@ -1480,4 +1829,13 @@ export interface WorkbenchState {
   codexUpdate?: CodexUpdateCheckResult;
   runtimeReadiness: RuntimeReadinessReport;
   diagnostics: string[];
+  rendererPayload?: RendererPayloadInfo;
+}
+
+export interface RendererPayloadInfo {
+  sizeBytes: number;
+  limitBytes: number;
+  truncated: boolean;
+  activeProjectSizeBytes?: number;
+  warning?: string;
 }

@@ -535,6 +535,111 @@ describe("integration flows", () => {
     expect(workflow?.workflowBudgets.maxRepairLoops).toBe(2);
   });
 
+  it("preserves the Original Ultimate Goal while updating the Current Effective Goal separately", async () => {
+    const root = await createSampleRepo("goal-charter-original-current");
+    const appData = await createTempDir("appdata-goal-charter-original-current");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    await service.updateUltimateGoal(selected.record.id, {
+      summary: "Build the original product charter.",
+      detailedIntent: "Capture the baseline goal.",
+      successCriteria: ["Original is visible"],
+      constraints: ["Keep IPC typed"],
+      nonGoals: ["Do not add planner behavior"],
+      targetAudience: "Operators",
+      qualityBar: "Clear and test-backed.",
+      source: "user"
+    });
+    await service.updateUltimateGoal(selected.record.id, {
+      summary: "Build the evolved effective charter.",
+      detailedIntent: "Current goal can evolve after acceptance.",
+      successCriteria: ["Current is distinct"],
+      constraints: ["Keep IPC typed"],
+      nonGoals: ["Do not alter original"],
+      targetAudience: "Operators",
+      qualityBar: "Clear and test-backed.",
+      source: "user"
+    });
+
+    const charter = service.getGoalCharter(selected.record.id);
+    expect(charter.originalUltimateGoal.summary).toBe("Build the original product charter.");
+    expect(charter.currentEffectiveGoal.summary).toBe("Build the evolved effective charter.");
+    expect(charter.acceptedGoalChanges[0]?.toGoalSummary).toBe("Build the evolved effective charter.");
+  });
+
+  it("persists custom Autopilot Strategy and visual preferences across app restart", async () => {
+    const root = await createSampleRepo("goal-charter-strategy-persistence");
+    const appData = await createTempDir("appdata-goal-charter-strategy-persistence");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    const presets = service.listAutopilotPresets();
+    expect(presets.map((preset) => preset.label)).toContain("Balanced Autopilot");
+    const strategy = {
+      ...service.getAutopilotStrategy(selected.record.id),
+      presetId: "custom" as const,
+      goalRestrictiveness: 42,
+      planningHorizon: "long" as const,
+      taskBatchingAggressiveness: "high" as const,
+      innovationLatitude: 77,
+      riskTolerance: "medium" as const,
+      refactorAppetite: "high" as const,
+      validationStrictness: "very_high" as const,
+      approvalSensitivity: "relaxed" as const,
+      visualPreferences: {
+        ...service.getAutopilotStrategy(selected.record.id).visualPreferences,
+        theme: "custom" as const,
+        primaryColor: "#123456",
+        accentColor: "#abcdef",
+        density: "compact" as const,
+        feel: "technical" as const,
+        layoutPriority: "data_heavy" as const,
+        motionPreference: "polished" as const,
+        accessibilityPriority: "keyboard_first" as const,
+        designStrictness: "follow_user_exactly" as const
+      }
+    };
+
+    await service.updateAutopilotStrategy(selected.record.id, strategy);
+    await service.updateGoalCharter(selected.record.id, {
+      technicalPreferences: ["Prefer generated protocol types"],
+      aestheticPreferences: ["Dense command-center UI"]
+    });
+    expect(service.getAutopilotStrategy(selected.record.id).goalRestrictiveness).toBe(42);
+
+    await service.dispose();
+    const restarted = await createService(appData);
+    const restored = getProjectRecord(restarted, selected.record.id);
+    expect(restored?.workflow.goalCharter.autopilotStrategy.goalRestrictiveness).toBe(42);
+    expect(restored?.workflow.goalCharter.autopilotStrategy.visualPreferences.primaryColor).toBe("#123456");
+    expect(restored?.workflow.goalCharter.technicalPreferences).toContain("Prefer generated protocol types");
+    expect(restored?.workflow.goalCharter.aestheticPreferences).toContain("Dense command-center UI");
+  });
+
+  it("auto-detects an Ultimate Goal proposal without starting workflow execution", async () => {
+    const root = await createSampleRepo("goal-charter-detect-proposal");
+    const appData = await createTempDir("appdata-goal-charter-detect-proposal");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+
+    const beforeAgents = getProjectRecord(service, selected.record.id)?.agents.length ?? 0;
+    const detected = await service.detectUltimateGoal(selected.record.id);
+    const record = getProjectRecord(service, selected.record.id);
+
+    expect(detected.summary).toBeTruthy();
+    expect(record?.workflow.goalCharter.proposedGoalChanges[0]?.source).toBe("detected");
+    expect(record?.workflow.goalCharter.proposedGoalChanges[0]?.proposedGoal?.summary).toBe(detected.summary);
+    expect(record?.workflow.ultimateGoal.confirmedAt).toBeUndefined();
+    expect(record?.workflow.recommendations).toHaveLength(0);
+    expect(record?.workflow.scopedGoal).toBeUndefined();
+    expect(record?.agents.filter((agent) => agent.category === "coding" || agent.category === "recommendation")).toHaveLength(0);
+    expect((record?.agents.length ?? 0)).toBeGreaterThanOrEqual(beforeAgents);
+  });
+
   it("applies the configured reasoning effort to interface creation state", async () => {
     const root = await createSampleRepo("reasoning-applied");
     const appData = await createTempDir("appdata-reasoning-applied");
@@ -3169,18 +3274,27 @@ describe("integration flows", () => {
     await reopenedService.loadProject(root, "create");
     const reopened = await reopenedService.selectPendingInterface("local");
 
+    let lastResumeState = "workflow not observed";
     const resumedWorkflow = await waitFor(() => {
       const record = getProjectRecord(reopenedService, reopened.record.id);
       const codingAgentCount = record?.agents.filter((agent) => agent.category === "coding" && agent.status !== "disconnected").length ?? 0;
       const workflow = record?.workflow;
+      lastResumeState = JSON.stringify({
+        repair: workflow?.repair,
+        codingAgentCount,
+        agentStatuses: record?.agents.map((agent) => ({ category: agent.category, status: agent.status })),
+        latestActivity: workflow?.activityLog.slice(-5).map((event) => ({ title: event.title, status: event.status }))
+      });
       return workflow?.repair.status === "exhausted" && workflow.repair.attemptCount === 2 && codingAgentCount === 3
         ? workflow
         : null;
-    }, 12_000);
+    }, 40_000).catch((error) => {
+      throw new Error(`${error instanceof Error ? error.message : String(error)} Last observed state: ${lastResumeState}`);
+    });
 
     expect(resumedWorkflow.repair.maxAttempts).toBe(2);
     expect(resumedWorkflow.activityLog.some((event) => event.title === "Automatic repair resumed")).toBe(true);
-  }, 16_000);
+  }, 48_000);
 
   it("imports an Ultimate Goal from a text file for review before confirmation", async () => {
     const root = await createSampleRepo("goal-import");

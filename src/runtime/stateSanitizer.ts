@@ -1,11 +1,20 @@
 import type {
   AgentCommandExecution,
   AgentState,
+  CandidateTask,
+  ChecklistChange,
+  CycleRetrospective,
+  GoalChangeRecord,
+  GoalChangeProposal,
+  GoalCharter,
   GoalAttainmentCheck,
   GoalCheckEvidenceHistoryEntry,
   LocalProjectRecord,
   ProjectWorkflowState,
   RuntimeEventRecord,
+  PlannerDecision,
+  StrategicPlan,
+  UltimateGoal,
   WorkflowActivityEvent,
   WorkflowMemory,
   WorkflowRecommendationOption,
@@ -25,6 +34,9 @@ export const AGENT_COMMANDS_MAX_TOTAL = 450;
 export const AGENT_EVENTS_MAX_PER_AGENT = 120;
 export const AGENT_COMMANDS_MAX_PER_AGENT = 80;
 export const FULL_AGENT_DETAILS_MAX = 120;
+export const AGENT_COMMAND_OUTPUT_PREVIEW_CHARS = 2_000;
+export const AGENT_EVENT_DETAIL_PREVIEW_CHARS = 1_200;
+export const AGENT_RAW_EVENT_PREVIEW_CHARS = 1_500;
 
 export interface StateSanitizerReport {
   version: number;
@@ -366,6 +378,177 @@ const sanitizeWorkPackage = (workPackage: WorkPackage, report?: StateSanitizerRe
   checkIds: asArray(workPackage.checkIds).slice(0, 40)
 });
 
+const sanitizeChecklistChange = (
+  change: ChecklistChange,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): ChecklistChange => ({
+  ...change,
+  checklistItemIds: asArray(change.checklistItemIds).slice(0, 40),
+  title: change.title ? sanitizeChecklistEvidenceText(change.title, 240, report) : change.title,
+  rationale: sanitizeChecklistEvidenceText(change.rationale, options.renderer ? 360 : 1_000, report),
+  affectedGoalArea: sanitizeChecklistEvidenceText(change.affectedGoalArea, 240, report),
+  linkedEvidence: asArray(change.linkedEvidence).slice(0, options.renderer ? 4 : 12).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 240 : 800, report)),
+  linkedChangedFiles: asArray(change.linkedChangedFiles).slice(0, 24),
+  linkedValidationCommands: asArray(change.linkedValidationCommands).slice(0, 12),
+  linkedCycleIds: asArray(change.linkedCycleIds).slice(0, 24),
+  linkedAgentIds: asArray(change.linkedAgentIds).slice(0, 24)
+});
+
+const sanitizeCandidateTask = (
+  candidate: CandidateTask,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): CandidateTask => ({
+  ...candidate,
+  title: sanitizeChecklistEvidenceText(candidate.title, 240, report),
+  summary: sanitizeChecklistEvidenceText(candidate.summary, options.renderer ? 360 : 1_000, report),
+  targetedCheckIds: asArray(candidate.targetedCheckIds).slice(0, 40),
+  expectedChecklistImpact: sanitizeChecklistEvidenceText(candidate.expectedChecklistImpact, options.renderer ? 300 : 800, report),
+  expectedFiles: asArray(candidate.expectedFiles).slice(0, 16),
+  expectedValidationCommands: asArray(candidate.expectedValidationCommands).slice(0, 12),
+  whyNext: sanitizeChecklistEvidenceText(candidate.whyNext, options.renderer ? 420 : 1_200, report),
+  goalChangeProposalIds: asArray(candidate.goalChangeProposalIds).slice(0, 24),
+  checklistChangeIds: asArray(candidate.checklistChangeIds).slice(0, 24),
+  scoreBreakdown: Object.fromEntries(Object.entries(candidate.scoreBreakdown ?? {}).slice(0, 24))
+});
+
+const sanitizeUltimateGoal = (
+  goal: UltimateGoal | undefined,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): UltimateGoal => ({
+  summary: sanitizeChecklistEvidenceText(goal?.summary, options.renderer ? 500 : 2_000, report),
+  detailedIntent: sanitizeChecklistEvidenceText(goal?.detailedIntent, options.renderer ? 800 : 3_000, report),
+  successCriteria: asArray(goal?.successCriteria).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report)),
+  constraints: asArray(goal?.constraints).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report)),
+  nonGoals: asArray(goal?.nonGoals).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report)),
+  qualityBar: sanitizeChecklistEvidenceText(goal?.qualityBar, options.renderer ? 500 : 1_500, report),
+  targetAudience: sanitizeChecklistEvidenceText(goal?.targetAudience, 500, report),
+  source: goal?.source ?? "user",
+  confirmedAt: goal?.confirmedAt,
+  lastUpdatedAt: goal?.lastUpdatedAt
+});
+
+const sanitizeGoalChangeRecord = (
+  change: GoalChangeRecord,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): GoalChangeRecord => ({
+  ...change,
+  title: sanitizeChecklistEvidenceText(change.title, 240, report),
+  summary: sanitizeChecklistEvidenceText(change.summary, options.renderer ? 360 : 1_000, report),
+  rationale: sanitizeChecklistEvidenceText(change.rationale, options.renderer ? 420 : 1_200, report),
+  fromGoalSummary: change.fromGoalSummary ? sanitizeChecklistEvidenceText(change.fromGoalSummary, 300, report) : change.fromGoalSummary,
+  toGoalSummary: change.toGoalSummary ? sanitizeChecklistEvidenceText(change.toGoalSummary, 300, report) : change.toGoalSummary,
+  decisionNotes: change.decisionNotes ? sanitizeChecklistEvidenceText(change.decisionNotes, 500, report) : change.decisionNotes,
+  proposedGoal: change.proposedGoal ? sanitizeUltimateGoal(change.proposedGoal, report, options) : change.proposedGoal
+});
+
+const sanitizeGoalChangeProposal = (
+  change: GoalChangeProposal,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): GoalChangeProposal => ({
+  ...sanitizeGoalChangeRecord(change, report, options),
+  approvalStatus: change.approvalStatus,
+  requiredByStrategy: Boolean(change.requiredByStrategy),
+  risk: change.risk,
+  affectedGoalArea: sanitizeChecklistEvidenceText(change.affectedGoalArea, 240, report)
+});
+
+const sanitizeStrategicPlan = (
+  plan: StrategicPlan,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): StrategicPlan => ({
+  ...plan,
+  originalGoalSummary: sanitizeChecklistEvidenceText(plan.originalGoalSummary, options.renderer ? 360 : 1_000, report),
+  currentEffectiveGoalSummary: sanitizeChecklistEvidenceText(plan.currentEffectiveGoalSummary, options.renderer ? 360 : 1_000, report),
+  strategyHighlights: asArray(plan.strategyHighlights).slice(0, 12).map((entry) => sanitizeChecklistEvidenceText(entry, 200, report)),
+  repoScanStatus: sanitizeChecklistEvidenceText(plan.repoScanStatus, 300, report),
+  previousCycleOutcomes: asArray(plan.previousCycleOutcomes).slice(0, options.renderer ? 4 : 12).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 240 : 800, report)),
+  failedCommands: asArray(plan.failedCommands).slice(0, 12).map((entry) => sanitizeChecklistEvidenceText(entry, 240, report)),
+  changedFiles: asArray(plan.changedFiles).slice(0, 32),
+  openBlockers: asArray(plan.openBlockers).slice(0, 16).map((entry) => sanitizeChecklistEvidenceText(entry, 240, report)),
+  userFeedback: asArray(plan.userFeedback).slice(0, 8).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 240 : 800, report)),
+  recentAgentOutputs: asArray(plan.recentAgentOutputs).slice(0, 8).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 240 : 800, report)),
+  architectureNotes: asArray(plan.architectureNotes).slice(0, 8).map((entry) => sanitizeChecklistEvidenceText(entry, 300, report)),
+  candidateTasks: asArray(plan.candidateTasks).slice(0, options.renderer ? 8 : 30).map((candidate) => sanitizeCandidateTask(candidate, report, options)),
+  candidateWorkPackages: asArray(plan.candidateWorkPackages).slice(0, options.renderer ? 4 : 12).map((workPackage) => sanitizeWorkPackage(workPackage, report)),
+  proposedGoalChanges: asArray(plan.proposedGoalChanges).slice(0, options.renderer ? 4 : 20).map((change) => sanitizeGoalChangeProposal(change, report, options)),
+  proposedChecklistChanges: asArray(plan.proposedChecklistChanges).slice(0, options.renderer ? 8 : 40).map((change) => sanitizeChecklistChange(change, report, options)),
+  plannerSummary: sanitizeChecklistEvidenceText(plan.plannerSummary, options.renderer ? 420 : 1_200, report),
+  pauseReason: plan.pauseReason ? sanitizeChecklistEvidenceText(plan.pauseReason, 500, report) : plan.pauseReason
+});
+
+const sanitizePlannerDecision = (
+  decision: PlannerDecision,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): PlannerDecision => ({
+  ...decision,
+  selectedTaskTitle: decision.selectedTaskTitle ? sanitizeChecklistEvidenceText(decision.selectedTaskTitle, 240, report) : decision.selectedTaskTitle,
+  whySelected: sanitizeChecklistEvidenceText(decision.whySelected, options.renderer ? 420 : 1_200, report),
+  scoreBreakdown: Object.fromEntries(Object.entries(decision.scoreBreakdown ?? {}).slice(0, 24)),
+  strategySettingsUsed: asArray(decision.strategySettingsUsed).slice(0, 12).map((entry) => sanitizeChecklistEvidenceText(entry, 200, report)),
+  targetedChecklistIds: asArray(decision.targetedChecklistIds).slice(0, 40),
+  expectedFiles: asArray(decision.expectedFiles).slice(0, 16),
+  expectedValidationCommands: asArray(decision.expectedValidationCommands).slice(0, 12),
+  goalChangeProposalIds: asArray(decision.goalChangeProposalIds).slice(0, 24),
+  checklistChangeIds: asArray(decision.checklistChangeIds).slice(0, 24)
+});
+
+const sanitizeCycleRetrospective = (
+  retrospective: CycleRetrospective,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): CycleRetrospective => ({
+  ...retrospective,
+  triedToDo: sanitizeChecklistEvidenceText(retrospective.triedToDo, options.renderer ? 300 : 900, report),
+  whyChosen: sanitizeChecklistEvidenceText(retrospective.whyChosen, options.renderer ? 420 : 1_200, report),
+  changedFiles: asArray(retrospective.changedFiles).slice(0, 40),
+  commandsRun: asArray(retrospective.commandsRun).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, 240, report)),
+  passed: asArray(retrospective.passed).slice(0, 20).map((entry) => sanitizeChecklistEvidenceText(entry, 240, report)),
+  failed: asArray(retrospective.failed).slice(0, 20).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 260 : 800, report)),
+  learned: asArray(retrospective.learned).slice(0, 12).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 260 : 800, report)),
+  checklistItemsAdvanced: asArray(retrospective.checklistItemsAdvanced).slice(0, 20).map((entry) => sanitizeChecklistEvidenceText(entry, 240, report)),
+  goalChecklistChangeRecommendation: sanitizeChecklistEvidenceText(retrospective.goalChecklistChangeRecommendation, options.renderer ? 300 : 800, report),
+  nextRecommendedTasks: asArray(retrospective.nextRecommendedTasks).slice(0, 8).map((entry) => sanitizeChecklistEvidenceText(entry, 240, report)),
+  pauseReason: retrospective.pauseReason ? sanitizeChecklistEvidenceText(retrospective.pauseReason, 500, report) : retrospective.pauseReason
+});
+
+const sanitizeGoalCharter = (
+  charter: GoalCharter | undefined,
+  fallbackGoal: UltimateGoal | undefined,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): GoalCharter | undefined => {
+  if (!charter) {
+    return charter;
+  }
+  const listLimit = options.renderer ? 16 : 80;
+  const changeLimit = options.renderer ? 8 : 50;
+  const sanitizeList = (entries: string[] | undefined): string[] =>
+    asArray(entries).slice(0, listLimit).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report));
+  return {
+    ...charter,
+    originalUltimateGoal: sanitizeUltimateGoal(charter.originalUltimateGoal ?? fallbackGoal, report, options),
+    currentEffectiveGoal: sanitizeUltimateGoal(charter.currentEffectiveGoal ?? fallbackGoal, report, options),
+    nonNegotiableRequirements: sanitizeList(charter.nonNegotiableRequirements),
+    flexibleRequirements: sanitizeList(charter.flexibleRequirements),
+    niceToHaveIdeas: sanitizeList(charter.niceToHaveIdeas),
+    explicitNonGoals: sanitizeList(charter.explicitNonGoals),
+    userConstraints: sanitizeList(charter.userConstraints),
+    aestheticPreferences: sanitizeList(charter.aestheticPreferences),
+    technicalPreferences: sanitizeList(charter.technicalPreferences),
+    definitionOfDone: sanitizeList(charter.definitionOfDone),
+    acceptedGoalChanges: asArray(charter.acceptedGoalChanges).slice(0, changeLimit).map((change) => sanitizeGoalChangeRecord(change, report, options)),
+    rejectedGoalChanges: asArray(charter.rejectedGoalChanges).slice(0, changeLimit).map((change) => sanitizeGoalChangeRecord(change, report, options)),
+    proposedGoalChanges: asArray(charter.proposedGoalChanges).slice(0, changeLimit).map((change) => sanitizeGoalChangeRecord(change, report, options))
+  };
+};
+
 const sanitizeWorkflowActivity = (
   activityLog: WorkflowActivityEvent[] | undefined,
   report?: StateSanitizerReport,
@@ -397,22 +580,18 @@ export const sanitizeWorkflowState = (
 
   return {
     ...workflow,
-    ultimateGoal: {
-      ...ultimateGoal,
-      summary: sanitizeChecklistEvidenceText(ultimateGoal?.summary, options.renderer ? 500 : 2_000, report),
-      detailedIntent: sanitizeChecklistEvidenceText(ultimateGoal?.detailedIntent, options.renderer ? 800 : 3_000, report),
-      successCriteria: asArray(ultimateGoal?.successCriteria).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report)),
-      constraints: asArray(ultimateGoal?.constraints).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report)),
-      nonGoals: asArray(ultimateGoal?.nonGoals).slice(0, 40).map((entry) => sanitizeChecklistEvidenceText(entry, options.renderer ? 300 : 1_000, report)),
-      qualityBar: sanitizeChecklistEvidenceText(ultimateGoal?.qualityBar, options.renderer ? 500 : 1_500, report),
-      targetAudience: sanitizeChecklistEvidenceText(ultimateGoal?.targetAudience, 500, report)
-    },
+    ultimateGoal: sanitizeUltimateGoal(ultimateGoal, report, options),
+    goalCharter: sanitizeGoalCharter(workflow.goalCharter, ultimateGoal, report, options) ?? workflow.goalCharter,
   goalChecklist: sanitizeGoalChecklist(workflow.goalChecklist, report, {
     evidenceMaxChars: options.renderer ? CHECKLIST_RENDERER_EVIDENCE_MAX_CHARS : CHECKLIST_EVIDENCE_MAX_CHARS,
     includeEvidenceHistory: !options.renderer
   }),
   taskMap: sanitizeTaskMap(workflow.taskMap, report, options),
   workPackages: asArray(workflow.workPackages).slice(0, options.renderer ? 8 : 30).map((workPackage) => sanitizeWorkPackage(workPackage, report)),
+  strategicPlans: asArray(workflow.strategicPlans).slice(0, options.renderer ? 3 : 30).map((plan) => sanitizeStrategicPlan(plan, report, options)),
+  plannerDecisions: asArray(workflow.plannerDecisions).slice(0, options.renderer ? 8 : 50).map((decision) => sanitizePlannerDecision(decision, report, options)),
+  checklistChanges: asArray(workflow.checklistChanges).slice(0, options.renderer ? 16 : 100).map((change) => sanitizeChecklistChange(change, report, options)),
+  cycleRetrospectives: asArray(workflow.cycleRetrospectives).slice(0, options.renderer ? 8 : 50).map((retrospective) => sanitizeCycleRetrospective(retrospective, report, options)),
   approvedRecommendation: workflow.approvedRecommendation
     ? {
       ...sanitizeRecommendation(workflow.approvedRecommendation, report, options),
@@ -462,16 +641,24 @@ const eventKey = (agent: AgentState, event: RuntimeEventRecord, index: number): 
 const commandKey = (agent: AgentState, command: AgentCommandExecution, index: number): string =>
   `${agent.id}:command:${command.itemId ?? command.startedAt}:${index}`;
 
-const compactRawEventValue = (value: unknown, maxChars: number): unknown => {
+const compactRawEventValue = (value: unknown, maxChars: number, report?: StateSanitizerReport): unknown => {
   if (value === undefined) {
     return undefined;
   }
   if (typeof value === "string") {
-    return sanitizeChecklistEvidenceText(value, maxChars);
+    return sanitizeChecklistEvidenceText(value, maxChars, report);
   }
   try {
-    return sanitizeChecklistEvidenceText(JSON.stringify(value), maxChars);
+    const serialized = JSON.stringify(value);
+    const compacted = sanitizeChecklistEvidenceText(serialized, maxChars, report);
+    if ((typeof value !== "string" || serialized !== compacted) && report) {
+      markChanged(report);
+    }
+    return compacted;
   } catch {
+    if (report) {
+      markChanged(report);
+    }
     return "[unserializable raw event]";
   }
 };
@@ -499,8 +686,8 @@ const sanitizeAgent = (
       .map(({ event }) => ({
         ...event,
         title: sanitizeChecklistEvidenceText(event.title, 240, report),
-        detail: event.detail ? sanitizeChecklistEvidenceText(event.detail, 1_200, report) : event.detail,
-        raw: compactRawEventValue(event.raw, 1_500)
+        detail: event.detail ? sanitizeChecklistEvidenceText(event.detail, AGENT_EVENT_DETAIL_PREVIEW_CHARS, report) : event.detail,
+        raw: compactRawEventValue(event.raw, AGENT_RAW_EVENT_PREVIEW_CHARS, report)
       }));
   const commandLog = options.compactDetails
     ? []
@@ -508,13 +695,19 @@ const sanitizeAgent = (
       .map((command, index) => ({ command, key: commandKey(agent, command, index) }))
       .filter(({ key }) => options.allowedCommandKeys.has(key))
       .slice(0, AGENT_COMMANDS_MAX_PER_AGENT)
-      .map(({ command }) => ({
-        ...command,
-        command: sanitizeChecklistEvidenceText(command.command, 4_000, report),
-        output: command.output.length > 8_000
-          ? `${command.output.slice(-8_000).trimStart()} [truncated from ${command.output.length} characters]`
-          : command.output
-      }));
+      .map(({ command }) => {
+        const output = command.output.length > AGENT_COMMAND_OUTPUT_PREVIEW_CHARS
+          ? `${command.output.slice(-AGENT_COMMAND_OUTPUT_PREVIEW_CHARS).trimStart()} [truncated from ${command.output.length} characters]`
+          : command.output;
+        if (output !== command.output) {
+          markChanged(report);
+        }
+        return {
+          ...command,
+          command: sanitizeChecklistEvidenceText(command.command, 4_000, report),
+          output
+        };
+      });
 
   if (events.length !== previousEventCount) {
     report.agentEventsRemoved += previousEventCount - events.length;

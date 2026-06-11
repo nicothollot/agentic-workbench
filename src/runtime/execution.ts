@@ -90,6 +90,7 @@ const toWslEnvArgs = (env?: Record<string, string | undefined>): string[] =>
 const WSL_RESOLVED_USER_PREFIX = "__AWB_WSL_RESOLVED_USER__=";
 const WSL_RESOLVED_CODEX_PREFIX = "__AWB_WSL_RESOLVED_CODEX__=";
 const WSL_RESOLVED_NODE_PREFIX = "__AWB_WSL_RESOLVED_NODE__=";
+const DEFAULT_WSL_PROBE_TIMEOUT_MS = 10_000;
 
 const quoteForBash = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 const dedupeStrings = (values: string[]): string[] => [...new Set(values.filter(Boolean))];
@@ -621,7 +622,7 @@ type ExecutionFailure = Error & {
   code?: number | string;
 };
 
-const executeWslBashCommandPlan = async (plan: WslBashCommandPlan): Promise<CommandResult> =>
+export const executeWslBashCommandPlan = async (plan: WslBashCommandPlan, timeoutMs = DEFAULT_WSL_PROBE_TIMEOUT_MS): Promise<CommandResult> =>
   new Promise((resolve, reject) => {
     const child = spawn(plan.file, plan.args, {
       env: process.env
@@ -630,12 +631,21 @@ const executeWslBashCommandPlan = async (plan: WslBashCommandPlan): Promise<Comm
     let stdout = "";
     let stderr = "";
     let settled = false;
+    const timeout = setTimeout(() => {
+      const failure = new Error(`WSL probe timed out after ${timeoutMs}ms.`) as ExecutionFailure;
+      failure.stdout = stdout;
+      failure.stderr = stderr;
+      failure.code = "ETIMEDOUT";
+      child.kill();
+      finishReject(failure);
+    }, timeoutMs);
 
     const finishReject = (error: ExecutionFailure): void => {
       if (settled) {
         return;
       }
       settled = true;
+      clearTimeout(timeout);
       reject(error);
     };
 
@@ -644,6 +654,7 @@ const executeWslBashCommandPlan = async (plan: WslBashCommandPlan): Promise<Comm
         return;
       }
       settled = true;
+      clearTimeout(timeout);
       resolve(result);
     };
 
@@ -739,7 +750,7 @@ export class RuntimeCommandExecutor {
     }
   }
 
-  async resolveWslCommand(spec: Pick<StructuredCommandSpec, "command" | "env" | "cwd">): Promise<WslResolvedCommand> {
+  async resolveWslCommand(spec: Pick<StructuredCommandSpec, "command" | "env" | "cwd" | "timeoutMs">): Promise<WslResolvedCommand> {
     const mode = resolveExecutionMode(this.settings, this.platform);
     if (mode !== "wsl") {
       return {
@@ -762,7 +773,7 @@ export class RuntimeCommandExecutor {
     });
 
     try {
-      const { stdout, stderr } = await executeWslBashCommandPlan(plan);
+      const { stdout, stderr } = await executeWslBashCommandPlan(plan, spec.timeoutMs);
       const parsed = parseWslCommandResolutionOutput(stdout);
       logWslCodexDetection({
         distro: this.settings.distroName,
@@ -821,7 +832,7 @@ export class RuntimeCommandExecutor {
     }
   }
 
-  async resolveWslCodexRuntime(spec: Pick<StructuredCommandSpec, "command" | "cwd">): Promise<WslResolvedCodexRuntime> {
+  async resolveWslCodexRuntime(spec: Pick<StructuredCommandSpec, "command" | "cwd" | "timeoutMs">): Promise<WslResolvedCodexRuntime> {
     const mode = resolveExecutionMode(this.settings, this.platform);
     if (mode !== "wsl") {
       return {
@@ -846,7 +857,7 @@ export class RuntimeCommandExecutor {
     });
 
     try {
-      const { stdout, stderr } = await executeWslBashCommandPlan(plan);
+      const { stdout, stderr } = await executeWslBashCommandPlan(plan, spec.timeoutMs);
       const parsed = parseWslCodexRuntimeResolutionOutput(stdout);
       logWslCodexDetection({
         distro: this.settings.distroName,

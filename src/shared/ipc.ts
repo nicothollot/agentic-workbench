@@ -3,13 +3,17 @@ import {
   agentCategorySchema,
   agentReasoningModeSchema,
   autopilotPolicySchema,
+  autopilotStrategySchema,
   appSettingsSchema,
   gitHubStatusSchema,
+  goalChangeRecordSchema,
+  goalCharterSchema,
   humanInterventionKindSchema,
   humanInterventionSeveritySchema,
   interfaceReasoningEffortSchema,
   localProjectRecordSchema,
   portableInterfaceSchema,
+  repositoryScanSettingsSchema,
   ultimateGoalSchema,
   validationStatusSchema,
   workflowModeSchema
@@ -118,6 +122,10 @@ export const visualExportSessionRequestSchema = z.object({
   exportId: z.string().min(1)
 });
 
+export const codexUpdateRunRequestSchema = z.object({
+  approvedCommand: z.string().min(1).optional()
+}).optional();
+
 export const importInterfaceRequestSchema = z.object({
   projectRootPath: z.string().min(1),
   importPath: z.string().min(1),
@@ -151,6 +159,17 @@ export const projectRepositoryChildrenRequestSchema = z.object({
 export const projectRepositorySearchRequestSchema = z.object({
   projectId: z.string().min(1),
   query: z.string().default(""),
+  limit: z.number().int().min(1).max(500).default(120)
+});
+
+export const repositoryScanSettingsRequestSchema = z.object({
+  projectId: z.string().min(1),
+  settings: repositoryScanSettingsSchema
+});
+
+export const projectRepositoryExcludedPathsRequestSchema = z.object({
+  projectId: z.string().min(1),
+  cursor: z.string().optional(),
   limit: z.number().int().min(1).max(500).default(120)
 });
 
@@ -198,7 +217,8 @@ export const agentTranscriptRequestSchema = z.object({
 export const repositoryRescanRequestSchema = z.object({
   projectId: z.string().min(1),
   options: z.object({
-    mode: z.enum(["normal", "deep"]).default("normal")
+    mode: z.enum(["normal", "deep"]).default("normal"),
+    settings: repositoryScanSettingsSchema.optional()
   }).default({ mode: "normal" })
 });
 
@@ -239,6 +259,44 @@ export const detectUltimateGoalRequestSchema = z.object({
 
 export const importUltimateGoalTextRequestSchema = z.object({
   projectId: z.string().min(1)
+});
+
+export const goalCharterRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
+export const updateGoalCharterRequestSchema = z.object({
+  projectId: z.string().min(1),
+  patch: goalCharterSchema.partial()
+});
+
+export const autopilotStrategyRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
+export const updateAutopilotStrategyRequestSchema = z.object({
+  projectId: z.string().min(1),
+  strategy: autopilotStrategySchema
+});
+
+export const strategicPlanRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
+export const goalChangeProposalRequestSchema = z.object({
+  projectId: z.string().min(1),
+  proposal: goalChangeRecordSchema
+});
+
+export const goalChangeDecisionRequestSchema = z.object({
+  projectId: z.string().min(1),
+  proposalId: z.string().min(1),
+  decisionNotes: z.string().max(1_000).optional()
+});
+
+export const plannerCycleRecordRequestSchema = z.object({
+  projectId: z.string().min(1),
+  cycleId: z.string().min(1)
 });
 
 export const approveRecommendationRequestSchema = z.object({
@@ -349,6 +407,7 @@ export const rendererStateSchema = z.object({
     executionMode: z.enum(["local", "wsl"]),
     distroName: z.string().optional(),
     codexBinaryPath: z.string(),
+    codexCliExists: z.boolean().optional(),
     codexPath: z.string().optional(),
     nodePath: z.string().optional(),
     codexVersion: z.string().optional(),
@@ -356,7 +415,9 @@ export const rendererStateSchema = z.object({
     updateAvailable: z.boolean(),
     updateCommand: z.string().optional(),
     status: z.enum(["checking", "ready", "outdated", "unavailable", "skipped"]),
-    message: z.string()
+    message: z.string(),
+    warnings: z.array(z.string()).optional(),
+    errors: z.array(z.string()).optional()
   }),
   codexUpdate: z.object({
     checkedAt: z.string(),
@@ -394,8 +455,10 @@ export type IpcChannel =
   | "app:openDevTools"
   | "app:checkRuntimeReadiness"
   | "app:getCodexReadiness"
+  | "app:refreshCodexReadiness"
   | "app:checkCodexUpdate"
   | "app:runCodexUpdate"
+  | "app:getExecutionEnvironmentStatus"
   | "app:quit"
   | "settings:get"
   | "settings:update"
@@ -435,6 +498,19 @@ export type IpcChannel =
   | "workflow:updateUltimateGoal"
   | "workflow:detectUltimateGoal"
   | "workflow:importUltimateGoalText"
+  | "workflow:getGoalCharter"
+  | "workflow:updateGoalCharter"
+  | "workflow:getAutopilotStrategy"
+  | "workflow:updateAutopilotStrategy"
+  | "workflow:listAutopilotPresets"
+  | "workflow:generateStrategicPlan"
+  | "workflow:selectNextWorkPackage"
+  | "workflow:proposeGoalChange"
+  | "workflow:acceptGoalChange"
+  | "workflow:rejectGoalChange"
+  | "workflow:listChecklistChanges"
+  | "workflow:getPlannerDecision"
+  | "workflow:getCycleRetrospective"
   | "workflow:approveRecommendation"
   | "workflow:createScopedGoal"
   | "workflow:retryGoal"

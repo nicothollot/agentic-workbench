@@ -2,6 +2,7 @@ import { nanoid } from "nanoid";
 import { APP_VERSION, DEFAULT_CODEX_BINARY, DEFAULT_DISTRO_NAME, DEFAULT_WORKTREE_BASE_DIR, PORTABLE_INTERFACE_VERSION } from "./constants";
 import { DEFAULT_AGENT_REASONING_EFFORTS, DEFAULT_AGENT_REASONING_MODE } from "./modelConfig";
 import { createDefaultAutopilotPolicy } from "./autopilotPolicy";
+import { createDefaultGoalCharter } from "./goalCharter";
 import type {
   AgentCategory,
   AgentFreshnessMarker,
@@ -146,6 +147,7 @@ export const defaultWorkflowStepProgressState = (): Record<WorkflowStepId, Workf
 
 export const defaultProjectWorkflowState = (): ProjectWorkflowState => ({
   ultimateGoal: emptyUltimateGoal(),
+  goalCharter: createDefaultGoalCharter(),
   workflowMode: "normal",
   previewRequest: {
     status: "none",
@@ -160,6 +162,10 @@ export const defaultProjectWorkflowState = (): ProjectWorkflowState => ({
     updatedAt: new Date(0).toISOString()
   },
   workPackages: [],
+  strategicPlans: [],
+  plannerDecisions: [],
+  checklistChanges: [],
+  cycleRetrospectives: [],
   workflowCycle: defaultWorkflowCycle(),
   workflowStage: "charter_needed",
   repairLoopCount: 0,

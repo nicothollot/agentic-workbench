@@ -20,6 +20,62 @@ export const workflowModeSchema = z.enum(["normal", "fast"]);
 export const workflowPreviewStatusSchema = z.enum(["none", "queued", "active", "ready", "completed", "cancelled"]);
 export const autopilotProfileSchema = z.enum(["balanced", "conservative", "aggressive", "custom"]);
 export const autopilotIntegrityFailurePolicySchema = z.enum(["repair", "pause", "policy"]);
+export const autopilotPresetIdSchema = z.enum([
+  "exact_builder",
+  "goal_focused",
+  "balanced_autopilot",
+  "creative_builder",
+  "experimental_moonshot"
+]);
+export const planningHorizonSchema = z.enum(["short", "medium", "long"]);
+export const taskBatchingAggressivenessSchema = z.enum(["low", "medium", "high", "very_high"]);
+export const riskToleranceSchema = z.enum(["low", "medium", "high"]);
+export const refactorAppetiteSchema = z.enum(["low", "medium", "high", "very_high"]);
+export const validationStrictnessSchema = z.enum(["low", "medium", "high", "very_high"]);
+export const approvalSensitivitySchema = z.enum(["strict", "normal", "relaxed", "autonomous"]);
+export const checklistChangeActionSchema = z.enum([
+  "add",
+  "remove",
+  "split",
+  "merge",
+  "reprioritize",
+  "mark_obsolete",
+  "mark_blocked",
+  "mark_complete",
+  "link_evidence",
+  "link_changed_files",
+  "link_validation_commands",
+  "link_cycle_ids",
+  "link_agent_ids"
+]);
+export const plannerApprovalStatusSchema = z.enum(["not_required", "pending", "accepted", "rejected"]);
+export const candidateTaskKindSchema = z.enum([
+  "goal_check",
+  "work_package",
+  "blocker",
+  "validation",
+  "stabilization",
+  "visual_polish",
+  "goal_evolution",
+  "custom",
+  "fallback"
+]);
+export const strategicAutopilotModeSchema = z.enum([
+  "manual",
+  "guided",
+  "autopilot_safe",
+  "autopilot_balanced",
+  "autopilot_creative",
+  "autopilot_aggressive"
+]);
+export const visualThemePreferenceSchema = z.enum(["light", "dark", "system", "custom"]);
+export const visualDensityPreferenceSchema = z.enum(["compact", "balanced", "spacious"]);
+export const visualFeelPreferenceSchema = z.enum(["professional", "modern", "playful", "minimal", "premium", "technical", "futuristic", "cozy"]);
+export const visualLayoutPrioritySchema = z.enum(["dashboard", "document_editor", "command_center", "kanban", "terminal_like", "data_heavy", "visual_first"]);
+export const motionPreferenceSchema = z.enum(["none", "subtle", "polished"]);
+export const accessibilityPrioritySchema = z.enum(["normal", "high_contrast", "keyboard_first", "screen_reader_conscious"]);
+export const designStrictnessSchema = z.enum(["follow_user_exactly", "allow_model_improvement"]);
+export const visualPrioritySchema = z.enum(["low", "medium", "high", "very_high"]);
 export const ultimateGoalCompletionStateSchema = z.enum(["needs_more_work", "goal_satisfied"]);
 export const goalCheckStatusSchema = z.enum(["unknown", "unmet", "met", "not_applicable"]);
 export const goalCheckItemKindSchema = z.enum(["required", "backlog", "observation"]);
@@ -214,6 +270,9 @@ export const dependencyRecordSchema = z.object({
 export const projectStatsSchema = z.object({
   projectRoot: z.string().min(1),
   kind: projectKindSchema,
+  scanStartedAt: isoDatetime().optional(),
+  scanCompletedAt: isoDatetime().optional(),
+  scanMode: z.enum(["normal", "deep"]).optional(),
   createdAt: isoDatetime().optional(),
   lastCommitAt: isoDatetime().optional(),
   totalFiles: z.number().int().nonnegative(),
@@ -262,6 +321,15 @@ export const projectStatsSchema = z.object({
   omittedDirectoriesEstimate: z.number().int().nonnegative().optional(),
   skippedManifestFiles: z.number().int().nonnegative().optional(),
   scanDurationMs: z.number().nonnegative().optional()
+});
+
+export const repositoryScanSettingsSchema = z.object({
+  maxIncludedFiles: z.number().int().min(1).max(250_000).optional(),
+  maxIncludedDirectories: z.number().int().min(1).max(100_000).optional(),
+  maxDepth: z.number().int().min(1).max(128).optional(),
+  maxManifestFileSizeBytes: z.number().int().min(1).max(20_000_000).optional(),
+  maxScanDurationMs: z.number().int().min(1).max(120_000).optional(),
+  maxExcludedPathRecords: z.number().int().min(1).max(10_000).optional()
 });
 
 export const repoTreeNodeSchema: z.ZodType<{
@@ -345,6 +413,84 @@ export const ultimateGoalSchema = z.object({
   source: ultimateGoalSourceSchema.default("user"),
   confirmedAt: isoDatetime().optional(),
   lastUpdatedAt: isoDatetime().optional()
+});
+
+export const visualPreferenceProfileSchema = z.object({
+  theme: visualThemePreferenceSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.theme),
+  primaryColor: z.string().min(1).max(40).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.primaryColor),
+  accentColor: z.string().min(1).max(40).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.accentColor),
+  density: visualDensityPreferenceSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.density),
+  feel: visualFeelPreferenceSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.feel),
+  layoutPriority: visualLayoutPrioritySchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.layoutPriority),
+  motionPreference: motionPreferenceSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.motionPreference),
+  accessibilityPriority: accessibilityPrioritySchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.accessibilityPriority),
+  designStrictness: designStrictnessSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences.designStrictness)
+});
+
+export const autonomyBudgetSchema = z.object({
+  maxCyclesBeforePause: z.number().int().min(1).max(24).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxCyclesBeforePause),
+  maxMinutesBeforePause: z.number().int().min(1).max(480).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxMinutesBeforePause),
+  maxFailedRepairAttempts: z.number().int().min(0).max(10).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxFailedRepairAttempts),
+  maxConsecutiveTasksWithoutUserReview: z.number().int().min(1).max(24).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxConsecutiveTasksWithoutUserReview),
+  stopWhenGoalComplete: z.boolean().default(true),
+  stopWhenNoSafeNextTaskExists: z.boolean().default(true),
+  stopWhenPlannerWantsToChangeUltimateGoal: z.boolean().default(true),
+  stopWhenValidationFailsRepeatedly: z.boolean().default(true)
+});
+
+export const autopilotStrategySchema = z.object({
+  presetId: z.union([autopilotPresetIdSchema, z.literal("custom")]).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.presetId),
+  goalRestrictiveness: z.number().int().min(0).max(100).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.goalRestrictiveness),
+  planningHorizon: planningHorizonSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.planningHorizon),
+  taskBatchingAggressiveness: taskBatchingAggressivenessSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.taskBatchingAggressiveness),
+  innovationLatitude: z.number().int().min(0).max(100).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.innovationLatitude),
+  riskTolerance: riskToleranceSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.riskTolerance),
+  refactorAppetite: refactorAppetiteSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.refactorAppetite),
+  visualPriority: visualPrioritySchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPriority),
+  visualPreferences: visualPreferenceProfileSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.visualPreferences),
+  validationStrictness: validationStrictnessSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.validationStrictness),
+  autonomyBudget: autonomyBudgetSchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget),
+  approvalSensitivity: approvalSensitivitySchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.approvalSensitivity)
+});
+
+export const goalChangeRecordSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  summary: z.string().default(""),
+  rationale: z.string().default(""),
+  source: z.enum(["user", "detected", "planner"]),
+  proposedGoal: ultimateGoalSchema.optional(),
+  fromGoalSummary: z.string().optional(),
+  toGoalSummary: z.string().optional(),
+  createdAt: isoDatetime(),
+  decidedAt: isoDatetime().optional(),
+  decisionNotes: z.string().optional()
+});
+
+export const goalChangeProposalSchema = goalChangeRecordSchema.extend({
+  approvalStatus: plannerApprovalStatusSchema.default("pending"),
+  requiredByStrategy: z.boolean().default(true),
+  risk: recommendationRiskLevelSchema.default("medium"),
+  affectedGoalArea: z.string().default("")
+});
+
+export const goalCharterSchema = z.object({
+  originalUltimateGoal: ultimateGoalSchema.default(defaultProjectWorkflowState().goalCharter.originalUltimateGoal),
+  currentEffectiveGoal: ultimateGoalSchema.default(defaultProjectWorkflowState().goalCharter.currentEffectiveGoal),
+  nonNegotiableRequirements: z.array(z.string()).default([]),
+  flexibleRequirements: z.array(z.string()).default([]),
+  niceToHaveIdeas: z.array(z.string()).default([]),
+  explicitNonGoals: z.array(z.string()).default([]),
+  userConstraints: z.array(z.string()).default([]),
+  aestheticPreferences: z.array(z.string()).default([]),
+  technicalPreferences: z.array(z.string()).default([]),
+  definitionOfDone: z.array(z.string()).default([]),
+  autopilotStrategy: autopilotStrategySchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy),
+  acceptedGoalChanges: z.array(goalChangeRecordSchema).default([]),
+  rejectedGoalChanges: z.array(goalChangeRecordSchema).default([]),
+  proposedGoalChanges: z.array(goalChangeRecordSchema).default([]),
+  createdAt: isoDatetime().default(defaultProjectWorkflowState().goalCharter.createdAt),
+  updatedAt: isoDatetime().default(defaultProjectWorkflowState().goalCharter.updatedAt)
 });
 
 export const workflowRecommendationOptionSchema = z.object({
@@ -469,6 +615,117 @@ export const workPackageSchema = z.object({
   reason: z.string().default(""),
   acceptanceHints: z.array(z.string()).default([]),
   score: z.number().default(0)
+});
+
+export const checklistChangeSchema = z.object({
+  id: z.string().min(1),
+  action: checklistChangeActionSchema,
+  checklistItemIds: z.array(z.string()).default([]),
+  title: z.string().optional(),
+  rationale: z.string().default(""),
+  sourceCycle: z.number().int().positive(),
+  sourceAgent: z.string().min(1).optional(),
+  userApprovalStatus: plannerApprovalStatusSchema.default("not_required"),
+  confidence: z.number().min(0).max(1).default(0.7),
+  risk: recommendationRiskLevelSchema.default("medium"),
+  affectedGoalArea: z.string().default(""),
+  linkedEvidence: z.array(z.string()).default([]),
+  linkedChangedFiles: z.array(z.string()).default([]),
+  linkedValidationCommands: z.array(z.string()).default([]),
+  linkedCycleIds: z.array(z.number().int().positive()).default([]),
+  linkedAgentIds: z.array(z.string()).default([]),
+  createdAt: isoDatetime()
+});
+
+export const candidateTaskSchema = z.object({
+  id: z.string().min(1),
+  kind: candidateTaskKindSchema,
+  title: z.string().min(1),
+  summary: z.string().default(""),
+  recommendationId: z.string().min(1).optional(),
+  sourceWorkPackageId: z.string().min(1).optional(),
+  targetedCheckIds: z.array(z.string()).default([]),
+  expectedChecklistImpact: z.string().default(""),
+  expectedFiles: z.array(z.string()).default([]),
+  expectedValidationCommands: z.array(z.string()).default([]),
+  riskLevel: recommendationRiskLevelSchema.default("medium"),
+  whyNext: z.string().default(""),
+  approvalRequired: z.boolean().default(false),
+  goalChangeProposalIds: z.array(z.string()).default([]),
+  checklistChangeIds: z.array(z.string()).default([]),
+  visualDesignImpact: z.boolean().default(false),
+  shouldSplit: z.boolean().default(false),
+  score: z.number().default(0),
+  scoreBreakdown: z.record(z.number()).default({}),
+  confidence: z.number().min(0).max(1).default(0.7)
+});
+
+export const strategicPlanSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  createdAt: isoDatetime(),
+  originalGoalSummary: z.string().default(""),
+  currentEffectiveGoalSummary: z.string().default(""),
+  mode: strategicAutopilotModeSchema.default("manual"),
+  strategySnapshot: autopilotStrategySchema.default(defaultProjectWorkflowState().goalCharter.autopilotStrategy),
+  strategyHighlights: z.array(z.string()).default([]),
+  repoScanStatus: z.string().default("unknown"),
+  previousCycleOutcomes: z.array(z.string()).default([]),
+  failedCommands: z.array(z.string()).default([]),
+  changedFiles: z.array(z.string()).default([]),
+  openBlockers: z.array(z.string()).default([]),
+  userFeedback: z.array(z.string()).default([]),
+  recentAgentOutputs: z.array(z.string()).default([]),
+  architectureNotes: z.array(z.string()).default([]),
+  candidateTasks: z.array(candidateTaskSchema).default([]),
+  candidateWorkPackages: z.array(workPackageSchema).default([]),
+  proposedGoalChanges: z.array(goalChangeProposalSchema).default([]),
+  proposedChecklistChanges: z.array(checklistChangeSchema).default([]),
+  recommendedTaskId: z.string().min(1).optional(),
+  requiresApproval: z.boolean().default(false),
+  plannerSummary: z.string().default(""),
+  continueRecommendation: z.enum(["continue", "pause", "ask_user"]).default("continue"),
+  pauseReason: z.string().optional()
+});
+
+export const plannerDecisionSchema = z.object({
+  id: z.string().min(1),
+  planId: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  selectedTaskId: z.string().min(1).optional(),
+  selectedRecommendationId: z.string().min(1).optional(),
+  selectedTaskTitle: z.string().optional(),
+  whySelected: z.string().default(""),
+  score: z.number().default(0),
+  scoreBreakdown: z.record(z.number()).default({}),
+  strategySettingsUsed: z.array(z.string()).default([]),
+  targetedChecklistIds: z.array(z.string()).default([]),
+  expectedFiles: z.array(z.string()).default([]),
+  expectedValidationCommands: z.array(z.string()).default([]),
+  approvalRequired: z.boolean().default(false),
+  goalChangeProposalIds: z.array(z.string()).default([]),
+  checklistChangeIds: z.array(z.string()).default([]),
+  visualDesignImpact: z.boolean().default(false),
+  createdAt: isoDatetime()
+});
+
+export const cycleRetrospectiveSchema = z.object({
+  id: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  createdAt: isoDatetime(),
+  triedToDo: z.string().default(""),
+  whyChosen: z.string().default(""),
+  changedFiles: z.array(z.string()).default([]),
+  commandsRun: z.array(z.string()).default([]),
+  passed: z.array(z.string()).default([]),
+  failed: z.array(z.string()).default([]),
+  learned: z.array(z.string()).default([]),
+  checklistItemsAdvanced: z.array(z.string()).default([]),
+  goalChecklistChangeRecommendation: z.string().default(""),
+  nextRecommendedTasks: z.array(z.string()).default([]),
+  shouldContinue: z.boolean().default(false),
+  pauseReason: z.string().optional()
 });
 
 export const workflowTaskMapGroupSchema = z.object({
@@ -770,9 +1027,10 @@ export const autopilotRuntimeStatusSchema = z.object({
     "merge_conflict",
     "ultimate_goal_satisfied",
     "no_safe_recommendation",
-    "project_access_validation_failed",
-    "repeated_failure",
-    "high_risk_package_requires_approval",
+  "project_access_validation_failed",
+  "repeated_failure",
+  "goal_change_requires_approval",
+  "high_risk_package_requires_approval",
     "unsafe_scope_broadening",
     "required_check_promotion_cap",
     "max_consecutive_cycles",
@@ -816,6 +1074,7 @@ export const workflowAppealStateSchema = z.object({
 export const projectWorkflowStateSchema = z.object({
   ultimateGoal: ultimateGoalSchema.default(defaultProjectWorkflowState().ultimateGoal),
   ultimateGoalDraft: ultimateGoalSchema.optional(),
+  goalCharter: goalCharterSchema.default(defaultProjectWorkflowState().goalCharter),
   workflowMode: workflowModeSchema.default(defaultProjectWorkflowState().workflowMode),
   previewRequest: workflowPreviewRequestSchema.default({ status: "none", remainingCycles: 1 }),
   autopilotPolicy: autopilotPolicySchema.default(defaultProjectWorkflowState().autopilotPolicy),
@@ -825,6 +1084,10 @@ export const projectWorkflowStateSchema = z.object({
   goalChecklist: z.array(goalAttainmentCheckSchema).default([]),
   taskMap: workflowTaskMapSchema.default(defaultProjectWorkflowState().taskMap),
   workPackages: z.array(workPackageSchema).default([]),
+  strategicPlans: z.array(strategicPlanSchema).default([]),
+  plannerDecisions: z.array(plannerDecisionSchema).default([]),
+  checklistChanges: z.array(checklistChangeSchema).default([]),
+  cycleRetrospectives: z.array(cycleRetrospectiveSchema).default([]),
   workflowCycle: workflowCycleSchema.default(defaultProjectWorkflowState().workflowCycle),
   approvedRecommendation: approvedRecommendationSchema.optional(),
   scopedGoal: scopedGoalSchema.optional(),
@@ -989,7 +1252,14 @@ export const agentStateSchema = z.object({
       appliedAt: isoDatetime(),
       source: z.string().optional()
     })
-  ).default([])
+  ).default([]),
+  outputReference: z.object({
+    agentId: z.string().min(1),
+    workflowCycleNumber: z.number().int().positive().optional(),
+    transcriptAvailable: z.boolean(),
+    fullOutputAvailable: z.boolean(),
+    updatedAt: isoDatetime()
+  }).optional()
 });
 
 export const portableInterfaceSchema = z.object({
@@ -1025,6 +1295,7 @@ export const localProjectRecordSchema = z.object({
   interfaceCreation: interfaceCreationStateSchema.optional(),
   overview: projectOverviewSchema.optional(),
   stats: projectStatsSchema.optional(),
+  repositoryScanSettings: repositoryScanSettingsSchema.optional(),
   dependencies: z.array(dependencyRecordSchema),
   summaryCache: z.array(fileSummarySchema),
   agents: z.array(agentStateSchema),

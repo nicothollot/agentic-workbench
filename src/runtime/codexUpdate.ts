@@ -29,8 +29,14 @@ export interface CodexUpdateCheck {
   supportedProtocolVersion?: string;
 }
 
+export interface CodexUpdateCommandRunner {
+  runCodexVersion(): Promise<string>;
+  runNpmCommand(args: string[], timeoutMs: number): Promise<string>;
+}
+
 export interface CodexUpdateOptions {
   supportedProtocolVersion?: string;
+  commandRunner?: CodexUpdateCommandRunner;
 }
 
 export interface CodexProtocolCompatibility {
@@ -214,6 +220,17 @@ const runNpmCommand = async (
   return `${result.stdout}\n${result.stderr}`;
 };
 
+const createDefaultCodexUpdateCommandRunner = (
+  settings: AppSettings,
+  platform: NodeJS.Platform
+): CodexUpdateCommandRunner => {
+  const executor = new RuntimeCommandExecutor(settings, platform);
+  return {
+    runCodexVersion: async () => await runCodexVersion(executor, settings, platform),
+    runNpmCommand: async (args, timeoutMs) => await runNpmCommand(executor, settings, platform, args, timeoutMs)
+  };
+};
+
 export const buildCodexUpdateCommand = (
   settings: AppSettings,
   platform: NodeJS.Platform = process.platform,
@@ -232,9 +249,9 @@ export const checkCodexCliUpdate = async (
   platform: NodeJS.Platform = process.platform,
   options: CodexUpdateOptions = {}
 ): Promise<CodexUpdateCheck> => {
-  const executor = new RuntimeCommandExecutor(settings, platform);
+  const runner = options.commandRunner ?? createDefaultCodexUpdateCommandRunner(settings, platform);
   try {
-    const currentVersion = parseCodexCliVersion(await runCodexVersion(executor, settings, platform));
+    const currentVersion = parseCodexCliVersion(await runner.runCodexVersion());
     if (!currentVersion) {
       return {
         status: "unavailable",
@@ -243,10 +260,7 @@ export const checkCodexCliUpdate = async (
       };
     }
 
-    const latestOutput = await runNpmCommand(
-      executor,
-      settings,
-      platform,
+    const latestOutput = await runner.runNpmCommand(
       ["view", CODEX_PACKAGE_NAME, "version"],
       NPM_VERSION_TIMEOUT_MS
     );
@@ -329,7 +343,7 @@ export const updateCodexCliIfAvailable = async (
   platform: NodeJS.Platform = process.platform,
   options: CodexUpdateOptions = {}
 ): Promise<CodexUpdateResult> => {
-  const executor = new RuntimeCommandExecutor(settings, platform);
+  const runner = options.commandRunner ?? createDefaultCodexUpdateCommandRunner(settings, platform);
 
   try {
     const check = await checkCodexCliUpdate(settings, platform, options);
@@ -356,14 +370,11 @@ export const updateCodexCliIfAvailable = async (
       };
     }
 
-    await runNpmCommand(
-      executor,
-      settings,
-      platform,
+    await runner.runNpmCommand(
       ["install", "-g", `${CODEX_PACKAGE_NAME}@${check.targetVersion}`],
       NPM_INSTALL_TIMEOUT_MS
     );
-    const updatedVersion = parseCodexCliVersion(await runCodexVersion(executor, settings, platform));
+    const updatedVersion = parseCodexCliVersion(await runner.runCodexVersion());
 
     return {
       status: updatedVersion && compareCodexVersions(updatedVersion, check.targetVersion) >= 0 ? "updated" : "failed",

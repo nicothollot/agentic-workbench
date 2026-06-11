@@ -7,7 +7,9 @@ import type {
   AgentReasoningMode,
   AgentState,
   AgentTranscriptResponse,
+  AutopilotPreset,
   AutopilotPolicy,
+  AutopilotStrategy,
   ApprovalDecision,
   CodexReadinessReport,
   CodexUpdateCheckResult,
@@ -16,8 +18,13 @@ import type {
   CredentialEntryMetadata,
   CredentialEntryStatus,
   CredentialRequestRecord,
+  ExecutionEnvironmentStatus,
   FileSummary,
   GitHubStatus,
+  ChecklistChange,
+  CycleRetrospective,
+  GoalChangeRecord,
+  GoalCharter,
   HumanInterventionRecord,
   InterfaceReasoningEffort,
   LocalProjectState,
@@ -28,10 +35,15 @@ import type {
   ProjectRepositoryView,
   ProjectRepositorySummary,
   ProjectWorkflowState,
+  PlannerDecision,
+  RepositoryExcludedPathsResponse,
   RepositoryScanStatus,
+  RepositoryScanLimitsResponse,
+  RepositoryScanSettings,
   RepositoryChildrenResponse,
   RepositorySearchResponse,
   RuntimeReadinessReport,
+  StrategicPlan,
   UserInputRequestRecord,
   UltimateGoalImportPreview,
   UltimateGoal,
@@ -57,8 +69,10 @@ export interface WorkbenchApi {
   openDevTools(): Promise<boolean>;
   checkRuntimeReadiness(): Promise<RuntimeReadinessReport>;
   getCodexReadiness(): Promise<CodexReadinessReport>;
+  refreshCodexReadiness(): Promise<CodexReadinessReport>;
   checkCodexUpdate(): Promise<CodexUpdateCheckResult>;
-  runCodexUpdate(): Promise<CodexUpdateRunResult>;
+  runCodexUpdate(approvedCommand?: string): Promise<CodexUpdateRunResult>;
+  getExecutionEnvironmentStatus(): Promise<ExecutionEnvironmentStatus>;
   quit(): Promise<void>;
   loadProject(inputPath: string, intent?: "open" | "create"): Promise<ProjectLoadResult>;
   openProject(projectId: string): Promise<LoadedProjectView>;
@@ -74,7 +88,10 @@ export interface WorkbenchApi {
   ): Promise<RepositoryChildrenResponse>;
   searchRepositoryFiles(projectId: string, query: string, options?: { limit?: number }): Promise<RepositorySearchResponse>;
   getRepositoryScanStatus(projectId: string): Promise<RepositoryScanStatus>;
-  rescanRepository(projectId: string, options?: { mode?: "normal" | "deep" }): Promise<ProjectRepositorySummary>;
+  getRepositoryScanLimits(projectId: string): Promise<RepositoryScanLimitsResponse>;
+  updateRepositoryScanSettings(projectId: string, settings: RepositoryScanSettings): Promise<RepositoryScanLimitsResponse>;
+  listExcludedPaths(projectId: string, options?: { cursor?: string; limit?: number }): Promise<RepositoryExcludedPathsResponse>;
+  rescanRepository(projectId: string, options?: { mode?: "normal" | "deep"; settings?: RepositoryScanSettings }): Promise<ProjectRepositorySummary>;
   listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
   listWorkflowCycles(projectId: string, options?: { cursor?: string; limit?: number }): Promise<WorkflowCycleListResponse>;
@@ -118,6 +135,19 @@ export interface WorkbenchApi {
   updateUltimateGoal(projectId: string, goal: Omit<UltimateGoal, "confirmedAt" | "lastUpdatedAt">, confirm?: boolean): Promise<UltimateGoal>;
   detectUltimateGoal(projectId: string): Promise<UltimateGoal>;
   importUltimateGoalText(projectId: string): Promise<UltimateGoalImportPreview | null>;
+  getGoalCharter(projectId: string): Promise<GoalCharter>;
+  updateGoalCharter(projectId: string, patch: Partial<GoalCharter>): Promise<GoalCharter>;
+  getAutopilotStrategy(projectId: string): Promise<AutopilotStrategy>;
+  updateAutopilotStrategy(projectId: string, strategy: AutopilotStrategy): Promise<AutopilotStrategy>;
+  listAutopilotPresets(): Promise<AutopilotPreset[]>;
+  generateStrategicPlan(projectId: string): Promise<StrategicPlan>;
+  selectNextWorkPackage(projectId: string): Promise<PlannerDecision>;
+  proposeGoalChange(projectId: string, proposal: GoalChangeRecord): Promise<GoalCharter>;
+  acceptGoalChange(projectId: string, proposalId: string): Promise<GoalCharter>;
+  rejectGoalChange(projectId: string, proposalId: string, decisionNotes?: string): Promise<GoalCharter>;
+  listChecklistChanges(projectId: string): Promise<ChecklistChange[]>;
+  getPlannerDecision(projectId: string, cycleId: string): Promise<PlannerDecision | undefined>;
+  getCycleRetrospective(projectId: string, cycleId: string): Promise<CycleRetrospective | undefined>;
   approveRecommendation(projectId: string, recommendationId: string): Promise<unknown>;
   createScopedGoal(projectId: string): Promise<unknown>;
   retryWorkflowGoal(projectId: string): Promise<unknown>;
@@ -202,8 +232,10 @@ const api: WorkbenchApi = {
   openDevTools: async () => await invoke<boolean>("app:openDevTools"),
   checkRuntimeReadiness: async () => await invoke<RuntimeReadinessReport>("app:checkRuntimeReadiness"),
   getCodexReadiness: async () => await invoke<CodexReadinessReport>("app:getCodexReadiness"),
+  refreshCodexReadiness: async () => await invoke<CodexReadinessReport>("app:refreshCodexReadiness"),
   checkCodexUpdate: async () => await invoke<CodexUpdateCheckResult>("app:checkCodexUpdate"),
-  runCodexUpdate: async () => await invoke<CodexUpdateRunResult>("app:runCodexUpdate"),
+  runCodexUpdate: async (approvedCommand) => await invoke<CodexUpdateRunResult>("app:runCodexUpdate", { approvedCommand }),
+  getExecutionEnvironmentStatus: async () => await invoke<ExecutionEnvironmentStatus>("app:getExecutionEnvironmentStatus"),
   quit: async () => await invoke<void>("app:quit"),
   loadProject: async (inputPath, intent = "open") => await invoke<ProjectLoadResult>("project:load", { inputPath, intent }),
   openProject: async (projectId) => await invoke<LoadedProjectView>("project:open", { projectId }),
@@ -219,6 +251,12 @@ const api: WorkbenchApi = {
     await invoke<RepositorySearchResponse>("project:searchRepositoryFiles", { projectId, query, ...options }),
   getRepositoryScanStatus: async (projectId) =>
     await invoke<RepositoryScanStatus>("project:getRepositoryScanStatus", { projectId }),
+  getRepositoryScanLimits: async (projectId) =>
+    await invoke<RepositoryScanLimitsResponse>("project:getRepositoryScanLimits", { projectId }),
+  updateRepositoryScanSettings: async (projectId, settings) =>
+    await invoke<RepositoryScanLimitsResponse>("project:updateRepositoryScanSettings", { projectId, settings }),
+  listExcludedPaths: async (projectId, options = {}) =>
+    await invoke<RepositoryExcludedPathsResponse>("project:listExcludedPaths", { projectId, ...options }),
   rescanRepository: async (projectId, options = {}) =>
     await invoke<ProjectRepositorySummary>("project:rescanRepository", { projectId, options }),
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
@@ -237,6 +275,30 @@ const api: WorkbenchApi = {
   detectUltimateGoal: async (projectId) => await invoke<UltimateGoal>("workflow:detectUltimateGoal", { projectId }),
   importUltimateGoalText: async (projectId) =>
     await invoke<UltimateGoalImportPreview | null>("workflow:importUltimateGoalText", { projectId }),
+  getGoalCharter: async (projectId) => await invoke<GoalCharter>("workflow:getGoalCharter", { projectId }),
+  updateGoalCharter: async (projectId, patch) =>
+    await invoke<GoalCharter>("workflow:updateGoalCharter", { projectId, patch }),
+  getAutopilotStrategy: async (projectId) =>
+    await invoke<AutopilotStrategy>("workflow:getAutopilotStrategy", { projectId }),
+  updateAutopilotStrategy: async (projectId, strategy) =>
+    await invoke<AutopilotStrategy>("workflow:updateAutopilotStrategy", { projectId, strategy }),
+  listAutopilotPresets: async () => await invoke<AutopilotPreset[]>("workflow:listAutopilotPresets"),
+  generateStrategicPlan: async (projectId) =>
+    await invoke<StrategicPlan>("workflow:generateStrategicPlan", { projectId }),
+  selectNextWorkPackage: async (projectId) =>
+    await invoke<PlannerDecision>("workflow:selectNextWorkPackage", { projectId }),
+  proposeGoalChange: async (projectId, proposal) =>
+    await invoke<GoalCharter>("workflow:proposeGoalChange", { projectId, proposal }),
+  acceptGoalChange: async (projectId, proposalId) =>
+    await invoke<GoalCharter>("workflow:acceptGoalChange", { projectId, proposalId }),
+  rejectGoalChange: async (projectId, proposalId, decisionNotes) =>
+    await invoke<GoalCharter>("workflow:rejectGoalChange", { projectId, proposalId, decisionNotes }),
+  listChecklistChanges: async (projectId) =>
+    await invoke<ChecklistChange[]>("workflow:listChecklistChanges", { projectId }),
+  getPlannerDecision: async (projectId, cycleId) =>
+    await invoke<PlannerDecision | undefined>("workflow:getPlannerDecision", { projectId, cycleId }),
+  getCycleRetrospective: async (projectId, cycleId) =>
+    await invoke<CycleRetrospective | undefined>("workflow:getCycleRetrospective", { projectId, cycleId }),
   approveRecommendation: async (projectId, recommendationId) =>
     await invoke("workflow:approveRecommendation", { projectId, recommendationId }),
   createScopedGoal: async (projectId) => await invoke("workflow:createScopedGoal", { projectId }),

@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, REVIEW_LOG_BUNDLE_VERSION } from "@shared/constants";
 import { createPortableInterface } from "@shared/defaults";
@@ -51,13 +51,29 @@ type CredentialSecretStore = {
 };
 
 type ProjectStateParseResult =
-  | { ok: true; value: unknown; repairedMalformedJson: boolean; message?: string }
-  | { ok: false; message: string };
+  | { ok: true; value: unknown }
+  | { ok: false; issue: ProjectStateIssueKind; message: string };
+
+type ProjectStateIssueKind =
+  | "malformed_json"
+  | "duplicate_appended_json"
+  | "state_too_large_to_load"
+  | "schema_invalid";
+
+export interface ProjectStateValidationResult {
+  ok: boolean;
+  statePath: string;
+  sizeBytes: number;
+  issue?: ProjectStateIssueKind;
+  message?: string;
+  parsed?: unknown;
+  shouldCompact: boolean;
+}
 
 export interface StateLoadIssue {
   projectId: string;
   statePath: string;
-  action: "repaired" | "quarantined" | "ignored";
+  action: "compacted" | "quarantined" | "ignored" | "warning";
   message: string;
   quarantinePath?: string;
 }
@@ -70,6 +86,23 @@ type AgentTranscriptStore = {
   updatedAt: string;
   entries: AgentTranscriptEntry[];
 };
+
+type AgentFullOutputStore = {
+  version: 1;
+  projectId: string;
+  agentId: string;
+  agentName?: string;
+  workflowCycleNumber?: number;
+  updatedAt: string;
+  output: string;
+};
+
+export const PROJECT_STATE_WARNING_BYTES = 750_000;
+export const PROJECT_STATE_COMPACT_BYTES = 1_500_000;
+export const PROJECT_STATE_HARD_LOAD_BYTES = 24_000_000;
+
+const SIDE_CAR_PRESERVE_TEXT_BYTES = 12_000;
+const SIDE_CAR_PRESERVE_EVENT_BYTES = 8_000;
 
 const buildReviewLogRuntimeContext = (settings: AppSettings): ReviewLogRuntimeContext => ({
   executionMode: settings.executionMode,
@@ -356,6 +389,14 @@ export class WorkbenchStorage {
     return path.join(this.projectAgentTranscriptDir(projectId), `${agentId}.json`);
   }
 
+  private projectAgentOutputDir(projectId: string): string {
+    return path.join(this.projectDir(projectId), "agent-outputs");
+  }
+
+  private projectAgentOutputPath(projectId: string, agentId: string): string {
+    return path.join(this.projectAgentOutputDir(projectId), `${agentId}.json`);
+  }
+
   private registryPath(): string {
     return path.join(this.appDataDir, "registry.json");
   }
@@ -399,6 +440,15 @@ export class WorkbenchStorage {
       );
     }
     return output;
+  }
+
+  private quarantineReasonSlug(message: string): string {
+    const slug = message
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+    return slug || "invalid-state";
   }
 
   private async writeJsonAtomicallyNow(filePath: string, value: unknown): Promise<void> {
@@ -468,6 +518,7 @@ export class WorkbenchStorage {
   async saveProject(record: LocalProjectRecord): Promise<void> {
     await this.ensureBaseDirs();
     await mkdir(this.projectDir(record.id), { recursive: true });
+    await this.preserveAgentOutputSidecars(record.id, record);
     const sanitizeStartedAt = performance.now();
     const sanitized = sanitizeProjectRecord(record);
     if (this.debugPerf) {
@@ -479,70 +530,122 @@ export class WorkbenchStorage {
     await this.writeJsonAtomically(this.projectStatePath(record.id), sanitized.record);
   }
 
+  private parseJsonObjectPrefix(raw: string): string | undefined {
+    const trimmed = raw.trimStart();
+    if (!trimmed.startsWith("{")) {
+      return undefined;
+    }
+
+    const startOffset = raw.length - trimmed.length;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = startOffset; index < raw.length; index += 1) {
+      const char = raw[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "\"") {
+        inString = !inString;
+        continue;
+      }
+      if (inString) {
+        continue;
+      }
+      if (char === "{") {
+        depth += 1;
+        continue;
+      }
+      if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return raw.slice(startOffset, index + 1);
+        }
+      }
+    }
+    return undefined;
+  }
+
   private parseProjectStateText(raw: string): ProjectStateParseResult {
     try {
-      return { ok: true, value: JSON.parse(raw), repairedMalformedJson: false };
+      return { ok: true, value: JSON.parse(raw) };
     } catch (error) {
       const parseMessage = error instanceof Error ? error.message : String(error);
-      const trimmed = raw.trimStart();
-      if (!trimmed.startsWith("{")) {
+      const prefix = this.parseJsonObjectPrefix(raw);
+      if (!prefix) {
         return {
           ok: false,
+          issue: "malformed_json",
           message: parseMessage
         };
       }
 
-      const startOffset = raw.length - trimmed.length;
-      let depth = 0;
-      let inString = false;
-      let escaped = false;
-      for (let index = startOffset; index < raw.length; index += 1) {
-        const char = raw[index];
-        if (escaped) {
-          escaped = false;
-          continue;
-        }
-        if (char === "\\") {
-          escaped = true;
-          continue;
-        }
-        if (char === "\"") {
-          inString = !inString;
-          continue;
-        }
-        if (inString) {
-          continue;
-        }
-        if (char === "{") {
-          depth += 1;
-        } else if (char === "}") {
-          depth -= 1;
-          if (depth === 0) {
-            const candidate = raw.slice(startOffset, index + 1);
-            try {
-              return {
-                ok: true,
-                value: JSON.parse(candidate),
-                repairedMalformedJson: true,
-                message: `Parsed the first complete JSON object and discarded ${raw.length - index - 1} trailing character(s). Original parse error: ${parseMessage}`
-              };
-            } catch {
-              break;
-            }
-          }
-        }
+      const startOffset = raw.length - raw.trimStart().length;
+      const trailing = raw.slice(startOffset + prefix.length).trim();
+      if (trailing.startsWith("{") || trailing.startsWith("[")) {
+        return {
+          ok: false,
+          issue: "duplicate_appended_json",
+          message: `A complete JSON object is followed by ${trailing.length} trailing character(s). Original parse error: ${parseMessage}`
+        };
       }
 
       return {
         ok: false,
+        issue: "malformed_json",
         message: parseMessage
       };
     }
   }
 
-  private async quarantineProjectState(projectId: string, statePath: string, message: string): Promise<string> {
+  async validateProjectStateFile(statePath: string): Promise<ProjectStateValidationResult> {
+    const sizeBytes = (await stat(statePath)).size;
+    if (sizeBytes > PROJECT_STATE_HARD_LOAD_BYTES) {
+      return {
+        ok: false,
+        statePath,
+        sizeBytes,
+        issue: "state_too_large_to_load",
+        message: `State file is ${sizeBytes} bytes, above the hard load limit of ${PROJECT_STATE_HARD_LOAD_BYTES} bytes.`,
+        shouldCompact: false
+      };
+    }
+
+    const raw = await readFile(statePath, "utf8");
+    const parsed = this.parseProjectStateText(raw);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        statePath,
+        sizeBytes,
+        issue: parsed.issue,
+        message: parsed.message,
+        shouldCompact: false
+      };
+    }
+
+    return {
+      ok: true,
+      statePath,
+      sizeBytes,
+      parsed: parsed.value,
+      shouldCompact: sizeBytes > PROJECT_STATE_COMPACT_BYTES
+    };
+  }
+
+  async quarantineProjectState(projectId: string, reason: string): Promise<string> {
+    return await this.quarantineProjectStateFile(projectId, this.projectStatePath(projectId), reason);
+  }
+
+  private async quarantineProjectStateFile(projectId: string, statePath: string, message: string): Promise<string> {
     const timestamp = nowIso().replace(/[:.]/g, "-");
-    const quarantinePath = path.join(this.projectDir(projectId), `state.json.quarantine.${timestamp}.json`);
+    const reason = this.quarantineReasonSlug(message);
+    const quarantinePath = path.join(this.projectDir(projectId), `state.json.quarantine.${reason}.${timestamp}.json`);
     await rename(statePath, quarantinePath);
     this.recordLoadIssue({
       projectId,
@@ -636,30 +739,138 @@ export class WorkbenchStorage {
     };
   }
 
+  private transcriptEntriesFromAgent(projectId: string, agent: LocalProjectRecord["agents"][number]): AgentTranscriptEntry[] {
+    const commandEntries: AgentTranscriptEntry[] = (agent.commandLog ?? []).map((command, index) => ({
+      id: `${agent.id}:command:${command.itemId ?? index}`,
+      timestamp: command.completedAt ?? command.startedAt,
+      kind: "command",
+      itemId: command.itemId,
+      title: command.command,
+      text: command.output,
+      metadata: {
+        status: command.status,
+        exitCode: command.exitCode ?? null,
+        cwd: command.cwd ?? null
+      }
+    }));
+    const approvalEntries: AgentTranscriptEntry[] = (agent.approvals ?? []).map((approval) => ({
+      id: `${agent.id}:approval:${approval.id}`,
+      timestamp: approval.createdAt,
+      kind: "approval",
+      itemId: approval.itemId,
+      title: "Approval requested",
+      text: [approval.summary, approval.reason, approval.command].filter(Boolean).join("\n\n"),
+      metadata: {
+        status: approval.status,
+        kind: approval.kind
+      }
+    }));
+    const eventEntries: AgentTranscriptEntry[] = (agent.events ?? []).map((event) => ({
+      id: `${agent.id}:event:${event.id}`,
+      timestamp: event.timestamp,
+      kind: event.type === "message" ? "message" : event.type === "raw" ? "raw" : "event",
+      itemId: event.itemId,
+      title: event.title,
+      text: event.detail,
+      raw: event.raw,
+      metadata: {
+        status: event.status ?? null,
+        type: event.type,
+        projectId
+      }
+    }));
+    return [...eventEntries, ...commandEntries, ...approvalEntries]
+      .filter((entry) => entry.text?.trim() || entry.raw !== undefined || entry.title.trim())
+      .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+  }
+
+  private transcriptOutputText(entries: AgentTranscriptEntry[]): string {
+    return entries
+      .map((entry) => {
+        const heading = `[${entry.timestamp}] ${entry.kind.toUpperCase()} - ${entry.title}`;
+        const body = entry.text?.trim()
+          ? entry.text
+          : entry.raw !== undefined
+            ? JSON.stringify(entry.raw, null, 2)
+            : "";
+        return body ? `${heading}\n${body}` : heading;
+      })
+      .join("\n\n");
+  }
+
+  private serializedByteLength(value: unknown): number {
+    try {
+      return Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value));
+    } catch {
+      return 0;
+    }
+  }
+
+  private agentHasSidecarWorthyOutput(agent: LocalProjectRecord["agents"][number]): boolean {
+    return (agent.commandLog ?? []).some((command) => Buffer.byteLength(command.output) > SIDE_CAR_PRESERVE_TEXT_BYTES) ||
+      (agent.events ?? []).some((event) =>
+        Buffer.byteLength(event.detail ?? "") > SIDE_CAR_PRESERVE_EVENT_BYTES ||
+        this.serializedByteLength(event.raw) > SIDE_CAR_PRESERVE_EVENT_BYTES
+      );
+  }
+
+  private async preserveAgentOutputSidecars(projectId: string, record: LocalProjectRecord, options: { force?: boolean } = {}): Promise<void> {
+    for (const agent of record.agents ?? []) {
+      if (!options.force && !this.agentHasSidecarWorthyOutput(agent)) {
+        continue;
+      }
+      const entries = this.transcriptEntriesFromAgent(projectId, agent);
+      if (entries.length === 0) {
+        continue;
+      }
+      await this.saveAgentTranscript(projectId, agent, entries);
+      await this.saveAgentFullOutput(projectId, agent, this.transcriptOutputText(entries));
+      agent.outputReference = {
+        agentId: agent.id,
+        workflowCycleNumber: agent.workflowCycleNumber,
+        transcriptAvailable: true,
+        fullOutputAvailable: true,
+        updatedAt: nowIso()
+      };
+    }
+  }
+
   async loadProject(projectId: string): Promise<LocalProjectRecord | null> {
     const statePath = this.projectStatePath(projectId);
     try {
-      const raw = await readFile(statePath, "utf8");
-      const parsed = this.parseProjectStateText(raw);
-      if (!parsed.ok) {
-        await this.quarantineProjectState(projectId, statePath, `Malformed JSON. ${parsed.message}`);
+      const validation = await this.validateProjectStateFile(statePath);
+      if (!validation.ok) {
+        await this.quarantineProjectStateFile(projectId, statePath, `${validation.issue ?? "invalid_state"}. ${validation.message ?? "Project state is invalid."}`);
         return null;
       }
-      const parsedJson = parsed.value as LocalProjectRecord;
+      if (validation.sizeBytes > PROJECT_STATE_WARNING_BYTES) {
+        this.recordLoadIssue({
+          projectId,
+          statePath,
+          action: "warning",
+          message: `Project state is ${validation.sizeBytes} bytes. It will be compacted at ${PROJECT_STATE_COMPACT_BYTES} bytes.`
+        });
+      }
+      const parsedJson = validation.parsed as LocalProjectRecord;
+      if (validation.shouldCompact) {
+        await this.preserveAgentOutputSidecars(projectId, parsedJson, { force: true });
+      } else {
+        await this.preserveAgentOutputSidecars(projectId, parsedJson);
+      }
       const sanitized = sanitizeProjectRecord(parsedJson);
       const record = localProjectRecordSchema.parse(sanitized.record) as LocalProjectRecord;
-      if (sanitized.report.changed || parsed.repairedMalformedJson) {
+      if (sanitized.report.changed || validation.shouldCompact) {
         await this.backupProjectStateBeforeMigration(projectId, statePath);
         await this.writeJsonAtomically(statePath, record);
-        if (parsed.repairedMalformedJson) {
-          this.recordLoadIssue({
-            projectId,
-            statePath,
-            action: "repaired",
-            message: parsed.message ?? "Malformed JSON was repaired by keeping the first complete JSON object."
-          });
-        }
-        this.logSanitizerReport(projectId, raw.length, JSON.stringify(record).length, sanitized.report);
+        this.recordLoadIssue({
+          projectId,
+          statePath,
+          action: "compacted",
+          message: validation.shouldCompact
+            ? `Oversized valid state was compacted from ${validation.sizeBytes} bytes to ${JSON.stringify(record).length} bytes.`
+            : "Project state was compacted by the sanitizer."
+        });
+        this.logSanitizerReport(projectId, validation.sizeBytes, JSON.stringify(record).length, sanitized.report);
       }
       return record;
     } catch (error) {
@@ -667,7 +878,7 @@ export class WorkbenchStorage {
         return null;
       }
       const message = error instanceof Error ? error.message : String(error);
-      await this.quarantineProjectState(projectId, statePath, `State validation failed. ${message}`).catch((quarantineError) => {
+      await this.quarantineProjectStateFile(projectId, statePath, `schema_invalid. State validation failed. ${message}`).catch((quarantineError) => {
         this.recordLoadIssue({
           projectId,
           statePath,
@@ -716,45 +927,85 @@ export class WorkbenchStorage {
     return records.filter((record): record is LocalProjectRecord => record !== null);
   }
 
-  async appendAgentTranscriptEntry(projectId: string, agent: Pick<LocalProjectRecord["agents"][number], "id" | "name">, entry: AgentTranscriptEntry): Promise<void> {
+  async saveAgentTranscript(
+    projectId: string,
+    agent: Pick<LocalProjectRecord["agents"][number], "id" | "name" | "workflowCycleNumber">,
+    transcript: AgentTranscriptEntry[]
+  ): Promise<void> {
     await this.ensureBaseDirs();
     await mkdir(this.projectAgentTranscriptDir(projectId), { recursive: true });
-    const transcriptPath = this.projectAgentTranscriptPath(projectId, agent.id);
-    let store: AgentTranscriptStore = {
+    const store: AgentTranscriptStore = {
       version: 1,
       projectId,
       agentId: agent.id,
       agentName: agent.name,
       updatedAt: nowIso(),
-      entries: []
+      entries: transcript
     };
+    await this.writeJsonAtomically(this.projectAgentTranscriptPath(projectId, agent.id), store);
+  }
+
+  async appendAgentTranscriptEntry(
+    projectId: string,
+    agent: Pick<LocalProjectRecord["agents"][number], "id" | "name" | "workflowCycleNumber">,
+    entry: AgentTranscriptEntry
+  ): Promise<void> {
+    await this.ensureBaseDirs();
+    await mkdir(this.projectAgentTranscriptDir(projectId), { recursive: true });
+    const transcriptPath = this.projectAgentTranscriptPath(projectId, agent.id);
+    let entries: AgentTranscriptEntry[] = [];
     try {
       const existing = JSON.parse(await readFile(transcriptPath, "utf8")) as AgentTranscriptStore;
-      store = {
-        version: 1,
-        projectId,
-        agentId: agent.id,
-        agentName: agent.name,
-        updatedAt: nowIso(),
-        entries: Array.isArray(existing.entries) ? existing.entries : []
-      };
+      entries = Array.isArray(existing.entries) ? existing.entries : [];
     } catch {
       // Missing or malformed transcript sidecars should not affect the primary project state.
     }
 
-    store.entries.push(entry);
-    if (store.entries.length > 2_000) {
-      store.entries = store.entries.slice(-2_000);
+    entries.push(entry);
+    if (entries.length > 2_000) {
+      entries = entries.slice(-2_000);
     }
-    store.updatedAt = nowIso();
-    await this.writeJsonAtomically(transcriptPath, store);
+    await this.saveAgentTranscript(projectId, agent, entries);
   }
 
-  async readAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptEntry[] | null> {
+  async getAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptEntry[] | null> {
     try {
       const transcriptPath = this.projectAgentTranscriptPath(projectId, agentId);
       const store = JSON.parse(await readFile(transcriptPath, "utf8")) as AgentTranscriptStore;
       return Array.isArray(store.entries) ? store.entries : [];
+    } catch {
+      return null;
+    }
+  }
+
+  async readAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptEntry[] | null> {
+    return await this.getAgentTranscript(projectId, agentId);
+  }
+
+  async saveAgentFullOutput(
+    projectId: string,
+    agent: Pick<LocalProjectRecord["agents"][number], "id" | "name" | "workflowCycleNumber">,
+    output: string
+  ): Promise<void> {
+    await this.ensureBaseDirs();
+    await mkdir(this.projectAgentOutputDir(projectId), { recursive: true });
+    const store: AgentFullOutputStore = {
+      version: 1,
+      projectId,
+      agentId: agent.id,
+      agentName: agent.name,
+      workflowCycleNumber: agent.workflowCycleNumber,
+      updatedAt: nowIso(),
+      output
+    };
+    await this.writeJsonAtomically(this.projectAgentOutputPath(projectId, agent.id), store);
+  }
+
+  async getAgentFullOutput(projectId: string, agentId: string): Promise<string | null> {
+    try {
+      const outputPath = this.projectAgentOutputPath(projectId, agentId);
+      const store = JSON.parse(await readFile(outputPath, "utf8")) as AgentFullOutputStore;
+      return typeof store.output === "string" ? store.output : "";
     } catch {
       return null;
     }

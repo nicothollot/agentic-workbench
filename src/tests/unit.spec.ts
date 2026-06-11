@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -11,9 +11,11 @@ import {
 } from "@shared/modelConfig";
 import { SummaryCache } from "@shared/summaryCache";
 import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/workflowRepairReport";
+import { buildCycleRetrospective, buildStrategicPlan, selectNextWorkPackage } from "@shared/strategicPlanner";
 import { humanInterventionRecordSchema, portableInterfaceSchema, projectCredentialsStateSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
 import { getPreloadEntryPath, getRendererBase, getRendererEntryPath } from "@shared/electronAppPaths";
 import { calculateValidationStatus } from "@shared/validation";
+import { createDefaultGoalCharter, listAutopilotPresets } from "@shared/goalCharter";
 import {
   approvalDecisionRequestSchema,
   agentDetailRequestSchema,
@@ -27,7 +29,12 @@ import {
   projectLogFeedRequestSchema,
   projectLoadRequestSchema,
   projectOpenRequestSchema,
+  projectRepositoryChildrenRequestSchema,
+  projectRepositoryExcludedPathsRequestSchema,
+  projectRepositorySearchRequestSchema,
   refreshOverviewRequestSchema,
+  repositoryRescanRequestSchema,
+  repositoryScanSettingsRequestSchema,
   requestWorkflowPreviewRequestSchema,
   setAutopilotPolicyRequestSchema,
   setWorkflowModeRequestSchema,
@@ -36,8 +43,8 @@ import {
   visualExportSessionRequestSchema,
   visualExportStartRequestSchema
 } from "@shared/ipc";
-import { createAgentSkeleton, createLocalProjectRecord, defaultLayout, defaultLocalState, defaultProjectWorkflowState, defaultWorkflowStepProgressState, emptyUltimateGoal } from "@shared/defaults";
-import type { AgentState, AgentTranscriptEntry, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
+import { createAgentSkeleton, createLocalProjectRecord, defaultLayout, defaultLocalState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowStepProgressState, emptyUltimateGoal } from "@shared/defaults";
+import type { AgentState, AgentTranscriptEntry, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, RepositoryScanSettings, RepoTreeNode, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
 import {
   createScopedGoalFromWorkPackage,
   createScopedGoalFromRecommendation,
@@ -91,6 +98,7 @@ import { parseUltimateGoalText } from "@runtime/ultimateGoalImport";
 import { buildGitHubRepositoryName, buildGitHubSshRemoteUrl, isGitHubRemote, parseGitHubRemote } from "@runtime/github";
 import {
   buildShellExecutionPlan,
+  executeWslBashCommandPlan,
   buildWslCodexRuntimeResolutionPlan,
   buildStructuredExecutionPlan,
   buildWslCommandResolutionPlan,
@@ -101,7 +109,7 @@ import {
   parseWslCodexRuntimeResolutionOutput,
   parseWslCommandResolutionOutput
 } from "@runtime/execution";
-import { assessCodexProtocolCompatibility, compareCodexVersions, parseCodexCliVersion, parseNpmPackageVersion } from "@runtime/codexUpdate";
+import { assessCodexProtocolCompatibility, buildCodexUpdateCommand, checkCodexCliUpdate, compareCodexVersions, parseCodexCliVersion, parseNpmPackageVersion, updateCodexCliIfAvailable } from "@runtime/codexUpdate";
 import { buildProjectShellHandoffPrompt, buildWindowsProjectShellLaunchPlan, openProjectShellWindow } from "@runtime/projectShell";
 import { createTempDir, initGitRepo, commitAll } from "./helpers";
 import { executionPathToHostPath, resolveProjectPath, windowsPathToWslPath } from "@shared/pathUtils";
@@ -167,6 +175,40 @@ type PackageAppScript = {
 const loadPackageAppScript = async (): Promise<PackageAppScript> => {
   const moduleUrl = pathToFileURL(path.resolve("scripts/package-app.mjs")).href;
   return await import(moduleUrl) as PackageAppScript;
+};
+
+const cssVariable = (source: string, name: string): string => {
+  const match = new RegExp(`${name}:\\s*([^;]+);`).exec(source);
+  if (!match) {
+    throw new Error(`Missing CSS variable ${name}`);
+  }
+  return match[1].trim();
+};
+
+const hexToRgb = (value: string): [number, number, number] => {
+  const normalized = value.trim().replace(/^#/, "");
+  if (!/^[0-9a-f]{6}$/i.test(normalized)) {
+    throw new Error(`Expected a six-digit hex color, received ${value}`);
+  }
+  return [
+    Number.parseInt(normalized.slice(0, 2), 16),
+    Number.parseInt(normalized.slice(2, 4), 16),
+    Number.parseInt(normalized.slice(4, 6), 16)
+  ];
+};
+
+const relativeLuminance = ([red, green, blue]: [number, number, number]): number => {
+  const [r, g, b] = [red, green, blue].map((channel) => {
+    const value = channel / 255;
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+
+const contrastRatio = (foreground: string, background: string): number => {
+  const lighter = Math.max(relativeLuminance(hexToRgb(foreground)), relativeLuminance(hexToRgb(background)));
+  const darker = Math.min(relativeLuminance(hexToRgb(foreground)), relativeLuminance(hexToRgb(background)));
+  return (lighter + 0.05) / (darker + 0.05);
 };
 
 const makeRecommendation = (overrides: Partial<WorkflowRecommendationOption> = {}): WorkflowRecommendationOption => ({
@@ -337,7 +379,7 @@ const makeAppServiceLoadedProject = (projectId = "project-1") => {
   const context = makeWorkflowRecommendationContext(workflow);
   return {
     record,
-    tree: [],
+    tree: [] as RepoTreeNode[],
     scan: context.scan,
     gitMetadata: {
       branch: "main",
@@ -871,6 +913,324 @@ describe("reasoning defaults", () => {
   });
 });
 
+describe("goal charter and autopilot strategy defaults", () => {
+  const goal = {
+    ...emptyUltimateGoal("user"),
+    summary: "Build the workbench planner settings.",
+    detailedIntent: "Give the user durable control over goal fidelity and strategy.",
+    successCriteria: ["Original goal is preserved", "Strategy presets persist"],
+    constraints: ["Keep IPC typed"],
+    nonGoals: ["Do not implement planner behavior"],
+    targetAudience: "Workbench operators",
+    qualityBar: "Test-backed and bounded.",
+    confirmedAt: "2026-04-12T00:00:00.000Z",
+    lastUpdatedAt: "2026-04-12T00:00:00.000Z"
+  };
+
+  it("creates a default Goal Charter from an accepted Ultimate Goal", () => {
+    const charter = createDefaultGoalCharter(goal, "2026-04-12T00:00:00.000Z");
+
+    expect(charter.originalUltimateGoal.summary).toBe(goal.summary);
+    expect(charter.currentEffectiveGoal.summary).toBe(goal.summary);
+    expect(charter.nonNegotiableRequirements).toEqual(goal.successCriteria);
+    expect(charter.explicitNonGoals).toEqual(goal.nonGoals);
+    expect(charter.userConstraints).toEqual(goal.constraints);
+    expect(charter.definitionOfDone).toEqual(goal.successCriteria);
+    expect(charter.autopilotStrategy.presetId).toBe("balanced_autopilot");
+  });
+
+  it("defines strategy presets across all requested operating modes", () => {
+    const presets = listAutopilotPresets();
+
+    expect(presets.map((preset) => preset.label)).toEqual([
+      "Exact Builder",
+      "Goal-Focused",
+      "Balanced Autopilot",
+      "Creative Builder",
+      "Experimental / Moonshot"
+    ]);
+    expect(presets.find((preset) => preset.id === "exact_builder")?.strategy.goalRestrictiveness).toBeGreaterThanOrEqual(90);
+    expect(presets.find((preset) => preset.id === "experimental_moonshot")?.strategy.innovationLatitude).toBeGreaterThanOrEqual(90);
+    expect(presets.every((preset) => preset.strategy.visualPreferences.theme)).toBe(true);
+  });
+
+  it("keeps Goal Charter renderer state bounded", () => {
+    const identity = createProjectIdentity({
+      kind: "git",
+      projectRoot: "/repo",
+      projectName: "repo",
+      manifestSignature: "m1",
+      treeSignature: "t1",
+      normalizedRemotes: ["git@example/repo"],
+      rootCommit: "abc"
+    });
+    const record = createLocalProjectRecord(
+      "project-1",
+      "/repo",
+      "/repo",
+      "/repo",
+      "/repo",
+      identity,
+      {
+        interfaceSchemaVersion: 1,
+        appMinVersion: "0.1.0",
+        projectKind: "git"
+      }
+    );
+    const longText = "x".repeat(2_000);
+    record.workflow.goalCharter = {
+      ...createDefaultGoalCharter({ ...goal, summary: longText }, "2026-04-12T00:00:00.000Z"),
+      nonNegotiableRequirements: Array.from({ length: 40 }, (_, index) => `${index}:${longText}`),
+      proposedGoalChanges: Array.from({ length: 30 }, (_, index) => ({
+        id: `proposal-${index}`,
+        title: `Proposal ${index}`,
+        summary: longText,
+        rationale: longText,
+        source: "detected" as const,
+        proposedGoal: { ...goal, summary: longText },
+        createdAt: "2026-04-12T00:00:00.000Z"
+      }))
+    };
+
+    const sanitized = sanitizeProjectRecord(record, { renderer: true }).record.workflow.goalCharter;
+    expect(sanitized.nonNegotiableRequirements).toHaveLength(16);
+    expect(sanitized.proposedGoalChanges).toHaveLength(8);
+    expect(sanitized.originalUltimateGoal.summary.length).toBeLessThanOrEqual(520);
+    expect(sanitized.proposedGoalChanges[0]?.proposedGoal?.summary.length).toBeLessThanOrEqual(520);
+  });
+});
+
+describe("strategic autopilot planner", () => {
+  const timestamp = "2026-04-12T00:00:00.000Z";
+  const makeStrategicWorkflow = (strategyOverrides: Partial<ReturnType<typeof defaultProjectWorkflowState>["goalCharter"]["autopilotStrategy"]> = {}) => {
+    const workflow = defaultProjectWorkflowState();
+    const goal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Build a visual market analytics dashboard.",
+      detailedIntent: "Create a GUI dashboard for portfolio risk, drawdown, and readable analytics workflows.",
+      successCriteria: [
+        "Dashboard shows portfolio risk metrics",
+        "Dashboard includes drawdown analysis",
+        "Dashboard remains readable and responsive"
+      ],
+      constraints: ["Keep typed IPC boundaries intact"],
+      nonGoals: ["Do not add live trading"],
+      targetAudience: "Portfolio analysts",
+      qualityBar: "Polished, validated, and easy to inspect.",
+      confirmedAt: timestamp,
+      lastUpdatedAt: timestamp
+    };
+    workflow.ultimateGoal = goal;
+    workflow.goalCharter = createDefaultGoalCharter(goal, timestamp);
+    workflow.goalCharter.autopilotStrategy = {
+      ...workflow.goalCharter.autopilotStrategy,
+      ...strategyOverrides,
+      visualPreferences: {
+        ...workflow.goalCharter.autopilotStrategy.visualPreferences,
+        ...strategyOverrides.visualPreferences
+      },
+      autonomyBudget: {
+        ...workflow.goalCharter.autopilotStrategy.autonomyBudget,
+        ...strategyOverrides.autonomyBudget
+      }
+    };
+    workflow.goalChecklist = [
+      makeGoalCheck({
+        id: "risk",
+        title: "Dashboard shows portfolio risk metrics",
+        status: "unmet",
+        relatedPaths: ["src/renderer/App.tsx"]
+      }),
+      makeGoalCheck({
+        id: "drawdown",
+        title: "Dashboard includes drawdown analysis",
+        status: "unmet",
+        relatedPaths: ["src/analytics/drawdown.ts"]
+      }),
+      makeGoalCheck({
+        id: "responsive",
+        title: "Dashboard remains readable and responsive",
+        status: "unmet",
+        relatedPaths: ["src/renderer/styles.css"]
+      })
+    ];
+    return workflow;
+  };
+  const planFor = (
+    workflow: ReturnType<typeof makeStrategicWorkflow>,
+    recommendations: WorkflowRecommendationOption[],
+    options: { isVisualProject?: boolean; failedCommands?: string[]; changedFiles?: string[]; sourceAgentId?: string } = {}
+  ) => buildStrategicPlan({
+    projectId: "project-1",
+    workflow,
+    recommendations,
+    workPackages: workflow.workPackages,
+    isVisualProject: options.isVisualProject ?? true,
+    validationCommands: ["npm run typecheck", "npm run lint", "npm test", "npm run build"],
+    failedCommands: options.failedCommands ?? [],
+    changedFiles: options.changedFiles ?? ["src/renderer/App.tsx", "src/renderer/styles.css"],
+    sourceAgentId: options.sourceAgentId ?? "planner-agent",
+    autopilotEnabled: true,
+    now: timestamp
+  });
+
+  it("uses restrictiveness 100 to choose strict explicit-goal tasks", () => {
+    const workflow = makeStrategicWorkflow({ goalRestrictiveness: 100, taskBatchingAggressiveness: "medium" });
+    const plan = planFor(workflow, [
+      makeRecommendation({ id: "ops", rank: 1, title: "Tighten operator feedback", confidence: 0.99, targetedCheckIds: undefined }),
+      makeRecommendation({ id: "risk", rank: 2, title: "Satisfy goal check: Dashboard shows portfolio risk metrics", targetedCheckIds: ["risk"], confidence: 0.78 })
+    ]);
+
+    expect(plan.candidateTasks[0]?.recommendationId).toBe("risk");
+  });
+
+  it("uses restrictiveness 60 to allow small beneficial improvements", () => {
+    const workflow = makeStrategicWorkflow({ goalRestrictiveness: 60, validationStrictness: "high" });
+    const plan = planFor(workflow, [
+      makeRecommendation({ id: "coverage", title: "Add regression coverage around dashboard risk metrics", summary: "A small verification improvement that supports the dashboard goal.", confidence: 0.86, riskLevel: "low" }),
+      makeRecommendation({ id: "generic", title: "Explore unrelated repository cleanup", summary: "A broad cleanup pass.", confidence: 0.9 })
+    ]);
+
+    expect(plan.candidateTasks[0]?.recommendationId).toBe("coverage");
+    expect(plan.candidateTasks[0]?.expectedValidationCommands.length).toBeGreaterThan(1);
+  });
+
+  it("uses restrictiveness 30 to propose meaningful checklist expansion", () => {
+    const workflow = makeStrategicWorkflow({ goalRestrictiveness: 30, innovationLatitude: 75 });
+    const plan = planFor(workflow, [
+      makeRecommendation({ id: "slice", title: "Ship one bounded slice in dashboard exports", summary: "Add a useful adjacent export workflow.", confidence: 0.7 })
+    ], { sourceAgentId: "recommendation-agent" });
+
+    expect(plan.proposedChecklistChanges).toHaveLength(1);
+    expect(plan.proposedChecklistChanges[0]).toMatchObject({
+      action: "add",
+      sourceCycle: workflow.workflowCycle.cycleNumber,
+      sourceAgent: "recommendation-agent",
+      userApprovalStatus: "pending"
+    });
+  });
+
+  it("uses restrictiveness 0 to propose divergent related goal changes without rewriting the original goal", () => {
+    const workflow = makeStrategicWorkflow({ goalRestrictiveness: 0, innovationLatitude: 100, taskBatchingAggressiveness: "very_high" });
+    const originalSummary = workflow.goalCharter.originalUltimateGoal.summary;
+    const plan = planFor(workflow, [
+      makeRecommendation({ id: "moonshot", title: "Explore a new analytics command center direction", summary: "Divergent but related dashboard direction.", confidence: 0.7 })
+    ]);
+
+    expect(plan.proposedGoalChanges).toHaveLength(1);
+    expect(plan.requiresApproval).toBe(true);
+    expect(workflow.goalCharter.originalUltimateGoal.summary).toBe(originalSummary);
+  });
+
+  it("uses batching settings to choose narrow tasks or coherent work packages", () => {
+    const narrow = makeRecommendation({ id: "narrow", title: "Satisfy goal check: Dashboard shows portfolio risk metrics", targetedCheckIds: ["risk"], confidence: 0.82 });
+    const batch = makeRecommendation({ id: "batch", title: "Satisfy work package: dashboard analytics", targetedCheckIds: ["risk", "drawdown", "responsive"], confidence: 0.82, estimatedScope: "medium" });
+
+    expect(planFor(makeStrategicWorkflow({ taskBatchingAggressiveness: "low" }), [batch, narrow]).candidateTasks[0]?.recommendationId).toBe("narrow");
+    expect(planFor(makeStrategicWorkflow({ taskBatchingAggressiveness: "high" }), [narrow, batch]).candidateTasks[0]?.recommendationId).toBe("batch");
+  });
+
+  it("avoids repetitive low-value tasks and respects risk tolerance", () => {
+    const workflow = makeStrategicWorkflow({ riskTolerance: "low" });
+    workflow.memory.lastAcceptedDecisions = [{
+      id: "decision-1",
+      kind: "recommendation",
+      title: "Stabilize recent work in dashboard",
+      summary: "Repeated low-value stabilization.",
+      decidedAt: timestamp,
+      cycleNumber: 1
+    }];
+    const plan = planFor(workflow, [
+      makeRecommendation({ id: "repeat", title: "Stabilize recent work in dashboard", confidence: 0.99, riskLevel: "low" }),
+      makeRecommendation({ id: "risky", title: "Change runtime command execution for dashboard", confidence: 0.95, riskLevel: "high" }),
+      makeRecommendation({ id: "safe", title: "Satisfy goal check: Dashboard includes drawdown analysis", targetedCheckIds: ["drawdown"], confidence: 0.78, riskLevel: "low" })
+    ]);
+
+    expect(plan.candidateTasks[0]?.recommendationId).toBe("safe");
+    expect(plan.candidateTasks.find((task) => task.recommendationId === "risky")?.approvalRequired).toBe(true);
+  });
+
+  it("creates visual design tasks for GUI projects when visual priority is high", () => {
+    const workflow = makeStrategicWorkflow({
+      visualPriority: "very_high",
+      visualPreferences: {
+        theme: "system",
+        primaryColor: "#102747",
+        accentColor: "#b56f3f",
+        density: "spacious",
+        feel: "premium",
+        layoutPriority: "command_center",
+        motionPreference: "subtle",
+        accessibilityPriority: "high_contrast",
+        designStrictness: "allow_model_improvement"
+      }
+    });
+    const plan = planFor(workflow, [
+      makeRecommendation({ id: "generic", title: "Ship one bounded slice in data loading", summary: "Add a repository data-loading slice.", relatedPaths: ["src/data/load.ts"], confidence: 0.7 })
+    ], { isVisualProject: true, changedFiles: ["src/renderer/App.tsx", "src/renderer/styles.css"] });
+    const visualTask = plan.candidateTasks.find((task) => task.kind === "visual_polish" && task.visualDesignImpact);
+
+    expect(visualTask).toBeDefined();
+    expect(visualTask?.summary).toContain("spacious density");
+    expect(visualTask?.summary).toContain("premium feel");
+    expect(visualTask?.summary).toContain("command center layout priority");
+    expect(visualTask?.whyNext).toContain("high-contrast accessibility");
+    expect(plan.strategyHighlights.some((entry) => entry.includes("Visual preferences"))).toBe(true);
+  });
+
+  it("returns planner decisions with strategy settings and checklist targets", () => {
+    const workflow = makeStrategicWorkflow({ goalRestrictiveness: 80 });
+    const decision = selectNextWorkPackage({
+      projectId: "project-1",
+      workflow,
+      recommendations: [
+        makeRecommendation({ id: "risk", title: "Satisfy goal check: Dashboard shows portfolio risk metrics", targetedCheckIds: ["risk"] })
+      ],
+      isVisualProject: true,
+      now: timestamp
+    });
+
+    expect(decision.selectedRecommendationId).toBe("risk");
+    expect(decision.strategySettingsUsed.some((entry) => entry.includes("Goal restrictiveness 80"))).toBe(true);
+    expect(decision.targetedChecklistIds).toEqual(["risk"]);
+  });
+
+  it("builds retrospectives with files, commands, validation outcome, and next tasks", () => {
+    const workflow = makeStrategicWorkflow();
+    workflow.approvedRecommendation = approveRecommendation(makeRecommendation({ id: "risk", title: "Satisfy goal check: Dashboard shows portfolio risk metrics", targetedCheckIds: ["risk"] }));
+    workflow.scopedGoal = createScopedGoalFromRecommendation(workflow.approvedRecommendation, workflow.ultimateGoal);
+    const codingAgent = {
+      ...createAgentSkeleton("coding", "Coding", "Implement risk metrics", "gpt-5.4"),
+      id: "coding-agent",
+      status: "completed" as const,
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      changedFiles: ["src/renderer/App.tsx"],
+      commandLog: [{
+        command: "npm test",
+        output: "passed",
+        status: "completed",
+        startedAt: timestamp,
+        completedAt: timestamp,
+        exitCode: 0
+      }]
+    };
+    const retrospective = buildCycleRetrospective({
+      workflow,
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      agents: [codingAgent, makePassedIntegrityAgent()],
+      shouldContinue: true,
+      nextRecommendedTasks: ["Satisfy goal check: drawdown analysis"],
+      now: timestamp
+    });
+
+    expect(retrospective.triedToDo).toContain("Satisfy goal check");
+    expect(retrospective.changedFiles).toContain("src/renderer/App.tsx");
+    expect(retrospective.commandsRun).toContain("npm test");
+    expect(retrospective.passed).toContain("npm test");
+    expect(retrospective.nextRecommendedTasks).toContain("Satisfy goal check: drawdown analysis");
+  });
+});
+
 describe("summary cache", () => {
   it("invalidates when content hash changes", () => {
     const cache = new SummaryCache([
@@ -958,6 +1318,17 @@ describe("schema validation and IPC", () => {
     expect(agentListRequestSchema.parse({ projectId: "p", scope: "workflow" }).limit).toBe(20);
     expect(agentDetailRequestSchema.parse({ projectId: "p", agentId: "a" }).agentId).toBe("a");
     expect(projectLogFeedRequestSchema.parse({ projectId: "p" }).commandLimit).toBe(50);
+    expect(projectRepositoryChildrenRequestSchema.parse({ projectId: "p" }).limit).toBe(120);
+    expect(projectRepositorySearchRequestSchema.parse({ projectId: "p", query: "src" }).limit).toBe(120);
+    expect(projectRepositoryExcludedPathsRequestSchema.parse({ projectId: "p" }).limit).toBe(120);
+    expect(repositoryScanSettingsRequestSchema.parse({
+      projectId: "p",
+      settings: { maxIncludedFiles: 24_000, maxDepth: 64 }
+    }).settings.maxDepth).toBe(64);
+    expect(repositoryRescanRequestSchema.parse({
+      projectId: "p",
+      options: { mode: "deep", settings: { maxIncludedFiles: 24_000 } }
+    }).options.mode).toBe("deep");
   });
 
   it("validates the project review log bundle format", () => {
@@ -1227,6 +1598,221 @@ describe("schema validation and IPC", () => {
     expect(compareCodexVersions("0.127.0", "0.126.0")).toBeGreaterThan(0);
   });
 
+  it("reports Codex installed and current from a real version check result", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    const check = await checkCodexCliUpdate(settings, "linux", {
+      supportedProtocolVersion: "0.128.0",
+      commandRunner: {
+        runCodexVersion: async () => "codex-cli 0.128.0",
+        runNpmCommand: async () => "0.128.0\n"
+      }
+    });
+
+    expect(check).toMatchObject({
+      status: "up-to-date",
+      currentVersion: "0.128.0",
+      latestVersion: "0.128.0",
+      updateAvailable: false
+    });
+  });
+
+  it("reports Codex installed and outdated with a safe compatible update command", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    const check = await checkCodexCliUpdate(settings, "linux", {
+      supportedProtocolVersion: "0.128.0",
+      commandRunner: {
+        runCodexVersion: async () => "codex-cli 0.127.0",
+        runNpmCommand: async () => "0.129.0\n"
+      }
+    });
+
+    expect(check.status).toBe("outdated");
+    expect(check.currentVersion).toBe("0.127.0");
+    expect(check.latestVersion).toBe("0.129.0");
+    expect(check.targetVersion).toBe("0.128.0");
+    expect(check.updateAvailable).toBe(true);
+    expect(check.updateCommand).toBe("npm install -g @openai/codex@0.128.0");
+  });
+
+  it("reports Codex missing when the installed version command fails", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    let npmCalls = 0;
+    const check = await checkCodexCliUpdate(settings, "linux", {
+      supportedProtocolVersion: "0.128.0",
+      commandRunner: {
+        runCodexVersion: async () => {
+          throw new Error("codex not found");
+        },
+        runNpmCommand: async () => {
+          npmCalls += 1;
+          return "0.128.0\n";
+        }
+      }
+    });
+
+    expect(check.status).toBe("unavailable");
+    expect(check.updateAvailable).toBe(false);
+    expect(check.message).toContain("codex not found");
+    expect(npmCalls).toBe(0);
+  });
+
+  it("explains when the latest Codex version is unavailable", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    const check = await checkCodexCliUpdate(settings, "linux", {
+      supportedProtocolVersion: "0.128.0",
+      commandRunner: {
+        runCodexVersion: async () => "codex-cli 0.128.0",
+        runNpmCommand: async () => "npm notice unable to contact registry"
+      }
+    });
+
+    expect(check.status).toBe("unavailable");
+    expect(check.currentVersion).toBe("0.128.0");
+    expect(check.latestVersion).toBeUndefined();
+    expect(check.message).toContain("latest Codex CLI version");
+  });
+
+  it("previews the exact Codex update command before update approval", () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    const wslSettings = {
+      ...settings,
+      executionMode: "wsl" as const,
+      distroName: "Ubuntu"
+    };
+
+    expect(buildCodexUpdateCommand(settings, "linux", "0.128.0")).toBe("npm install -g @openai/codex@0.128.0");
+    expect(buildCodexUpdateCommand(wslSettings, "win32", "0.128.0")).toBe("wsl -d \"Ubuntu\" -- npm install -g @openai/codex@0.128.0");
+  });
+
+  it("updates Codex with the target version and verifies the installed version afterward", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    let installedVersion = "0.127.0";
+    let installArgs: string[] | undefined;
+
+    const result = await updateCodexCliIfAvailable(settings, "linux", {
+      supportedProtocolVersion: "0.128.0",
+      commandRunner: {
+        runCodexVersion: async () => `codex-cli ${installedVersion}`,
+        runNpmCommand: async (args) => {
+          if (args[0] === "view") {
+            return "0.128.0\n";
+          }
+          installArgs = args;
+          installedVersion = "0.128.0";
+          return "updated\n";
+        }
+      }
+    });
+
+    expect(installArgs).toEqual(["install", "-g", "@openai/codex@0.128.0"]);
+    expect(result).toMatchObject({
+      status: "updated",
+      currentVersion: "0.127.0",
+      updatedVersion: "0.128.0"
+    });
+  });
+
+  it("requires update command approval and rechecks readiness after an approved update", async () => {
+    const updateCommand = "npm install -g @openai/codex@0.128.0";
+    const service = new AppService(await createTempDir("codex-update-approval")) as unknown as {
+      settings: ReturnType<typeof defaultSettings>;
+      codexUpdateCheck: {
+        checkedAt: string;
+        currentVersion?: string;
+        latestVersion?: string;
+        updateAvailable: boolean;
+        updateCommand?: string;
+        status: "up-to-date" | "outdated" | "unavailable" | "skipped";
+        message: string;
+      };
+      runCodexUpdate: AppService["runCodexUpdate"];
+      refreshCodexReadiness: AppService["refreshCodexReadiness"];
+      checkCodexUpdate: AppService["checkCodexUpdate"];
+    };
+    service.settings = {
+      ...defaultSettings(),
+      executionMode: "local"
+    };
+    service.codexUpdateCheck = {
+      checkedAt: "2026-06-11T00:00:00.000Z",
+      currentVersion: "0.127.0",
+      latestVersion: "0.128.0",
+      updateAvailable: true,
+      updateCommand,
+      status: "outdated",
+      message: "Codex CLI can be updated."
+    };
+
+    const unapproved = await service.runCodexUpdate();
+    expect(unapproved.status).toBe("failed");
+    expect(unapproved.message).toContain("not approved");
+
+    let readinessRefreshes = 0;
+    let updateRechecks = 0;
+    service.refreshCodexReadiness = async () => {
+      readinessRefreshes += 1;
+      return {
+        checkedAt: "2026-06-11T00:00:01.000Z",
+        executionMode: "local",
+        codexBinaryPath: "codex",
+        codexCliExists: true,
+        codexVersion: "0.128.0",
+        latestCodexVersion: "0.128.0",
+        updateAvailable: false,
+        status: "ready",
+        message: "Codex CLI 0.128.0 is available."
+      };
+    };
+    service.checkCodexUpdate = async () => {
+      updateRechecks += 1;
+      return {
+        checkedAt: "2026-06-11T00:00:02.000Z",
+        currentVersion: "0.128.0",
+        latestVersion: "0.128.0",
+        updateAvailable: false,
+        status: "up-to-date",
+        message: "Codex CLI is up to date."
+      };
+    };
+
+    let installedVersion = "0.127.0";
+    const approved = await service.runCodexUpdate({
+      approvedCommand: updateCommand,
+      commandRunner: {
+        runCodexVersion: async () => `codex-cli ${installedVersion}`,
+        runNpmCommand: async (args) => {
+          if (args[0] === "view") {
+            return "0.128.0\n";
+          }
+          installedVersion = "0.128.0";
+          return "updated\n";
+        }
+      }
+    });
+
+    expect(approved.status).toBe("updated");
+    expect(readinessRefreshes).toBe(1);
+    expect(updateRechecks).toBe(1);
+  });
+
   it("detects Codex app-server protocol drift before live agents launch", () => {
     expect(assessCodexProtocolCompatibility("0.128.0", "0.128.0")).toMatchObject({
       status: "compatible",
@@ -1292,6 +1878,22 @@ describe("schema validation and IPC", () => {
     ).toBe(
       'Command "codex" is not installed inside WSL distro "Ubuntu" when checked with executable "wsl.exe" with args ["-d","Ubuntu","bash","-lc","command -v \'codex\'"].'
     );
+  });
+
+  it("bounds WSL detection probes with a timeout", async () => {
+    await expect(
+      executeWslBashCommandPlan(
+        {
+          file: process.execPath,
+          args: ["-e", "setTimeout(() => {}, 1000)"],
+          shellCommand: "sleep",
+          transport: "argv"
+        },
+        10
+      )
+    ).rejects.toMatchObject({
+      code: "ETIMEDOUT"
+    });
   });
 
   it("reports when codex is found but node is missing during WSL runtime resolution", () => {
@@ -5863,24 +6465,22 @@ describe("ultimate goal text import", () => {
 });
 
 describe("AppService workflow performance guards", () => {
-  it("repairs appended project state JSON and quarantines unrecoverable state without throwing", async () => {
+  it("quarantines appended and malformed project state JSON without throwing", async () => {
     const appData = await createTempDir("state-repair-storage");
     const storage = new WorkbenchStorage(appData);
-    const repairedRecord = makeAppServiceLoadedProject("repaired-state").record;
-    const repairedStatePath = path.join(appData, "projects", repairedRecord.id, "state.json");
-    await mkdir(path.dirname(repairedStatePath), { recursive: true });
-    await storage.saveRegistry([repairedRecord.id]);
-    await writeFile(repairedStatePath, `${JSON.stringify(repairedRecord)}${JSON.stringify({ duplicate: true })}`);
+    const appendedRecord = makeAppServiceLoadedProject("appended-state").record;
+    const appendedStatePath = path.join(appData, "projects", appendedRecord.id, "state.json");
+    await mkdir(path.dirname(appendedStatePath), { recursive: true });
+    await storage.saveRegistry([appendedRecord.id]);
+    await writeFile(appendedStatePath, `${JSON.stringify(appendedRecord)}${JSON.stringify({ duplicate: true })}`);
 
-    const repairedProjects = await storage.loadAllProjects();
-    const repairedIssues = storage.consumeLoadIssues();
-    const repairedStateText = await readFile(repairedStatePath, "utf8");
+    const appendedProjects = await storage.loadAllProjects();
+    const appendedIssues = storage.consumeLoadIssues();
+    const appendedIssue = appendedIssues.find((issue) => issue.action === "quarantined" && issue.statePath === appendedStatePath);
 
-    expect(repairedProjects).toHaveLength(1);
-    expect(repairedProjects[0]?.id).toBe(repairedRecord.id);
-    expect(repairedIssues.some((issue) => issue.action === "repaired" && issue.statePath === repairedStatePath)).toBe(true);
-    expect(() => JSON.parse(repairedStateText)).not.toThrow();
-    expect(repairedStateText).not.toContain("\"duplicate\":true");
+    expect(appendedProjects).toEqual([]);
+    expect(appendedIssue?.message).toContain("duplicate_appended_json");
+    expect(appendedIssue?.quarantinePath).toContain("state.json.quarantine.duplicate-appended-json");
 
     const brokenRecord = makeAppServiceLoadedProject("broken-state").record;
     const brokenStatePath = path.join(appData, "projects", brokenRecord.id, "state.json");
@@ -5891,7 +6491,7 @@ describe("AppService workflow performance guards", () => {
     await expect(storage.loadAllProjects()).resolves.toEqual([]);
     const quarantineIssues = storage.consumeLoadIssues();
     const quarantineIssue = quarantineIssues.find((issue) => issue.action === "quarantined" && issue.statePath === brokenStatePath);
-    expect(quarantineIssue?.quarantinePath).toContain("state.json.quarantine.");
+    expect(quarantineIssue?.quarantinePath).toContain("state.json.quarantine.malformed-json");
   });
 
   it("repair:state reports a malformed state path and exits cleanly after quarantine", async () => {
@@ -5912,10 +6512,77 @@ describe("AppService workflow performance guards", () => {
     expect(printable).toMatchObject({
       statePath,
       action: "quarantined",
-      changed: true
+      changed: true,
+      issue: "malformed_json"
     });
+    expect(printable.before).toBe("8 bytes");
+    expect(String(printable.backupPath)).toContain("state.json.backup.repair-malformed-malformed_json");
     expect(String(printable.message)).toContain("Malformed JSON");
     expect(String(printable.quarantinePath)).toContain("state.json.quarantine.repair-");
+  });
+
+  it("repair:state quarantines duplicate appended JSON and reports the exact corrupted path", async () => {
+    const appData = await createTempDir("repair-state-script-appended");
+    const projectDir = path.join(appData, "projects", "script-appended");
+    const statePath = path.join(projectDir, "state.json");
+    const record = makeAppServiceLoadedProject("script-appended").record;
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(statePath, `${JSON.stringify(record)}${JSON.stringify(record)}`);
+
+    const repairModule = await import(pathToFileURL(path.resolve("scripts/repair-state.mjs")).href) as {
+      loadSanitizer: () => Promise<unknown>;
+      repairFile: (targetStatePath: string, sanitizer: unknown) => Promise<unknown>;
+      buildPrintableResult: (result: unknown) => Record<string, unknown>;
+    };
+    const result = await repairModule.repairFile(statePath, await repairModule.loadSanitizer());
+    const printable = repairModule.buildPrintableResult(result);
+
+    expect(printable.statePath).toBe(statePath);
+    expect(printable.action).toBe("quarantined");
+    expect(printable.issue).toBe("duplicate_appended_json");
+    expect(String(printable.quarantinePath)).toContain("state.json.quarantine.repair-duplicate-appended-json");
+    await expect(readFile(statePath, "utf8")).rejects.toThrow();
+  });
+
+  it("repair:state compacts oversized valid state and writes full output sidecars", async () => {
+    const appData = await createTempDir("repair-state-script-oversized");
+    const projectDir = path.join(appData, "projects", "script-oversized");
+    const statePath = path.join(projectDir, "state.json");
+    const record = makeAppServiceLoadedProject("script-oversized").record;
+    const agent = createAgentSkeleton("coding", "Repair Huge Output", "Prompt", "gpt-5.4");
+    const fullOutput = `repair full output ${"z".repeat(1_550_000)}`;
+    agent.commandLog = [{
+      itemId: "cmd-repair-huge",
+      command: "npm test",
+      output: fullOutput,
+      status: "completed",
+      startedAt: "2026-04-07T00:00:00.000Z",
+      completedAt: "2026-04-07T00:01:00.000Z",
+      exitCode: 0
+    }];
+    record.agents = [agent];
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(statePath, JSON.stringify(record));
+
+    const repairModule = await import(pathToFileURL(path.resolve("scripts/repair-state.mjs")).href) as {
+      loadSanitizer: () => Promise<unknown>;
+      repairFile: (targetStatePath: string, sanitizer: unknown) => Promise<unknown>;
+      buildPrintableResult: (result: unknown) => Record<string, unknown>;
+    };
+    const result = await repairModule.repairFile(statePath, await repairModule.loadSanitizer());
+    const printable = repairModule.buildPrintableResult(result);
+    const outputSidecar = JSON.parse(await readFile(path.join(projectDir, "agent-outputs", `${agent.id}.json`), "utf8")) as { output: string };
+
+    expect(printable).toMatchObject({
+      statePath,
+      action: "compacted",
+      issue: "oversized_valid_state",
+      changed: true,
+      sidecarsWritten: 1
+    });
+    expect(String(printable.backupPath)).toContain("state.json.backup.sanitizer-v");
+    expect(outputSidecar.output).toContain(fullOutput);
+    expect((await stat(statePath)).size).toBeLessThan(100_000);
   });
 
   it("stores full agent transcript text in a sidecar and reads it back without truncation", async () => {
@@ -5933,10 +6600,178 @@ describe("AppService workflow performance guards", () => {
     };
 
     await storage.appendAgentTranscriptEntry(projectId, agent, entry);
+    await storage.saveAgentFullOutput(projectId, agent, fullText);
 
     const entries = await storage.readAgentTranscript(projectId, agent.id);
+    const output = await storage.getAgentFullOutput(projectId, agent.id);
     expect(entries).toHaveLength(1);
     expect(entries?.[0]?.text).toBe(fullText);
+    expect(output).toBe(fullText);
+  });
+
+  it("compacts oversized valid state while preserving full agent output sidecars", async () => {
+    const appData = await createTempDir("oversized-valid-state");
+    const storage = new WorkbenchStorage(appData);
+    const project = makeAppServiceLoadedProject("oversized-project");
+    const agent = createAgentSkeleton("coding", "Huge Output Agent", "Implement with verbose logs.", "gpt-5.4");
+    const fullOutput = `full command output\n${"x".repeat(1_650_000)}`;
+    agent.status = "completed";
+    agent.workflowCycleNumber = 3;
+    agent.commandLog = [{
+      itemId: "cmd-huge-output",
+      command: "npm test -- --verbose",
+      output: fullOutput,
+      status: "completed",
+      startedAt: "2026-04-07T00:00:00.000Z",
+      completedAt: "2026-04-07T00:01:00.000Z",
+      exitCode: 0
+    }];
+    agent.events = [{
+      id: "event-huge-raw",
+      agentId: agent.id,
+      timestamp: "2026-04-07T00:01:00.000Z",
+      type: "raw",
+      status: "info",
+      title: "Huge raw transport event",
+      detail: "raw detail",
+      raw: { payload: "r".repeat(80_000) }
+    }];
+    project.record.agents = [agent];
+    const statePath = path.join(appData, "projects", project.record.id, "state.json");
+    await mkdir(path.dirname(statePath), { recursive: true });
+    await storage.saveRegistry([project.record.id]);
+    await writeFile(statePath, JSON.stringify(project.record));
+
+    const beforeSize = (await stat(statePath)).size;
+    const records = await storage.loadAllProjects();
+    const issues = storage.consumeLoadIssues();
+    const afterSize = (await stat(statePath)).size;
+    const sidecarOutput = await storage.getAgentFullOutput(project.record.id, agent.id);
+
+    expect(beforeSize).toBeGreaterThan(1_500_000);
+    expect(records).toHaveLength(1);
+    expect(afterSize).toBeLessThan(beforeSize / 5);
+    expect(issues.some((issue) => issue.action === "warning" && issue.statePath === statePath)).toBe(true);
+    expect(issues.some((issue) => issue.action === "compacted" && issue.statePath === statePath)).toBe(true);
+    expect(records[0]?.agents[0]?.commandLog[0]?.output.length ?? 0).toBeLessThan(2_200);
+    expect(records[0]?.agents[0]?.events[0]?.raw).not.toEqual({ payload: "r".repeat(80_000) });
+    expect(records[0]?.agents[0]?.outputReference?.fullOutputAvailable).toBe(true);
+    expect(sidecarOutput).toContain(fullOutput);
+  });
+
+  it("adds a safe recovery diagnostic when startup quarantines saved state", async () => {
+    const appData = await createTempDir("startup-quarantine-diagnostic");
+    const storage = new WorkbenchStorage(appData);
+    const record = makeAppServiceLoadedProject("startup-broken").record;
+    const statePath = path.join(appData, "projects", record.id, "state.json");
+    await mkdir(path.dirname(statePath), { recursive: true });
+    await storage.saveRegistry([record.id]);
+    await writeFile(statePath, "{ broken");
+
+    const service = new AppService(appData) as unknown as {
+      loadStoredProjects: () => Promise<void>;
+      getRendererState: () => { diagnostics: string[]; projects: unknown[] };
+    };
+
+    await service.loadStoredProjects();
+    const state = service.getRendererState();
+
+    expect(state.projects).toHaveLength(0);
+    expect(state.diagnostics.some((entry) => entry.includes("saved project state file") && entry.includes("quarantined"))).toBe(true);
+    expect(state.diagnostics.some((entry) => entry.includes(statePath))).toBe(true);
+  });
+
+  it("caps renderer state payloads and flags omitted nonessential details", async () => {
+    const service = new AppService(await createTempDir("renderer-payload-cap")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      activeProjectId?: string;
+      getRendererState: () => ReturnType<AppService["getRendererState"]>;
+    };
+    for (let index = 0; index < 650; index += 1) {
+      const project = makeAppServiceLoadedProject(`payload-project-${index}`);
+      project.record.workflow.memory.canonicalFacts = Array.from({ length: 24 }, (_, factIndex) => `fact ${index}-${factIndex} ${"x".repeat(120)}`);
+      service.projects.set(project.record.id, project);
+      if (index === 0) {
+        service.activeProjectId = project.record.id;
+      }
+    }
+
+    const state = service.getRendererState();
+
+    expect(state.rendererPayload?.truncated).toBe(true);
+    expect(state.rendererPayload?.sizeBytes ?? 0).toBeLessThanOrEqual(state.rendererPayload?.limitBytes ?? 0);
+    expect(state.rendererPayload?.warning).toContain("capped");
+    expect(state.projects).toHaveLength(1);
+    expect(state.projects[0]?.record.id).toBe(service.activeProjectId);
+  });
+
+  it("safe mode skips saved projects and agent resume on startup", async () => {
+    const appData = await createTempDir("safe-mode-startup");
+    const storage = new WorkbenchStorage(appData);
+    const project = makeAppServiceLoadedProject("safe-mode-project");
+    const agent = createAgentSkeleton("coding", "Running Agent", "Continue work.", "gpt-5.4");
+    agent.status = "running";
+    agent.threadId = "thread-safe-mode";
+    project.record.agents = [agent];
+    const statePath = path.join(appData, "projects", project.record.id, "state.json");
+    await mkdir(path.dirname(statePath), { recursive: true });
+    await storage.saveRegistry([project.record.id]);
+    await writeFile(statePath, JSON.stringify(project.record));
+
+    const service = new AppService(appData);
+    await service.initialize({ safeMode: true });
+    const state = service.getRendererState();
+    const stored = JSON.parse(await readFile(statePath, "utf8")) as { agents: Array<{ status: string }> };
+
+    expect(state.projects).toHaveLength(0);
+    expect(state.activeProjectId).toBeUndefined();
+    expect(state.codexReadiness.status).toBe("skipped");
+    expect(state.codexAvailability.message).toContain("Safe mode");
+    expect(stored.agents[0]?.status).toBe("running");
+  });
+
+  it("keeps huge live agent messages as previews in main state", () => {
+    const agent = createAgentSkeleton("coding", "Huge Message Agent", "Prompt", "gpt-5.4");
+    const hugeText = `message ${"m".repeat(120_000)}`;
+
+    reduceAgentRuntimeEvent(agent, {
+      kind: "item-completed",
+      threadId: "thread-huge-message",
+      itemId: "message-huge",
+      itemType: "agentMessage",
+      title: "Agent message",
+      detail: hugeText,
+      raw: { text: hugeText }
+    });
+
+    expect(agent.lastMessageSnippet?.length ?? 0).toBeLessThanOrEqual(260);
+    expect(agent.events[0]?.detail?.length ?? 0).toBeLessThanOrEqual(4_000);
+    expect(JSON.stringify(agent.events[0]?.raw).length).toBeLessThan(3_000);
+  });
+
+  it("sanitizes huge raw transport event lists in saved state", () => {
+    const project = makeAppServiceLoadedProject("huge-raw-events");
+    const agent = createAgentSkeleton("coding", "Raw Event Agent", "Prompt", "gpt-5.4");
+    agent.events = Array.from({ length: 1_200 }, (_, index) => ({
+      id: `raw-${index}`,
+      agentId: agent.id,
+      timestamp: `2026-04-07T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      type: "raw" as const,
+      status: "info" as const,
+      title: `Raw event ${index}`,
+      detail: "d".repeat(10_000),
+      raw: { payload: "r".repeat(20_000) }
+    }));
+    project.record.agents = [agent];
+
+    const sanitized = sanitizeProjectRecord(project.record);
+    const storedAgent = sanitized.record.agents[0];
+
+    expect(sanitized.report.changed).toBe(true);
+    expect(sanitized.report.agentEventsRemoved).toBeGreaterThan(0);
+    expect(storedAgent?.events.length).toBeLessThanOrEqual(120);
+    expect(storedAgent?.events[0]?.detail?.length ?? 0).toBeLessThanOrEqual(1_250);
+    expect(JSON.stringify(storedAgent?.events[0]?.raw).length).toBeLessThan(1_700);
   });
 
   it("lists workflow cycles as capped summaries and loads older cycle agents/full output on demand", async () => {
@@ -5945,6 +6780,7 @@ describe("AppService workflow performance guards", () => {
       projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
       storage: WorkbenchStorage;
       listWorkflowCycles: AppService["listWorkflowCycles"];
+      getWorkflowCycle: AppService["getWorkflowCycle"];
       listCycleAgents: AppService["listCycleAgents"];
       getAgentTranscript: AppService["getAgentTranscript"];
       getAgentFullOutput: AppService["getAgentFullOutput"];
@@ -5959,6 +6795,7 @@ describe("AppService workflow performance guards", () => {
       createdAt: `2026-04-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`
     }));
     const longOutput = `complete sidecar output ${"x".repeat(50_000)}`;
+    const longCommandOutput = `command output ${"y".repeat(25_000)}`;
     const cycleEightAgent = {
       ...createAgentSkeleton("coding", "Cycle 8 Coding", "Implement cycle 8.", "gpt-5.4"),
       id: "cycle-8-agent",
@@ -5970,13 +6807,58 @@ describe("AppService workflow performance guards", () => {
       commandLog: [{
         itemId: "cmd-cycle-8",
         command: "npm test -- cycle-eight",
-        output: "short retained command output",
+        output: longCommandOutput,
         status: "completed",
         startedAt: "2026-04-08T00:02:00.000Z",
         completedAt: "2026-04-08T00:03:00.000Z",
         exitCode: 0
+      }],
+      approvals: [{
+        id: "approval-cycle-8",
+        agentId: "cycle-8-agent",
+        kind: "command",
+        summary: "Run cycle eight validation",
+        reason: "The test command validates this cycle.",
+        command: "npm test -- cycle-eight",
+        filePaths: [],
+        createdAt: "2026-04-08T00:01:30.000Z",
+        status: "approved" as const,
+        availableDecisions: ["accept", "decline"]
+      }],
+      events: [{
+        id: "failed-event-cycle-8",
+        agentId: "cycle-8-agent",
+        timestamp: "2026-04-08T00:03:30.000Z",
+        type: "item" as const,
+        status: "failed" as const,
+        title: "Retryable warning",
+        detail: "A nonfatal issue was recorded without expanding the full transcript.",
+        raw: { payload: "debug".repeat(4_000) }
       }]
     } satisfies AgentState;
+    project.record.workflow.goalChecklist.push(makeGoalCheck({
+      id: "cycle-eight-check",
+      title: "Cycle eight behavior is validated",
+      status: "met",
+      ownerAgentId: cycleEightAgent.id,
+      relatedPaths: ["src/cycle-eight.ts"]
+    }));
+    project.record.userInputRequests.push({
+      id: "input-cycle-8",
+      agentId: cycleEightAgent.id,
+      requestedByAgentCategory: "coding",
+      threadId: "thread-cycle-8",
+      serverRequestId: "request-cycle-8",
+      title: "Clarify cycle eight scope",
+      description: "Operator input was requested during cycle eight.",
+      questions: [],
+      attachmentInboxPath: "/tmp/inbox",
+      attachmentInboxRelativePath: ".agent-workbench/user-input/input-cycle-8",
+      attachments: [],
+      status: "submitted",
+      createdAt: "2026-04-08T00:01:00.000Z",
+      submittedAt: "2026-04-08T00:01:10.000Z"
+    });
     project.record.agents = [
       cycleEightAgent,
       {
@@ -5999,6 +6881,61 @@ describe("AppService workflow performance guards", () => {
         commandLog: []
       }
     ];
+    project.record.workflow.plannerDecisions = [{
+      id: "planner-cycle-8",
+      planId: "plan-cycle-8",
+      cycleNumber: 8,
+      selectedTaskId: "candidate-cycle-8",
+      selectedRecommendationId: "recommendation-cycle-8",
+      selectedTaskTitle: "Satisfy goal check: Cycle eight behavior is validated",
+      whySelected: "Selected because it targeted a required checklist item and had direct validation available.",
+      score: 321,
+      scoreBreakdown: { checklistImpact: 90 },
+      strategySettingsUsed: ["Goal restrictiveness 80", "medium batching", "high validation strictness"],
+      targetedChecklistIds: ["cycle-eight-check"],
+      expectedFiles: ["src/cycle-eight.ts"],
+      expectedValidationCommands: ["npm test -- cycle-eight"],
+      approvalRequired: false,
+      goalChangeProposalIds: [],
+      checklistChangeIds: ["check-change-cycle-8"],
+      visualDesignImpact: false,
+      createdAt: "2026-04-08T00:00:30.000Z"
+    }];
+    project.record.workflow.checklistChanges = [{
+      id: "check-change-cycle-8",
+      action: "mark_complete",
+      checklistItemIds: ["cycle-eight-check"],
+      title: "Cycle eight behavior is validated",
+      rationale: "Cycle eight completed with linked validation evidence.",
+      sourceCycle: 8,
+      sourceAgent: cycleEightAgent.id,
+      userApprovalStatus: "not_required",
+      confidence: 0.9,
+      risk: "low",
+      affectedGoalArea: "Workflow history",
+      linkedEvidence: ["npm test -- cycle-eight passed"],
+      linkedChangedFiles: ["src/cycle-eight.ts"],
+      linkedValidationCommands: ["npm test -- cycle-eight"],
+      linkedCycleIds: [8],
+      linkedAgentIds: [cycleEightAgent.id],
+      createdAt: "2026-04-08T00:04:00.000Z"
+    }];
+    project.record.workflow.cycleRetrospectives = [{
+      id: "retro-cycle-8",
+      cycleNumber: 8,
+      createdAt: "2026-04-08T00:04:00.000Z",
+      triedToDo: "Satisfy goal check: Cycle eight behavior is validated",
+      whyChosen: "Selected because the planner targeted a required checklist item.",
+      changedFiles: ["src/cycle-eight.ts"],
+      commandsRun: ["npm test -- cycle-eight"],
+      passed: ["npm test -- cycle-eight"],
+      failed: [],
+      learned: ["Cycle eight validation is observable."],
+      checklistItemsAdvanced: ["met: Cycle eight behavior is validated"],
+      goalChecklistChangeRecommendation: "Checklist evidence was linked to the completed cycle.",
+      nextRecommendedTasks: ["Satisfy next checklist item"],
+      shouldContinue: true
+    }];
     service.projects.set(project.record.id, project);
     await service.storage.appendAgentTranscriptEntry(project.record.id, cycleEightAgent, {
       id: "cycle-8-sidecar",
@@ -6010,6 +6947,7 @@ describe("AppService workflow performance guards", () => {
 
     const firstPage = service.listWorkflowCycles(project.record.id, { limit: 5 });
     const secondPage = service.listWorkflowCycles(project.record.id, { cursor: firstPage.nextCursor, limit: 5 });
+    const cycleEightDetail = service.getWorkflowCycle(project.record.id, "8");
     const cycleEightAgents = service.listCycleAgents(project.record.id, "8");
     const fullOutput = await service.getAgentFullOutput(project.record.id, cycleEightAgent.id);
     const transcript = await service.getAgentTranscript(project.record.id, cycleEightAgent.id);
@@ -6018,12 +6956,96 @@ describe("AppService workflow performance guards", () => {
     expect(firstPage.recentPreloaded).toBe(5);
     expect(firstPage.nextCursor).toBe("5");
     expect(JSON.stringify(firstPage)).not.toContain(longOutput);
+    expect(JSON.stringify(firstPage)).not.toContain(longCommandOutput);
     expect(secondPage.cycles.map((cycle) => cycle.cycleNumber)).toEqual([7, 6, 5, 4, 3]);
+    expect(firstPage.cycles.some((cycle) => cycle.cycleNumber === 7)).toBe(false);
+    const cycleEightSummary = firstPage.cycles.find((cycle) => cycle.cycleNumber === 8);
+    expect(cycleEightSummary?.commandsRun).toEqual(["npm test -- cycle-eight"]);
+    expect(cycleEightSummary?.approvalSummaries[0]).toContain("Run cycle eight validation");
+    expect(cycleEightSummary?.errorSummaries[0]).toContain("Retryable warning");
+    expect(cycleEightSummary?.userInputRequestSummaries[0]).toContain("Clarify cycle eight scope");
+    expect(cycleEightSummary?.checklistTargets[0]).toContain("Cycle eight behavior is validated");
+    expect(cycleEightSummary?.selectionReason).toContain("targeted a required checklist item");
+    expect(cycleEightSummary?.strategySettingsUsed).toContain("Goal restrictiveness 80");
+    expect(cycleEightSummary?.checklistChanges[0]).toContain("mark complete");
+    expect(cycleEightSummary?.retrospective).toContain("Tried: Satisfy goal check");
+    expect(cycleEightSummary?.validationOutcome).toContain("no retained validation report");
+    expect(cycleEightDetail).not.toHaveProperty("agents");
+    expect(cycleEightDetail.plannerDecision?.selectedRecommendationId).toBe("recommendation-cycle-8");
+    expect(cycleEightDetail.retrospectiveRecord?.commandsRun).toContain("npm test -- cycle-eight");
+    expect(cycleEightDetail.checklistChangeRecords[0]?.rationale).toContain("linked validation evidence");
     expect(cycleEightAgents.total).toBe(1);
     expect(cycleEightAgents.agents[0]?.changedFiles).toEqual(["src/cycle-eight.ts"]);
+    expect(cycleEightAgents.agents[0]?.commands).toEqual(["npm test -- cycle-eight"]);
+    expect(cycleEightAgents.agents[0]?.approvalSummaries[0]).toContain("Run cycle eight validation");
+    expect(cycleEightAgents.agents[0]?.errorSummaries[0]).toContain("Retryable warning");
+    expect(cycleEightAgents.agents[0]?.transcriptAvailable).toBe(true);
+    expect(JSON.stringify(cycleEightAgents)).not.toContain(longOutput);
+    expect(JSON.stringify(cycleEightAgents)).not.toContain(longCommandOutput);
     expect(fullOutput.fromSidecar).toBe(true);
     expect(fullOutput.output).toContain(longOutput);
+    expect(fullOutput.output.length).toBeGreaterThan(50_000);
     expect(transcript.entries[0]?.text).toBe(longOutput);
+  });
+
+  it("keeps history viewer controls explicit and raw details collapsed by default", async () => {
+    const source = await readFile(path.join(process.cwd(), "src/renderer/App.tsx"), "utf8");
+
+    expect(source).toContain("Copy output");
+    expect(source).toContain("Search within output");
+    expect(source).toContain("Wrap text");
+    expect(source).toContain("Preformatted");
+    expect(source).toContain("Plain text");
+    expect(source).toContain("Open transcript");
+    expect(source).toContain("<summary>Technical details</summary>");
+    expect(source).toContain("technicalDetailsOpen && viewer?.transcript");
+    expect(source).toContain("transcriptEntries.slice(0, 220)");
+    expect(source).toContain("Show all transcript events");
+    expect(source).not.toContain("Promise.all([\n      window.workbench.getAgentFullOutput");
+  });
+
+  it("keeps key design tokens above readable contrast thresholds", async () => {
+    const styles = await readFile(path.join(process.cwd(), "src/renderer/styles.css"), "utf8");
+
+    expect(styles).toContain("--surfaceElevated");
+    expect(styles).toContain("--textPrimary");
+    expect(styles).toContain("--textMuted");
+    expect(styles).toContain("--focusRing");
+    expect(contrastRatio(cssVariable(styles, "--textPrimary"), cssVariable(styles, "--ivory-50"))).toBeGreaterThanOrEqual(12);
+    expect(contrastRatio(cssVariable(styles, "--textMuted"), cssVariable(styles, "--ivory-50"))).toBeGreaterThanOrEqual(6);
+    expect(contrastRatio(cssVariable(styles, "--onNavy"), cssVariable(styles, "--navy-970"))).toBeGreaterThanOrEqual(13);
+    expect(contrastRatio(cssVariable(styles, "--onNavyMuted"), cssVariable(styles, "--navy-970"))).toBeGreaterThanOrEqual(10);
+  });
+
+  it("keeps transcript and History surfaces spacious in the visual polish layer", async () => {
+    const styles = await readFile(path.join(process.cwd(), "src/renderer/styles.css"), "utf8");
+    const polishSection = styles.slice(styles.indexOf("/* Visual polish pass"));
+
+    expect(polishSection).toContain("min-height: min(62vh, 640px)");
+    expect(polishSection).toContain("max-height: min(58vh, 680px)");
+    expect(polishSection).toContain("grid-template-columns: minmax(0, 1fr) minmax(min(460px, 100%), 0.44fr)");
+    expect(polishSection).toContain("max-width: 88ch");
+    expect(polishSection).toContain("background: var(--codeSurface)");
+  });
+
+  it("uses visible focus and non-color-only state indicators in key renderer styles", async () => {
+    const styles = await readFile(path.join(process.cwd(), "src/renderer/styles.css"), "utf8");
+    const polishSection = styles.slice(styles.indexOf("/* Visual polish pass"));
+
+    expect(polishSection).toContain("button:focus-visible");
+    expect(polishSection).toContain(".status-chip::before");
+    expect(polishSection).toContain(".badge-exact::before");
+    expect(polishSection).toContain(".badge-stale::before");
+    expect(polishSection).toContain(".badge-incompatible::before");
+    expect(polishSection).toContain(".badge-unvalidated::before");
+  });
+
+  it("keeps Goal Charter visual preferences in scoped goal prompt context", async () => {
+    const source = await readFile(path.join(process.cwd(), "src/runtime/appService.ts"), "utf8");
+
+    expect(source).toContain("buildVisualPreferenceBrief(currentStrategy)");
+    expect(source).toContain("Goal Charter / Autopilot Strategy visual preferences");
+    expect(source).toContain("comfortable card/table/transcript readability");
   });
 
   it("reports repository scan truncation and skipped counts without expanding the full tree", async () => {
@@ -6087,6 +7109,175 @@ describe("AppService workflow performance guards", () => {
     expect(status.excludedPaths[0]?.path).toBe("node_modules");
   });
 
+  it("reports partial repository scans when exclusions exist without truncation", async () => {
+    const service = new AppService(await createTempDir("repository-partial-status")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      getRepositoryScanStatus: AppService["getRepositoryScanStatus"];
+    };
+    const project = makeAppServiceLoadedProject("repo-partial-project");
+    project.record.stats = {
+      ...(project.record.stats ?? project.scan.stats),
+      totalFiles: 12,
+      totalFolders: 5,
+      totalSizeBytes: 50_000,
+      includedFiles: 10,
+      includedFolders: 4,
+      includedSizeBytes: 42_000,
+      excludedFiles: 2,
+      excludedFolders: 1,
+      excludedSizeBytes: 8_000,
+      excludedPaths: [{
+        path: ".git",
+        kind: "directory",
+        rule: "default",
+        fileCount: 2,
+        totalSizeBytes: 8_000
+      }],
+      truncated: false,
+      truncationReason: undefined,
+      truncationReasons: []
+    };
+    service.projects.set(project.record.id, project);
+
+    const status = service.getRepositoryScanStatus(project.record.id);
+
+    expect(status.status).toBe("partially_indexed");
+    expect(status.truncated).toBe(false);
+    expect(status.excludedFiles).toBe(2);
+    expect(status.excludedFolders).toBe(1);
+    expect(status.searchScope).toBe("indexed_files");
+  });
+
+  it("caps repository search results and reports search scope", async () => {
+    const service = new AppService(await createTempDir("repository-search-cap")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      searchRepositoryFiles: AppService["searchRepositoryFiles"];
+    };
+    const project = makeAppServiceLoadedProject("repo-search-project");
+    const files = Array.from({ length: 12 }, (_, index) => ({
+      absolutePath: `/repo/src/match-${index}.ts`,
+      relativePath: `src/match-${index}.ts`,
+      size: 100 + index,
+      language: "TypeScript"
+    }));
+    project.scan = {
+      ...project.scan,
+      files,
+      stats: {
+        ...project.scan.stats,
+        scanMode: "deep",
+        totalFiles: files.length,
+        includedFiles: files.length,
+        includedSizeBytes: files.reduce((sum, file) => sum + file.size, 0)
+      }
+    };
+    project.record.stats = project.scan.stats;
+    service.projects.set(project.record.id, project);
+
+    const results = service.searchRepositoryFiles(project.record.id, "match", { limit: 5 });
+
+    expect(results.results).toHaveLength(5);
+    expect(results.total).toBe(12);
+    expect(results.truncated).toBe(true);
+    expect(results.resultCap).toBe(5);
+    expect(results.searchScope).toBe("full_deep_index");
+  });
+
+  it("keeps repository summary and tree children paged instead of sending the full tree", async () => {
+    const service = new AppService(await createTempDir("repository-lazy-summary")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      getRepositorySummary: AppService["getRepositorySummary"];
+      listRepositoryChildren: AppService["listRepositoryChildren"];
+      listExcludedPaths: AppService["listExcludedPaths"];
+    };
+    const project = makeAppServiceLoadedProject("repo-lazy-project");
+    project.scan = {
+      ...project.scan,
+      files: Array.from({ length: 20 }, (_, index) => ({
+        absolutePath: `/repo/src/file-${index}.ts`,
+        relativePath: `src/file-${index}.ts`,
+        size: 20,
+        language: "TypeScript"
+      })),
+      stats: {
+        ...project.scan.stats,
+        totalFiles: 22,
+        includedFiles: 20,
+        excludedFiles: 2,
+        excludedPaths: [
+          { path: "node_modules", kind: "directory", rule: "default", fileCount: 2, totalSizeBytes: 1_000 },
+          { path: ".agent-workbench", kind: "directory", rule: "default", fileCount: 0, totalSizeBytes: 0 }
+        ]
+      }
+    };
+    project.record.stats = project.scan.stats;
+    project.tree = [{
+      path: "massive",
+      name: "massive",
+      type: "directory",
+      children: [{ path: "massive/private.ts", name: "private.ts", type: "file", size: 99, language: "TypeScript" }]
+    }];
+    service.projects.set(project.record.id, project);
+
+    const summary = service.getRepositorySummary(project.record.id);
+    const rootPage = service.listRepositoryChildren(project.record.id, "", { limit: 1 });
+    const excluded = service.listExcludedPaths(project.record.id, { limit: 1 });
+
+    expect("tree" in summary).toBe(false);
+    expect(JSON.stringify(summary)).not.toContain("massive/private.ts");
+    expect(rootPage.children).toHaveLength(1);
+    expect(rootPage.children[0]?.path).toBe("src");
+    expect(rootPage.children[0]).not.toHaveProperty("children");
+    expect(excluded.paths).toHaveLength(1);
+    expect(excluded.total).toBe(2);
+    expect(excluded.truncated).toBe(true);
+  });
+
+  it("rescans normally and supports persisted deep scan settings", async () => {
+    const repoRoot = await createTempDir("repository-rescan-action");
+    await mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await writeFile(path.join(repoRoot, "package.json"), JSON.stringify({ name: "repository-rescan-action" }));
+    for (let index = 0; index < 6; index += 1) {
+      await writeFile(path.join(repoRoot, "src", `file-${index}.ts`), `export const value${index} = ${index};\n`);
+    }
+    const service = new AppService(await createTempDir("repository-rescan-appdata")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      rescanRepository: AppService["rescanRepository"];
+      getRepositoryScanStatus: AppService["getRepositoryScanStatus"];
+      getRepositoryScanLimits: AppService["getRepositoryScanLimits"];
+      updateRepositoryScanSettings: AppService["updateRepositoryScanSettings"];
+    };
+    const project = makeAppServiceLoadedProject("repo-rescan-project");
+    project.record.displayPath = repoRoot;
+    project.record.wslPath = repoRoot;
+    project.record.projectRoot = repoRoot;
+    project.record.hostPath = repoRoot;
+    service.projects.set(project.record.id, project);
+
+    await service.rescanRepository(project.record.id, { mode: "normal" });
+    const normalStatus = service.getRepositoryScanStatus(project.record.id);
+    const deepSettings: RepositoryScanSettings = {
+      maxIncludedFiles: 2,
+      maxIncludedDirectories: 10,
+      maxDepth: 8,
+      maxManifestFileSizeBytes: 100_000,
+      maxScanDurationMs: 10_000,
+      maxExcludedPathRecords: 10
+    };
+    const limits = await service.updateRepositoryScanSettings(project.record.id, deepSettings);
+    await service.rescanRepository(project.record.id, { mode: "deep" });
+    const deepStatus = service.getRepositoryScanStatus(project.record.id);
+
+    expect(normalStatus.status).toBe("indexed");
+    expect(normalStatus.searchScope).toBe("indexed_files");
+    expect(limits.effective.maxIncludedFiles).toBe(2);
+    expect(service.getRepositoryScanLimits(project.record.id).settings.maxIncludedFiles).toBe(2);
+    expect(deepStatus.status).toBe("truncated");
+    expect(deepStatus.searchScope).toBe("full_deep_index");
+    expect(deepStatus.limitHits.map((hit) => hit.code)).toContain("included_file_limit");
+    expect(deepStatus.limits.includedFileLimit).toBe(2);
+  });
+
   it("skips Codex readiness and update checks in mock mode", async () => {
     const service = new AppService(await createTempDir("mock-codex-readiness")) as unknown as {
       settings: { mockMode: boolean };
@@ -6095,13 +7286,51 @@ describe("AppService workflow performance guards", () => {
     };
     service.settings.mockMode = true;
 
+    const startedAt = performance.now();
     const readiness = await service.refreshCodexReadiness("test mock readiness");
     const update = await service.checkCodexUpdate();
 
     expect(readiness.status).toBe("skipped");
     expect(readiness.message).toContain("Mock mode");
+    expect(readiness.warnings?.[0]).toContain("Mock mode skips");
     expect(update.status).toBe("skipped");
     expect(update.updateAvailable).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(250);
+  });
+
+  it("coalesces repeated Codex readiness detection requests", async () => {
+    let releaseProbe: (() => void) | undefined;
+    const probeGate = new Promise<void>((resolve) => {
+      releaseProbe = resolve;
+    });
+    const service = new AppService(await createTempDir("codex-readiness-coalescing")) as unknown as {
+      refreshCodexReadiness: AppService["refreshCodexReadiness"];
+      refreshCodexReadinessInternal: AppService["refreshCodexReadiness"];
+    };
+    let probes = 0;
+    service.refreshCodexReadinessInternal = async () => {
+      probes += 1;
+      await probeGate;
+      return {
+        checkedAt: "2026-06-11T00:00:00.000Z",
+        executionMode: "local",
+        codexBinaryPath: "codex",
+        codexCliExists: true,
+        codexVersion: "0.128.0",
+        updateAvailable: false,
+        status: "ready",
+        message: "Codex ready."
+      };
+    };
+
+    const first = service.refreshCodexReadiness("first check");
+    const second = service.refreshCodexReadiness("second check");
+    await Promise.resolve();
+    expect(probes).toBe(1);
+    releaseProbe?.();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toBe(secondResult);
   });
 
   it("coalesces duplicate workflow automation schedules for one project", async () => {

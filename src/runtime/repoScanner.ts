@@ -398,6 +398,7 @@ export const scanRepository = async (
   scanLimits: Partial<RepositoryScanLimits> = {}
 ): Promise<RepoScanResult> => {
   const limits = mergeScanLimits(scanLimits);
+  const scanStartedAtIso = new Date().toISOString();
   const scanStartedAt = performance.now();
   const matcher = await buildIgnoreMatcher(projectRootHostPath);
   const files: ScannedFile[] = [];
@@ -620,10 +621,13 @@ export const scanRepository = async (
   const totalFolders = folders.size + excludedFolders + omittedDirectoriesEstimate;
   const totalSizeBytes = includedSizeBytes + excludedSizeBytes;
   const scanDurationMs = performance.now() - scanStartedAt;
+  const scanCompletedAtIso = new Date().toISOString();
   const sortedTruncationReasons = [...truncationReasons].sort();
   const stats: ProjectStats = {
     projectRoot: executionProjectRoot,
     kind: gitMetadata.isGit ? "git" : "folder",
+    scanStartedAt: scanStartedAtIso,
+    scanCompletedAt: scanCompletedAtIso,
     createdAt: gitMetadata.earliestCommitAt,
     lastCommitAt: gitMetadata.lastCommitAt,
     totalFiles,

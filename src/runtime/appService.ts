@@ -7,6 +7,7 @@ import type { JsonValue } from "@generated/app-server/serde_json/JsonValue";
 import type { SandboxPolicy, ToolRequestUserInputQuestion } from "@generated/app-server/v2";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, USER_INPUT_REQUESTS_PATH } from "@shared/constants";
 import { createAgentSkeleton, createLocalProjectRecord, defaultLocalState, defaultProjectCredentialsState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
+import { createDefaultGoalCharter, listAutopilotPresets as buildAutopilotPresets } from "@shared/goalCharter";
 import { agentRoles } from "@shared/agentRoles";
 import {
   DEFAULT_AGENT_REASONING_EFFORTS,
@@ -18,6 +19,8 @@ import { executionPathToHostPath, resolveProjectPath } from "@shared/pathUtils";
 import {
   appSettingsSchema,
   fileSummarySchema,
+  autopilotStrategySchema,
+  goalCharterSchema,
   portableInterfaceSchema,
   scopedGoalSchema,
   ultimateGoalSchema,
@@ -36,8 +39,10 @@ import type {
   AgentListResponse,
   ApprovedRecommendation,
   AppSettings,
+  AutopilotPreset,
   AutopilotPauseReason,
   AutopilotPolicy,
+  AutopilotStrategy,
   ApprovalDecision,
   ApprovalRequestRecord,
   CodexAvailability,
@@ -50,7 +55,13 @@ import type {
   CredentialRequestRecord,
   CredentialRequestStatus,
   DiscoveredModel,
+  ExecutionEnvironmentStatus,
   GitHubStatus,
+  ChecklistChange,
+  CycleRetrospective,
+  GoalChangeRecord,
+  GoalChangeProposal,
+  GoalCharter,
   GoalAttainmentCheck,
   HumanInterventionRecord,
   InterfaceCandidate,
@@ -60,14 +71,21 @@ import type {
   OpenProjectShellResult,
   ProjectAccessProbe,
   ProjectLogFeedResponse,
+  ProjectOverview,
   ProjectRepositoryView,
   ProjectRepositorySummary,
+  RendererPayloadInfo,
   RepositoryRescanOptions,
+  RepositoryExcludedPathsResponse,
+  RepositoryScanLimitsResponse,
+  RepositoryScanSettings,
   RepositoryScanStatus,
   ProjectWorkflowState,
   ProjectLoadResult,
+  PlannerDecision,
   RepositoryChildrenResponse,
   RepositorySearchResponse,
+  ProjectStats,
   RepositoryTreeEntry,
   RepoTreeNode,
   RuntimeDependencyCheck,
@@ -129,8 +147,8 @@ import { CodexAppServerTransport, type CodexTransport } from "./codexTransport";
 import {
   GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION,
   assessCodexProtocolCompatibility,
-  buildCodexUpdateCommand,
   checkCodexCliUpdate,
+  type CodexUpdateCommandRunner,
   readInstalledCodexCliVersion,
   updateCodexCliIfAvailable
 } from "./codexUpdate";
@@ -156,7 +174,7 @@ import {
   assertProjectRelativeHostPath,
   resolveExecutionPathWithinProjectRoot
 } from "./projectBoundary";
-import { DEFAULT_REPOSITORY_SCAN_LIMITS, hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult } from "./repoScanner";
+import { DEFAULT_REPOSITORY_SCAN_LIMITS, hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult, type RepositoryScanLimits } from "./repoScanner";
 import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
 import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
 import { sanitizeWorkflowState } from "./stateSanitizer";
@@ -191,6 +209,14 @@ import {
   sanitizeScopedGoalForSingleAgent
 } from "./workflowGuardrails";
 import { buildRepairStrategyContext } from "./workflowRepairPlanner";
+import {
+  buildVisualPreferenceBrief,
+  buildCycleRetrospective,
+  buildStrategicPlan,
+  decisionFromStrategicPlan,
+  rankRecommendationsByStrategicPlan,
+  type StrategicPlannerInput
+} from "@shared/strategicPlanner";
 
 interface LoadedProject {
   record: LocalProjectRecord;
@@ -210,6 +236,10 @@ interface PendingLoad {
 type AppServiceInitializeOptions = {
   deferStartupWork?: boolean;
   safeMode?: boolean;
+};
+type CodexUpdateRunOptions = {
+  approvedCommand?: string;
+  commandRunner?: CodexUpdateCommandRunner;
 };
 type InterfaceCreationParseFailure = Exclude<InterfaceCreationParseResult, { ok: true }>;
 type ProjectSaveMode = "immediate" | "deferred" | false;
@@ -260,11 +290,15 @@ const RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT = 32;
 const RENDERER_REPO_TREE_PREVIEW_CHILD_LIMIT = 8;
 const RENDERER_REPOSITORY_DEPENDENCY_LIMIT = 80;
 const RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT = 80;
+const RENDERER_PAYLOAD_WARNING_BYTES = 1_000_000;
+const RENDERER_PAYLOAD_HARD_LIMIT_BYTES = 1_800_000;
 const REPOSITORY_CHILDREN_DEFAULT_LIMIT = 120;
 const REPOSITORY_CHILDREN_MAX_LIMIT = 500;
 const REPOSITORY_SEARCH_DEFAULT_LIMIT = 120;
 const REPOSITORY_SEARCH_MAX_LIMIT = 500;
 const REPOSITORY_PAYLOAD_WARNING_BYTES = 750_000;
+const REPOSITORY_DEEP_SCAN_MULTIPLIER = 4;
+const CODEX_READINESS_PROBE_TIMEOUT_MS = 10_000;
 const STATE_EMIT_THROTTLE_MS = 350;
 const LIVE_PROJECT_SAVE_THROTTLE_MS = 3_000;
 const LIVE_DELTA_REDUCE_THROTTLE_MS = 1_500;
@@ -332,6 +366,68 @@ const formatBytesForStatus = (value: number): string => {
   return `${value} bytes`;
 };
 
+const requiredRepositoryScanSettings = (limits: RepositoryScanLimits): Required<RepositoryScanSettings> => ({
+  maxIncludedFiles: limits.maxIncludedFiles,
+  maxIncludedDirectories: limits.maxIncludedDirectories,
+  maxDepth: limits.maxDepth,
+  maxManifestFileSizeBytes: limits.maxManifestFileSizeBytes,
+  maxScanDurationMs: limits.maxScanDurationMs,
+  maxExcludedPathRecords: limits.maxExcludedPathRecords
+});
+
+const scaleRepositoryScanSettings = (
+  limits: Required<RepositoryScanSettings>,
+  multiplier: number,
+  overrides: Partial<RepositoryScanSettings> = {}
+): Required<RepositoryScanSettings> => ({
+  maxIncludedFiles: overrides.maxIncludedFiles ?? limits.maxIncludedFiles * multiplier,
+  maxIncludedDirectories: overrides.maxIncludedDirectories ?? limits.maxIncludedDirectories * multiplier,
+  maxDepth: overrides.maxDepth ?? limits.maxDepth * multiplier,
+  maxManifestFileSizeBytes: overrides.maxManifestFileSizeBytes ?? limits.maxManifestFileSizeBytes * multiplier,
+  maxScanDurationMs: overrides.maxScanDurationMs ?? limits.maxScanDurationMs * multiplier,
+  maxExcludedPathRecords: overrides.maxExcludedPathRecords ?? limits.maxExcludedPathRecords * multiplier
+});
+
+const REPOSITORY_DEFAULT_SCAN_SETTINGS = requiredRepositoryScanSettings(DEFAULT_REPOSITORY_SCAN_LIMITS);
+const REPOSITORY_DEEP_SCAN_SETTINGS = scaleRepositoryScanSettings(REPOSITORY_DEFAULT_SCAN_SETTINGS, REPOSITORY_DEEP_SCAN_MULTIPLIER, {
+  maxDepth: DEFAULT_REPOSITORY_SCAN_LIMITS.maxDepth * 2,
+  maxManifestFileSizeBytes: DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes * 2,
+  maxExcludedPathRecords: DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords * 2
+});
+const REPOSITORY_HARD_SCAN_SETTINGS = scaleRepositoryScanSettings(REPOSITORY_DEFAULT_SCAN_SETTINGS, 8, {
+  maxDepth: 96,
+  maxManifestFileSizeBytes: DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes * 8,
+  maxScanDurationMs: 90_000,
+  maxExcludedPathRecords: DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords * 8
+});
+
+const clampRepositoryScanSetting = (value: number | undefined, fallback: number, max: number): number =>
+  Math.max(1, Math.min(max, Math.floor(value ?? fallback)));
+
+const normalizeRepositoryScanSettings = (
+  settings: RepositoryScanSettings | undefined,
+  fallback: Required<RepositoryScanSettings> = REPOSITORY_DEEP_SCAN_SETTINGS
+): Required<RepositoryScanSettings> => ({
+  maxIncludedFiles: clampRepositoryScanSetting(settings?.maxIncludedFiles, fallback.maxIncludedFiles, REPOSITORY_HARD_SCAN_SETTINGS.maxIncludedFiles),
+  maxIncludedDirectories: clampRepositoryScanSetting(settings?.maxIncludedDirectories, fallback.maxIncludedDirectories, REPOSITORY_HARD_SCAN_SETTINGS.maxIncludedDirectories),
+  maxDepth: clampRepositoryScanSetting(settings?.maxDepth, fallback.maxDepth, REPOSITORY_HARD_SCAN_SETTINGS.maxDepth),
+  maxManifestFileSizeBytes: clampRepositoryScanSetting(settings?.maxManifestFileSizeBytes, fallback.maxManifestFileSizeBytes, REPOSITORY_HARD_SCAN_SETTINGS.maxManifestFileSizeBytes),
+  maxScanDurationMs: clampRepositoryScanSetting(settings?.maxScanDurationMs, fallback.maxScanDurationMs, REPOSITORY_HARD_SCAN_SETTINGS.maxScanDurationMs),
+  maxExcludedPathRecords: clampRepositoryScanSetting(settings?.maxExcludedPathRecords, fallback.maxExcludedPathRecords, REPOSITORY_HARD_SCAN_SETTINGS.maxExcludedPathRecords)
+});
+
+const toStoredRepositoryScanSettings = (settings: RepositoryScanSettings): RepositoryScanSettings => {
+  const normalized = normalizeRepositoryScanSettings(settings);
+  return {
+    maxIncludedFiles: normalized.maxIncludedFiles,
+    maxIncludedDirectories: normalized.maxIncludedDirectories,
+    maxDepth: normalized.maxDepth,
+    maxManifestFileSizeBytes: normalized.maxManifestFileSizeBytes,
+    maxScanDurationMs: normalized.maxScanDurationMs,
+    maxExcludedPathRecords: normalized.maxExcludedPathRecords
+  };
+};
+
 const compactRawForRenderer = (value: unknown): unknown => {
   if (value === undefined) {
     return undefined;
@@ -371,6 +467,26 @@ const compactRepoTreePreview = (nodes: RepoTreeNode[]): RepoTreeNode[] => {
     .slice(0, RENDERER_REPO_TREE_PREVIEW_ROOT_LIMIT)
     .map((node) => compactNode(node, 0));
 };
+
+const compactOverviewForRenderer = (overview: ProjectOverview | undefined): ProjectOverview | undefined => overview
+  ? {
+    ...overview,
+    summary: compactText(overview.summary, 1_200),
+    architecture: compactText(overview.architecture, 1_500),
+    whatProjectDoes: overview.whatProjectDoes ? compactText(overview.whatProjectDoes, 800) : overview.whatProjectDoes,
+    howItIsOrganized: overview.howItIsOrganized ? compactText(overview.howItIsOrganized, 800) : overview.howItIsOrganized,
+    importantToKnowFirst: overview.importantToKnowFirst ? compactText(overview.importantToKnowFirst, 800) : overview.importantToKnowFirst,
+    importantFiles: overview.importantFiles.slice(0, 24),
+    subsystemSummaries: overview.subsystemSummaries.slice(0, 12).map((summary) => ({
+      ...summary,
+      summary: compactText(summary.summary, 500),
+      paths: summary.paths.slice(0, 12)
+    })),
+    dependencyHighlights: overview.dependencyHighlights.slice(0, 16).map((entry) => compactText(entry, 240)),
+    statisticsSummary: overview.statisticsSummary ? compactText(overview.statisticsSummary, 500) : overview.statisticsSummary,
+    recommendations: overview.recommendations.slice(0, 12).map((entry) => compactText(entry, 280))
+  }
+  : undefined;
 
 const countRepoTreeNodes = (nodes: RepoTreeNode[]): number => {
   let count = 0;
@@ -467,6 +583,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     message: "Codex readiness has not run yet."
   };
   private codexUpdateCheck?: CodexUpdateCheckResult;
+  private codexReadinessInFlight?: Promise<CodexReadinessReport>;
+  private codexUpdateCheckInFlight?: Promise<CodexUpdateCheckResult>;
   private readonly diagnostics: string[] = [];
   private readonly interfaceCreationRepairAttempts = new Map<string, number>();
   private readonly workflowAutomationInFlight = new Set<string>();
@@ -483,6 +601,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly projectSaveInFlight = new Map<string, Promise<void>>();
   private readonly projectSaveQueued = new Map<string, Promise<void>>();
   private readonly projectSaveQueuedOptions = new Map<string, ProjectSaveOptions>();
+  private readonly repositoryScanOperations = new Map<string, { startedAt: string; mode: "normal" | "deep"; settings: Required<RepositoryScanSettings> }>();
+  private readonly repositoryScanFailures = new Map<string, { failedAt: string; message: string; recoverySteps: string[] }>();
   private readonly registeredProjectIds = new Set<string>();
   private readonly structuredOutputApplicationsInFlight = new Set<string>();
   private readonly commandOutputBuffers = new Map<string, {
@@ -555,6 +675,92 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       `activity=${activity}`,
       `recommendations=${recommendations}`
     ].join(" ");
+  }
+
+  private measureRendererPayload(payload: WorkbenchState): RendererPayloadInfo {
+    let sizeBytes = 0;
+    let activeProjectSizeBytes = 0;
+    try {
+      sizeBytes = Buffer.byteLength(JSON.stringify({
+        ...payload,
+        rendererPayload: undefined
+      }));
+      const activeProject = payload.projects.find((project) => project.record.id === payload.activeProjectId);
+      activeProjectSizeBytes = activeProject ? Buffer.byteLength(JSON.stringify(activeProject.record)) : 0;
+    } catch {
+      sizeBytes = Number.MAX_SAFE_INTEGER;
+      activeProjectSizeBytes = Number.MAX_SAFE_INTEGER;
+    }
+    return {
+      sizeBytes,
+      activeProjectSizeBytes,
+      limitBytes: RENDERER_PAYLOAD_HARD_LIMIT_BYTES,
+      truncated: false
+    };
+  }
+
+  private withRendererPayloadInfo(state: WorkbenchState, info: RendererPayloadInfo): WorkbenchState {
+    return {
+      ...state,
+      rendererPayload: info
+    };
+  }
+
+  private capRendererStatePayload(state: WorkbenchState, label: string): WorkbenchState {
+    const measured = this.measureRendererPayload(state);
+    if (measured.sizeBytes <= RENDERER_PAYLOAD_HARD_LIMIT_BYTES) {
+      const info: RendererPayloadInfo = {
+        ...measured,
+        warning: measured.sizeBytes > RENDERER_PAYLOAD_WARNING_BYTES
+          ? `Renderer state is ${formatBytesForStatus(measured.sizeBytes)}. Nonessential details will be omitted above ${formatBytesForStatus(RENDERER_PAYLOAD_HARD_LIMIT_BYTES)}.`
+          : undefined
+      };
+      if (this.debugWorkflowPerf) {
+        this.logWorkflowPerf(`${label}: renderer payload measured ${measured.sizeBytes} bytes, activeProject=${measured.activeProjectSizeBytes ?? 0} bytes`);
+      }
+      return this.withRendererPayloadInfo(state, info);
+    }
+
+    const degradedProjects = [...this.projects.values()].map((project) => {
+      const inactive = project.record.id !== this.activeProjectId;
+      return {
+        record: this.compactRendererProjectRecord(project.record, { inactive, summaryOnly: true }),
+        tree: inactive ? [] : compactRepoTreePreview(project.tree),
+        validationStatus: project.record.validation.lastValidatedAt ? "exact" as const : "unvalidated" as const,
+        candidates: []
+      };
+    });
+    const degraded: WorkbenchState = {
+      ...state,
+      projects: degradedProjects,
+      diagnostics: [
+        `Renderer state exceeded ${formatBytesForStatus(RENDERER_PAYLOAD_HARD_LIMIT_BYTES)}; nonessential project details were omitted from this update.`,
+        ...state.diagnostics.slice(0, 100).map((entry) => compactText(entry, 1_000))
+      ]
+    };
+    let cappedState = degraded;
+    let after = this.measureRendererPayload(cappedState);
+    if (after.sizeBytes > RENDERER_PAYLOAD_HARD_LIMIT_BYTES) {
+      const activeProject = degraded.projects.find((project) => project.record.id === this.activeProjectId);
+      cappedState = {
+        ...degraded,
+        projects: activeProject ? [activeProject] : degraded.projects.slice(0, 1),
+        diagnostics: [
+          `Renderer state remained above ${formatBytesForStatus(RENDERER_PAYLOAD_HARD_LIMIT_BYTES)} after compaction; inactive project details were omitted from this update.`,
+          ...degraded.diagnostics.slice(0, 100).map((entry) => compactText(entry, 1_000))
+        ]
+      };
+      after = this.measureRendererPayload(cappedState);
+    }
+    const info: RendererPayloadInfo = {
+      ...after,
+      truncated: true,
+      warning: `Renderer state was capped from ${formatBytesForStatus(measured.sizeBytes)} to ${formatBytesForStatus(after.sizeBytes)}. Open history/output details on demand.`
+    };
+    if (this.debugWorkflowPerf) {
+      this.logWorkflowPerf(`${label}: renderer payload capped ${measured.sizeBytes} -> ${after.sizeBytes} bytes, ${this.collectRendererStateStats(cappedState)}`);
+    }
+    return this.withRendererPayloadInfo(cappedState, info);
   }
 
   private normalizePersistProjectUpdateOptions(
@@ -920,6 +1126,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   async checkCodexUpdate(): Promise<CodexUpdateCheckResult> {
+    if (this.codexUpdateCheckInFlight) {
+      return this.codexUpdateCheckInFlight;
+    }
+
+    this.codexUpdateCheckInFlight = this.checkCodexUpdateInternal()
+      .finally(() => {
+        this.codexUpdateCheckInFlight = undefined;
+      });
+    return this.codexUpdateCheckInFlight;
+  }
+
+  private async checkCodexUpdateInternal(): Promise<CodexUpdateCheckResult> {
     if (this.settings.mockMode) {
       const skipped: CodexUpdateCheckResult = {
         checkedAt: nowIso(),
@@ -931,9 +1149,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.codexReadiness = {
         ...this.codexReadiness,
         checkedAt: skipped.checkedAt,
+        codexCliExists: undefined,
+        codexVersion: undefined,
+        latestCodexVersion: undefined,
         updateAvailable: false,
+        updateCommand: undefined,
         status: "skipped",
-        message: skipped.message
+        message: skipped.message,
+        warnings: ["Mock mode skips Codex CLI, WSL, Node.js, and npm update detection."],
+        errors: []
       };
       this.emitState();
       return skipped;
@@ -951,30 +1175,36 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       status: result.status,
       message: result.message
     };
+    const updateWarnings = result.status === "unavailable" && result.currentVersion ? [result.message] : [];
+    const updateErrors = result.status === "unavailable" && !result.currentVersion ? [result.message] : [];
+    const codexCliMissing = result.status === "unavailable" && !result.currentVersion;
     this.codexUpdateCheck = checked;
     this.codexReadiness = {
       ...this.codexReadiness,
       checkedAt: checked.checkedAt,
-      codexVersion: checked.currentVersion ?? this.codexReadiness.codexVersion,
+      codexCliExists: codexCliMissing ? false : Boolean(checked.currentVersion) || this.codexReadiness.codexCliExists,
+      codexVersion: codexCliMissing ? undefined : checked.currentVersion ?? this.codexReadiness.codexVersion,
       latestCodexVersion: checked.latestVersion,
       updateAvailable: checked.updateAvailable,
       updateCommand: checked.updateCommand,
       status: checked.updateAvailable
         ? "outdated"
-        : checked.status === "unavailable"
+        : checked.status === "unavailable" && !checked.currentVersion
           ? "unavailable"
           : checked.status === "skipped"
             ? "skipped"
-            : this.codexReadiness.status === "unavailable"
+            : this.codexReadiness.status === "unavailable" && !checked.currentVersion
               ? "unavailable"
               : "ready",
-      message: checked.message
+      message: checked.message,
+      warnings: updateWarnings,
+      errors: updateErrors
     };
     this.emitState();
     return checked;
   }
 
-  async runCodexUpdate(): Promise<CodexUpdateRunResult> {
+  async runCodexUpdate(options: CodexUpdateRunOptions = {}): Promise<CodexUpdateRunResult> {
     if (this.settings.mockMode) {
       const skipped: CodexUpdateRunResult = {
         checkedAt: nowIso(),
@@ -996,9 +1226,31 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         message: before.message
       };
     }
+    if (!before.updateCommand) {
+      return {
+        checkedAt: nowIso(),
+        status: "failed",
+        previousVersion: before.currentVersion,
+        currentVersion: before.currentVersion,
+        latestVersion: before.latestVersion,
+        message: "Codex CLI update is available, but Workbench could not build a safe update command preview."
+      };
+    }
+    if (options.approvedCommand !== before.updateCommand) {
+      return {
+        checkedAt: nowIso(),
+        status: "failed",
+        previousVersion: before.currentVersion,
+        currentVersion: before.currentVersion,
+        latestVersion: before.latestVersion,
+        command: before.updateCommand,
+        message: "Codex CLI update was not approved. Review and approve the displayed command before updating."
+      };
+    }
 
     const result = await updateCodexCliIfAvailable(this.settings, process.platform, {
-      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION
+      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION,
+      commandRunner: options.commandRunner
     });
     const updateResult: CodexUpdateRunResult = {
       checkedAt: nowIso(),
@@ -1015,6 +1267,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   async refreshCodexReadiness(reason = "Codex readiness check"): Promise<CodexReadinessReport> {
+    if (this.codexReadinessInFlight) {
+      return this.codexReadinessInFlight;
+    }
+
+    this.codexReadinessInFlight = this.refreshCodexReadinessInternal(reason)
+      .finally(() => {
+        this.codexReadinessInFlight = undefined;
+      });
+    return this.codexReadinessInFlight;
+  }
+
+  private async refreshCodexReadinessInternal(reason = "Codex readiness check"): Promise<CodexReadinessReport> {
     const checkedAt = nowIso();
     const mode = resolveExecutionMode(this.settings, process.platform);
     if (this.settings.mockMode) {
@@ -1024,10 +1288,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         distroName: this.settings.distroName,
         codexBinaryPath: this.settings.codexBinaryPath,
         codexPath: this.settings.codexBinaryPath,
+        codexCliExists: undefined,
         nodePath: process.execPath,
         updateAvailable: false,
+        updateCommand: undefined,
         status: "skipped",
-        message: "Mock mode is enabled. Codex detection is skipped until a live agent-backed action needs it."
+        message: "Mock mode is enabled. Codex detection is skipped until a live agent-backed action needs it.",
+        warnings: ["Mock mode skips Codex CLI, WSL, Node.js, and npm update detection."],
+        errors: []
       };
       this.emitState();
       return this.codexReadiness;
@@ -1041,7 +1309,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       updateAvailable: this.codexUpdateCheck?.updateAvailable ?? false,
       updateCommand: this.codexUpdateCheck?.updateCommand,
       status: "checking",
-      message: "Checking Codex CLI, Node.js, runtime path, and available update."
+      message: "Checking Codex CLI, Node.js, runtime path, and available update.",
+      warnings: [],
+      errors: []
     };
     this.emitState();
 
@@ -1051,50 +1321,94 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       let nodePath = process.execPath;
       if (mode === "wsl") {
         const runtime = await executor.resolveWslCodexRuntime({
-          command: this.settings.codexBinaryPath
+          command: this.settings.codexBinaryPath,
+          timeoutMs: CODEX_READINESS_PROBE_TIMEOUT_MS
         });
         codexPath = runtime.resolvedCodexCommand ?? this.settings.codexBinaryPath;
         nodePath = runtime.resolvedNodeCommand ?? nodePath;
       } else {
-        codexPath = (await executor.resolveWslCommand({ command: this.settings.codexBinaryPath })).resolvedCommand ?? this.settings.codexBinaryPath;
-        nodePath = (await executor.resolveWslCommand({ command: "node" })).resolvedCommand ?? process.execPath;
+        const resolverCommand = process.platform === "win32" ? "where" : "which";
+        const resolveLocalPath = async (command: string, fallback: string): Promise<string> => {
+          try {
+            const result = await executor.execStructuredCommand({
+              command: resolverCommand,
+              args: [command],
+              timeoutMs: CODEX_READINESS_PROBE_TIMEOUT_MS
+            });
+            return result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? fallback;
+          } catch {
+            return fallback;
+          }
+        };
+        codexPath = await resolveLocalPath(this.settings.codexBinaryPath, this.settings.codexBinaryPath);
+        nodePath = await resolveLocalPath("node", process.execPath);
       }
 
       const codexVersion = await readInstalledCodexCliVersion(this.settings);
       const update = await this.checkCodexUpdate();
+      const updateWarning = update.status === "unavailable" && update.currentVersion
+        ? [`Latest Codex CLI version could not be determined. ${update.message}`]
+        : [];
+      const versionErrors = codexVersion ? [] : [update.message || "Codex CLI version command returned no parsable version."];
       this.codexReadiness = {
         checkedAt: nowIso(),
         executionMode: this.settings.executionMode,
         distroName: mode === "wsl" ? this.settings.distroName : undefined,
         codexBinaryPath: this.settings.codexBinaryPath,
+        codexCliExists: Boolean(codexVersion),
         codexPath,
         nodePath,
         codexVersion,
         latestCodexVersion: update.latestVersion,
         updateAvailable: update.updateAvailable,
-        updateCommand: update.updateCommand ?? buildCodexUpdateCommand(this.settings, process.platform),
+        updateCommand: update.updateCommand,
         status: update.updateAvailable ? "outdated" : codexVersion ? "ready" : "unavailable",
         message: update.updateAvailable
           ? update.message
-          : codexVersion
-            ? `Codex CLI ${codexVersion} is available at ${codexPath}.`
-            : "Codex CLI exists could not be verified."
+          : update.status === "unavailable" && codexVersion
+            ? `Codex CLI ${codexVersion} is available at ${codexPath}. ${update.message}`
+            : codexVersion
+              ? `Codex CLI ${codexVersion} is available at ${codexPath}.`
+              : "Codex CLI existence could not be verified.",
+        warnings: updateWarning,
+        errors: versionErrors
       };
     } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const message = `${reason} failed. ${detail}`;
       this.codexReadiness = {
         checkedAt: nowIso(),
         executionMode: this.settings.executionMode,
         distroName: mode === "wsl" ? this.settings.distroName : undefined,
         codexBinaryPath: this.settings.codexBinaryPath,
+        codexCliExists: false,
+        nodePath: mode === "wsl" ? undefined : process.execPath,
         updateAvailable: false,
         status: "unavailable",
-        message: `${reason} failed. ${error instanceof Error ? error.message : String(error)}`
+        message: `${message} Verify the Codex CLI is installed, confirm the configured binary path, and rerun readiness from Settings.`,
+        warnings: mode === "wsl"
+          ? [`WSL detection is timeout-bounded at ${CODEX_READINESS_PROBE_TIMEOUT_MS}ms. Confirm the distro is running and named "${this.settings.distroName}".`]
+          : [],
+        errors: [detail]
       };
       this.diagnostics.unshift(this.codexReadiness.message);
     }
 
     this.emitState();
     return this.codexReadiness;
+  }
+
+  getExecutionEnvironmentStatus(): ExecutionEnvironmentStatus {
+    const mode = resolveExecutionMode(this.settings, process.platform);
+    return {
+      checkedAt: this.codexReadiness.checkedAt ?? this.runtimeReadinessLastCheckedAt ?? nowIso(),
+      executionMode: this.settings.executionMode,
+      distroName: mode === "wsl" ? this.settings.distroName : undefined,
+      platform: process.platform,
+      mockMode: this.settings.mockMode,
+      safeMode: this.safeMode,
+      codexReadiness: this.codexReadiness
+    };
   }
 
   private startRuntimeReadinessCheck(reason: string): void {
@@ -1315,6 +1629,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ...defaults.ultimateGoal,
       ...workflow.ultimateGoal
     };
+    this.ensureGoalCharterForWorkflow(workflow);
     workflow.workflowCycle = {
       ...defaults.workflowCycle,
       ...workflow.workflowCycle
@@ -1363,6 +1678,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       : workflow.goalChecklist ?? [];
     workflow.taskMap ??= defaults.taskMap;
     workflow.workPackages ??= defaults.workPackages;
+    workflow.strategicPlans ??= defaults.strategicPlans;
+    workflow.plannerDecisions ??= defaults.plannerDecisions;
+    workflow.checklistChanges ??= defaults.checklistChanges;
+    workflow.cycleRetrospectives ??= defaults.cycleRetrospectives;
     record.userInputRequests ??= [];
     record.credentials = {
       ...defaultProjectCredentialsState(),
@@ -1383,6 +1702,57 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
     record.workflow = workflow;
     return workflow;
+  }
+
+  private ensureGoalCharterForWorkflow(workflow: ProjectWorkflowState): GoalCharter {
+    const acceptedGoal = hasConfirmedUltimateGoal(workflow.ultimateGoal) ? workflow.ultimateGoal : undefined;
+    const defaults = createDefaultGoalCharter(
+      acceptedGoal,
+      workflow.goalCharter?.createdAt ?? acceptedGoal?.confirmedAt ?? new Date(0).toISOString()
+    );
+    const existingStrategy = workflow.goalCharter?.autopilotStrategy;
+    const normalized = goalCharterSchema.parse({
+      ...defaults,
+      ...workflow.goalCharter,
+      originalUltimateGoal: {
+        ...defaults.originalUltimateGoal,
+        ...workflow.goalCharter?.originalUltimateGoal
+      },
+      currentEffectiveGoal: {
+        ...defaults.currentEffectiveGoal,
+        ...workflow.goalCharter?.currentEffectiveGoal
+      },
+      autopilotStrategy: {
+        ...defaults.autopilotStrategy,
+        ...existingStrategy,
+        visualPreferences: {
+          ...defaults.autopilotStrategy.visualPreferences,
+          ...existingStrategy?.visualPreferences
+        },
+        autonomyBudget: {
+          ...defaults.autopilotStrategy.autonomyBudget,
+          ...existingStrategy?.autonomyBudget
+        }
+      },
+      createdAt: workflow.goalCharter?.createdAt ?? defaults.createdAt,
+      updatedAt: workflow.goalCharter?.updatedAt ?? defaults.updatedAt
+    });
+
+    if (acceptedGoal && !hasMeaningfulUltimateGoal(normalized.originalUltimateGoal)) {
+      normalized.originalUltimateGoal = { ...acceptedGoal };
+    }
+    if (acceptedGoal && !hasMeaningfulUltimateGoal(normalized.currentEffectiveGoal)) {
+      normalized.currentEffectiveGoal = { ...acceptedGoal };
+    }
+    if (
+      hasConfirmedUltimateGoal(normalized.currentEffectiveGoal) &&
+      (!hasConfirmedUltimateGoal(workflow.ultimateGoal) || workflow.ultimateGoal.summary !== normalized.currentEffectiveGoal.summary)
+    ) {
+      workflow.ultimateGoal = { ...normalized.currentEffectiveGoal };
+    }
+
+    workflow.goalCharter = normalized;
+    return normalized;
   }
 
   private syncWorkflowSettings(workflow: ProjectWorkflowState): void {
@@ -2067,7 +2437,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       project.record.localState.workflowObjective
     );
     const autopilotRecommendation = nextAutopilotAction === "approve_recommendation"
-      ? pickAutopilotRecommendation(workflow.recommendations, workflow)
+      ? this.selectAutopilotRecommendation(project)
       : undefined;
     const autopilotPause = shouldAutopilotPause({
       workflow,
@@ -2078,6 +2448,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       projectAccessStatus: project.record.validation.projectAccess?.status ?? "unknown",
       nextAction: nextAutopilotAction,
       recommendation: autopilotRecommendation,
+      goalChangeRequiresApproval: this.plannerRequiresGoalApproval(workflow),
       previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
     }, autopilotPolicy);
     const preserveNoProgressPause =
@@ -2333,6 +2704,27 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }],
       { timestamp, ultimateGoal: workflow.ultimateGoal, cycleNumber: workflow.workflowCycle.cycleNumber }
     );
+    const cycleAgents = this.cycleAgents(project, workflow.workflowCycle.cycleNumber);
+    const completionChecklistChange: ChecklistChange = {
+      id: nanoid(),
+      action: "mark_complete",
+      checklistItemIds: [targetCheck.id],
+      title: targetCheck.title,
+      rationale: "The workflow cycle completed after validation/integration and produced direct evidence for the targeted goal check.",
+      sourceCycle: workflow.workflowCycle.cycleNumber,
+      sourceAgent: cycleAgents[0]?.id,
+      userApprovalStatus: "not_required",
+      confidence: 0.86,
+      risk: "low",
+      affectedGoalArea: workflow.ultimateGoal.summary,
+      linkedEvidence: [evidence],
+      linkedChangedFiles: workflow.approvedRecommendation?.relatedPaths ?? [],
+      linkedValidationCommands: unique(cycleAgents.flatMap((agent) => agent.commandLog.map((command) => command.command))).slice(0, 12),
+      linkedCycleIds: [workflow.workflowCycle.cycleNumber],
+      linkedAgentIds: cycleAgents.map((agent) => agent.id),
+      createdAt: timestamp
+    };
+    workflow.checklistChanges = [completionChecklistChange, ...workflow.checklistChanges].slice(0, 100);
     this.refreshWorkflowTaskMap(project, timestamp);
     this.recordWorkflowActivity(workflow, {
       source: "workflow",
@@ -2613,6 +3005,31 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.markCompletedCycleGoalCheckEvidence(project, completedAt);
     this.refreshUltimateGoalAssessment(project, completedAt);
     this.markWorkflowPreviewReady(project, completedAt);
+    const retrospective = buildCycleRetrospective({
+      workflow,
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      agents: this.cycleAgents(project, workflow.workflowCycle.cycleNumber),
+      plannerDecision: this.plannerDecisionForCycle(workflow, workflow.workflowCycle.cycleNumber),
+      nextRecommendedTasks: workflow.recommendations.slice(0, 4).map((recommendation) => recommendation.title),
+      shouldContinue: workflow.ultimateGoalCompletion?.state !== "goal_satisfied" && workflow.memory.knownOpenIssues.every((issue) => issue.status !== "open"),
+      now: completedAt
+    });
+    workflow.cycleRetrospectives = [
+      retrospective,
+      ...workflow.cycleRetrospectives.filter((entry) => entry.cycleNumber !== retrospective.cycleNumber)
+    ].slice(0, 50);
+    const latestSummary = workflow.memory.perCycleSummaries.find((summary) => summary.cycleNumber === workflow.workflowCycle.cycleNumber);
+    if (latestSummary) {
+      latestSummary.summary = compactText(
+        [
+          `Tried: ${retrospective.triedToDo}`,
+          retrospective.changedFiles.length ? `Changed ${retrospective.changedFiles.length} file${retrospective.changedFiles.length === 1 ? "" : "s"}` : "",
+          retrospective.passed.length ? `${retrospective.passed.length} validation signal${retrospective.passed.length === 1 ? "" : "s"} passed` : "",
+          retrospective.failed.length ? `${retrospective.failed.length} failure signal${retrospective.failed.length === 1 ? "" : "s"} recorded` : ""
+        ].filter(Boolean).join(". "),
+        700
+      );
+    }
     this.updateWorkflowStepProgress(workflow, "merge", {
       requiresUserInput: false,
       currentActivity: "Cycle complete",
@@ -2740,7 +3157,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const recommendation = action === "approve_recommendation"
-      ? pickAutopilotRecommendation(workflow.recommendations, workflow)
+      ? this.selectAutopilotRecommendation(project)
       : undefined;
     const pauseDecision = shouldAutopilotPause({
       workflow,
@@ -2751,6 +3168,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       projectAccessStatus: project.record.validation.projectAccess?.status ?? "unknown",
       nextAction: action,
       recommendation,
+      goalChangeRequiresApproval: this.plannerRequiresGoalApproval(workflow),
       previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
     }, autopilotPolicy);
     return !pauseDecision.shouldPause;
@@ -2881,6 +3299,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       scopedGoalId: workflow.scopedGoal?.id,
       recommendations: workflow.recommendations.map((recommendation) => recommendation.id).join(","),
       recommendationGeneratedAt: workflow.recommendationsGeneratedAt,
+      plannerDecision: this.plannerDecisionForCycle(workflow)?.id,
+      proposedGoalChanges: workflow.goalCharter.proposedGoalChanges.length,
+      checklistChanges: workflow.checklistChanges.length,
       repairStatus: workflow.repair.status,
       repairAttempts: workflow.repair.attemptCount,
       mergeStatus: workflow.stepProgress.merge.status,
@@ -2940,6 +3361,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.workflowAutomationInFlight.add(projectId);
     this.workflowAutomationQueued.delete(projectId);
     try {
+      const automationPassStartedAt = performance.now();
       let automaticActionsThisPass = 0;
       let completedCyclesThisPass = 0;
       let repeatedNoProgressCount = 0;
@@ -2964,7 +3386,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         }
         const workflow = this.ensureWorkflowState(project.record);
         const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
-        const maxActionsThisPass = Math.min(autopilotPolicy.maxAutomaticActionsPerPass, WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT);
+        const autonomyBudget = workflow.goalCharter.autopilotStrategy.autonomyBudget;
+        const maxActionsThisPass = Math.min(
+          autopilotPolicy.maxAutomaticActionsPerPass,
+          autonomyBudget.maxConsecutiveTasksWithoutUserReview,
+          WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT
+        );
         if (automaticActionsThisPass >= maxActionsThisPass) {
           this.updateAutopilotRuntimeStatus(project);
           await this.persistProjectUpdate(project, {
@@ -2974,14 +3401,37 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           });
           break;
         }
-        if (
-          autopilotPolicy.maxConsecutiveCycles !== undefined &&
-          completedCyclesThisPass >= autopilotPolicy.maxConsecutiveCycles
-        ) {
+        if (performance.now() - automationPassStartedAt >= autonomyBudget.maxMinutesBeforePause * 60_000) {
           project.record.localState.workflowPauseRequested = true;
           const pause = {
             reason: "max_consecutive_cycles" as const,
-            detail: `Autopilot reached the ${autopilotPolicy.maxConsecutiveCycles} cycle policy checkpoint.`,
+            detail: `Autopilot reached the ${autonomyBudget.maxMinutesBeforePause} minute strategy budget checkpoint.`,
+            highRiskPackageRequiresApproval: false
+          };
+          this.updateAutopilotRuntimeStatus(project, { pause });
+          this.recordAutopilotPause(workflow, pause.reason, pause.detail);
+          await this.persistProjectUpdate(project, {
+            save: "immediate",
+            emit: "coalesced",
+            reason: "workflow automation time budget"
+          });
+          break;
+        }
+        if (
+          completedCyclesThisPass >= autonomyBudget.maxCyclesBeforePause ||
+          (
+            autopilotPolicy.maxConsecutiveCycles !== undefined &&
+            completedCyclesThisPass >= autopilotPolicy.maxConsecutiveCycles
+          )
+        ) {
+          project.record.localState.workflowPauseRequested = true;
+          const maxCycleCheckpoint = Math.min(
+            autonomyBudget.maxCyclesBeforePause,
+            autopilotPolicy.maxConsecutiveCycles ?? autonomyBudget.maxCyclesBeforePause
+          );
+          const pause = {
+            reason: "max_consecutive_cycles" as const,
+            detail: `Autopilot reached the ${maxCycleCheckpoint} cycle strategy checkpoint.`,
             highRiskPackageRequiresApproval: false
           };
           this.updateAutopilotRuntimeStatus(project, { pause });
@@ -2990,6 +3440,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             save: "immediate",
             emit: "coalesced",
             reason: "workflow automation cycle limit"
+          });
+          break;
+        }
+        if (
+          autonomyBudget.stopWhenValidationFailsRepeatedly &&
+          workflow.repair.attemptCount > autonomyBudget.maxFailedRepairAttempts
+        ) {
+          project.record.localState.workflowPauseRequested = true;
+          const pause = {
+            reason: "repeated_failure" as const,
+            detail: `Autopilot reached the ${autonomyBudget.maxFailedRepairAttempts} failed repair attempt strategy budget.`,
+            highRiskPackageRequiresApproval: false
+          };
+          this.updateAutopilotRuntimeStatus(project, { pause });
+          this.recordAutopilotPause(workflow, pause.reason, pause.detail);
+          await this.persistProjectUpdate(project, {
+            save: "immediate",
+            emit: "coalesced",
+            reason: "workflow automation repair budget"
           });
           break;
         }
@@ -3002,7 +3471,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           project.record.localState.workflowObjective
         );
         const recommendation = action === "approve_recommendation"
-          ? pickAutopilotRecommendation(workflow.recommendations, workflow)
+          ? this.selectAutopilotRecommendation(project)
           : undefined;
         const pauseDecision = shouldAutopilotPause({
           workflow,
@@ -3013,6 +3482,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           projectAccessStatus: project.record.validation.projectAccess?.status ?? "unknown",
           nextAction: action,
           recommendation,
+          goalChangeRequiresApproval: this.plannerRequiresGoalApproval(workflow),
           previewReady: getWorkflowPreviewRequest(workflow).status === "ready"
         }, autopilotPolicy);
         this.updateAutopilotRuntimeStatus(project, {
@@ -3234,6 +3704,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.refreshWorkflowTaskMap(project);
     }
     this.syncWorkflowState(project);
+    const charter = this.ensureGoalCharterForWorkflow(workflow);
+    const proposal: GoalChangeRecord = {
+      id: charter.proposedGoalChanges.find((change) => change.source === "detected")?.id ?? nanoid(),
+      title: "Detected Ultimate Goal",
+      summary: normalizedDraft.summary,
+      rationale: "Auto-detected from repository overview, scan evidence, and existing project boundaries. It is a proposal until accepted.",
+      source: "detected",
+      proposedGoal: normalizedDraft,
+      fromGoalSummary: charter.currentEffectiveGoal.summary,
+      toGoalSummary: normalizedDraft.summary,
+      createdAt: nowIso()
+    };
+    charter.proposedGoalChanges = [
+      proposal,
+      ...charter.proposedGoalChanges.filter((change) => change.id !== proposal.id && change.source !== "detected")
+    ].slice(0, 20);
+    charter.updatedAt = nowIso();
+    workflow.goalCharter = charter;
     return normalizedDraft;
   }
 
@@ -3689,6 +4177,48 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : options?.detail
           ? compactText(agent.taskPrompt, 12_000)
           : compactText(agent.taskPrompt, 1_200),
+      changedFiles: agent.changedFiles.slice(0, options?.summaryOnly ? 12 : 80),
+      approvals: agent.approvals.slice(0, options?.summaryOnly ? 3 : 12).map((approval) => ({
+        ...approval,
+        summary: compactText(approval.summary, 300),
+        reason: approval.reason ? compactText(approval.reason, 400) : approval.reason,
+        command: approval.command ? compactText(approval.command, 1_000) : approval.command,
+        filePaths: approval.filePaths.slice(0, 20)
+      })),
+      integrityReport: agent.integrityReport
+        ? {
+          ...agent.integrityReport,
+          summary: compactText(agent.integrityReport.summary, 700),
+          checks: agent.integrityReport.checks.slice(0, 12).map((check) => ({
+            ...check,
+            command: compactText(check.command, 500),
+            outputSnippet: compactText(check.outputSnippet, 500)
+          })),
+          risks: agent.integrityReport.risks.slice(0, 12).map((risk) => compactText(risk, 400))
+        }
+        : agent.integrityReport,
+      mergeReport: agent.mergeReport
+        ? {
+          ...agent.mergeReport,
+          summary: compactText(agent.mergeReport.summary, 700),
+          mergedBranches: agent.mergeReport.mergedBranches.slice(0, 24),
+          conflicts: agent.mergeReport.conflicts.slice(0, 24).map((conflict) => compactText(conflict, 400))
+        }
+        : agent.mergeReport,
+      recommendationReport: agent.recommendationReport
+        ? {
+          ...agent.recommendationReport,
+          summary: compactText(agent.recommendationReport.summary, 700),
+          nextSteps: agent.recommendationReport.nextSteps.slice(0, 5).map((step) => ({
+            ...step,
+            title: compactText(step.title, 180),
+            summary: compactText(step.summary, 300),
+            rationale: compactText(step.rationale, 300),
+            expectedImpact: compactText(step.expectedImpact, 300),
+            relatedPaths: step.relatedPaths.slice(0, 12)
+          }))
+        }
+        : agent.recommendationReport,
       commandLog: agent.commandLog.slice(0, commandLimit).map((command) => ({
         ...command,
         command: command.command.length > RENDERER_COMMAND_TEXT_LIMIT
@@ -3706,12 +4236,30 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
   }
 
-  private compactRendererProjectRecord(record: LocalProjectRecord, options?: { inactive?: boolean }): LocalProjectRecord {
-    if (options?.inactive) {
+  private compactRendererProjectRecord(record: LocalProjectRecord, options?: { inactive?: boolean; summaryOnly?: boolean }): LocalProjectRecord {
+    if (options?.inactive || options?.summaryOnly) {
       const workflow = sanitizeWorkflowState(record.workflow, undefined, { renderer: true });
       return {
         ...record,
-        agents: [],
+        localState: {
+          ...record.localState,
+          selectedFile: record.localState.selectedFile ? compactText(record.localState.selectedFile, 500) : record.localState.selectedFile,
+          treeFilter: compactText(record.localState.treeFilter, 300)
+        },
+        interfaceCreation: record.interfaceCreation
+          ? {
+            ...record.interfaceCreation,
+            phase: compactText(record.interfaceCreation.phase, 300),
+            message: compactText(record.interfaceCreation.message, 600),
+            lastError: record.interfaceCreation.lastError ? compactText(record.interfaceCreation.lastError, 600) : record.interfaceCreation.lastError
+          }
+          : record.interfaceCreation,
+        overview: compactOverviewForRenderer(record.overview),
+        agents: options?.inactive
+          ? []
+          : this.sortAgentsForHistory(record.agents).slice(0, RENDERER_RECENT_AGENT_PREVIEW_LIMIT).map((agent) =>
+            this.compactRendererAgent(agent, { summaryOnly: true })
+          ),
         summaryCache: [],
         dependencies: [],
         credentials: {
@@ -3722,11 +4270,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         userInputRequests: record.userInputRequests.filter((request) => request.status === "pending").slice(0, 3),
         workflow: {
           ...workflow,
-          recommendations: [],
-          goalChecklist: [],
+          recommendations: options?.inactive ? [] : workflow.recommendations.slice(0, 3),
+          goalChecklist: options?.inactive ? [] : workflow.goalChecklist.slice(0, 12),
           activityLog: [],
           memory: {
-            ...record.workflow.memory,
+            ...workflow.memory,
             perCycleSummaries: [],
             lastAcceptedDecisions: [],
             knownOpenIssues: [],
@@ -3747,6 +4295,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     return {
       ...record,
+      localState: {
+        ...record.localState,
+        selectedFile: record.localState.selectedFile ? compactText(record.localState.selectedFile, 500) : record.localState.selectedFile,
+        treeFilter: compactText(record.localState.treeFilter, 300)
+      },
+      interfaceCreation: record.interfaceCreation
+        ? {
+          ...record.interfaceCreation,
+          phase: compactText(record.interfaceCreation.phase, 300),
+          message: compactText(record.interfaceCreation.message, 600),
+          lastError: record.interfaceCreation.lastError ? compactText(record.interfaceCreation.lastError, 600) : record.interfaceCreation.lastError
+        }
+        : record.interfaceCreation,
+      overview: compactOverviewForRenderer(record.overview),
       dependencies: record.dependencies.slice(0, RENDERER_REPOSITORY_DEPENDENCY_LIMIT),
       summaryCache: record.summaryCache.slice(0, RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT),
       agents: previewAgents.map((agent) => this.compactRendererAgent(agent, {
@@ -3782,7 +4344,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   getRendererState(): WorkbenchState {
-    return {
+    const state: WorkbenchState = {
       settings: this.settings,
       github: this.githubStatus,
       projects: [...this.projects.values()].map((project) => this.toRendererLoadedProjectView(project)),
@@ -3792,8 +4354,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       codexReadiness: this.codexReadiness,
       codexUpdate: this.codexUpdateCheck,
       runtimeReadiness: this.buildRuntimeReadinessReport(this.getActiveProject()),
-      diagnostics: [...this.diagnostics]
+      diagnostics: this.diagnostics.slice(0, 200).map((entry) => compactText(entry, 1_000))
     };
+    return this.capRendererStatePayload(state, "getRendererState");
   }
 
   getState(): WorkbenchState {
@@ -3913,7 +4476,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private async loadStoredProjects(): Promise<void> {
     const records = await this.storage.loadAllProjects();
-    for (const issue of this.storage.consumeLoadIssues()) {
+    const loadIssues = this.storage.consumeLoadIssues();
+    const quarantinedIssues = loadIssues.filter((issue) => issue.action === "quarantined");
+    if (quarantinedIssues.length > 0) {
+      this.diagnostics.unshift(
+        `${quarantinedIssues.length} saved project state file${quarantinedIssues.length === 1 ? "" : "s"} could not be loaded and ${quarantinedIssues.length === 1 ? "was" : "were"} quarantined. The app started with the remaining safe state; run npm run repair:state for a detailed repair report.`
+      );
+    }
+    for (const issue of loadIssues) {
       const destination = issue.quarantinePath ? ` -> ${issue.quarantinePath}` : "";
       this.diagnostics.unshift(`Saved state ${issue.action}: ${issue.statePath}${destination}. ${issue.message}`);
     }
@@ -4401,6 +4971,89 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     } as const;
   }
 
+  private getEffectiveRepositoryScanSettings(
+    project: Pick<LoadedProject, "record">,
+    mode: "normal" | "deep" = "normal",
+    settings?: RepositoryScanSettings
+  ): Required<RepositoryScanSettings> {
+    if (mode === "normal") {
+      return normalizeRepositoryScanSettings(undefined, REPOSITORY_DEFAULT_SCAN_SETTINGS);
+    }
+    return normalizeRepositoryScanSettings(settings ?? project.record.repositoryScanSettings, REPOSITORY_DEEP_SCAN_SETTINGS);
+  }
+
+  private buildRepositoryScanLimitsResponse(projectId: string, settings: RepositoryScanSettings): RepositoryScanLimitsResponse {
+    return {
+      projectId,
+      defaults: REPOSITORY_DEFAULT_SCAN_SETTINGS,
+      deepDefaults: REPOSITORY_DEEP_SCAN_SETTINGS,
+      hardMaximums: REPOSITORY_HARD_SCAN_SETTINGS,
+      settings,
+      effective: normalizeRepositoryScanSettings(settings, REPOSITORY_DEEP_SCAN_SETTINGS)
+    };
+  }
+
+  private annotateRepositoryScan(scan: RepoScanResult, mode: "normal" | "deep"): RepoScanResult {
+    scan.stats.scanMode = mode;
+    return scan;
+  }
+
+  private repositorySearchScope(stats?: ProjectStats): RepositorySearchResponse["searchScope"] {
+    return stats?.scanMode === "deep" ? "full_deep_index" : "indexed_files";
+  }
+
+  private repositoryScanRecoverySteps(errorMessage: string): string[] {
+    const steps = [
+      "Verify the repository folder still exists and is readable from the configured runtime.",
+      "Run Rescan Repository after closing tools that may be locking files.",
+      "Use Deep Scan only after the normal scan succeeds if the repository is very large."
+    ];
+    if (/\b(EACCES|EPERM|permission|access)\b/i.test(errorMessage)) {
+      steps.unshift("Check file permissions for the repository and excluded cache/build directories.");
+    }
+    if (/\b(ENOENT|not found|no such file)\b/i.test(errorMessage)) {
+      steps.unshift("Confirm the saved project path still points at the repository checkout.");
+    }
+    return steps;
+  }
+
+  private limitValueForTruncationReason(
+    stats: ProjectStats,
+    reason: NonNullable<ProjectStats["truncationReasons"]>[number]
+  ): number | undefined {
+    switch (reason) {
+      case "included_file_limit":
+        return stats.includedFileLimit;
+      case "included_directory_limit":
+        return stats.includedDirectoryLimit;
+      case "depth_limit":
+        return stats.maxDepth;
+      case "scan_duration_limit":
+        return stats.maxScanDurationMs;
+      case "manifest_file_size":
+        return stats.maxManifestFileSizeBytes;
+      case "excluded_path_record_limit":
+        return stats.excludedPathLimit;
+    }
+  }
+
+  private repositoryTruncationReasonLabel(reason: NonNullable<ProjectStats["truncationReasons"]>[number]): string {
+    switch (reason) {
+      case "included_file_limit":
+        return "Included file limit";
+      case "included_directory_limit":
+        return "Included folder limit";
+      case "depth_limit":
+        return "Maximum depth";
+      case "scan_duration_limit":
+        return "Scan duration";
+      case "manifest_file_size":
+        return "Manifest file size";
+      case "excluded_path_record_limit":
+        return "Excluded-path record limit";
+    }
+  }
+
   private async scanCurrentProject(project: Pick<LoadedProject, "record">): Promise<{
     projectRoot: string;
     projectHostPath: string;
@@ -4416,7 +5069,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const projectHostPath = gitMetadata.gitRoot
       ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, project.record.distroName)
       : project.record.hostPath;
-    const scan = await scanRepository(projectHostPath, gitMetadata, projectRoot);
+    const scan = this.annotateRepositoryScan(await scanRepository(projectHostPath, gitMetadata, projectRoot), "normal");
     const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
     const identity = createProjectIdentity({
       kind: scan.kind,
@@ -4505,6 +5158,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   getRepositoryScanStatus(projectId: string): RepositoryScanStatus {
     const project = this.findProject(projectId);
     const stats = project.record.stats;
+    const operation = this.repositoryScanOperations.get(projectId);
+    const failure = this.repositoryScanFailures.get(projectId);
     const skippedReasons = [
       stats?.excludedFiles || stats?.excludedFolders
         ? {
@@ -4529,24 +5184,50 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : undefined
     ].filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
     const truncated = Boolean(stats?.truncated);
+    const hasExclusions = Boolean((stats?.excludedFiles ?? 0) + (stats?.excludedFolders ?? 0) + (stats?.skippedManifestFiles ?? 0));
+    const truncationReasons = stats?.truncationReasons ?? [];
+    const limitHits = truncationReasons.map((reason) => ({
+      code: reason,
+      label: this.repositoryTruncationReasonLabel(reason),
+      limit: stats ? this.limitValueForTruncationReason(stats, reason) : undefined,
+      omittedFilesEstimate: stats?.omittedFilesEstimate,
+      omittedDirectoriesEstimate: stats?.omittedDirectoriesEstimate
+    }));
+    const status: RepositoryScanStatus["status"] = operation
+      ? "scanning"
+      : failure
+        ? "failed"
+        : !stats
+          ? "not_scanned"
+          : truncated
+            ? "truncated"
+            : hasExclusions || project.scan.files.length < (stats.includedFiles ?? 0)
+              ? "partially_indexed"
+              : "indexed";
     return {
       projectId,
-      status: !stats
-        ? "failed"
-        : truncated
-          ? "truncated"
-          : project.scan.files.length < (stats.includedFiles ?? 0)
-            ? "partially_indexed"
-            : "indexed",
-      lastScanAt: stats ? project.record.validation.lastValidatedAt ?? project.record.overview?.generatedAt ?? project.record.localState.lastOpenedAt : undefined,
+      status,
+      lastScanAt: stats ? stats.scanCompletedAt ?? project.record.validation.lastValidatedAt ?? project.record.overview?.generatedAt ?? project.record.localState.lastOpenedAt : undefined,
+      scanStartedAt: operation?.startedAt ?? stats?.scanStartedAt,
+      scanDurationMs: stats?.scanDurationMs,
+      lastError: failure?.message,
+      recoverySteps: failure?.recoverySteps ?? [],
       filesIndexed: stats?.includedFiles ?? project.scan.files.length,
       foldersIndexed: stats?.includedFolders ?? 0,
       filesTotal: stats?.totalFiles ?? project.scan.files.length,
       foldersTotal: stats?.totalFolders ?? 0,
+      includedFiles: stats?.includedFiles ?? project.scan.files.length,
+      includedFolders: stats?.includedFolders ?? 0,
+      excludedFiles: stats?.excludedFiles ?? 0,
+      excludedFolders: stats?.excludedFolders ?? 0,
+      indexedSizeBytes: stats?.includedSizeBytes ?? 0,
+      excludedSizeBytes: stats?.excludedSizeBytes,
       skippedCount: skippedReasons.reduce((sum, entry) => sum + entry.count, 0),
       skippedReasons,
       truncated,
       truncationReason: stats?.truncationReason,
+      truncationReasons,
+      limitHits,
       limits: {
         includedFileLimit: stats?.includedFileLimit,
         includedDirectoryLimit: stats?.includedDirectoryLimit,
@@ -4555,63 +5236,116 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         maxManifestFileSizeBytes: stats?.maxManifestFileSizeBytes,
         excludedPathLimit: stats?.excludedPathLimit
       },
-      searchScope: "full_index",
+      searchScope: this.repositorySearchScope(stats),
       excludedPaths: stats?.excludedPaths ?? [],
       deepScanAvailable: true
     };
   }
 
+  getRepositoryScanLimits(projectId: string): RepositoryScanLimitsResponse {
+    const project = this.findProject(projectId);
+    return this.buildRepositoryScanLimitsResponse(projectId, project.record.repositoryScanSettings ?? {});
+  }
+
+  async updateRepositoryScanSettings(projectId: string, settings: RepositoryScanSettings): Promise<RepositoryScanLimitsResponse> {
+    const project = this.findProject(projectId);
+    project.record.repositoryScanSettings = toStoredRepositoryScanSettings(settings);
+    await this.saveProject(project);
+    this.emitState();
+    return this.buildRepositoryScanLimitsResponse(projectId, project.record.repositoryScanSettings);
+  }
+
+  listExcludedPaths(
+    projectId: string,
+    options: { cursor?: string; limit?: number } = {}
+  ): RepositoryExcludedPathsResponse {
+    const project = this.findProject(projectId);
+    const stats = project.record.stats;
+    const limit = this.capRepositoryLimit(options.limit, REPOSITORY_CHILDREN_DEFAULT_LIMIT, REPOSITORY_CHILDREN_MAX_LIMIT);
+    const offset = this.repositoryPageOffset(options.cursor);
+    const paths = (stats?.excludedPaths ?? []).slice(offset, offset + limit);
+    const response: RepositoryExcludedPathsResponse = {
+      projectId,
+      total: stats?.excludedPaths.length ?? 0,
+      paths,
+      truncated: offset + limit < (stats?.excludedPaths.length ?? 0) || Boolean(stats?.excludedPathRecordsTruncated),
+      excludedFiles: stats?.excludedFiles ?? 0,
+      excludedFolders: stats?.excludedFolders ?? 0,
+      excludedSizeBytes: stats?.excludedSizeBytes
+    };
+    this.logRepositoryPayload("listExcludedPaths", response, `returned=${paths.length}, total=${response.total}`);
+    return response;
+  }
+
   async rescanRepository(projectId: string, options: RepositoryRescanOptions = {}): Promise<ProjectRepositorySummary> {
     const existing = this.findProject(projectId);
-    const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
-    const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
-    const projectRoot = gitMetadata.gitRoot ?? existing.record.projectRoot;
-    const projectHostPath = gitMetadata.gitRoot
-      ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
-      : existing.record.hostPath ?? existing.record.projectRoot;
-    const deep = options.mode === "deep";
-    const scan = await scanRepository(projectHostPath, gitMetadata, projectRoot, deep
-      ? {
-        maxIncludedFiles: DEFAULT_REPOSITORY_SCAN_LIMITS.maxIncludedFiles * 4,
-        maxIncludedDirectories: DEFAULT_REPOSITORY_SCAN_LIMITS.maxIncludedDirectories * 4,
-        maxDepth: DEFAULT_REPOSITORY_SCAN_LIMITS.maxDepth * 2,
-        maxManifestFileSizeBytes: DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes * 2,
-        maxScanDurationMs: DEFAULT_REPOSITORY_SCAN_LIMITS.maxScanDurationMs * 4,
-        maxExcludedPathRecords: DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords * 2
-      }
-      : undefined);
-    const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
-    existing.scan = scan;
-    existing.tree = scan.tree;
-    existing.gitMetadata = gitMetadata;
-    existing.record.projectRoot = projectRoot;
-    existing.record.hostPath = projectHostPath;
-    existing.record.identity = createProjectIdentity({
-      kind: scan.kind,
-      projectRoot,
-      projectName: path.basename(projectRoot),
-      repositoryName: path.basename(gitMetadata.gitRoot ?? projectRoot),
-      gitRoot: gitMetadata.gitRoot,
-      normalizedRemotes: gitMetadata.normalizedRemotes,
-      rootCommit: gitMetadata.rootCommit,
-      manifestSignature: scan.manifestHash,
-      treeSignature: scan.treeHash
+    const mode = options.mode === "deep" ? "deep" : "normal";
+    const effectiveSettings = this.getEffectiveRepositoryScanSettings(existing, mode, options.settings);
+    this.repositoryScanFailures.delete(projectId);
+    this.repositoryScanOperations.set(projectId, {
+      startedAt: nowIso(),
+      mode,
+      settings: effectiveSettings
     });
-    existing.record.validation = this.buildValidationSnapshot(scan, gitMetadata, projectAccess);
-    existing.record.stats = scan.stats;
-    existing.record.dependencies = scan.dependencies;
-    existing.record.overview = buildDeterministicOverview({
-      projectName: existing.record.identity.projectName,
-      explanation: hasMeaningfulRepositoryContent(scan)
-        ? scan.stats.explanation
-        : "This project folder is effectively empty and ready for initial setup.",
-      entryPoints: scan.stats.entryPoints,
-      manifestFiles: scan.stats.manifestFiles,
-      primaryManagers: scan.stats.primaryManagers
-    });
-    await this.saveProject(existing);
     this.emitState();
-    return this.getRepositorySummary(projectId);
+    const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
+    try {
+      const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
+      const projectRoot = gitMetadata.gitRoot ?? existing.record.projectRoot;
+      const projectHostPath = gitMetadata.gitRoot
+        ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
+        : existing.record.hostPath ?? existing.record.projectRoot;
+      const scan = this.annotateRepositoryScan(
+        await scanRepository(projectHostPath, gitMetadata, projectRoot, mode === "deep" ? effectiveSettings : undefined),
+        mode
+      );
+      const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
+      existing.scan = scan;
+      existing.tree = scan.tree;
+      existing.gitMetadata = gitMetadata;
+      existing.record.projectRoot = projectRoot;
+      existing.record.hostPath = projectHostPath;
+      existing.record.identity = createProjectIdentity({
+        kind: scan.kind,
+        projectRoot,
+        projectName: path.basename(projectRoot),
+        repositoryName: path.basename(gitMetadata.gitRoot ?? projectRoot),
+        gitRoot: gitMetadata.gitRoot,
+        normalizedRemotes: gitMetadata.normalizedRemotes,
+        rootCommit: gitMetadata.rootCommit,
+        manifestSignature: scan.manifestHash,
+        treeSignature: scan.treeHash
+      });
+      existing.record.validation = this.buildValidationSnapshot(scan, gitMetadata, projectAccess);
+      existing.record.stats = scan.stats;
+      existing.record.dependencies = scan.dependencies;
+      if (mode === "deep") {
+        existing.record.repositoryScanSettings = toStoredRepositoryScanSettings(effectiveSettings);
+      }
+      existing.record.overview = buildDeterministicOverview({
+        projectName: existing.record.identity.projectName,
+        explanation: hasMeaningfulRepositoryContent(scan)
+          ? scan.stats.explanation
+          : "This project folder is effectively empty and ready for initial setup.",
+        entryPoints: scan.stats.entryPoints,
+        manifestFiles: scan.stats.manifestFiles,
+        primaryManagers: scan.stats.primaryManagers
+      });
+      this.repositoryScanFailures.delete(projectId);
+      await this.saveProject(existing);
+      return this.getRepositorySummary(projectId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.repositoryScanFailures.set(projectId, {
+        failedAt: nowIso(),
+        message,
+        recoverySteps: this.repositoryScanRecoverySteps(message)
+      });
+      throw error;
+    } finally {
+      this.repositoryScanOperations.delete(projectId);
+      this.emitState();
+    }
   }
 
   getRepositoryView(projectId: string): ProjectRepositoryView {
@@ -4759,6 +5493,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       total: matchedFiles.length,
       results,
       truncated: matchedFiles.length > results.length,
+      searchScope: this.repositorySearchScope(project.record.stats),
+      resultCap: limit,
       scanTruncated: project.record.stats?.truncated,
       scanTruncationReason: project.record.stats?.truncationReason
     };
@@ -4766,12 +5502,52 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return response;
   }
 
-  private agentHistorySummary(agent: AgentState): AgentHistorySummary {
-    const errors = [
+  private agentApprovalSummaries(agent: AgentState): string[] {
+    return agent.approvals
+      .slice(0, 8)
+      .map((approval) => compactText(
+        [
+          approval.status,
+          approval.summary,
+          approval.reason,
+          approval.command
+        ].filter(Boolean).join(": "),
+        260
+      ));
+  }
+
+  private agentErrorSummaries(agent: AgentState): string[] {
+    const lifecycleError = agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected"
+      ? `${agent.name} ended as ${agent.status.replace(/_/g, " ")}${agent.disconnectedReason ? `: ${agent.disconnectedReason}` : ""}`
+      : undefined;
+    return unique([
+      lifecycleError,
+      ...agent.events
+        .filter((event) => event.status === "failed")
+        .map((event) => `${event.title}${event.detail ? `: ${event.detail}` : ""}`),
+      ...(agent.integrityReport?.checks
+        .filter((check) => check.status === "failed")
+        .map((check) => `${check.name} failed: ${check.command}`) ?? []),
+      ...(agent.integrityReport?.risks ?? []),
+      ...(agent.mergeReport?.conflicts.map((conflict) => `Merge conflict: ${conflict}`) ?? [])
+    ].filter((entry): entry is string => Boolean(entry?.trim())))
+      .slice(0, 10)
+      .map((entry) => compactText(entry, 300));
+  }
+
+  private agentErrorCount(agent: AgentState): number {
+    return [
       agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected" ? 1 : 0,
-      ...agent.events.map((event) => event.status === "failed" ? 1 : 0),
-      ...(agent.integrityReport?.checks.map((check) => check.status === "failed" ? 1 : 0) ?? [])
+      agent.events.filter((event) => event.status === "failed").length,
+      agent.integrityReport?.checks.filter((check) => check.status === "failed").length ?? 0,
+      agent.integrityReport?.risks.length ?? 0,
+      agent.mergeReport?.conflicts.length ?? 0
     ].reduce((sum, value) => sum + value, 0);
+  }
+
+  private agentHistorySummary(agent: AgentState): AgentHistorySummary {
+    const errorSummaries = this.agentErrorSummaries(agent);
+    const approvalSummaries = this.agentApprovalSummaries(agent);
     const commands = agent.commandLog
       .slice(0, 6)
       .map((command) => command.command);
@@ -4805,8 +5581,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       commands,
       approvalCount: agent.approvals.length,
       pendingApprovalCount: agent.approvals.filter((approval) => approval.status === "pending").length,
-      errorCount: errors,
-      tokenUsage: this.extractTokenUsage(agent)
+      approvalSummaries,
+      errorCount: this.agentErrorCount(agent),
+      errorSummaries,
+      tokenUsage: this.extractTokenUsage(agent),
+      transcriptAvailable: agent.outputReference?.transcriptAvailable ?? (agent.events.length > 0 || agent.commandLog.length > 0 || agent.approvals.length > 0),
+      fullOutputAvailable: agent.outputReference?.fullOutputAvailable ?? (agent.events.length > 0 || agent.commandLog.length > 0 || agent.approvals.length > 0)
     };
   }
 
@@ -4846,6 +5626,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         numbers.add(decision.cycleNumber);
       }
     }
+    for (const decision of project.record.workflow.plannerDecisions ?? []) {
+      numbers.add(decision.cycleNumber);
+    }
+    for (const retrospective of project.record.workflow.cycleRetrospectives ?? []) {
+      numbers.add(retrospective.cycleNumber);
+    }
+    for (const change of project.record.workflow.checklistChanges ?? []) {
+      numbers.add(change.sourceCycle);
+    }
     return [...numbers].filter((value) => Number.isFinite(value) && value > 0).sort((left, right) => right - left);
   }
 
@@ -4882,6 +5671,168 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return `${completedAgents} of ${agents.length} agent run${agents.length === 1 ? "" : "s"} completed. The cycle touched ${changedFiles} file${changedFiles === 1 ? "" : "s"} and recorded ${commandCount} command${commandCount === 1 ? "" : "s"}.`;
   }
 
+  private cycleChecklistTargets(project: LoadedProject, cycleNumber: number, agents: AgentState[]): string[] {
+    const workflow = project.record.workflow;
+    const agentIds = new Set(agents.map((agent) => agent.id));
+    const targetedIds = new Set<string>();
+    if (cycleNumber === workflow.workflowCycle.cycleNumber) {
+      for (const checkId of workflow.scopedGoal?.targetedCheckIds ?? []) {
+        targetedIds.add(checkId);
+      }
+      for (const checkId of workflow.approvedRecommendation?.targetedCheckIds ?? []) {
+        targetedIds.add(checkId);
+      }
+    }
+    return workflow.goalChecklist
+      .filter((check) =>
+        targetedIds.has(check.id) ||
+        check.introducedCycleNumber === cycleNumber ||
+        (check.ownerAgentId ? agentIds.has(check.ownerAgentId) : false) ||
+        (check.evidenceHistory ?? []).some((entry) => entry.ownerAgentId ? agentIds.has(entry.ownerAgentId) : false)
+      )
+      .slice(0, 12)
+      .map((check) => compactText(`${check.status.replace(/_/g, " ")}: ${check.title}`, 220));
+  }
+
+  private cycleValidationOutcome(agents: AgentState[], status: WorkflowCycleStatus | "manual"): string {
+    const integrityAgent = [...agents]
+      .filter((agent) => agent.integrityReport)
+      .sort((left, right) => toTime(right.completedAt ?? right.lastActivityAt ?? right.createdAt) - toTime(left.completedAt ?? left.lastActivityAt ?? left.createdAt))[0];
+    if (integrityAgent?.integrityReport) {
+      const checks = integrityAgent.integrityReport.checks;
+      const passed = checks.filter((check) => check.status === "passed").length;
+      const failed = checks.filter((check) => check.status === "failed").length;
+      const skipped = checks.filter((check) => check.status === "skipped").length;
+      const counts = checks.length ? ` (${passed} passed, ${failed} failed, ${skipped} skipped)` : "";
+      return compactText(`${integrityAgent.integrityReport.summary}${counts}`, 500);
+    }
+    if (status === "completed" || status === "merged") {
+      return "Cycle completed; no retained validation report is attached.";
+    }
+    if (agents.some((agent) => agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected")) {
+      return "Validation outcome needs review because at least one agent did not complete cleanly.";
+    }
+    return "No validation result recorded yet.";
+  }
+
+  private cyclePlannerDecision(project: LoadedProject, cycleNumber: number): PlannerDecision | undefined {
+    return project.record.workflow.plannerDecisions
+      .filter((decision) => decision.cycleNumber === cycleNumber)
+      .sort((left, right) => toTime(right.createdAt) - toTime(left.createdAt))[0];
+  }
+
+  private cycleChecklistChangeRecords(project: LoadedProject, cycleNumber: number): ChecklistChange[] {
+    return project.record.workflow.checklistChanges
+      .filter((change) => change.sourceCycle === cycleNumber)
+      .sort((left, right) => toTime(right.createdAt) - toTime(left.createdAt))
+      .slice(0, 24);
+  }
+
+  private cycleGoalChangeProposalRecords(project: LoadedProject, cycleNumber: number): GoalChangeProposal[] {
+    const workflow = project.record.workflow;
+    const cycleDecision = this.cyclePlannerDecision(project, cycleNumber);
+    const proposalIds = new Set(cycleDecision?.goalChangeProposalIds ?? []);
+    return [
+      ...workflow.strategicPlans
+        .filter((plan) => plan.cycleNumber === cycleNumber)
+        .flatMap((plan) => plan.proposedGoalChanges),
+      ...workflow.goalCharter.proposedGoalChanges.filter((proposal) => proposalIds.has(proposal.id)).map((proposal) => ({
+        ...proposal,
+        approvalStatus: "pending" as const,
+        requiredByStrategy: true,
+        risk: "high" as const,
+        affectedGoalArea: proposal.toGoalSummary ?? proposal.summary
+      }))
+    ]
+      .filter((proposal, index, list) => list.findIndex((entry) => entry.id === proposal.id) === index)
+      .slice(0, 12);
+  }
+
+  private cycleRetrospective(project: LoadedProject, cycleNumber: number, agents: AgentState[]): string | undefined {
+    const retained = project.record.workflow.cycleRetrospectives.find((entry) => entry.cycleNumber === cycleNumber);
+    if (retained) {
+      return compactText([
+        `Tried: ${retained.triedToDo}`,
+        `Why: ${retained.whyChosen}`,
+        retained.changedFiles.length ? `Changed files: ${retained.changedFiles.slice(0, 8).join(", ")}` : "",
+        retained.commandsRun.length ? `Commands/tests: ${retained.commandsRun.slice(0, 6).join("; ")}` : "",
+        retained.passed.length ? `Passed: ${retained.passed.slice(0, 4).join("; ")}` : "",
+        retained.failed.length ? `Failed: ${retained.failed.slice(0, 4).join("; ")}` : "",
+        retained.learned.length ? `Learned: ${retained.learned.slice(0, 4).join("; ")}` : "",
+        retained.checklistItemsAdvanced.length ? `Checklist advanced: ${retained.checklistItemsAdvanced.slice(0, 6).join("; ")}` : "",
+        retained.goalChecklistChangeRecommendation ? `Goal/checklist: ${retained.goalChecklistChangeRecommendation}` : "",
+        retained.nextRecommendedTasks.length ? `Next: ${retained.nextRecommendedTasks.slice(0, 4).join("; ")}` : "",
+        retained.shouldContinue ? "Autopilot recommendation: continue." : `Autopilot recommendation: pause${retained.pauseReason ? ` (${retained.pauseReason})` : ""}.`
+      ].filter(Boolean).join("\n"), 1_800);
+    }
+    const mergeSummary = [...agents]
+      .filter((agent) => agent.mergeReport?.summary)
+      .sort((left, right) => toTime(right.completedAt ?? right.lastActivityAt ?? right.createdAt) - toTime(left.completedAt ?? left.lastActivityAt ?? left.createdAt))[0]
+      ?.mergeReport?.summary;
+    if (mergeSummary) {
+      return compactText(mergeSummary, 500);
+    }
+    const memorySummary = project.record.workflow.memory.perCycleSummaries.find((summary) => summary.cycleNumber === cycleNumber)?.summary;
+    return memorySummary ? compactText(memorySummary, 500) : undefined;
+  }
+
+  private cycleNextStepRecommendation(project: LoadedProject, cycleNumber: number, agents: AgentState[]): string | undefined {
+    const workflow = project.record.workflow;
+    if (cycleNumber === workflow.workflowCycle.cycleNumber) {
+      const currentRecommendation = workflow.recommendations[0] ?? workflow.approvedRecommendation;
+      if (currentRecommendation) {
+        return compactText(`${currentRecommendation.title}: ${currentRecommendation.summary}`, 500);
+      }
+      if (workflow.ultimateGoalCompletion?.state === "goal_satisfied") {
+        return compactText(workflow.ultimateGoalCompletion.rationale, 500);
+      }
+    }
+    const recommendation = [...agents]
+      .filter((agent) => agent.recommendationReport?.nextSteps.length)
+      .sort((left, right) => toTime(right.completedAt ?? right.lastActivityAt ?? right.createdAt) - toTime(left.completedAt ?? left.lastActivityAt ?? left.createdAt))[0]
+      ?.recommendationReport?.nextSteps[0];
+    if (recommendation) {
+      return compactText(`${recommendation.title}: ${recommendation.summary}`, 500);
+    }
+    const openIssue = workflow.memory.knownOpenIssues.find((issue) => issue.status === "open");
+    return openIssue ? compactText(`${openIssue.title}: ${openIssue.detail}`, 500) : undefined;
+  }
+
+  private cycleSelectedTask(project: LoadedProject, cycleNumber: number, agents: AgentState[]): { selectedTask?: string; selectionReason?: string } {
+    const workflow = project.record.workflow;
+    const plannerDecision = this.cyclePlannerDecision(project, cycleNumber);
+    if (plannerDecision?.selectedTaskTitle || plannerDecision?.whySelected) {
+      return {
+        selectedTask: plannerDecision.selectedTaskTitle ? compactText(plannerDecision.selectedTaskTitle, 500) : undefined,
+        selectionReason: plannerDecision.whySelected ? compactText(plannerDecision.whySelected, 900) : undefined
+      };
+    }
+    if (cycleNumber === workflow.workflowCycle.cycleNumber) {
+      const task = workflow.scopedGoal?.summary ?? workflow.approvedRecommendation?.title;
+      const reason = workflow.approvedRecommendation?.rationale;
+      return {
+        selectedTask: task ? compactText(task, 500) : undefined,
+        selectionReason: reason ? compactText(reason, 700) : undefined
+      };
+    }
+    const decision = workflow.memory.lastAcceptedDecisions.find((entry) => entry.cycleNumber === cycleNumber && entry.kind !== "merge")
+      ?? workflow.memory.lastAcceptedDecisions.find((entry) => entry.cycleNumber === cycleNumber);
+    if (decision) {
+      return {
+        selectedTask: compactText(decision.title, 500),
+        selectionReason: compactText(decision.summary, 700)
+      };
+    }
+    const goalAgent = agents.find((agent) => agent.category === "goal" && agent.lastMessageSnippet);
+    if (goalAgent?.lastMessageSnippet) {
+      return {
+        selectedTask: compactText(goalAgent.lastMessageSnippet, 500),
+        selectionReason: undefined
+      };
+    }
+    return {};
+  }
+
   private workflowCycleSummary(project: LoadedProject, cycleNumber: number): WorkflowCycleSummaryView {
     const workflow = project.record.workflow;
     const agents = this.cycleAgents(project, cycleNumber);
@@ -4899,6 +5850,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const userInputRequests = project.record.userInputRequests.filter((request) =>
       agents.some((agent) => agent.id === request.agentId)
     );
+    const errorSummaries = unique(agents.flatMap((agent) => this.agentErrorSummaries(agent)))
+      .slice(0, 12)
+      .map((entry) => compactText(entry, 300));
+    const approvalSummaries = approvals
+      .slice(0, 12)
+      .map((approval) => compactText([approval.status, approval.summary, approval.reason, approval.command].filter(Boolean).join(": "), 260));
+    const userInputRequestSummaries = userInputRequests
+      .slice(0, 8)
+      .map((request) => compactText([request.status, request.title, request.description].filter(Boolean).join(": "), 260));
+    const selected = this.cycleSelectedTask(project, cycleNumber, agents);
+    const plannerDecision = this.cyclePlannerDecision(project, cycleNumber);
+    const checklistChangeRecords = this.cycleChecklistChangeRecords(project, cycleNumber);
+    const goalChangeProposalRecords = this.cycleGoalChangeProposalRecords(project, cycleNumber);
     const goalPrompt = cycle?.scopedGoalSummary
       ?? cycle?.approvedRecommendationTitle
       ?? workflow.memory.lastAcceptedDecisions.find((decision) => decision.cycleNumber === cycleNumber)?.title
@@ -4929,8 +5893,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ),
       hasApprovals: approvals.length > 0,
       hasUserInputRequests: userInputRequests.length > 0,
+      errorSummaries,
+      approvalSummaries,
+      userInputRequestSummaries,
       agentCount: agents.length,
-      summary: this.buildCycleHumanSummary(project, cycleNumber, agents, status)
+      summary: this.buildCycleHumanSummary(project, cycleNumber, agents, status),
+      selectedTask: selected.selectedTask,
+      selectionReason: selected.selectionReason,
+      strategySettingsUsed: plannerDecision?.strategySettingsUsed.slice(0, 12) ?? [],
+      checklistTargets: this.cycleChecklistTargets(project, cycleNumber, agents),
+      checklistChanges: checklistChangeRecords.map((change) =>
+        compactText(`${change.action.replace(/_/g, " ")}: ${change.title ?? change.affectedGoalArea}${change.userApprovalStatus !== "not_required" ? ` (${change.userApprovalStatus})` : ""}`, 260)
+      ),
+      goalChangeProposals: goalChangeProposalRecords.map((proposal) =>
+        compactText(`${proposal.approvalStatus}: ${proposal.title}: ${proposal.summary || proposal.toGoalSummary || ""}`, 260)
+      ),
+      validationOutcome: this.cycleValidationOutcome(agents, status),
+      retrospective: this.cycleRetrospective(project, cycleNumber, agents),
+      nextStepRecommendation: this.cycleNextStepRecommendation(project, cycleNumber, agents)
     };
   }
 
@@ -4960,6 +5940,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const summary = this.workflowCycleSummary(project, cycleNumber);
     const agents = this.cycleAgents(project, cycleNumber);
     const agentIds = new Set(agents.map((agent) => agent.id));
+    const plannerDecision = this.cyclePlannerDecision(project, cycleNumber);
+    const retrospectiveRecord = project.record.workflow.cycleRetrospectives.find((entry) => entry.cycleNumber === cycleNumber);
     return {
       ...summary,
       activity: project.record.workflow.activityLog
@@ -4970,7 +5952,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         .slice(0, 24),
       decisions: project.record.workflow.memory.lastAcceptedDecisions
         .filter((decision) => decision.cycleNumber === cycleNumber)
-        .slice(0, 24)
+        .slice(0, 24),
+      plannerDecision,
+      retrospectiveRecord,
+      checklistChangeRecords: this.cycleChecklistChangeRecords(project, cycleNumber),
+      goalChangeProposalRecords: this.cycleGoalChangeProposalRecords(project, cycleNumber)
     };
   }
 
@@ -5054,6 +6040,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   async getAgentFullOutput(projectId: string, agentId: string): Promise<AgentFullOutputResponse> {
+    const project = this.findProject(projectId);
+    const agent = project.record.agents.find((entry) => entry.id === agentId);
+    if (!agent) {
+      throw new Error(`Unknown agent: ${agentId}`);
+    }
+    const storedOutput = await this.storage.getAgentFullOutput(projectId, agentId);
+    if (storedOutput !== null) {
+      return {
+        projectId,
+        agentId,
+        agentName: agent.name,
+        generatedAt: nowIso(),
+        output: storedOutput,
+        fromSidecar: true
+      };
+    }
     const transcript = await this.getAgentTranscript(projectId, agentId);
     const output = transcript.entries
       .map((entry) => {
@@ -5206,7 +6208,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const projectHostPath = gitMetadata.gitRoot
       ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, resolvedPath.distroName)
       : resolvedPath.hostPath;
-    const scan = await scanRepository(projectHostPath, gitMetadata, projectRoot);
+    const scan = this.annotateRepositoryScan(await scanRepository(projectHostPath, gitMetadata, projectRoot), "normal");
     const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
     const identity = createProjectIdentity({
       kind: scan.kind,
@@ -5279,7 +6281,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const projectHostPath = gitMetadata.gitRoot
       ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
       : existing.record.hostPath;
-    const scan = await scanRepository(projectHostPath, gitMetadata, projectRoot);
+    const scan = this.annotateRepositoryScan(await scanRepository(projectHostPath, gitMetadata, projectRoot), "normal");
     const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
     const identity = createProjectIdentity({
       kind: scan.kind,
@@ -5871,7 +6873,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         command: entry.command.length > 8_000
           ? `${entry.command.slice(0, 8_000).trimEnd()}...[truncated ${entry.command.length - 8_000} chars]`
           : entry.command,
-        output: entry.output.length > 12_000 ? entry.output.slice(-12_000) : entry.output
+        output: entry.output.length > 2_000 ? entry.output.slice(-2_000) : entry.output
       }));
     }
   }
@@ -5956,11 +6958,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       },
       scan:
         this.pendingLoad?.scan ??
-        (await scanRepository(
-          loadResult.projectHostPath,
-          await readGitMetadata(loadResult.projectRoot, this.getRuntimeSettings(loadResult.resolvedPath.distroName)),
-          loadResult.projectRoot
-        )),
+        this.annotateRepositoryScan(
+          await scanRepository(
+            loadResult.projectHostPath,
+            await readGitMetadata(loadResult.projectRoot, this.getRuntimeSettings(loadResult.resolvedPath.distroName)),
+            loadResult.projectRoot
+          ),
+          "normal"
+        ),
       gitMetadata:
         this.pendingLoad?.gitMetadata ??
         (await readGitMetadata(loadResult.projectRoot, this.getRuntimeSettings(loadResult.resolvedPath.distroName)))
@@ -6555,6 +7560,407 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
   }
 
+  getGoalCharter(projectId: string): GoalCharter {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    return workflow.goalCharter;
+  }
+
+  async updateGoalCharter(projectId: string, patch: Partial<GoalCharter>): Promise<GoalCharter> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const previousCharter = this.ensureGoalCharterForWorkflow(workflow);
+    const previousCurrentGoal = previousCharter.currentEffectiveGoal;
+    const originalGoal = hasMeaningfulUltimateGoal(previousCharter.originalUltimateGoal)
+      ? previousCharter.originalUltimateGoal
+      : patch.originalUltimateGoal;
+    const currentEffectiveGoal = patch.currentEffectiveGoal
+      ? ultimateGoalSchema.parse({
+        ...previousCharter.currentEffectiveGoal,
+        ...patch.currentEffectiveGoal,
+        source: patch.currentEffectiveGoal.source ?? "user",
+        confirmedAt: patch.currentEffectiveGoal.confirmedAt ?? previousCharter.currentEffectiveGoal.confirmedAt ?? nowIso(),
+        lastUpdatedAt: nowIso()
+      })
+      : previousCharter.currentEffectiveGoal;
+    const merged = goalCharterSchema.parse({
+      ...previousCharter,
+      ...patch,
+      originalUltimateGoal: originalGoal
+        ? {
+          ...previousCharter.originalUltimateGoal,
+          ...originalGoal
+        }
+        : previousCharter.originalUltimateGoal,
+      currentEffectiveGoal,
+      autopilotStrategy: patch.autopilotStrategy
+        ? autopilotStrategySchema.parse({
+          ...previousCharter.autopilotStrategy,
+          ...patch.autopilotStrategy,
+          visualPreferences: {
+            ...previousCharter.autopilotStrategy.visualPreferences,
+            ...patch.autopilotStrategy.visualPreferences
+          },
+          autonomyBudget: {
+            ...previousCharter.autopilotStrategy.autonomyBudget,
+            ...patch.autopilotStrategy.autonomyBudget
+          }
+        })
+        : previousCharter.autopilotStrategy,
+      updatedAt: nowIso()
+    });
+
+    if (hasMeaningfulUltimateGoal(previousCharter.originalUltimateGoal)) {
+      merged.originalUltimateGoal = previousCharter.originalUltimateGoal;
+    } else if (hasMeaningfulUltimateGoal(currentEffectiveGoal)) {
+      merged.originalUltimateGoal = currentEffectiveGoal;
+    }
+
+    if (patch.currentEffectiveGoal && this.goalChanged(previousCurrentGoal, currentEffectiveGoal)) {
+      workflow.ultimateGoal = currentEffectiveGoal;
+      merged.acceptedGoalChanges = this.addGoalChangeRecord(merged.acceptedGoalChanges, {
+        title: "Updated Current Effective Goal",
+        summary: currentEffectiveGoal.summary,
+        rationale: "The user edited and saved the Current Effective Goal.",
+        source: "user",
+        proposedGoal: currentEffectiveGoal,
+        fromGoalSummary: previousCurrentGoal.summary,
+        toGoalSummary: currentEffectiveGoal.summary,
+        decisionNotes: "Accepted by direct user edit."
+      });
+      workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(currentEffectiveGoal, workflow.goalChecklist);
+      this.refreshWorkflowTaskMap(project);
+      workflow.ultimateGoalProgress = undefined;
+      workflow.ultimateGoalCompletion = undefined;
+    }
+
+    if (
+      patch.proposedGoalChanges !== undefined &&
+      !merged.proposedGoalChanges.some((change) => change.source === "detected" && change.proposedGoal)
+    ) {
+      workflow.ultimateGoalDraft = undefined;
+      if (!workflow.ultimateGoal.confirmedAt && workflow.ultimateGoal.source === "detected") {
+        workflow.ultimateGoal = defaultProjectWorkflowState().ultimateGoal;
+      }
+    }
+
+    workflow.goalCharter = merged;
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: false,
+      reason: "goal charter updated"
+    });
+    return workflow.goalCharter;
+  }
+
+  getAutopilotStrategy(projectId: string): AutopilotStrategy {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    return workflow.goalCharter.autopilotStrategy;
+  }
+
+  async updateAutopilotStrategy(projectId: string, strategy: AutopilotStrategy): Promise<AutopilotStrategy> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    workflow.goalCharter.autopilotStrategy = autopilotStrategySchema.parse(strategy);
+    workflow.goalCharter.updatedAt = nowIso();
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "completed",
+      title: "Autopilot strategy updated",
+      detail: `${workflow.goalCharter.autopilotStrategy.presetId} · fidelity ${workflow.goalCharter.autopilotStrategy.goalRestrictiveness}`,
+      stepId: getWorkflowActiveStepId(workflow)
+    });
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: false,
+      reason: "autopilot strategy updated"
+    });
+    return workflow.goalCharter.autopilotStrategy;
+  }
+
+  listAutopilotPresets(): AutopilotPreset[] {
+    return buildAutopilotPresets();
+  }
+
+  generateStrategicPlan(projectId: string) {
+    const project = this.findProject(projectId);
+    this.refreshUltimateGoalAssessmentIfChanged(project);
+    const workflow = this.ensureWorkflowState(project.record);
+    this.refreshWorkflowTaskMap(project);
+    const context = this.buildWorkflowRecommendationContext(project);
+    const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
+    const recommendations = (workflow.recommendations.length
+      ? workflow.recommendations
+      : buildWorkflowRecommendations(context)
+        .map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
+        .filter((entry): entry is ProjectWorkflowState["recommendations"][number] => Boolean(entry))
+        .map((entry, index) => ({ ...entry, rank: index + 1 }))
+    );
+    const plan = buildStrategicPlan(this.collectStrategicPlannerInput(project, recommendations, context));
+    const decision = decisionFromStrategicPlan(plan);
+    workflow.strategicPlans = [plan, ...workflow.strategicPlans].slice(0, 30);
+    workflow.plannerDecisions = [decision, ...workflow.plannerDecisions].slice(0, 50);
+    workflow.checklistChanges = [
+      ...plan.proposedChecklistChanges,
+      ...workflow.checklistChanges.filter((change) => !plan.proposedChecklistChanges.some((entry) => entry.id === change.id))
+    ].slice(0, 100);
+    if (plan.proposedGoalChanges.length > 0) {
+      const charter = this.ensureGoalCharterForWorkflow(workflow);
+      charter.proposedGoalChanges = [
+        ...plan.proposedGoalChanges,
+        ...charter.proposedGoalChanges.filter((proposal) => !plan.proposedGoalChanges.some((entry) => entry.id === proposal.id))
+      ].slice(0, 50);
+      charter.updatedAt = nowIso();
+    }
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: plan.continueRecommendation === "continue" ? "completed" : "waiting",
+      title: "Strategic plan generated",
+      detail: plan.plannerSummary,
+      stepId: "recommendation"
+    });
+    this.syncWorkflowState(project);
+    void this.persistProjectUpdate(project, {
+      save: "deferred",
+      emit: "coalesced",
+      automate: false,
+      reason: "strategic plan generated"
+    });
+    return plan;
+  }
+
+  selectNextWorkPackage(projectId: string): PlannerDecision {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const existing = this.plannerDecisionForCycle(workflow);
+    if (existing) {
+      return existing;
+    }
+    this.generateStrategicPlan(projectId);
+    return this.plannerDecisionForCycle(workflow) ?? {
+      id: nanoid(),
+      planId: "none",
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      whySelected: "No planner decision is available.",
+      score: 0,
+      scoreBreakdown: {},
+      strategySettingsUsed: [],
+      targetedChecklistIds: [],
+      expectedFiles: [],
+      expectedValidationCommands: [],
+      approvalRequired: false,
+      goalChangeProposalIds: [],
+      checklistChangeIds: [],
+      visualDesignImpact: false,
+      createdAt: nowIso()
+    };
+  }
+
+  async proposeGoalChange(projectId: string, proposal: GoalChangeRecord): Promise<GoalCharter> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const charter = this.ensureGoalCharterForWorkflow(workflow);
+    const normalized: GoalChangeRecord = {
+      ...proposal,
+      id: proposal.id || nanoid(),
+      source: proposal.source ?? "planner",
+      fromGoalSummary: proposal.fromGoalSummary ?? charter.currentEffectiveGoal.summary,
+      toGoalSummary: proposal.toGoalSummary ?? proposal.proposedGoal?.summary ?? proposal.summary,
+      createdAt: proposal.createdAt ?? nowIso()
+    };
+    charter.proposedGoalChanges = [
+      normalized,
+      ...charter.proposedGoalChanges.filter((entry) => entry.id !== normalized.id)
+    ].slice(0, 50);
+    charter.updatedAt = nowIso();
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: "Goal change proposed",
+      detail: normalized.title,
+      stepId: "recommendation"
+    });
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: false,
+      reason: "goal change proposed"
+    });
+    return charter;
+  }
+
+  async acceptGoalChange(projectId: string, proposalId: string): Promise<GoalCharter> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const charter = this.ensureGoalCharterForWorkflow(workflow);
+    const proposal = charter.proposedGoalChanges.find((entry) => entry.id === proposalId);
+    if (!proposal) {
+      throw new Error(`Unknown goal change proposal: ${proposalId}`);
+    }
+    if (proposal.proposedGoal) {
+      await this.updateUltimateGoal(projectId, proposal.proposedGoal, true);
+      return this.getGoalCharter(projectId);
+    }
+    charter.acceptedGoalChanges = [
+      {
+        ...proposal,
+        decidedAt: nowIso(),
+        decisionNotes: "Accepted without changing the Current Effective Goal text."
+      },
+      ...charter.acceptedGoalChanges
+    ].slice(0, 50);
+    charter.proposedGoalChanges = charter.proposedGoalChanges.filter((entry) => entry.id !== proposalId);
+    charter.updatedAt = nowIso();
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: false,
+      reason: "goal change accepted"
+    });
+    return charter;
+  }
+
+  async rejectGoalChange(projectId: string, proposalId: string, decisionNotes?: string): Promise<GoalCharter> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const charter = this.ensureGoalCharterForWorkflow(workflow);
+    const proposal = charter.proposedGoalChanges.find((entry) => entry.id === proposalId);
+    if (!proposal) {
+      throw new Error(`Unknown goal change proposal: ${proposalId}`);
+    }
+    charter.rejectedGoalChanges = [
+      {
+        ...proposal,
+        decidedAt: nowIso(),
+        decisionNotes: decisionNotes ?? "Rejected by the user."
+      },
+      ...charter.rejectedGoalChanges
+    ].slice(0, 50);
+    charter.proposedGoalChanges = charter.proposedGoalChanges.filter((entry) => entry.id !== proposalId);
+    charter.updatedAt = nowIso();
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "completed",
+      title: "Goal change rejected",
+      detail: proposal.title,
+      stepId: "recommendation"
+    });
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      automate: false,
+      reason: "goal change rejected"
+    });
+    return charter;
+  }
+
+  listChecklistChanges(projectId: string): ChecklistChange[] {
+    return this.ensureWorkflowState(this.findProject(projectId).record).checklistChanges;
+  }
+
+  getPlannerDecision(projectId: string, cycleId: string): PlannerDecision | undefined {
+    const project = this.findProject(projectId);
+    const cycleNumber = Number.parseInt(cycleId, 10);
+    if (!Number.isFinite(cycleNumber) || cycleNumber <= 0) {
+      throw new Error(`Unknown workflow cycle: ${cycleId}`);
+    }
+    return this.cyclePlannerDecision(project, cycleNumber);
+  }
+
+  getCycleRetrospective(projectId: string, cycleId: string): CycleRetrospective | undefined {
+    const project = this.findProject(projectId);
+    const cycleNumber = Number.parseInt(cycleId, 10);
+    if (!Number.isFinite(cycleNumber) || cycleNumber <= 0) {
+      throw new Error(`Unknown workflow cycle: ${cycleId}`);
+    }
+    return project.record.workflow.cycleRetrospectives.find((entry) => entry.cycleNumber === cycleNumber);
+  }
+
+  private goalChanged(left: UltimateGoal, right: UltimateGoal): boolean {
+    return JSON.stringify({
+      summary: left.summary,
+      detailedIntent: left.detailedIntent,
+      successCriteria: left.successCriteria,
+      constraints: left.constraints,
+      nonGoals: left.nonGoals,
+      targetAudience: left.targetAudience,
+      qualityBar: left.qualityBar
+    }) !== JSON.stringify({
+      summary: right.summary,
+      detailedIntent: right.detailedIntent,
+      successCriteria: right.successCriteria,
+      constraints: right.constraints,
+      nonGoals: right.nonGoals,
+      targetAudience: right.targetAudience,
+      qualityBar: right.qualityBar
+    });
+  }
+
+  private addGoalChangeRecord(
+    records: GoalChangeRecord[],
+    input: Omit<GoalChangeRecord, "id" | "createdAt" | "decidedAt">
+  ): GoalChangeRecord[] {
+    const now = nowIso();
+    return [
+      {
+        id: nanoid(),
+        createdAt: now,
+        decidedAt: now,
+        ...input
+      },
+      ...records
+    ].slice(0, 50);
+  }
+
+  private applyConfirmedGoalToCharter(workflow: ProjectWorkflowState, goal: UltimateGoal): void {
+    const charter = this.ensureGoalCharterForWorkflow(workflow);
+    const previousCurrent = charter.currentEffectiveGoal;
+    const originalWasSet = hasMeaningfulUltimateGoal(charter.originalUltimateGoal);
+    const matchingProposal = charter.proposedGoalChanges.find((change) =>
+      change.proposedGoal && this.goalChanged(change.proposedGoal, goal) === false
+    );
+
+    if (!originalWasSet) {
+      charter.originalUltimateGoal = goal;
+      charter.createdAt = charter.createdAt === new Date(0).toISOString() ? nowIso() : charter.createdAt;
+    }
+    charter.currentEffectiveGoal = goal;
+    charter.nonNegotiableRequirements = charter.nonNegotiableRequirements.length
+      ? charter.nonNegotiableRequirements
+      : [...goal.successCriteria];
+    charter.userConstraints = charter.userConstraints.length ? charter.userConstraints : [...goal.constraints];
+    charter.explicitNonGoals = charter.explicitNonGoals.length ? charter.explicitNonGoals : [...goal.nonGoals];
+    charter.definitionOfDone = charter.definitionOfDone.length ? charter.definitionOfDone : [...goal.successCriteria];
+
+    if (matchingProposal) {
+      charter.acceptedGoalChanges = [
+        {
+          ...matchingProposal,
+          decidedAt: nowIso(),
+          decisionNotes: "Accepted as the Current Effective Goal."
+        },
+        ...charter.acceptedGoalChanges
+      ].slice(0, 50);
+      charter.proposedGoalChanges = charter.proposedGoalChanges.filter((change) => change.id !== matchingProposal.id);
+    } else if (originalWasSet && this.goalChanged(previousCurrent, goal)) {
+      charter.acceptedGoalChanges = this.addGoalChangeRecord(charter.acceptedGoalChanges, {
+        title: "Updated Current Effective Goal",
+        summary: goal.summary,
+        rationale: "The user confirmed an updated Ultimate Goal.",
+        source: "user",
+        proposedGoal: goal,
+        fromGoalSummary: previousCurrent.summary,
+        toGoalSummary: goal.summary,
+        decisionNotes: "Accepted by direct user confirmation."
+      });
+    }
+    charter.updatedAt = nowIso();
+  }
+
   async updateUltimateGoal(
     projectId: string,
     goal: Omit<UltimateGoal, "confirmedAt" | "lastUpdatedAt">,
@@ -6570,6 +7976,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
 
     workflow.ultimateGoal = updatedGoal;
+    if (confirm) {
+      this.applyConfirmedGoalToCharter(workflow, updatedGoal);
+    } else {
+      workflow.goalCharter = this.ensureGoalCharterForWorkflow(workflow);
+      workflow.goalCharter.updatedAt = nowIso();
+    }
     workflow.goalChecklist = buildGoalChecklistFromUltimateGoal(updatedGoal, workflow.goalChecklist);
     this.refreshWorkflowTaskMap(project);
     workflow.ultimateGoalProgress = undefined;
@@ -7187,6 +8599,175 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }));
   }
 
+  private strategicValidationCommands(project: LoadedProject): string[] {
+    const managers = project.scan.stats.primaryManagers.map((manager) => manager.toLowerCase());
+    if (managers.includes("npm") || project.scan.stats.manifestFiles.some((file) => file.endsWith("package.json"))) {
+      return ["npm run typecheck", "npm run lint", "npm test", "npm run build"];
+    }
+    if (managers.includes("python") || project.scan.stats.manifestFiles.some((file) => /pyproject\.toml|requirements\.txt$/i.test(file))) {
+      return ["python -m pytest"];
+    }
+    return ["Run the project-supported deterministic verification commands"];
+  }
+
+  private collectStrategicPlannerInput(
+    project: LoadedProject,
+    recommendations: ProjectWorkflowState["recommendations"],
+    context: WorkflowRecommendationContext,
+    options: { timestamp?: string; sourceAgentId?: string } = {}
+  ): StrategicPlannerInput {
+    const workflow = this.ensureWorkflowState(project.record);
+    const recentAgents = project.record.agents
+      .filter((agent) => agent.category !== "manual")
+      .slice()
+      .sort((left, right) => toTime(right.lastActivityAt ?? right.completedAt ?? right.createdAt) - toTime(left.lastActivityAt ?? left.completedAt ?? left.createdAt))
+      .slice(0, 8);
+    const failedCommands = unique(recentAgents.flatMap((agent) =>
+      agent.commandLog
+        .filter((command) => command.status === "failed" || (typeof command.exitCode === "number" && command.exitCode !== 0))
+        .map((command) => command.command)
+    ));
+    const changedFiles = unique(recentAgents.flatMap((agent) => agent.changedFiles));
+    const recentAgentOutputs = unique(recentAgents.map((agent) =>
+      agent.recommendationReport?.summary ??
+      agent.integrityReport?.summary ??
+      agent.mergeReport?.summary ??
+      agent.lastMessageSnippet
+    ).filter((entry): entry is string => Boolean(entry?.trim()))).map((entry) => compactText(entry, 300));
+    const architectureNotes = unique([
+      project.record.overview?.architecture,
+      project.scan.stats.explanation,
+      ...project.scan.stats.entryPoints.slice(0, 6),
+      ...(project.record.overview?.importantFiles.slice(0, 6) ?? [])
+    ].filter((entry): entry is string => Boolean(entry?.trim()))).map((entry) => compactText(entry, 300));
+    return {
+      projectId: project.record.id,
+      workflow,
+      recommendations,
+      workPackages: workflow.workPackages,
+      isVisualProject: isVisualProject(context),
+      repoScanStatus: `${project.scan.kind} scan with ${project.scan.files.length} indexed file${project.scan.files.length === 1 ? "" : "s"} and entry points ${project.scan.stats.entryPoints.slice(0, 4).join(", ") || "none"}.`,
+      validationCommands: this.strategicValidationCommands(project),
+      failedCommands,
+      changedFiles,
+      openBlockers: workflow.memory.knownOpenIssues.filter((issue) => issue.status === "open").map((issue) => issue.title),
+      userFeedback: workflow.activityLog
+        .filter((event) => event.source === "approval" || event.source === "workflow")
+        .slice(0, 6)
+        .map((event) => compactText(`${event.title}${event.detail ? `: ${event.detail}` : ""}`, 240)),
+      recentAgentOutputs,
+      architectureNotes,
+      sourceAgentId: options.sourceAgentId,
+      autopilotPolicy: resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled),
+      autopilotEnabled: project.record.localState.autopilotEnabled,
+      now: options.timestamp
+    };
+  }
+
+  private applyStrategicPlannerToRecommendations(
+    project: LoadedProject,
+    recommendations: ProjectWorkflowState["recommendations"],
+    context: WorkflowRecommendationContext,
+    options: { timestamp?: string; sourceAgentId?: string } = {}
+  ): ProjectWorkflowState["recommendations"] {
+    const workflow = this.ensureWorkflowState(project.record);
+    if (recommendations.length === 0) {
+      return recommendations;
+    }
+    const plan = buildStrategicPlan(this.collectStrategicPlannerInput(project, recommendations, context, options));
+    const decision = decisionFromStrategicPlan(plan);
+    const recommendationIds = new Set(recommendations.map((recommendation) => recommendation.id));
+    const plannerGeneratedRecommendations: ProjectWorkflowState["recommendations"] = plan.candidateTasks
+      .filter((candidate) =>
+        candidate.recommendationId &&
+        !recommendationIds.has(candidate.recommendationId) &&
+        candidate.kind === "visual_polish"
+      )
+      .map((candidate, index) => ({
+        id: candidate.recommendationId ?? candidate.id,
+        rank: recommendations.length + index + 1,
+        title: candidate.title,
+        summary: candidate.summary,
+        rationale: candidate.whyNext,
+        expectedImpact: candidate.expectedChecklistImpact,
+        priority: "high" as const,
+        confidence: candidate.confidence,
+        estimatedScope: candidate.shouldSplit ? "medium" as const : "small" as const,
+        riskLevel: candidate.riskLevel,
+        relatedPaths: candidate.expectedFiles,
+        targetedCheckIds: candidate.targetedCheckIds.length ? candidate.targetedCheckIds : undefined
+      }));
+    const rankedRecommendations = rankRecommendationsByStrategicPlan([...recommendations, ...plannerGeneratedRecommendations], plan);
+    const existingPlanIds = new Set(workflow.strategicPlans.map((entry) => entry.id));
+    if (!existingPlanIds.has(plan.id)) {
+      workflow.strategicPlans = [plan, ...workflow.strategicPlans].slice(0, 30);
+    }
+    workflow.plannerDecisions = [
+      decision,
+      ...workflow.plannerDecisions.filter((entry) => !(entry.cycleNumber === decision.cycleNumber && entry.planId === decision.planId))
+    ].slice(0, 50);
+    if (plan.proposedChecklistChanges.length > 0) {
+      const existingChangeIds = new Set(workflow.checklistChanges.map((change) => change.id));
+      workflow.checklistChanges = [
+        ...plan.proposedChecklistChanges.filter((change) => !existingChangeIds.has(change.id)),
+        ...workflow.checklistChanges
+      ].slice(0, 100);
+    }
+    if (plan.proposedGoalChanges.length > 0) {
+      const charter = this.ensureGoalCharterForWorkflow(workflow);
+      const existingProposalIds = new Set(charter.proposedGoalChanges.map((proposal) => proposal.id));
+      charter.proposedGoalChanges = [
+        ...plan.proposedGoalChanges.filter((proposal) => !existingProposalIds.has(proposal.id)),
+        ...charter.proposedGoalChanges
+      ].slice(0, 50);
+      charter.updatedAt = options.timestamp ?? nowIso();
+      workflow.goalCharter = charter;
+    }
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: plan.continueRecommendation === "continue" ? "completed" : "waiting",
+      title: "Strategic planner selected next task",
+      detail: `${decision.selectedTaskTitle ?? "No task selected"} — ${compactText(decision.whySelected, 600)}`,
+      stepId: "recommendation"
+    });
+    return rankedRecommendations;
+  }
+
+  private plannerDecisionForCycle(workflow: ProjectWorkflowState, cycleNumber = workflow.workflowCycle.cycleNumber): PlannerDecision | undefined {
+    return workflow.plannerDecisions
+      .filter((decision) => decision.cycleNumber === cycleNumber)
+      .sort((left, right) => toTime(right.createdAt) - toTime(left.createdAt))[0];
+  }
+
+  private selectAutopilotRecommendation(project: LoadedProject): ProjectWorkflowState["recommendations"][number] | undefined {
+    const workflow = this.ensureWorkflowState(project.record);
+    const decision = this.plannerDecisionForCycle(workflow);
+    if (decision?.selectedRecommendationId) {
+      const selected = workflow.recommendations.find((recommendation) => recommendation.id === decision.selectedRecommendationId);
+      if (selected) {
+        return selected;
+      }
+    }
+    return pickAutopilotRecommendation(workflow.recommendations, workflow);
+  }
+
+  private plannerRequiresGoalApproval(workflow: ProjectWorkflowState): boolean {
+    const decision = this.plannerDecisionForCycle(workflow);
+    if (!decision?.approvalRequired) {
+      return false;
+    }
+    if (decision.goalChangeProposalIds.length > 0) {
+      return true;
+    }
+    if (!workflow.goalCharter.autopilotStrategy.autonomyBudget.stopWhenPlannerWantsToChangeUltimateGoal) {
+      return false;
+    }
+    return decision.checklistChangeIds.length > 0 &&
+      decision.checklistChangeIds.some((changeId) =>
+        workflow.checklistChanges.some((change) => change.id === changeId && change.userApprovalStatus === "pending")
+      );
+  }
+
   private async applyRecommendationSet(
     project: LoadedProject,
     agent: AgentState | undefined,
@@ -7242,6 +8823,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const effectiveRecommendations = checklistGoalCompletion.state === "goal_satisfied"
       ? candidateRecommendations
       : this.ensureChecklistRecommendationsLead(recommendationContext, candidateRecommendations, deterministicRecommendations);
+    const plannedRecommendations = this.applyStrategicPlannerToRecommendations(
+      project,
+      effectiveRecommendations,
+      recommendationContext,
+      { timestamp: generatedAt, sourceAgentId: agent?.id }
+    );
     const appealPassQueued = this.shouldQueueAppealPass(recommendationContext, checklistGoalCompletion) && effectiveRecommendations.length > 0;
     const normalizedProgressEstimate = checklistGoalCompletion.state === "goal_satisfied"
       ? {
@@ -7249,7 +8836,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         percentComplete: 100
       }
       : checklistProgressEstimate;
-    workflow.recommendations = effectiveRecommendations;
+    workflow.recommendations = plannedRecommendations;
     workflow.recommendationsGeneratedAt = generatedAt;
     workflow.ultimateGoalProgress = {
       ...normalizedProgressEstimate,
@@ -7285,7 +8872,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           percentComplete: normalizedProgressEstimate.percentComplete,
           rationale: normalizedProgressEstimate.rationale
         },
-        nextSteps: effectiveRecommendations.map((recommendation) => ({
+        nextSteps: plannedRecommendations.map((recommendation) => ({
           rank: recommendation.rank,
           title: recommendation.title,
           summary: recommendation.summary,
@@ -7308,21 +8895,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           : "Ultimate Goal satisfied";
       agent.lastMessageSnippet = summary.slice(0, 240);
     }
-    if (effectiveRecommendations.length > 0) {
+    if (plannedRecommendations.length > 0) {
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
         status: "waiting",
         title: appealPassQueued ? "Appeal recommendations are ready" : "Recommendations are ready",
-        detail: effectiveRecommendations[0]?.title ?? "Choose one recommendation to continue.",
+        detail: plannedRecommendations[0]?.title ?? "Choose one recommendation to continue.",
         stepId: "recommendation"
       });
       this.updateWorkflowStepProgress(workflow, "recommendation", {
         requiresUserInput: true,
         currentActivity: appealPassQueued ? "Waiting for the final appeal choice" : "Waiting for a recommendation choice",
-        currentSubstep: effectiveRecommendations[0]
-          ? `Recommended next cycle target: ${effectiveRecommendations[0].title}`
+        currentSubstep: plannedRecommendations[0]
+          ? `Recommended next cycle target: ${plannedRecommendations[0].title}`
           : undefined,
-        latestProgressNote: effectiveRecommendations[0]?.title ?? "Recommendations are ready.",
+        latestProgressNote: plannedRecommendations[0]?.title ?? "Recommendations are ready.",
         message: summary || (appealPassQueued ? "Choose one final appeal pass to continue." : "Choose exactly one recommendation to continue."),
         warning: undefined
       }, { status: "waiting" });
@@ -7552,10 +9139,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         const evidence = check.status === "unknown" ? "" : check.evidence;
         return `- [${check.status}] ${check.title}${evidence ? ` -- ${compactText(evidence, MAX_PROMPT_DETAIL_LENGTH)}` : ""}`;
       });
-    const outcomeStrategyBrief = buildOutcomeStrategyBrief(this.buildWorkflowRecommendationContext(project), {
+    const recommendationContext = this.buildWorkflowRecommendationContext(project);
+    const outcomeStrategyBrief = buildOutcomeStrategyBrief(recommendationContext, {
       maxOpenChecks: 4,
       maxFocusPaths: 4
     });
+    const currentStrategy = workflow.goalCharter.autopilotStrategy;
+    const visualPromptRelevant = currentStrategy.visualPriority !== "low" && (
+      isVisualProject(recommendationContext) ||
+      /\b(visual|ui|ux|layout|contrast|readability|responsive|hierarchy|polish|dashboard|spacing|theme|renderer|css|tsx|jsx|transcript|card|table)\b/i.test([
+        approvedRecommendation.title,
+        approvedRecommendation.summary,
+        approvedRecommendation.rationale,
+        approvedRecommendation.expectedImpact,
+        approvedRecommendation.relatedPaths.join(" ")
+      ].join(" "))
+    );
+    const visualPreferenceBrief = visualPromptRelevant ? buildVisualPreferenceBrief(currentStrategy) : "";
     const relevantPriorContext = this.selectAndRememberRelevantContext(
       project,
       "goal",
@@ -7587,6 +9187,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Keep acceptanceCriteria to at most 6 bullets and testStrategy to at most 4 focused checks.",
       "Use the Goal checklist as the completion source of truth. Prefer a scoped plan that turns a coherent group of unmet or unknown required checks into met checks with evidence.",
       "Keep constraints aligned with the Ultimate Goal and the repository boundaries.",
+      visualPreferenceBrief
+        ? `For GUI or visual work, reflect these Goal Charter / Autopilot Strategy visual preferences in the scoped task: ${visualPreferenceBrief}. Include contrast, visual hierarchy, spacing, responsive behavior, empty/loading/error states, and comfortable card/table/transcript readability when relevant.`
+        : "",
       "Use the outcome strategy below to keep the scoped plan pointed at the best finished project outcome.",
       outcomeStrategyBrief,
       "Use the relevant prior context below when it is directly applicable. Keep the scoped goal compact and do not include unrelated historical notes. Current checklist counts override historical progress counts in prior context.",
@@ -7949,7 +9552,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       currentActivity: decisionSource === "autopilot" ? "Autopilot approved the next step" : "Recommendation approved",
       latestProgressNote: recommendation.title,
       message: decisionSource === "autopilot"
-        ? "Autopilot chose the highest-impact checklist-aligned recommendation and is preparing the scoped execution plan."
+        ? "Autopilot chose the strategic planner's top-ranked recommendation and is preparing the scoped execution plan."
         : "Preparing the scoped execution plan."
     }, { status: "completed" });
     this.resetWorkflowStepProgress(workflow, "goal_plan", {
@@ -7961,10 +9564,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.resetWorkflowStepProgress(workflow, "coding");
     this.resetWorkflowStepProgress(workflow, "integrity");
     this.resetWorkflowStepProgress(workflow, "merge");
+    const plannerDecision = this.plannerDecisionForCycle(workflow);
     this.recordAcceptedDecision(workflow, {
       kind: "recommendation",
       title: recommendation.title,
-      summary: recommendation.summary,
+      summary: plannerDecision?.whySelected ?? recommendation.summary,
       cycleNumber: workflow.workflowCycle.cycleNumber,
       sourceAgentCategory: "recommendation"
     });
@@ -11559,6 +13163,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private appendAgentTranscriptEntry(project: LoadedProject, agent: AgentState, entry: AgentTranscriptEntry): void {
+    agent.outputReference = {
+      agentId: agent.id,
+      workflowCycleNumber: agent.workflowCycleNumber,
+      transcriptAvailable: true,
+      fullOutputAvailable: true,
+      updatedAt: nowIso()
+    };
     void this.storage.appendAgentTranscriptEntry(project.record.id, agent, entry).catch((error) => {
       this.diagnostics.unshift(
         `Failed to save full output for ${agent.name}. ${error instanceof Error ? error.message : String(error)}`

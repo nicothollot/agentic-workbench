@@ -37,8 +37,9 @@ const getStepIdForAgent = (agent: AgentState): RuntimeEventRecord["stepId"] => {
   }
 };
 
-const MAX_EVENT_DETAIL_LENGTH = 8_000;
-const MAX_EVENT_RAW_STRING_LENGTH = 2_000;
+const MAX_EVENT_DETAIL_LENGTH = 4_000;
+const MAX_EVENT_RAW_STRING_LENGTH = 1_500;
+const MAX_COMMAND_OUTPUT_PREVIEW_LENGTH = 2_000;
 const MAX_EVENT_RAW_ARRAY_LENGTH = 20;
 const MAX_EVENT_RAW_OBJECT_KEYS = 40;
 const MAX_EVENT_RAW_DEPTH = 4;
@@ -496,12 +497,12 @@ export const reduceAgentRuntimeEvent = (agent: AgentState, event: WorkbenchTrans
     case "command-output": {
       const lastCommand = agent.commandLog.find((entry) => entry.itemId === event.itemId) ?? agent.commandLog[0];
       if (lastCommand) {
-        lastCommand.output = capDetail(`${lastCommand.output}${event.delta}`, 12_000);
+        lastCommand.output = capDetail(`${lastCommand.output}${event.delta}`, MAX_COMMAND_OUTPUT_PREVIEW_LENGTH);
       }
       upsertStreamingEvent(agent, "command", "Command output", event.delta, {
         status: "running",
         itemId: event.itemId,
-        maxLength: 12_000
+        maxLength: MAX_COMMAND_OUTPUT_PREVIEW_LENGTH
       });
       return agent;
     }
