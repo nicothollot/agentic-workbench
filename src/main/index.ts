@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell } from "electron";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -106,9 +106,6 @@ const toSafeFileStem = (value: string): string => {
   const normalized = value.trim().replace(/[^a-z0-9._-]+/gi, "-").replace(/^-+|-+$/g, "");
   return normalized || "project";
 };
-
-const ensurePdfExtension = (filePath: string): string =>
-  path.extname(filePath).toLowerCase() === ".pdf" ? filePath : `${filePath}.pdf`;
 
 const escapeHtml = (value: string): string =>
   value
@@ -231,6 +228,7 @@ const writeVisualExportPdf = async (captures: VisualExportCapture[], destination
         marginType: "none"
       }
     });
+    await mkdir(path.dirname(destinationPath), { recursive: true });
     await writeFile(destinationPath, pdf);
   } finally {
     if (!pdfWindow.isDestroyed()) {
@@ -433,36 +431,22 @@ const registerIpc = (): void => {
 
     return await appService?.downloadLogs(parsed.projectId, fileResult.filePath);
   });
-  ipcMain.handle("project:startVisualExport", async (_event, payload) => {
+  ipcMain.handle("project:startVisualExport", (_event, payload) => {
     const parsed = visualExportStartRequestSchema.parse(payload);
     if (!mainWindow) {
       throw new Error("The workbench window is not available.");
     }
-    const project = appService?.getState().projects.find((entry) => entry.record.id === parsed.projectId);
-    if (!project) {
-      throw new Error("Unknown project for visual export.");
+    if (!appService) {
+      throw new Error("The workbench service is not available.");
     }
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const suggestedName = `${toSafeFileStem(project.record.identity.projectName)}-interface-visuals-${timestamp}.pdf`;
-    const fileResult = await dialog.showSaveDialog(mainWindow, {
-      title: "Save interface visuals as PDF",
-      defaultPath: path.join(app.getPath("downloads"), suggestedName),
-      filters: [
-        {
-          name: "PDF",
-          extensions: ["pdf"]
-        }
-      ]
-    });
-    if (fileResult.canceled || !fileResult.filePath) {
-      return null;
+    if (!appService.getState().projects.some((entry) => entry.record.id === parsed.projectId)) {
+      throw new Error("Unknown project for visual export.");
     }
 
     const exportId = randomUUID();
     visualExportSessions.set(exportId, {
       projectId: parsed.projectId,
-      destinationPath: ensurePdfExtension(fileResult.filePath),
+      destinationPath: appService.createVisualExportDestination(parsed.projectId),
       tabs: parsed.tabs,
       captures: []
     });

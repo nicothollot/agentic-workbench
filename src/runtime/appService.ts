@@ -165,6 +165,13 @@ import {
   parseInterfaceCreationOutput,
   toStoredOverview
 } from "./interfaceCreation";
+import {
+  assertSafeArtifactDestination,
+  defaultPortableInterfacePath,
+  defaultReviewLogPath,
+  defaultVisualExportPath,
+  resolveArtifactDestination
+} from "./artifactPaths";
 import { buildDiscoveredModels, getRecommendedInterfaceCreationModel } from "./modelCatalog";
 import { MockCodexTransport } from "./mockCodexTransport";
 import { createProjectIdentity } from "./projectIdentity";
@@ -6888,13 +6895,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   async exportInterface(projectId: string, destinationPath?: string): Promise<string> {
     const project = this.findProject(projectId);
-    if (destinationPath) {
-      const resolvedDestinationPath = path.isAbsolute(destinationPath)
-        ? destinationPath
-        : path.join(project.record.hostPath, destinationPath);
-      await assertHostPathWithinProjectRoot(project.record.hostPath, resolvedDestinationPath, "Portable interface export");
-    }
-    const exportPath = await this.storage.writePortableInterface(project.record.hostPath, project.record, destinationPath);
+    const resolvedDestinationPath = assertSafeArtifactDestination({
+      projectRoot: project.record.hostPath,
+      destinationPath: resolveArtifactDestination(
+        project.record.hostPath,
+        destinationPath,
+        defaultPortableInterfacePath(project.record.hostPath)
+      ),
+      artifactKind: "portable-interface"
+    });
+    await assertHostPathWithinProjectRoot(project.record.hostPath, resolvedDestinationPath, "Portable interface export");
+    const exportPath = await this.storage.writePortableInterface(project.record.hostPath, project.record, resolvedDestinationPath);
     project.record.interfacePath = exportPath;
     await this.persistProjectUpdate(project, {
       save: "immediate",
@@ -6904,14 +6915,41 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return exportPath;
   }
 
-  async downloadInterface(projectId: string, destinationPath: string): Promise<string> {
+  async downloadInterface(projectId: string, destinationPath?: string): Promise<string> {
     const project = this.findProject(projectId);
-    return await this.storage.writePortableInterfaceToFile(project.record, destinationPath);
+    const outputPath = assertSafeArtifactDestination({
+      projectRoot: project.record.hostPath,
+      destinationPath: resolveArtifactDestination(
+        project.record.hostPath,
+        destinationPath,
+        defaultPortableInterfacePath(project.record.hostPath)
+      ),
+      artifactKind: "portable-interface"
+    });
+    return await this.storage.writePortableInterfaceToFile(project.record, outputPath);
   }
 
-  async downloadLogs(projectId: string, destinationPath: string): Promise<string> {
+  async downloadLogs(projectId: string, destinationPath?: string): Promise<string> {
     const project = this.findProject(projectId);
-    return await this.storage.writeReviewLogBundleToFile(project.record, this.settings, this.diagnostics, destinationPath);
+    const outputPath = assertSafeArtifactDestination({
+      projectRoot: project.record.hostPath,
+      destinationPath: resolveArtifactDestination(
+        project.record.hostPath,
+        destinationPath,
+        defaultReviewLogPath(project.record.hostPath, project.record.identity.projectName)
+      ),
+      artifactKind: "review-log"
+    });
+    return await this.storage.writeReviewLogBundleToFile(project.record, this.settings, this.diagnostics, outputPath);
+  }
+
+  createVisualExportDestination(projectId: string): string {
+    const project = this.findProject(projectId);
+    return assertSafeArtifactDestination({
+      projectRoot: project.record.hostPath,
+      destinationPath: defaultVisualExportPath(project.record.hostPath, project.record.identity.projectName),
+      artifactKind: "visual-export"
+    });
   }
 
   private async importInterfaceInternal(

@@ -11,6 +11,8 @@ The desktop UI is intended to run on Windows. Codex, Git, worktrees, and determi
 - Shows a saved-interface decision flow with validation badges and synthetic preview cards.
 - Bootstraps repository tree, project stats, dependency discovery, overview text, and cached file summaries.
 - Creates bootstrap, coding, integrity, merge, and recommendation agents.
+- Opens to a Command Center view that summarizes the current task, why it matters, progress, attention items, last result, next step, and project health.
+- Keeps full workflow, history, repository, logs, credentials, and settings details available in advanced tabs.
 - Uses the official `codex app-server` stdio JSON-RPC path for live Codex integration.
 - Stores machine-local registry/state in app data and portable interface data in the repo.
 
@@ -79,6 +81,7 @@ npm start
 ## Build And Test
 
 ```bash
+npm run check:repo-hygiene
 npm run typecheck
 npm run lint
 npm test
@@ -117,21 +120,64 @@ Machine-local state is stored under the OS app-data directory and contains:
 - local layout/UI state
 - cached file summaries
 - runtime metadata
+- agent transcript/full-output sidecars
+- diagnostics used for safe mode and state repair
 
 Portable interfaces are stored in:
 
 ```text
-.agent-workbench/interface.json
+<target-project>/.agent-workbench/interface.json
 ```
 
 The portable file is versioned, schema-validated, checksumed, and excludes secrets, auth state, and raw credentials.
 
 ## Import And Export
 
-- Export writes `.agent-workbench/interface.json` by default.
+- Export writes `<target-project>/.agent-workbench/interface.json` by default.
+- Review logs write to `<target-project>/.agent-workbench/review-logs/` when no user-chosen download path is provided.
+- Visual exports write to `<target-project>/.agent-workbench/visuals/` by default.
+- Repair reports and other generated workflow artifacts belong under `<target-project>/.agent-workbench/reports/` or a user-chosen download location.
 - Import validates schema version and project identity before applying.
 - Identity mismatches are blocked unless the caller explicitly allows them.
 - Machine-specific paths and settings stay local.
+- The runtime blocks target-project artifacts from being written into the Agentic Workbench source repository.
+
+## Command Center And Advanced Views
+
+The Overview tab starts with Command Center, a high-level Simple Mode for non-technical review:
+
+- Current focus: task, phase, active agent, and status.
+- Why this matters: planner rationale or goal/checklist impact.
+- Progress: stage, cycle, and goal completion.
+- What changed so far: changed files, commands, and validation status.
+- Needs your attention: approvals, blockers, credential requests, user input, or "No action needed".
+- Last result and next step: links into History and Workflow details.
+- Project health: workflow, validation, repository scan, Codex readiness, runtime readiness, and state-repair signals.
+
+Advanced tabs remain available for detailed operation:
+
+- Workflow: current plan, automation controls, approvals, handoffs, and deeper traces.
+- History: cycle summaries and agent cards. Every retained agent has a visible "View full output" action.
+- Repository: indexed file tree, scan status, truncation/partial-index warnings, summaries, and excluded paths.
+- Settings: runtime readiness, Codex update checks, credentials, model defaults, safe mode state, and Goal Charter settings.
+
+The full-output viewer supports copy, search, line wrapping, preformatted/plain text modes, and collapsed technical details. Preview text may be truncated, but retained sidecar output is loaded on demand.
+
+## Repo Hygiene
+
+Do not commit generated target-project artifacts to this repository. In particular, keep these out of the `agentic-workbench` repo root:
+
+- target-project review logs
+- exported interface JSON
+- visual audit PDFs and screenshots
+- repair reports
+- agent transcripts or full outputs
+- workflow histories
+- repository scan artifacts
+
+Use the target project's `.agent-workbench/` directory for portable target-project artifacts, or OS app-data for machine-local state. The root `.gitignore` blocks common generated artifact patterns, and `npm run check:repo-hygiene` fails when forbidden tracked files or unexpectedly large unallowlisted files appear.
+
+If a generated artifact with private project history, absolute local paths, transcripts, or sensitive content was committed, remove it from the current tree immediately. A Git history purge may also be advisable, but should only be done deliberately by maintainers.
 
 ## Limitations / Non-goals
 

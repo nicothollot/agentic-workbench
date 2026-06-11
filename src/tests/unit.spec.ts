@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
 import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -82,6 +83,12 @@ import { reduceAgentRuntimeEvent } from "@runtime/runtimeEvents";
 import { AppService } from "@runtime/appService";
 import { WorkbenchStorage } from "@runtime/storage";
 import { buildInterfaceCreationOutputSchema, parseInterfaceCreationOutput } from "@runtime/interfaceCreation";
+import {
+  assertSafeArtifactDestination,
+  defaultPortableInterfacePath,
+  defaultReviewLogPath,
+  defaultVisualExportPath
+} from "@runtime/artifactPaths";
 import { parseManifestFile } from "@runtime/manifestParser";
 import { createProjectIdentity } from "@runtime/projectIdentity";
 import { classifyCommandApproval, shouldAutoApproveApproval } from "@runtime/approvalPolicy";
@@ -172,9 +179,29 @@ type PackageAppScript = {
   windowsPathToWslPath: (inputPath: string) => string;
 };
 
+type RepoHygieneScript = {
+  analyzeTrackedFiles: (
+    files: Array<string | { path: string; sizeBytes?: number }>,
+    options?: { largeFileLimitBytes?: number }
+  ) => Array<{ path: string; reason: string }>;
+};
+
 const loadPackageAppScript = async (): Promise<PackageAppScript> => {
   const moduleUrl = pathToFileURL(path.resolve("scripts/package-app.mjs")).href;
   return await import(moduleUrl) as PackageAppScript;
+};
+
+const loadRepoHygieneScript = async (): Promise<RepoHygieneScript> => {
+  const moduleUrl = pathToFileURL(path.resolve("scripts/check-repo-hygiene.mjs")).href;
+  return await import(moduleUrl) as RepoHygieneScript;
+};
+
+const runGitText = (args: string[]): string => {
+  const result = spawnSync("git", args, { cwd: process.cwd(), encoding: "utf8" });
+  if (result.status !== 0 || (!result.stdout && result.error)) {
+    throw result.error ?? new Error(result.stderr || `git ${args.join(" ")} failed.`);
+  }
+  return result.stdout;
 };
 
 const cssVariable = (source: string, name: string): string => {
@@ -455,6 +482,53 @@ describe("path utils", () => {
   });
 });
 
+describe("artifact destination safety", () => {
+  it("builds target-project .agent-workbench defaults for portable, log, and visual artifacts", () => {
+    const projectRoot = path.join("/tmp", "target-project");
+
+    expect(defaultPortableInterfacePath(projectRoot)).toBe(path.join(projectRoot, ".agent-workbench", "interface.json"));
+    expect(defaultReviewLogPath(projectRoot, "Quant Interview Prep", new Date("2026-06-10T17:53:57.596Z")))
+      .toBe(path.join(projectRoot, ".agent-workbench", "review-logs", "Quant-Interview-Prep-review-log-2026-06-10T17-53-57-596Z.json"));
+    expect(defaultVisualExportPath(projectRoot, "Quant Interview Prep", new Date("2026-06-10T17:54:19.586Z")))
+      .toBe(path.join(projectRoot, ".agent-workbench", "visuals", "Quant-Interview-Prep-interface-visuals-2026-06-10T17-54-19-586Z.pdf"));
+  });
+
+  it("blocks target-project artifacts from being written into the Workbench source root", async () => {
+    const projectRoot = await createTempDir("target-artifact-root");
+    const wrongRootLog = path.join(process.cwd(), "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json");
+
+    expect(() => assertSafeArtifactDestination({
+      projectRoot,
+      destinationPath: wrongRootLog,
+      artifactKind: "review-log",
+      appSourceRoot: process.cwd()
+    })).toThrow(/Agentic Workbench source repository/);
+  });
+
+  it("writes default review logs and visual paths under the active target project", async () => {
+    const projectRoot = await createTempDir("target-artifact-project");
+    const service = new AppService(await createTempDir("artifact-appdata")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      downloadLogs: AppService["downloadLogs"];
+      createVisualExportDestination: AppService["createVisualExportDestination"];
+    };
+    const project = makeAppServiceLoadedProject("artifact-project");
+    project.record.hostPath = projectRoot;
+    project.record.projectRoot = projectRoot;
+    project.record.displayPath = projectRoot;
+    service.projects.set(project.record.id, project);
+
+    const logPath = await service.downloadLogs(project.record.id);
+    const visualPath = service.createVisualExportDestination(project.record.id);
+
+    expect(logPath.startsWith(path.join(projectRoot, ".agent-workbench", "review-logs"))).toBe(true);
+    expect(visualPath.startsWith(path.join(projectRoot, ".agent-workbench", "visuals"))).toBe(true);
+    await expect(stat(logPath)).resolves.toBeTruthy();
+    await expect(service.downloadLogs(project.record.id, path.join(process.cwd(), "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json")))
+      .rejects.toThrow(/Agentic Workbench source repository/);
+  });
+});
+
 describe("packaging script", () => {
   it("converts Windows paths and parses distributable targets", async () => {
     const packageAppScript = await loadPackageAppScript();
@@ -519,6 +593,53 @@ describe("packaging script", () => {
     expect(env.npm_config_loglevel).toBeUndefined();
     expect(env.CSC_IDENTITY_AUTO_DISCOVERY).toBe("false");
     expect(env.PATH).toBe("/usr/bin");
+  });
+});
+
+describe("repo hygiene guardrails", () => {
+  it("detects generated target-project artifacts and large unallowlisted tracked files", async () => {
+    const repoHygiene = await loadRepoHygieneScript();
+    const issues = repoHygiene.analyzeTrackedFiles([
+      { path: "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json", sizeBytes: 3_132_204 },
+      { path: "Master_Trading_Interface-review-log-2026-04-27T18-05-38-994Z.json", sizeBytes: 45_601_439 },
+      { path: "quant_interview_prep-interface.json", sizeBytes: 2_492_457 },
+      { path: ".agent-workbench/review-logs/project-review-log.json", sizeBytes: 1_000 },
+      { path: "docs/intentional.md", sizeBytes: 1_000 },
+      { path: "assets/branding/interface_icon.png", sizeBytes: 9_000_000 },
+      { path: "debug-dump.bin", sizeBytes: 8_000_000 }
+    ]);
+
+    expect(issues.map((issue) => issue.path)).toEqual(expect.arrayContaining([
+      "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json",
+      "Master_Trading_Interface-review-log-2026-04-27T18-05-38-994Z.json",
+      "quant_interview_prep-interface.json",
+      ".agent-workbench/review-logs/project-review-log.json",
+      "debug-dump.bin"
+    ]));
+    expect(issues.some((issue) => issue.path === "docs/intentional.md")).toBe(false);
+    expect(issues.some((issue) => issue.path === "assets/branding/interface_icon.png")).toBe(false);
+  });
+
+  it("ignores generated target-project export patterns before they can be added", () => {
+    const ignored = runGitText(
+      [
+        "check-ignore",
+        "--no-index",
+        "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json",
+        "quant_interview_prep-interface-visuals-2026-06-10T17-54-19-586Z.pdf",
+        "quant-interview-prep-cycle-2-repair-report-2026-05-07T20-46-41-218Z.md",
+        ".agent-workbench/interface.json",
+        "agent-outputs/coding-agent.txt"
+      ]
+    ).trim().split(/\r?\n/);
+
+    expect(ignored).toEqual([
+      "quant_interview_prep-review-log-2026-06-10T17-53-57-596Z.json",
+      "quant_interview_prep-interface-visuals-2026-06-10T17-54-19-586Z.pdf",
+      "quant-interview-prep-cycle-2-repair-report-2026-05-07T20-46-41-218Z.md",
+      ".agent-workbench/interface.json",
+      "agent-outputs/coding-agent.txt"
+    ]);
   });
 });
 
@@ -7002,6 +7123,25 @@ describe("AppService workflow performance guards", () => {
     expect(source).toContain("transcriptEntries.slice(0, 220)");
     expect(source).toContain("Show all transcript events");
     expect(source).not.toContain("Promise.all([\n      window.workbench.getAgentFullOutput");
+  });
+
+  it("keeps Command Center simple-mode labels and full-output actions visible", async () => {
+    const appSource = await readFile(path.join(process.cwd(), "src/renderer/App.tsx"), "utf8");
+    const commandCenterSource = await readFile(path.join(process.cwd(), "src/renderer/components/CommandCenter.tsx"), "utf8");
+
+    expect(appSource).toContain("<CommandCenter");
+    expect(appSource).toContain("whyThisMatters={commandCenterWhy}");
+    expect(appSource).toContain("health={commandCenterHealth}");
+    expect(appSource).toContain("onOpenOutput={(agent) => openAgentOutputById(agent)}");
+    expect(appSource).toContain("<button className=\"primary-button\" type=\"button\" onClick={() => onOpenOutput(agent)}>View full output</button>");
+    expect(commandCenterSource).toContain("Current focus");
+    expect(commandCenterSource).toContain("Why this matters");
+    expect(commandCenterSource).toContain("What changed so far");
+    expect(commandCenterSource).toContain("Needs your attention");
+    expect(commandCenterSource).toContain("No action needed");
+    expect(commandCenterSource).toContain("Last result");
+    expect(commandCenterSource).toContain("Next step");
+    expect(commandCenterSource).toContain("Project health");
   });
 
   it("keeps key design tokens above readable contrast thresholds", async () => {

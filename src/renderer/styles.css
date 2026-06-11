@@ -846,7 +846,6 @@ p {
   border: 1px solid rgba(25, 40, 68, 0.1);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(247, 241, 232, 0.92));
   text-align: left;
-  cursor: pointer;
   transition:
     border-color 140ms ease,
     box-shadow 140ms ease,
@@ -859,6 +858,13 @@ p {
   display: flex;
   justify-content: space-between;
   gap: 12px;
+}
+
+.agent-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .agent-card__subtle {

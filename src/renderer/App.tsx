@@ -22,6 +22,7 @@ import {
 } from "@shared/workflowView";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
+import { CommandCenter, type CommandCenterHealthItem, type CommandCenterItem, type CommandCenterTone } from "./components/CommandCenter";
 import { createDefaultAutopilotStrategy, goalRestrictivenessMode, listAutopilotPresets as defaultAutopilotPresets } from "@shared/goalCharter";
 import type {
   AgentCategory,
@@ -1830,16 +1831,18 @@ const AgentCard = ({
   agent,
   workflow,
   selected = false,
-  onSelect
+  onSelect,
+  onOpenOutput
 }: {
   agent: AgentState;
   workflow?: ProjectWorkflowState;
   selected?: boolean;
   onSelect?: (agentId: string) => void;
+  onOpenOutput?: (agent: AgentState) => void;
 }) => {
   const status = agentLifecycleStatusChip(agent.status);
   return (
-    <button className={`agent-card ${selected ? "agent-card--selected" : ""}`} onClick={() => onSelect?.(agent.id)} type="button">
+    <article className={`agent-card ${selected ? "agent-card--selected" : ""}`}>
       <div className="agent-card__header">
         <div>
           <strong>{agent.name}</strong>
@@ -1854,7 +1857,15 @@ const AgentCard = ({
         <span>{agent.changedFiles.length} changed files</span>
       </div>
       <p>{redactSensitiveText(agentPreviewText(agent, workflow))}</p>
-    </button>
+      <div className="agent-card__actions">
+        <button className="primary-button secondary-button--compact" type="button" onClick={() => onOpenOutput?.(agent)}>
+          View full output
+        </button>
+        <button className="secondary-button secondary-button--compact" type="button" onClick={() => onSelect?.(agent.id)}>
+          Select
+        </button>
+      </div>
+    </article>
   );
 };
 
@@ -2211,7 +2222,8 @@ const AgentLane = ({
   action,
   children,
   workflow,
-  onSelect
+  onSelect,
+  onOpenOutput
 }: {
   eyebrow: string;
   title: string;
@@ -2223,6 +2235,7 @@ const AgentLane = ({
   children?: JSX.Element | null;
   workflow?: ProjectWorkflowState;
   onSelect: (agentId: string) => void;
+  onOpenOutput?: (agent: AgentState) => void;
 }) => (
   <section className="agent-lane">
     <div className="agent-lane__header">
@@ -2237,7 +2250,14 @@ const AgentLane = ({
     {action ? <div className="agent-lane__actions">{action}</div> : null}
     <div className="agent-lane__list">
       {agents.length ? agents.map((agent) => (
-        <AgentCard key={agent.id} agent={agent} workflow={workflow} selected={selectedAgentId === agent.id} onSelect={onSelect} />
+        <AgentCard
+          key={agent.id}
+          agent={agent}
+          workflow={workflow}
+          selected={selectedAgentId === agent.id}
+          onSelect={onSelect}
+          onOpenOutput={onOpenOutput}
+        />
       )) : (
         <div className="empty-copy">{emptyCopy}</div>
       )}
@@ -2427,12 +2447,14 @@ const RunDetailPanel = ({
   agent,
   workflow,
   onOpenWorkflow,
-  onOpenLogs
+  onOpenLogs,
+  onOpenOutput
 }: {
   agent?: AgentState;
   workflow?: ProjectWorkflowState;
   onOpenWorkflow: () => void;
   onOpenLogs: () => void;
+  onOpenOutput: (agent: AgentState) => void;
 }) => {
   if (!agent) {
     return (
@@ -2463,6 +2485,7 @@ const RunDetailPanel = ({
         </div>
         <div className="runs-detail-card__header-actions">
           <StatusChip label={status.label} tone={status.tone} />
+          <button className="primary-button" type="button" onClick={() => onOpenOutput(agent)}>View full output</button>
           <button className="secondary-button" type="button" onClick={onOpenWorkflow}>Open Workflow</button>
           <button className="secondary-button" type="button" onClick={onOpenLogs}>Open History</button>
         </div>
@@ -2636,6 +2659,7 @@ const RunsReviewPage = ({
   onManualPageChange,
   onOpenWorkflow,
   onOpenLogs,
+  onOpenOutput,
   onManualPromptChange,
   onManualModelChange,
   onManualReasoningModeChange,
@@ -2664,6 +2688,7 @@ const RunsReviewPage = ({
   onManualPageChange: (pageIndex: number) => void;
   onOpenWorkflow: () => void;
   onOpenLogs: () => void;
+  onOpenOutput: (agent: AgentState) => void;
   onManualPromptChange: (value: string) => void;
   onManualModelChange: (value: string) => void;
   onManualReasoningModeChange: (value: AgentReasoningMode) => void;
@@ -2759,7 +2784,7 @@ const RunsReviewPage = ({
         </div>
       </article>
 
-      <RunDetailPanel agent={selectedRun} workflow={workflow} onOpenWorkflow={onOpenWorkflow} onOpenLogs={onOpenLogs} />
+      <RunDetailPanel agent={selectedRun} workflow={workflow} onOpenWorkflow={onOpenWorkflow} onOpenLogs={onOpenLogs} onOpenOutput={onOpenOutput} />
 
       <details className="runs-manual-panel">
         <summary>
@@ -7961,7 +7986,7 @@ export const App = () => {
       });
   };
 
-  const openAgentOutput = (agent: AgentHistorySummary, options: { loadTranscript?: boolean } = {}) => {
+  const openAgentOutputById = (agent: Pick<AgentState, "id" | "name">, options: { loadTranscript?: boolean } = {}) => {
     if (!activeProjectId) {
       return;
     }
@@ -8021,6 +8046,10 @@ export const App = () => {
           handleError(error);
         });
     }
+  };
+
+  const openAgentOutput = (agent: AgentHistorySummary, options: { loadTranscript?: boolean } = {}) => {
+    openAgentOutputById(agent, options);
   };
 
   const rescanRepository = async (mode: "normal" | "deep", settings?: RepositoryScanSettings) => {
@@ -9839,6 +9868,115 @@ export const App = () => {
     workflow?.scopedGoal?.acceptanceCriteria.length ? `Acceptance criteria:\n${workflow.scopedGoal.acceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n")}` : undefined,
     workflow?.scopedGoal?.testStrategy.length ? `Validation:\n${workflow.scopedGoal.testStrategy.map((strategy) => `- ${strategy}`).join("\n")}` : undefined
   ].filter((entry): entry is string => Boolean(entry)).join("\n\n") || "No scoped plan has been generated yet.";
+  const commandCenterCurrentCycleAgents = workflow
+    ? workflowAgents.filter((agent) =>
+      agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
+    )
+    : [];
+  const commandCenterCommands = uniqueSortedStrings(
+    commandCenterCurrentCycleAgents.flatMap((agent) => agent.commandLog.map((command) => command.command))
+  );
+  const commandCenterProgress: CommandCenterItem[] = [
+    {
+      label: "Stage",
+      value: workflowStageText,
+      detail: workflowCurrentPhase
+    },
+    {
+      label: "Cycle",
+      value: workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No active cycle",
+      detail: workflowRunState
+    },
+    {
+      label: "Goal progress",
+      value: typeof workflowChecklistOverview.percentComplete === "number"
+        ? `${workflowChecklistOverview.percentComplete}%`
+        : workflowChecklistSummary,
+      detail: workflowChecklistOverview.requiredTotal
+        ? `${workflowChecklistOverview.requiredMet}/${workflowChecklistOverview.requiredTotal} required checks met`
+        : "Goal checklist not generated yet."
+    }
+  ];
+  const commandCenterChanges: CommandCenterItem[] = [
+    {
+      label: "Files changed",
+      value: String(currentWorkflowChangedFiles.length),
+      detail: currentWorkflowChangedFiles.slice(0, 4).join(", ") || "No file changes recorded in the current cycle."
+    },
+    {
+      label: "Commands run",
+      value: String(commandCenterCommands.length),
+      detail: commandCenterCommands.slice(0, 3).join(" | ") || "No commands recorded in the current cycle."
+    },
+    {
+      label: "Validation",
+      value: workflowChecksStatus,
+      tone: /\b(fail|error|blocked)\b/i.test(workflowChecksStatus) ? "error" : "success"
+    }
+  ];
+  const commandCenterAttention: CommandCenterItem[] = workflowAttentionItems.slice(0, 4).map((item) => ({
+    label: workflowAttentionKindLabel(item.kind),
+    value: item.title,
+    detail: item.detail,
+    tone: item.tone === "danger" ? "error" : item.tone === "neutral" ? "pending" : item.tone
+  }));
+  const latestRun = allAgents[0];
+  const commandCenterLastResult = latestRun
+    ? `${latestRun.name}: ${runResultSummary(latestRun, workflow)}`
+    : recentActivity[0]
+      ? `${recentActivity[0].title}${recentActivity[0].detail ? `: ${summarizeText(recentActivity[0].detail, "", 160)}` : ""}`
+      : "No completed workflow result has been recorded yet.";
+  const commandCenterWhy = summarizeText(
+    currentPlannerDecision?.whySelected ??
+      workflowGoalView?.whyThisMatters ??
+      workflow?.approvedRecommendation?.rationale ??
+      workflowLead,
+    "The current workflow step is selected to advance the confirmed project goal.",
+    260
+  );
+  const commandCenterNextStep = summarizeText(
+    workflowAction?.title
+      ? `${workflowAction.title}. ${workflowAction.description ?? ""}`
+      : workflowNextGuidance,
+    "No action is needed right now.",
+    220
+  );
+  const repositoryHealth = repositoryScanStatus?.status === "failed"
+    ? { label: "Repository scan failed", tone: "error" as CommandCenterTone }
+    : repositoryScanStatus?.status === "truncated" || repositoryScanStatus?.status === "partially_indexed"
+      ? { label: "Repository partially indexed", tone: "warning" as CommandCenterTone }
+      : repositoryScanStatus?.status === "scanning"
+        ? { label: "Repository scanning", tone: "running" as CommandCenterTone }
+        : repositoryScanStatus?.status === "indexed"
+          ? { label: "Repository indexed", tone: "success" as CommandCenterTone }
+          : { label: "Repository scan pending", tone: "pending" as CommandCenterTone };
+  const validationHealth = validationStatusChip(activeProject.validationStatus);
+  const codexHealth = codexReadinessStatusChip(state.codexReadiness.status);
+  const runtimeHealth: CommandCenterHealthItem = state.runtimeReadiness.status === "blocked"
+    ? { label: "Needs validation", tone: "blocked" }
+    : state.runtimeReadiness.status === "checking"
+      ? { label: "Validation running", tone: "running" }
+      : { label: "Runtime ready", tone: "success" };
+  const diagnosticHealth: CommandCenterHealthItem | undefined = state.diagnostics.some((entry) => /\b(repair|repaired|quarantine|compacted)\b/i.test(entry))
+    ? { label: "State repaired", tone: "warning" }
+    : undefined;
+  const commandCenterHealth: CommandCenterHealthItem[] = [
+    { label: workflowShellStatus.label, tone: workflowShellStatus.tone as CommandCenterTone },
+    { label: `Validation ${validationHealth.label.toLowerCase()}`, tone: validationHealth.tone as CommandCenterTone },
+    repositoryHealth,
+    { label: codexHealth.label === "Update available" ? "Codex outdated" : `Codex ${codexHealth.label.toLowerCase()}`, tone: codexHealth.tone as CommandCenterTone },
+    runtimeHealth,
+    ...(diagnosticHealth ? [diagnosticHealth] : [])
+  ];
+  const commandCenterPrimaryAction = topBarPrimaryAction ? (
+    <button className="primary-button" type="button" disabled={topBarPrimaryAction.disabled} onClick={topBarPrimaryAction.onClick}>
+      {topBarPrimaryAction.label}
+    </button>
+  ) : (
+    <button className="secondary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>
+      Open Workflow
+    </button>
+  );
 
   return (
     <div className="shell shell--workspace">
@@ -9934,6 +10072,28 @@ export const App = () => {
 
         {activeWorkspaceTab === "overview" ? (
           <section className="overview-page">
+            <CommandCenter
+              projectName={activeProject.record.identity.projectName}
+              projectContext={projectBranchOrPath}
+              currentFocus={workflowCurrentFocus}
+              currentPhase={workflowCurrentPhase}
+              activeAgent={workflowAgentLabel}
+              statusLabel={workflowShellStatus.label}
+              statusTone={workflowShellStatus.tone as CommandCenterTone}
+              whyThisMatters={commandCenterWhy}
+              progress={commandCenterProgress}
+              changes={commandCenterChanges}
+              attention={commandCenterAttention}
+              lastResult={commandCenterLastResult}
+              nextStep={commandCenterNextStep}
+              health={commandCenterHealth}
+              primaryAction={commandCenterPrimaryAction}
+              onOpenWorkflow={() => void setWorkspaceTab("workflow")}
+              onOpenHistory={() => void setWorkspaceTab("history")}
+              onOpenRepository={() => void setWorkspaceTab("repository")}
+              onOpenSettings={() => void setWorkspaceTab("settings")}
+            />
+
             <section className="overview-executive-header">
               <div className="overview-executive-header__main">
                 <div className="eyebrow">Home</div>
@@ -10987,6 +11147,7 @@ export const App = () => {
                           selectedAgentId={activeAgent?.id}
                           emptyCopy="No goal or bootstrap agent is active yet."
                           onSelect={(agentId) => void selectAgent(agentId)}
+                          onOpenOutput={(agent) => openAgentOutputById(agent)}
                         />
 
                         <AgentLane
@@ -10998,6 +11159,7 @@ export const App = () => {
                           selectedAgentId={activeAgent?.id}
                           emptyCopy="No coding agents are running yet."
                           onSelect={(agentId) => void selectAgent(agentId)}
+                          onOpenOutput={(agent) => openAgentOutputById(agent)}
                         />
 
                         <AgentLane
@@ -11009,6 +11171,7 @@ export const App = () => {
                           selectedAgentId={activeAgent?.id}
                           emptyCopy="Integrity checks have not been run yet."
                           onSelect={(agentId) => void selectAgent(agentId)}
+                          onOpenOutput={(agent) => openAgentOutputById(agent)}
                         />
 
                         <AgentLane
@@ -11020,6 +11183,7 @@ export const App = () => {
                           selectedAgentId={activeAgent?.id}
                           emptyCopy="No recommendation or merge agent is active yet."
                           onSelect={(agentId) => void selectAgent(agentId)}
+                          onOpenOutput={(agent) => openAgentOutputById(agent)}
                         />
 
                         <AgentLane
@@ -11031,6 +11195,7 @@ export const App = () => {
                           selectedAgentId={activeAgent?.id}
                           emptyCopy="No manual agents are active yet."
                           onSelect={(agentId) => void selectAgent(agentId)}
+                          onOpenOutput={(agent) => openAgentOutputById(agent)}
                         />
                       </div>
                     </div>
@@ -11168,6 +11333,7 @@ export const App = () => {
               onManualPageChange={setManualAgentPageIndex}
               onOpenWorkflow={() => void setWorkspaceTab("workflow")}
               onOpenLogs={() => void setWorkspaceTab("history")}
+              onOpenOutput={(agent) => openAgentOutputById(agent)}
               onManualPromptChange={setManualAgentPrompt}
               onManualModelChange={setManualAgentModel}
               onManualReasoningModeChange={setManualAgentReasoningMode}

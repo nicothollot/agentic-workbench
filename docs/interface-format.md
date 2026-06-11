@@ -1,6 +1,6 @@
 # Portable Interface Format
 
-Portable interfaces are stored at `.agent-workbench/interface.json`.
+Portable interfaces are stored at `<target-project>/.agent-workbench/interface.json`.
 
 Top-level fields:
 
@@ -27,3 +27,5 @@ Properties:
 - intentionally free of auth state and secrets
 
 The runtime excludes `.agent-workbench` from repository fingerprinting so exporting the file does not invalidate the project identity by itself.
+
+Generated review logs, visuals, repair reports, transcripts, and workflow histories are not part of the Agentic Workbench source tree. Keep them under the target project's `.agent-workbench/` subdirectories or machine-local app data, and never commit them to the `agentic-workbench` repo root.
