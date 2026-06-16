@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import type { ClientRequest, InitializeResponse, ServerNotification, ServerRequest } from "@generated/app-server";
+import type { ClientRequest, InitializeParams, InitializeResponse, ServerNotification, ServerRequest } from "@generated/app-server";
 import type { ModelListResponse, ThreadReadResponse, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnStartParams, TurnStartResponse } from "@generated/app-server/v2";
 import type { AppSettings } from "@shared/types";
 import {
@@ -218,19 +218,21 @@ export class CodexAppServerTransport extends EventEmitter<TransportEventMap> imp
   }
 
   async initialize(): Promise<InitializeResponse> {
+    const params: InitializeParams = {
+      clientInfo: {
+        name: "codex-agent-workbench",
+        title: "Codex Agent Workbench",
+        version: "0.1.0"
+      },
+      capabilities: {
+        experimentalApi: true,
+        requestAttestation: false
+      }
+    };
     return await this.call<InitializeResponse>({
       id: this.requestId++,
       method: "initialize",
-      params: {
-        clientInfo: {
-          name: "codex-agent-workbench",
-          title: "Codex Agent Workbench",
-          version: "0.1.0"
-        },
-        capabilities: {
-          experimentalApi: true
-        }
-      }
+      params
     });
   }
 
@@ -278,8 +280,7 @@ export class CodexAppServerTransport extends EventEmitter<TransportEventMap> imp
       id: this.requestId++,
       method: "thread/resume",
       params: {
-        threadId,
-        persistExtendedHistory: true
+        threadId
       }
     });
   }

@@ -977,7 +977,9 @@ describe("reasoning defaults", () => {
     supportsPersonality: true,
     additionalSpeedTiers: [],
     isDefault: false,
-    ...overrides
+    ...overrides,
+    serviceTiers: overrides.serviceTiers ?? [],
+    defaultServiceTier: overrides.defaultServiceTier ?? null
   });
 
   it("keeps interface reasoning cost-conscious unless explicitly overridden", () => {
@@ -1855,6 +1857,72 @@ describe("schema validation and IPC", () => {
       currentVersion: "0.127.0",
       updatedVersion: "0.128.0"
     });
+  });
+
+  it("updates Codex to the latest version when the bundled protocol supports it", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    let installedVersion = "0.128.0";
+    let installArgs: string[] | undefined;
+
+    const result = await updateCodexCliIfAvailable(settings, "linux", {
+      supportedProtocolVersion: "0.140.0",
+      commandRunner: {
+        runCodexVersion: async () => `codex-cli ${installedVersion}`,
+        runNpmCommand: async (args) => {
+          if (args[0] === "view") {
+            return "0.140.0\n";
+          }
+          installArgs = args;
+          installedVersion = "0.140.0";
+          return "updated\n";
+        }
+      }
+    });
+
+    expect(installArgs).toEqual(["install", "-g", "@openai/codex@0.140.0"]);
+    expect(result).toMatchObject({
+      status: "updated",
+      currentVersion: "0.128.0",
+      latestVersion: "0.140.0",
+      updatedVersion: "0.140.0"
+    });
+  });
+
+  it("runs the Codex CLI updater during non-mock startup before readiness checks", async () => {
+    const service = new AppService(await createTempDir("codex-startup-update")) as unknown as {
+      settings: ReturnType<typeof defaultSettings>;
+      refreshGitHubStatus: (emitState: boolean) => Promise<void>;
+      updateCodexCliOnStartup: () => Promise<void>;
+      refreshCodexReadiness: (reason?: string) => Promise<unknown>;
+      loadStoredProjects: () => Promise<void>;
+      runStartupWork: (options: { emitState: boolean }) => Promise<void>;
+    };
+    const calls: string[] = [];
+    service.settings = {
+      ...defaultSettings(),
+      executionMode: "local",
+      mockMode: false
+    };
+    service.refreshGitHubStatus = async () => {
+      calls.push("github");
+    };
+    service.updateCodexCliOnStartup = async () => {
+      calls.push("codex-update");
+    };
+    service.refreshCodexReadiness = async () => {
+      calls.push("codex-readiness");
+      return {};
+    };
+    service.loadStoredProjects = async () => {
+      calls.push("projects");
+    };
+
+    await service.runStartupWork({ emitState: false });
+
+    expect(calls).toEqual(["github", "codex-update", "codex-readiness", "projects"]);
   });
 
   it("requires update command approval and rechecks readiness after an approved update", async () => {

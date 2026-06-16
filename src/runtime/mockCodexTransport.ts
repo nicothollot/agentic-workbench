@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import path from "node:path";
 import { nanoid } from "nanoid";
 import type { InitializeResponse, ServerNotification } from "@generated/app-server";
-import type { ModelListResponse, ThreadReadResponse, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnStartParams, TurnStartResponse } from "@generated/app-server/v2";
+import type { ModelListResponse, ThreadItem, ThreadReadResponse, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, Turn, TurnStartParams, TurnStartResponse } from "@generated/app-server/v2";
 import type { CodexTransport, TransportEventMap } from "./codexTransport";
 
 const MOCK_TURN_COMPLETION_DELAY_MS = 50;
@@ -307,10 +307,11 @@ const extractWorkflowObjective = (input: TurnStartParams["input"]): MockRecommen
 export class MockCodexTransport extends EventEmitter<TransportEventMap> implements CodexTransport {
   private readonly threads = new Map<string, { id: string; cwd: string; model: string; turns: Array<{ id: string; items: Array<{ id: string; type: string; text?: string }> }> }>();
 
-  private buildMockTurn(id: string, items: ReturnType<MockCodexTransport["buildMockThreadItem"]>[], status: "inProgress" | "completed") {
+  private buildMockTurn(id: string, items: ThreadItem[], status: "inProgress" | "completed"): Turn {
     return {
       id,
       items,
+      itemsView: "full",
       status,
       error: null,
       startedAt: Math.floor(Date.now() / 1000),
@@ -319,7 +320,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     };
   }
 
-  private buildMockThreadItem(item: { id: string; type: string; text?: string }) {
+  private buildMockThreadItem(item: { id: string; type: string; text?: string }): ThreadItem {
     return item.type === "agentMessage"
       ? {
           type: "agentMessage" as const,
@@ -331,6 +332,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       : {
           type: "userMessage" as const,
           id: item.id,
+          clientId: null,
           content: []
         };
   }
@@ -366,6 +368,8 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           inputModalities: ["text"],
           supportsPersonality: true,
           additionalSpeedTiers: [],
+          serviceTiers: [],
+          defaultServiceTier: null,
           isDefault: false
         },
         {
@@ -386,6 +390,8 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           inputModalities: ["text"],
           supportsPersonality: true,
           additionalSpeedTiers: [],
+          serviceTiers: [],
+          defaultServiceTier: null,
           isDefault: true
         },
         {
@@ -407,6 +413,8 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           inputModalities: ["text"],
           supportsPersonality: true,
           additionalSpeedTiers: [],
+          serviceTiers: [],
+          defaultServiceTier: null,
           isDefault: false
         }
       ],
@@ -425,7 +433,9 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       thread: {
         id: threadId,
+        sessionId: threadId,
         forkedFromId: null,
+        parentThreadId: null,
         preview: "",
         ephemeral: false,
         modelProvider: "openai",
@@ -436,6 +446,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         cwd: params.cwd ?? "/tmp",
         cliVersion: "mock",
         source: { custom: "mock" },
+        threadSource: null,
         agentNickname: null,
         agentRole: null,
         gitInfo: null,
@@ -446,6 +457,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       modelProvider: "openai",
       serviceTier: null,
       cwd: params.cwd ?? "/tmp",
+      runtimeWorkspaceRoots: [params.cwd ?? "/tmp"],
       instructionSources: [],
       approvalPolicy: params.approvalPolicy ?? "on-request",
       approvalsReviewer: "user",
@@ -456,7 +468,6 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false
       },
-      permissionProfile: null,
       activePermissionProfile: null,
       reasoningEffort: null
     };
@@ -470,7 +481,9 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       thread: {
         id: thread.id,
+        sessionId: thread.id,
         forkedFromId: null,
+        parentThreadId: null,
         preview: "",
         ephemeral: false,
         modelProvider: "openai",
@@ -481,6 +494,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         cwd: thread.cwd,
         cliVersion: "mock",
         source: { custom: "mock" },
+        threadSource: null,
         agentNickname: null,
         agentRole: null,
         gitInfo: null,
@@ -491,6 +505,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       modelProvider: "openai",
       serviceTier: null,
       cwd: thread.cwd,
+      runtimeWorkspaceRoots: [thread.cwd],
       instructionSources: [],
       approvalPolicy: "on-request",
       approvalsReviewer: "user",
@@ -501,9 +516,9 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false
       },
-      permissionProfile: null,
       activePermissionProfile: null,
-      reasoningEffort: null
+      reasoningEffort: null,
+      initialTurnsPage: null
     };
   }
 
@@ -517,7 +532,9 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       thread: {
         id: thread.id,
+        sessionId: thread.id,
         forkedFromId: null,
+        parentThreadId: null,
         preview: "",
         ephemeral: false,
         modelProvider: "openai",
@@ -528,6 +545,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         cwd: thread.cwd,
         cliVersion: "mock",
         source: { custom: "mock" },
+        threadSource: null,
         agentNickname: null,
         agentRole: null,
         gitInfo: null,
@@ -596,7 +614,8 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
             text: responseText,
             phase: null,
             memoryCitation: null
-          }
+          },
+          completedAtMs: Date.now()
         }
       } satisfies ServerNotification);
       this.emit("notification", {
@@ -612,6 +631,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       turn: {
         id: turnId,
         items: [],
+        itemsView: "full",
         status: "inProgress",
         error: null,
         startedAt: Math.floor(Date.now() / 1000),

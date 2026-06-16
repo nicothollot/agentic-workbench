@@ -4465,6 +4465,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (this.settings.mockMode) {
       await this.initializeTransport();
     } else {
+      await this.updateCodexCliOnStartup();
       this.codexAvailability = {
         source: "unavailable",
         message: "Codex app-server will start when an agent-backed action runs."
@@ -10980,8 +10981,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       baseInstructions,
       developerInstructions: this.buildProjectBoundaryDeveloperInstructions(project, cwd, sandbox),
       personality: "pragmatic",
-      experimentalRawEvents: false,
-      persistExtendedHistory: true
+      experimentalRawEvents: false
     });
     this.logWorkflowPerf(`app-server thread started for ${agent.name}: ${Math.round(performance.now() - threadStartedAt)}ms`);
     agent.threadId = threadResponse.thread.id;
