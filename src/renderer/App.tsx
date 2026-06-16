@@ -7672,7 +7672,7 @@ export const App = () => {
       },
       treeError: undefined
     }));
-    void window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: 500 })
+    void window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: 5_000 })
       .then((page) => {
         setRepositoryData((current) =>
           current.projectId === projectId
@@ -7738,7 +7738,7 @@ export const App = () => {
       treeError: undefined
     }));
     const timeoutId = window.setTimeout(() => {
-      void window.workbench.searchRepositoryFiles(projectId, query, { limit: 500 })
+      void window.workbench.searchRepositoryFiles(projectId, query, { limit: 5_000 })
         .then((results) => {
           if (!cancelled) {
             setRepositoryData((current) => current.projectId === projectId

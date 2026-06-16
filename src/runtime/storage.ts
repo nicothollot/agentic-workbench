@@ -97,6 +97,22 @@ type AgentFullOutputStore = {
   output: string;
 };
 
+export type RepositoryIndexEntry = {
+  relativePath: string;
+  size: number;
+  language: string;
+};
+
+export type RepositoryIndexStore = {
+  version: 1;
+  projectId: string;
+  savedAt: string;
+  projectRoot: string;
+  treeHash?: string;
+  scanMode?: "normal" | "deep";
+  files: RepositoryIndexEntry[];
+};
+
 export const PROJECT_STATE_WARNING_BYTES = 750_000;
 export const PROJECT_STATE_COMPACT_BYTES = 1_500_000;
 export const PROJECT_STATE_HARD_LOAD_BYTES = 24_000_000;
@@ -381,6 +397,10 @@ export class WorkbenchStorage {
     return path.join(this.projectDir(projectId), "credentials.secrets.json");
   }
 
+  private projectRepositoryIndexPath(projectId: string): string {
+    return path.join(this.projectDir(projectId), "repository-index.json");
+  }
+
   private projectAgentTranscriptDir(projectId: string): string {
     return path.join(this.projectDir(projectId), "agent-transcripts");
   }
@@ -528,6 +548,58 @@ export class WorkbenchStorage {
       );
     }
     await this.writeJsonAtomically(this.projectStatePath(record.id), sanitized.record);
+  }
+
+  async saveRepositoryIndex(index: Omit<RepositoryIndexStore, "version" | "savedAt">): Promise<void> {
+    await this.ensureBaseDirs();
+    const store: RepositoryIndexStore = {
+      version: 1,
+      savedAt: nowIso(),
+      ...index,
+      files: index.files.map((file) => ({
+        relativePath: file.relativePath,
+        size: Math.max(0, Math.floor(file.size)),
+        language: file.language
+      }))
+    };
+    await this.writeJsonAtomically(this.projectRepositoryIndexPath(index.projectId), store);
+  }
+
+  async loadRepositoryIndex(projectId: string): Promise<RepositoryIndexStore | null> {
+    try {
+      const raw = await readFile(this.projectRepositoryIndexPath(projectId), "utf8");
+      const parsed = JSON.parse(raw) as Partial<RepositoryIndexStore>;
+      if (parsed.version !== 1 || parsed.projectId !== projectId || typeof parsed.projectRoot !== "string" || !Array.isArray(parsed.files)) {
+        return null;
+      }
+      const files = parsed.files
+        .filter((file): file is RepositoryIndexEntry =>
+          Boolean(file) &&
+          typeof file.relativePath === "string" &&
+          file.relativePath.length > 0 &&
+          !path.isAbsolute(file.relativePath) &&
+          !file.relativePath.split("/").includes("..") &&
+          typeof file.size === "number" &&
+          Number.isFinite(file.size) &&
+          typeof file.language === "string"
+        )
+        .map((file) => ({
+          relativePath: file.relativePath,
+          size: Math.max(0, Math.floor(file.size)),
+          language: file.language
+        }));
+      return {
+        version: 1,
+        projectId,
+        savedAt: typeof parsed.savedAt === "string" ? parsed.savedAt : nowIso(),
+        projectRoot: parsed.projectRoot,
+        treeHash: typeof parsed.treeHash === "string" ? parsed.treeHash : undefined,
+        scanMode: parsed.scanMode === "deep" ? "deep" : parsed.scanMode === "normal" ? "normal" : undefined,
+        files
+      };
+    } catch {
+      return null;
+    }
   }
 
   private parseJsonObjectPrefix(raw: string): string | undefined {

@@ -367,22 +367,22 @@ describe("integration flows", () => {
     expect(legacyView.tree.length).toBeLessThanOrEqual(32);
     expect(legacyView.treeTruncated).toBe(true);
 
-    const summary = service.getRepositorySummary(selected.record.id);
+    const summary = await service.getRepositorySummary(selected.record.id);
     expect(summary.rootChildren.total).toBeGreaterThan(32);
     expect(summary.rootChildren.children.some((entry) => entry.path === "src")).toBe(true);
 
-    const firstPage = service.listRepositoryChildren(selected.record.id, "", { limit: 10 });
+    const firstPage = await service.listRepositoryChildren(selected.record.id, "", { limit: 10 });
     expect(firstPage.children).toHaveLength(10);
     expect(firstPage.nextCursor).toBeTruthy();
 
-    const secondPage = service.listRepositoryChildren(selected.record.id, "", { cursor: firstPage.nextCursor, limit: 10 });
+    const secondPage = await service.listRepositoryChildren(selected.record.id, "", { cursor: firstPage.nextCursor, limit: 10 });
     expect(secondPage.children).toHaveLength(10);
     expect(secondPage.children[0]?.path).not.toBe(firstPage.children[0]?.path);
 
-    const moduleChildren = service.listRepositoryChildren(selected.record.id, "module-00", { limit: 10 });
+    const moduleChildren = await service.listRepositoryChildren(selected.record.id, "module-00", { limit: 10 });
     expect(moduleChildren.children.map((entry) => entry.path)).toContain("module-00/index.ts");
 
-    const search = service.searchRepositoryFiles(selected.record.id, "index.ts", { limit: 5 });
+    const search = await service.searchRepositoryFiles(selected.record.id, "index.ts", { limit: 5 });
     expect(search.results).toHaveLength(5);
     expect(search.truncated).toBe(true);
     expect(search.total).toBeGreaterThan(5);

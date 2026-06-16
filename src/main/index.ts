@@ -529,20 +529,20 @@ const registerIpc = (): void => {
     const parsed = projectRepositoryViewRequestSchema.parse(payload);
     return appService?.getRepositoryView(parsed.projectId);
   });
-  ipcMain.handle("project:getRepositorySummary", (_event, payload) => {
+  ipcMain.handle("project:getRepositorySummary", async (_event, payload) => {
     const parsed = projectRepositorySummaryRequestSchema.parse(payload);
-    return appService?.getRepositorySummary(parsed.projectId);
+    return await appService?.getRepositorySummary(parsed.projectId);
   });
-  ipcMain.handle("project:listRepositoryChildren", (_event, payload) => {
+  ipcMain.handle("project:listRepositoryChildren", async (_event, payload) => {
     const parsed = projectRepositoryChildrenRequestSchema.parse(payload);
-    return appService?.listRepositoryChildren(parsed.projectId, parsed.parentPath, {
+    return await appService?.listRepositoryChildren(parsed.projectId, parsed.parentPath, {
       cursor: parsed.cursor,
       limit: parsed.limit
     });
   });
-  ipcMain.handle("project:searchRepositoryFiles", (_event, payload) => {
+  ipcMain.handle("project:searchRepositoryFiles", async (_event, payload) => {
     const parsed = projectRepositorySearchRequestSchema.parse(payload);
-    return appService?.searchRepositoryFiles(parsed.projectId, parsed.query, { limit: parsed.limit });
+    return await appService?.searchRepositoryFiles(parsed.projectId, parsed.query, { limit: parsed.limit });
   });
   ipcMain.handle("project:getRepositoryScanStatus", (_event, payload) => {
     const parsed = projectRepositoryViewRequestSchema.parse(payload);

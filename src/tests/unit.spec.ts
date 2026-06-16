@@ -1981,7 +1981,6 @@ describe("schema validation and IPC", () => {
       refreshGitHubStatus: (emitState: boolean) => Promise<void>;
       updateCodexCliOnStartup: () => Promise<void>;
       loadStoredProjects: () => Promise<void>;
-      startStartupRepositoryScans: () => void;
       refreshRuntimeReadiness: (reason?: string) => Promise<unknown>;
       runStartupWork: (options: { emitState: boolean }) => Promise<void>;
     };
@@ -2000,9 +1999,6 @@ describe("schema validation and IPC", () => {
     service.loadStoredProjects = async () => {
       calls.push("projects");
     };
-    service.startStartupRepositoryScans = () => {
-      calls.push("repository-scans");
-    };
     service.refreshRuntimeReadiness = async () => {
       calls.push("runtime-readiness");
       return {};
@@ -2010,10 +2006,10 @@ describe("schema validation and IPC", () => {
 
     await service.runStartupWork({ emitState: false });
 
-    expect(calls).toEqual(["github", "codex-update", "projects", "repository-scans", "runtime-readiness"]);
+    expect(calls).toEqual(["github", "codex-update", "projects", "runtime-readiness"]);
   });
 
-  it("starts saved-project repository scans in the background during startup", async () => {
+  it("does not hydrate saved-project repository indexes during startup", async () => {
     const service = new AppService(await createTempDir("startup-repository-scan")) as unknown as {
       settings: ReturnType<typeof defaultSettings>;
       projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
@@ -2026,14 +2022,6 @@ describe("schema validation and IPC", () => {
     };
     const project = makeAppServiceLoadedProject("startup-scan-project");
     const calls: string[] = [];
-    let resolveScanStarted: () => void = () => undefined;
-    let resolveScan: () => void = () => undefined;
-    const scanStarted = new Promise<void>((resolve) => {
-      resolveScanStarted = resolve;
-    });
-    const scanRelease = new Promise<void>((resolve) => {
-      resolveScan = resolve;
-    });
 
     service.settings = {
       ...defaultSettings(),
@@ -2056,19 +2044,12 @@ describe("schema validation and IPC", () => {
     };
     service.rescanRepository = async (projectId) => {
       calls.push(`scan:${projectId}`);
-      resolveScanStarted();
-      await scanRelease;
       return {} as Awaited<ReturnType<AppService["rescanRepository"]>>;
     };
 
-    const startup = service.runStartupWork({ emitState: false });
-    await scanStarted;
-    await startup;
+    await service.runStartupWork({ emitState: false });
 
-    expect(calls).toEqual(["github", "codex-update", "projects", `scan:${project.record.id}`, "runtime-readiness"]);
-
-    resolveScan();
-    await scanRelease;
+    expect(calls).toEqual(["github", "codex-update", "projects", "runtime-readiness"]);
   });
 
   it("requires update command approval and rechecks readiness after an approved update", async () => {
@@ -7534,7 +7515,7 @@ describe("AppService workflow performance guards", () => {
     project.record.stats = project.scan.stats;
     service.projects.set(project.record.id, project);
 
-    const results = service.searchRepositoryFiles(project.record.id, "match", { limit: 5 });
+    const results = await service.searchRepositoryFiles(project.record.id, "match", { limit: 5 });
 
     expect(results.results).toHaveLength(5);
     expect(results.total).toBe(12);
@@ -7579,8 +7560,8 @@ describe("AppService workflow performance guards", () => {
     }];
     service.projects.set(project.record.id, project);
 
-    const summary = service.getRepositorySummary(project.record.id);
-    const rootPage = service.listRepositoryChildren(project.record.id, "", { limit: 1 });
+    const summary = await service.getRepositorySummary(project.record.id);
+    const rootPage = await service.listRepositoryChildren(project.record.id, "", { limit: 1 });
     const excluded = service.listExcludedPaths(project.record.id, { limit: 1 });
 
     expect("tree" in summary).toBe(false);
@@ -7600,7 +7581,7 @@ describe("AppService workflow performance guards", () => {
       listRepositoryChildren: AppService["listRepositoryChildren"];
     };
     const project = makeAppServiceLoadedProject("repo-large-page-project");
-    const files = Array.from({ length: 600 }, (_, index) => ({
+    const files = Array.from({ length: 5_200 }, (_, index) => ({
       absolutePath: `/repo/file-${index}.ts`,
       relativePath: `file-${index}.ts`,
       size: 20,
@@ -7622,14 +7603,67 @@ describe("AppService workflow performance guards", () => {
     project.record.stats = project.scan.stats;
     service.projects.set(project.record.id, project);
 
-    const summary = service.getRepositorySummary(project.record.id);
-    const nextPage = service.listRepositoryChildren(project.record.id, "", { cursor: summary.rootChildren.nextCursor });
+    const summary = await service.getRepositorySummary(project.record.id);
+    const nextPage = await service.listRepositoryChildren(project.record.id, "", { cursor: summary.rootChildren.nextCursor });
 
-    expect(summary.rootChildren.children).toHaveLength(500);
-    expect(summary.rootChildren.total).toBe(600);
-    expect(summary.rootChildren.nextCursor).toBe("500");
-    expect(nextPage.children).toHaveLength(100);
+    expect(summary.rootChildren.children).toHaveLength(5_000);
+    expect(summary.rootChildren.total).toBe(5_200);
+    expect(summary.rootChildren.nextCursor).toBe("5000");
+    expect(nextPage.children).toHaveLength(200);
     expect(nextPage.nextCursor).toBeUndefined();
+  });
+
+  it("hydrates repository tree data lazily from the saved sidecar index", async () => {
+    const repoRoot = await createTempDir("repository-sidecar-index");
+    await mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await writeFile(path.join(repoRoot, "src/index.ts"), "export const value = 1;\n");
+    const service = new AppService(await createTempDir("repository-sidecar-appdata")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      storage: WorkbenchStorage;
+      rescanRepository: AppService["rescanRepository"];
+      getRepositorySummary: AppService["getRepositorySummary"];
+    };
+    const project = makeAppServiceLoadedProject("repo-sidecar-project");
+    project.record.displayPath = repoRoot;
+    project.record.wslPath = repoRoot;
+    project.record.projectRoot = repoRoot;
+    project.record.hostPath = repoRoot;
+    project.record.stats = {
+      ...project.scan.stats,
+      projectRoot: repoRoot,
+      includedFiles: 1,
+      totalFiles: 1,
+      includedSizeBytes: 24,
+      totalSizeBytes: 24
+    };
+    project.scan = {
+      ...project.scan,
+      files: [],
+      stats: project.record.stats
+    };
+    let rescanCalled = false;
+    service.rescanRepository = async () => {
+      rescanCalled = true;
+      return {} as Awaited<ReturnType<AppService["rescanRepository"]>>;
+    };
+    service.projects.set(project.record.id, project);
+    await service.storage.saveRepositoryIndex({
+      projectId: project.record.id,
+      projectRoot: repoRoot,
+      treeHash: "tree",
+      scanMode: "deep",
+      files: [
+        { relativePath: "src/index.ts", size: 24, language: "TypeScript" }
+      ]
+    });
+
+    const summary = await service.getRepositorySummary(project.record.id);
+
+    expect(rescanCalled).toBe(false);
+    expect(project.scan.files.map((file) => file.relativePath)).toEqual(["src/index.ts"]);
+    expect(project.scan.files[0]?.absolutePath).toBe(path.join(repoRoot, "src", "index.ts"));
+    expect(project.scan.stats.scanMode).toBe("deep");
+    expect(summary.rootChildren.children.map((entry) => entry.path)).toEqual(["src"]);
   });
 
   it("rescans normally and supports persisted deep scan settings", async () => {
@@ -7655,6 +7689,7 @@ describe("AppService workflow performance guards", () => {
 
     await service.rescanRepository(project.record.id, { mode: "normal" });
     const normalStatus = service.getRepositoryScanStatus(project.record.id);
+    const defaultLimits = service.getRepositoryScanLimits(project.record.id);
     const deepSettings: RepositoryScanSettings = {
       maxIncludedFiles: 2,
       maxIncludedDirectories: 10,
@@ -7669,6 +7704,8 @@ describe("AppService workflow performance guards", () => {
 
     expect(normalStatus.status).toBe("indexed");
     expect(normalStatus.searchScope).toBe("indexed_files");
+    expect(defaultLimits.deepDefaults.maxIncludedFiles).toBe(100_000);
+    expect(defaultLimits.hardMaximums.maxIncludedFiles).toBe(100_000);
     expect(limits.effective.maxIncludedFiles).toBe(2);
     expect(service.getRepositoryScanLimits(project.record.id).settings.maxIncludedFiles).toBe(2);
     expect(deepStatus.status).toBe("truncated");

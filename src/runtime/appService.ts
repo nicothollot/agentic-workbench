@@ -181,7 +181,7 @@ import {
   assertProjectRelativeHostPath,
   resolveExecutionPathWithinProjectRoot
 } from "./projectBoundary";
-import { DEFAULT_REPOSITORY_SCAN_LIMITS, hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult, type RepositoryScanLimits } from "./repoScanner";
+import { DEFAULT_REPOSITORY_SCAN_LIMITS, hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult, type RepositoryScanLimits, type ScannedFile } from "./repoScanner";
 import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
 import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
 import { sanitizeWorkflowState } from "./stateSanitizer";
@@ -299,10 +299,10 @@ const RENDERER_REPOSITORY_DEPENDENCY_LIMIT = 80;
 const RENDERER_REPOSITORY_SUMMARY_CACHE_LIMIT = 80;
 const RENDERER_PAYLOAD_WARNING_BYTES = 1_000_000;
 const RENDERER_PAYLOAD_HARD_LIMIT_BYTES = 1_800_000;
-const REPOSITORY_CHILDREN_DEFAULT_LIMIT = 500;
-const REPOSITORY_CHILDREN_MAX_LIMIT = 2_500;
-const REPOSITORY_SEARCH_DEFAULT_LIMIT = 500;
-const REPOSITORY_SEARCH_MAX_LIMIT = 2_500;
+const REPOSITORY_CHILDREN_DEFAULT_LIMIT = 5_000;
+const REPOSITORY_CHILDREN_MAX_LIMIT = 20_000;
+const REPOSITORY_SEARCH_DEFAULT_LIMIT = 5_000;
+const REPOSITORY_SEARCH_MAX_LIMIT = 20_000;
 const REPOSITORY_PAYLOAD_WARNING_BYTES = 750_000;
 const REPOSITORY_DEEP_SCAN_MULTIPLIER = 4;
 const CODEX_READINESS_PROBE_TIMEOUT_MS = 10_000;
@@ -397,14 +397,19 @@ const scaleRepositoryScanSettings = (
 
 const REPOSITORY_DEFAULT_SCAN_SETTINGS = requiredRepositoryScanSettings(DEFAULT_REPOSITORY_SCAN_LIMITS);
 const REPOSITORY_DEEP_SCAN_SETTINGS = scaleRepositoryScanSettings(REPOSITORY_DEFAULT_SCAN_SETTINGS, REPOSITORY_DEEP_SCAN_MULTIPLIER, {
-  maxDepth: DEFAULT_REPOSITORY_SCAN_LIMITS.maxDepth * 2,
+  maxIncludedFiles: 100_000,
+  maxIncludedDirectories: 60_000,
+  maxDepth: 128,
   maxManifestFileSizeBytes: DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes * 2,
+  maxScanDurationMs: 120_000,
   maxExcludedPathRecords: DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords * 2
 });
 const REPOSITORY_HARD_SCAN_SETTINGS = scaleRepositoryScanSettings(REPOSITORY_DEFAULT_SCAN_SETTINGS, 8, {
-  maxDepth: 96,
+  maxIncludedFiles: 100_000,
+  maxIncludedDirectories: 60_000,
+  maxDepth: 128,
   maxManifestFileSizeBytes: DEFAULT_REPOSITORY_SCAN_LIMITS.maxManifestFileSizeBytes * 8,
-  maxScanDurationMs: 90_000,
+  maxScanDurationMs: 180_000,
   maxExcludedPathRecords: DEFAULT_REPOSITORY_SCAN_LIMITS.maxExcludedPathRecords * 8
 });
 
@@ -626,7 +631,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private safeMode = false;
   private disposePromise?: Promise<void>;
   private deferredStartupWork?: Promise<void>;
-  private startupRepositoryScansInFlight?: Promise<void>;
+  private readonly repositoryIndexLoadOperations = new Map<string, Promise<void>>();
   private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
   private readonly workflowPerfCounters = new Map<string, { count: number; startedAt: number; lastLoggedAt: number }>();
 
@@ -4474,48 +4479,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     await this.loadStoredProjects();
-    this.startStartupRepositoryScans();
     await this.refreshRuntimeReadiness("startup runtime readiness check");
     if (options.emitState) {
       this.emitState();
-    }
-  }
-
-  private startStartupRepositoryScans(): void {
-    if (this.safeMode || this.disposed || this.startupRepositoryScansInFlight) {
-      return;
-    }
-    const projectIds = [...this.projects.keys()];
-    if (projectIds.length === 0) {
-      return;
-    }
-
-    this.startupRepositoryScansInFlight = this.runStartupRepositoryScans(projectIds)
-      .catch((error) => {
-        this.diagnostics.unshift(`Startup repository scans failed. ${error instanceof Error ? error.message : String(error)}`);
-        this.emitState();
-      })
-      .finally(() => {
-        this.startupRepositoryScansInFlight = undefined;
-      });
-  }
-
-  private async runStartupRepositoryScans(projectIds: string[]): Promise<void> {
-    for (const projectId of projectIds) {
-      if (this.safeMode || this.disposed) {
-        return;
-      }
-      if (!this.projects.has(projectId) || this.repositoryScanOperations.has(projectId)) {
-        continue;
-      }
-
-      try {
-        await this.rescanRepository(projectId, { mode: "normal" });
-      } catch (error) {
-        const projectName = this.projects.get(projectId)?.record.identity.projectName ?? projectId;
-        this.diagnostics.unshift(`Startup repository scan failed for ${projectName}. ${error instanceof Error ? error.message : String(error)}`);
-        this.emitState();
-      }
     }
   }
 
@@ -4839,6 +4805,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (repairLimitChanged || reasoningChanged || agentReasoningChanged || modelChanged) {
       const interfaceConfig = this.resolveInterfaceCreationConfig();
       for (const project of this.projects.values()) {
+        if (project.record.id !== this.activeProjectId) {
+          continue;
+        }
         const workflow = this.ensureWorkflowState(project.record);
         this.syncWorkflowSettings(workflow);
         if (project.record.interfaceCreation && project.record.interfaceCreation.status !== "running") {
@@ -5153,6 +5122,93 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     project.gitMetadata = scannedProject.gitMetadata;
   }
 
+  private repositoryIndexHostPath(project: LoadedProject): string {
+    return project.record.hostPath || project.record.projectRoot;
+  }
+
+  private repositoryIndexAbsoluteFilePath(project: LoadedProject, relativePath: string): string {
+    return path.join(this.repositoryIndexHostPath(project), ...relativePath.split("/"));
+  }
+
+  private async saveRepositoryIndex(project: LoadedProject): Promise<void> {
+    if (project.scan.files.length === 0) {
+      return;
+    }
+    await this.storage.saveRepositoryIndex({
+      projectId: project.record.id,
+      projectRoot: project.record.projectRoot,
+      treeHash: project.scan.treeHash,
+      scanMode: project.scan.stats.scanMode,
+      files: project.scan.files.map((file) => ({
+        relativePath: file.relativePath,
+        size: file.size,
+        language: file.language
+      }))
+    });
+  }
+
+  private async hydrateRepositoryIndex(projectId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    if (project.scan.files.length > 0) {
+      return;
+    }
+
+    const index = await this.storage.loadRepositoryIndex(projectId);
+    if (index?.files.length) {
+      const files: ScannedFile[] = index.files.map((file) => ({
+        absolutePath: this.repositoryIndexAbsoluteFilePath(project, file.relativePath),
+        relativePath: file.relativePath,
+        size: file.size,
+        language: file.language
+      }));
+      project.scan = {
+        ...project.scan,
+        files,
+        treeHash: index.treeHash ?? project.scan.treeHash,
+        stats: {
+          ...project.scan.stats,
+          scanMode: index.scanMode ?? project.scan.stats.scanMode
+        }
+      };
+      return;
+    }
+
+    if ((project.record.stats?.includedFiles ?? 0) > 0) {
+      await this.rescanRepository(projectId, {
+        mode: project.record.stats?.scanMode === "deep" ? "deep" : "normal"
+      });
+    }
+  }
+
+  private async ensureRepositoryIndexLoaded(projectId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    if (project.scan.files.length > 0) {
+      return;
+    }
+    const existingLoad = this.repositoryIndexLoadOperations.get(projectId);
+    if (existingLoad) {
+      await existingLoad;
+      return;
+    }
+
+    const load = this.hydrateRepositoryIndex(projectId)
+      .catch((error) => {
+        this.repositoryScanFailures.set(projectId, {
+          failedAt: nowIso(),
+          message: error instanceof Error ? error.message : String(error),
+          recoverySteps: this.repositoryScanRecoverySteps(error instanceof Error ? error.message : String(error))
+        });
+        throw error;
+      })
+      .finally(() => {
+        if (this.repositoryIndexLoadOperations.get(projectId) === load) {
+          this.repositoryIndexLoadOperations.delete(projectId);
+        }
+      });
+    this.repositoryIndexLoadOperations.set(projectId, load);
+    await load;
+  }
+
   private normalizeRepositoryRelativePath(input: string): string {
     const trimmed = input.trim().replace(/\\/g, "/");
     if (!trimmed) {
@@ -5383,8 +5439,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         primaryManagers: scan.stats.primaryManagers
       });
       this.repositoryScanFailures.delete(projectId);
+      await this.saveRepositoryIndex(existing);
       await this.saveProject(existing);
-      return this.getRepositorySummary(projectId);
+      return this.buildRepositorySummary(projectId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.repositoryScanFailures.set(projectId, {
@@ -5415,9 +5472,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return view;
   }
 
-  getRepositorySummary(projectId: string): ProjectRepositorySummary {
+  private buildRepositorySummary(projectId: string): ProjectRepositorySummary {
     const project = this.findProject(projectId);
-    const rootChildren = this.listRepositoryChildren(projectId, "", { limit: REPOSITORY_CHILDREN_DEFAULT_LIMIT });
+    const rootChildren = this.buildRepositoryChildren(projectId, "", { limit: REPOSITORY_CHILDREN_DEFAULT_LIMIT });
     const summary: ProjectRepositorySummary = {
       projectId,
       stats: project.record.stats,
@@ -5437,7 +5494,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return summary;
   }
 
-  listRepositoryChildren(
+  async getRepositorySummary(projectId: string): Promise<ProjectRepositorySummary> {
+    await this.ensureRepositoryIndexLoaded(projectId);
+    return this.buildRepositorySummary(projectId);
+  }
+
+  private buildRepositoryChildren(
     projectId: string,
     parentPath = "",
     options: { cursor?: string; limit?: number } = {}
@@ -5517,7 +5579,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return response;
   }
 
-  searchRepositoryFiles(
+  async listRepositoryChildren(
+    projectId: string,
+    parentPath = "",
+    options: { cursor?: string; limit?: number } = {}
+  ): Promise<RepositoryChildrenResponse> {
+    await this.ensureRepositoryIndexLoaded(projectId);
+    return this.buildRepositoryChildren(projectId, parentPath, options);
+  }
+
+  private buildRepositorySearchResults(
     projectId: string,
     query: string,
     options: { limit?: number } = {}
@@ -5551,6 +5622,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
     this.logRepositoryPayload("searchRepositoryFiles", response, `query=${normalizedQuery}, returned=${results.length}, total=${matchedFiles.length}`);
     return response;
+  }
+
+  async searchRepositoryFiles(
+    projectId: string,
+    query: string,
+    options: { limit?: number } = {}
+  ): Promise<RepositorySearchResponse> {
+    await this.ensureRepositoryIndexLoaded(projectId);
+    return this.buildRepositorySearchResults(projectId, query, options);
   }
 
   private agentApprovalSummaries(agent: AgentState): string[] {
@@ -6392,6 +6472,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.syncWorkflowState(project);
     this.projects.set(projectId, project);
     await this.cleanupCompletedManagedWorktrees(project);
+    await this.saveRepositoryIndex(project);
     await this.saveProject(project);
     this.activeProjectId = projectId;
     await this.resumeSavedAgents(project);
@@ -6815,6 +6896,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (source === "local") {
       await this.cleanupCompletedManagedWorktrees(project);
     }
+    await this.saveRepositoryIndex(project);
     await this.saveProject(project);
     this.activeProjectId = projectId;
     if (source !== "fresh") {
@@ -7131,6 +7213,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     );
     project.record.interfaceCreation.phase = "Queued";
     project.record.interfaceCreation.message = "Repository rescan complete. Preparing a fresh overview analysis run.";
+    await this.saveRepositoryIndex(project);
     await this.saveProject(project);
     this.emitState();
     void this.runBootstrapIfNeeded(project);
@@ -7146,12 +7229,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       project.record.validation
     );
     this.applyScannedProjectState(project, scannedProject);
+    await this.saveRepositoryIndex(project);
     await this.saveProject(project);
     this.emitState();
     return status;
   }
 
   async getFileSummary(projectId: string, relativePath: string) {
+    await this.ensureRepositoryIndexLoaded(projectId);
     const project = this.findProject(projectId);
     const file = project.scan.files.find((entry) => entry.relativePath === relativePath);
     if (!file) {
@@ -11703,6 +11788,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     try {
       const refreshedProject = await this.scanCurrentProject(project);
       this.applyScannedProjectState(project, refreshedProject);
+      await this.saveRepositoryIndex(project);
     } catch (error) {
       this.diagnostics.unshift(
         `${operation} updated the opened checkout on ${appliedBranch}, but the project overview refresh failed. ${error instanceof Error ? error.message : String(error)}`
