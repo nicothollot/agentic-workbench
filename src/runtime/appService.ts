@@ -626,6 +626,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private safeMode = false;
   private disposePromise?: Promise<void>;
   private deferredStartupWork?: Promise<void>;
+  private startupRepositoryScansInFlight?: Promise<void>;
   private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
   private readonly workflowPerfCounters = new Map<string, { count: number; startedAt: number; lastLoggedAt: number }>();
 
@@ -4470,15 +4471,51 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         source: "unavailable",
         message: "Codex app-server will start when an agent-backed action runs."
       };
-      void this.refreshCodexReadiness("startup Codex readiness check").catch((error) => {
-        this.diagnostics.unshift(`Startup Codex readiness check failed. ${error instanceof Error ? error.message : String(error)}`);
-        this.emitState();
-      });
     }
 
     await this.loadStoredProjects();
+    this.startStartupRepositoryScans();
+    await this.refreshRuntimeReadiness("startup runtime readiness check");
     if (options.emitState) {
       this.emitState();
+    }
+  }
+
+  private startStartupRepositoryScans(): void {
+    if (this.safeMode || this.disposed || this.startupRepositoryScansInFlight) {
+      return;
+    }
+    const projectIds = [...this.projects.keys()];
+    if (projectIds.length === 0) {
+      return;
+    }
+
+    this.startupRepositoryScansInFlight = this.runStartupRepositoryScans(projectIds)
+      .catch((error) => {
+        this.diagnostics.unshift(`Startup repository scans failed. ${error instanceof Error ? error.message : String(error)}`);
+        this.emitState();
+      })
+      .finally(() => {
+        this.startupRepositoryScansInFlight = undefined;
+      });
+  }
+
+  private async runStartupRepositoryScans(projectIds: string[]): Promise<void> {
+    for (const projectId of projectIds) {
+      if (this.safeMode || this.disposed) {
+        return;
+      }
+      if (!this.projects.has(projectId) || this.repositoryScanOperations.has(projectId)) {
+        continue;
+      }
+
+      try {
+        await this.rescanRepository(projectId, { mode: "normal" });
+      } catch (error) {
+        const projectName = this.projects.get(projectId)?.record.identity.projectName ?? projectId;
+        this.diagnostics.unshift(`Startup repository scan failed for ${projectName}. ${error instanceof Error ? error.message : String(error)}`);
+        this.emitState();
+      }
     }
   }
 

@@ -896,6 +896,35 @@ describe("repo stats", () => {
     expect(scan.stats.entryPoints).toContain("src/index.ts");
   });
 
+  it("recursively accounts for ignored directory size without indexing ignored files", async () => {
+    const root = await createTempDir("scan-excluded-size");
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await mkdir(path.join(root, "node_modules", "pkg", "nested"), { recursive: true });
+    await writeFile(path.join(root, "src/index.ts"), "export const value = 1;\n");
+    await writeFile(path.join(root, "node_modules", "pkg", "index.js"), "x".repeat(512));
+    await writeFile(path.join(root, "node_modules", "pkg", "nested", "bundle.js"), "y".repeat(1_536));
+
+    const scan = await scanRepository(root, {
+      isGit: false,
+      normalizedRemotes: []
+    }, root);
+
+    const nodeModules = scan.stats.excludedPaths.find((entry) => entry.path === "node_modules");
+
+    expect(scan.files.some((file) => file.relativePath.startsWith("node_modules/"))).toBe(false);
+    expect(nodeModules).toMatchObject({
+      kind: "directory",
+      rule: "default",
+      fileCount: 2,
+      totalSizeBytes: 2_048
+    });
+    expect(scan.stats.excludedFiles).toBe(2);
+    expect(scan.stats.excludedFolders).toBeGreaterThanOrEqual(3);
+    expect(scan.stats.excludedSizeBytes).toBe(2_048);
+    expect(scan.stats.totalSizeBytes).toBe(scan.stats.includedSizeBytes + scan.stats.excludedSizeBytes);
+    expect(scan.stats.totalSizeBytes).toBeGreaterThan(scan.stats.includedSizeBytes);
+  });
+
   it("skips dependency parsing for oversized manifests", async () => {
     const root = await createTempDir("scan-huge-manifest");
     await writeFile(path.join(root, "package.json"), "{".repeat(128));
@@ -1896,8 +1925,9 @@ describe("schema validation and IPC", () => {
       settings: ReturnType<typeof defaultSettings>;
       refreshGitHubStatus: (emitState: boolean) => Promise<void>;
       updateCodexCliOnStartup: () => Promise<void>;
-      refreshCodexReadiness: (reason?: string) => Promise<unknown>;
       loadStoredProjects: () => Promise<void>;
+      startStartupRepositoryScans: () => void;
+      refreshRuntimeReadiness: (reason?: string) => Promise<unknown>;
       runStartupWork: (options: { emitState: boolean }) => Promise<void>;
     };
     const calls: string[] = [];
@@ -1912,17 +1942,78 @@ describe("schema validation and IPC", () => {
     service.updateCodexCliOnStartup = async () => {
       calls.push("codex-update");
     };
-    service.refreshCodexReadiness = async () => {
-      calls.push("codex-readiness");
-      return {};
-    };
     service.loadStoredProjects = async () => {
       calls.push("projects");
+    };
+    service.startStartupRepositoryScans = () => {
+      calls.push("repository-scans");
+    };
+    service.refreshRuntimeReadiness = async () => {
+      calls.push("runtime-readiness");
+      return {};
     };
 
     await service.runStartupWork({ emitState: false });
 
-    expect(calls).toEqual(["github", "codex-update", "codex-readiness", "projects"]);
+    expect(calls).toEqual(["github", "codex-update", "projects", "repository-scans", "runtime-readiness"]);
+  });
+
+  it("starts saved-project repository scans in the background during startup", async () => {
+    const service = new AppService(await createTempDir("startup-repository-scan")) as unknown as {
+      settings: ReturnType<typeof defaultSettings>;
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      refreshGitHubStatus: (emitState: boolean) => Promise<void>;
+      updateCodexCliOnStartup: () => Promise<void>;
+      loadStoredProjects: () => Promise<void>;
+      refreshRuntimeReadiness: (reason?: string) => Promise<unknown>;
+      rescanRepository: AppService["rescanRepository"];
+      runStartupWork: (options: { emitState: boolean }) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("startup-scan-project");
+    const calls: string[] = [];
+    let resolveScanStarted: () => void = () => undefined;
+    let resolveScan: () => void = () => undefined;
+    const scanStarted = new Promise<void>((resolve) => {
+      resolveScanStarted = resolve;
+    });
+    const scanRelease = new Promise<void>((resolve) => {
+      resolveScan = resolve;
+    });
+
+    service.settings = {
+      ...defaultSettings(),
+      executionMode: "local",
+      mockMode: false
+    };
+    service.refreshGitHubStatus = async () => {
+      calls.push("github");
+    };
+    service.updateCodexCliOnStartup = async () => {
+      calls.push("codex-update");
+    };
+    service.loadStoredProjects = async () => {
+      calls.push("projects");
+      service.projects.set(project.record.id, project);
+    };
+    service.refreshRuntimeReadiness = async () => {
+      calls.push("runtime-readiness");
+      return {};
+    };
+    service.rescanRepository = async (projectId) => {
+      calls.push(`scan:${projectId}`);
+      resolveScanStarted();
+      await scanRelease;
+      return {} as Awaited<ReturnType<AppService["rescanRepository"]>>;
+    };
+
+    const startup = service.runStartupWork({ emitState: false });
+    await scanStarted;
+    await startup;
+
+    expect(calls).toEqual(["github", "codex-update", "projects", `scan:${project.record.id}`, "runtime-readiness"]);
+
+    resolveScan();
+    await scanRelease;
   });
 
   it("requires update command approval and rechecks readiness after an approved update", async () => {

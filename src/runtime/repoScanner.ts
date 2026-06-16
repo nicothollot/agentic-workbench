@@ -486,11 +486,68 @@ export const scanRepository = async (
       };
     }
 
-    return {
+    const summary = {
       fileCount: 0,
       folderCount: 1,
       totalSizeBytes: 0
     };
+    const pendingDirectories = [absolutePath];
+
+    while (pendingDirectories.length > 0 && !stopScan) {
+      const currentExcludedDir = pendingDirectories.pop();
+      if (!currentExcludedDir) {
+        continue;
+      }
+
+      let entries;
+      try {
+        entries = await readdir(currentExcludedDir, { withFileTypes: true });
+      } catch (error) {
+        if (isSkippableScanError(error)) {
+          continue;
+        }
+        throw error;
+      }
+
+      for (const entry of entries) {
+        if (stopScan) {
+          return summary;
+        }
+        await yieldDuringLargeScan();
+        if (stopScan) {
+          return summary;
+        }
+
+        const childPath = path.join(currentExcludedDir, entry.name);
+        let childStats;
+        try {
+          childStats = await lstat(childPath);
+        } catch (error) {
+          if (isSkippableScanError(error)) {
+            continue;
+          }
+          throw error;
+        }
+
+        if (childStats.isDirectory()) {
+          summary.folderCount += 1;
+          pendingDirectories.push(childPath);
+          continue;
+        }
+
+        if (childStats.isFile()) {
+          summary.fileCount += 1;
+          summary.totalSizeBytes += childStats.size;
+          continue;
+        }
+
+        if (childStats.isSymbolicLink()) {
+          summary.fileCount += 1;
+        }
+      }
+    }
+
+    return summary;
   };
 
   const recordExcludedPath = (entry: {
