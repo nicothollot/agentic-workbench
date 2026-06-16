@@ -20,6 +20,7 @@ import {
   workflowStageLabel,
   workflowStatusSummary
 } from "@shared/workflowView";
+import { isWorkflowAutomationBlockingAgent } from "@shared/workflow";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
 import { CommandCenter, type CommandCenterHealthItem, type CommandCenterItem, type CommandCenterTone } from "./components/CommandCenter";
@@ -1299,6 +1300,28 @@ const runStageName = (agent: AgentState): string => {
 const runModelSummary = (agent: AgentState): string =>
   `${agent.model}${agent.reasoningEffort ? ` / ${reasoningEffortLabel(agent.reasoningEffort)}${agent.reasoningEffortSource ? ` ${agent.reasoningEffortSource}` : ""}` : ""}`;
 
+const repositoryFileExtensionLabel = (relativePath: string): string => {
+  const fileName = relativePath.split("/").pop() ?? relativePath;
+  const dotIndex = fileName.lastIndexOf(".");
+  return dotIndex > 0 && dotIndex < fileName.length - 1 ? fileName.slice(dotIndex) : "";
+};
+
+const repositoryTreeRowKindLabel = (row: RepositoryTreeEntry): string =>
+  row.type === "directory" ? "Folder" : repositoryFileExtensionLabel(row.path) || "File";
+
+const repositoryTreeRowMeta = (row: RepositoryTreeEntry, loading = false): string => {
+  if (loading) {
+    return "Loading";
+  }
+  if (row.type === "directory") {
+    return row.childCount === undefined ? "Folder" : `${row.childCount} item${row.childCount === 1 ? "" : "s"}`;
+  }
+  return [
+    row.language,
+    formatBytes(row.size ?? 0)
+  ].filter(Boolean).join(" · ");
+};
+
 const runResultSummary = (agent: AgentState, workflow?: ProjectWorkflowState): string => {
   if (agent.status === "waiting_approval") {
     return "Waiting for an explicit approval before continuing.";
@@ -1801,8 +1824,9 @@ const RepoTree = ({
                   <span className="tree-row__marker">
                     {row.type === "directory" ? row.expanded ? "▾" : "▸" : "•"}
                   </span>
+                  <span className={`tree-row__kind tree-row__kind--${row.type}`}>{repositoryTreeRowKindLabel(row)}</span>
                   <span className="tree-row__label">{row.name}</span>
-                  {row.loading ? <span className="tree-row__meta">Loading</span> : null}
+                  <span className="tree-row__meta">{repositoryTreeRowMeta(row, row.loading)}</span>
                 </button>
               ))}
             </div>
@@ -1864,7 +1888,7 @@ const AgentCard = ({
       </div>
       <div className="agent-card__meta">
         <span>{agent.lastActivityAt ? `Updated ${formatDateTime(agent.lastActivityAt)}` : "Waiting to start"}</span>
-        <span>{agent.reasoningEffort ? `${reasoningEffortLabel(agent.reasoningEffort)}${agent.reasoningEffortSource === "auto" ? " auto" : agent.reasoningEffortSource === "manual" ? " manual" : ""}` : "Default reasoning"}</span>
+        <span>{runModelSummary(agent)}</span>
         <span>{agent.approvals.filter((approval) => approval.status === "pending").length} approvals</span>
         <span>{agent.changedFiles.length} changed files</span>
       </div>
@@ -2414,7 +2438,7 @@ const RunRow = ({
         <span>{formatDateTime(agentRunTimestamp(agent))}</span>
         <span>{agent.changedFiles.length} files</span>
         <span>{pendingApprovalCount} approvals</span>
-        <span>{agent.reasoningEffort ? reasoningEffortLabel(agent.reasoningEffort) : "Default reasoning"}</span>
+        <span>{runModelSummary(agent)}</span>
       </div>
     </button>
   );
@@ -6993,7 +7017,7 @@ export const App = () => {
     [allAgents]
   );
   const workflowAgents = useMemo(() => allAgents.filter((agent) => agent.category !== "manual"), [allAgents]);
-  const workflowHasActiveAgent = useMemo(() => workflowAgents.some((agent) => isWorkflowAgentActive(agent)), [workflowAgents]);
+  const workflowHasActiveAgent = useMemo(() => workflowAgents.some(isWorkflowAutomationBlockingAgent), [workflowAgents]);
   const manualAgents = useMemo(() => allAgents.filter((agent) => agent.category === "manual"), [allAgents]);
   const goalAgents = useMemo(() => workflowAgents.filter((agent) => agent.category === "bootstrap" || agent.category === "goal"), [workflowAgents]);
   const codingAgents = useMemo(() => workflowAgents.filter((agent) => agent.category === "coding"), [workflowAgents]);
@@ -7129,7 +7153,8 @@ export const App = () => {
     const isCurrentCycleAgent = (agent: AgentState): boolean =>
       agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber;
 
-    return workflowAgents.find((agent) => isCurrentCycleAgent(agent) && isWorkflowAgentActive(agent))
+    return workflowAgents.find((agent) => isCurrentCycleAgent(agent) && isWorkflowAutomationBlockingAgent(agent))
+      ?? workflowAgents.find((agent) => isCurrentCycleAgent(agent) && isWorkflowAgentActive(agent))
       ?? workflowAgents.find(isCurrentCycleAgent)
       ?? workflowAgents[0];
   }, [workflow, workflowAgents]);
@@ -7592,7 +7617,7 @@ export const App = () => {
   }, [activeAgent?.id, activeProjectId, activeWorkspaceTab, agentHistoryVersion, focusedAgentId, runsPageAgents]);
 
   useEffect(() => {
-    if (!activeProjectId || activeWorkspaceTab !== "repository") {
+    if (!activeProjectId) {
       return;
     }
     if (repositoryData.projectId === activeProjectId) {
@@ -7634,10 +7659,10 @@ export const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeProjectId, activeWorkspaceTab, repositoryData.projectId]);
+  }, [activeProjectId, repositoryData.projectId]);
 
   useEffect(() => {
-    if (!activeProjectId || activeWorkspaceTab !== "repository") {
+    if (!activeProjectId) {
       return;
     }
 
@@ -7657,7 +7682,7 @@ export const App = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeProjectId, activeWorkspaceTab, repositoryData.projectId]);
+  }, [activeProjectId, repositoryData.projectId]);
 
   const loadRepositoryChildren = (parentPath: string, cursor?: string) => {
     if (!activeProjectId) {

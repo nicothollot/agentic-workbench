@@ -149,17 +149,19 @@ export const projectRepositorySummaryRequestSchema = z.object({
   projectId: z.string().min(1)
 });
 
+const repositoryTreePageLimit = 20_000;
+
 export const projectRepositoryChildrenRequestSchema = z.object({
   projectId: z.string().min(1),
   parentPath: z.string().default(""),
   cursor: z.string().optional(),
-  limit: z.number().int().min(1).max(500).default(120)
+  limit: z.number().int().min(1).max(repositoryTreePageLimit).default(120)
 });
 
 export const projectRepositorySearchRequestSchema = z.object({
   projectId: z.string().min(1),
   query: z.string().default(""),
-  limit: z.number().int().min(1).max(500).default(120)
+  limit: z.number().int().min(1).max(repositoryTreePageLimit).default(120)
 });
 
 export const repositoryScanSettingsRequestSchema = z.object({

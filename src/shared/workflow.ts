@@ -45,6 +45,20 @@ const workflowPreviewStatuses = new Set(["none", "queued", "active", "ready", "c
 
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
 
+export const isUltimateGoalDetectionAgent = (agent: AgentState): boolean =>
+  agent.category === "goal" &&
+  (agent.name === "Ultimate Goal Agent" || Boolean(agent.currentPhase?.toLowerCase().includes("ultimate goal")));
+
+export const isWorkflowAutomationBlockingAgent = (agent: AgentState): boolean =>
+  isAgentActive(agent) &&
+  (
+    agent.category === "recommendation" ||
+    agent.category === "coding" ||
+    agent.category === "integrity" ||
+    agent.category === "merge" ||
+    (agent.category === "goal" && !isUltimateGoalDetectionAgent(agent))
+  );
+
 const normalizePreviewCycleCount = (value: unknown): number => {
   const numeric = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : 1;
   return Math.max(0, Math.min(3, numeric));
@@ -906,7 +920,11 @@ export const getNextWorkflowAutomationAction = (
     : validateAutopilotPolicy(autopilot);
   const autopilotEnabled = autopilotPolicy.enabled;
   const recommendationAgentActive = agents.some((agent) => agent.category === "recommendation" && isAgentActive(agent));
-  const goalAgentActive = agents.some((agent) => agent.category === "goal" && isAgentActive(agent));
+  const goalPlanAgentActive = agents.some((agent) =>
+    agent.category === "goal" &&
+    isAgentActive(agent) &&
+    !isUltimateGoalDetectionAgent(agent)
+  );
   const codingAgentActive = agents.some((agent) => agent.category === "coding" && isAgentActive(agent));
   const integrityAgentActive = agents.some((agent) => agent.category === "integrity" && isAgentActive(agent));
   const mergeAgentActive = agents.some((agent) => agent.category === "merge" && isAgentActive(agent));
@@ -960,7 +978,7 @@ export const getNextWorkflowAutomationAction = (
   }
 
   if (workflow.approvedRecommendation && !workflow.scopedGoal) {
-    if (workflow.stepProgress.goal_plan.status === "running" || goalAgentActive) {
+    if (workflow.stepProgress.goal_plan.status === "running" || goalPlanAgentActive) {
       return null;
     }
     return "create_scoped_goal";

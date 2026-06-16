@@ -18,6 +18,7 @@ import {
   hasConfirmedUltimateGoal,
   hasPendingAgentApprovals,
   hasUnfinishedWorkflowAppeal,
+  isWorkflowAutomationBlockingAgent,
   isWorkflowAppealFinished
 } from "./workflow";
 
@@ -275,8 +276,7 @@ export const deriveWorkflowRuntimeStatus = (
   const pendingApproval = hasPendingAgentApprovals(agents);
   const blockingHuman = hasBlockingHumanIntervention(workflow);
   const activeAgent = agents.some((agent) =>
-    agent.category !== "manual" &&
-    isAgentActive(agent) &&
+    isWorkflowAutomationBlockingAgent(agent) &&
     (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
   );
 

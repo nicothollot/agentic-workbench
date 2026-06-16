@@ -119,6 +119,7 @@ import {
   getWorkflowPreviewRequest,
   hasConfirmedUltimateGoal,
   hasMeaningfulUltimateGoal,
+  isWorkflowAutomationBlockingAgent,
   isPreviewRecommendation,
   latestAgentByCategory,
   normalizeWorkflowPreviewRequest,
@@ -3641,8 +3642,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const activeInterruptedAgents = project.record.agents.filter((agent) =>
-      agent.category !== "manual" &&
-      isAgentActive(agent) &&
+      isWorkflowAutomationBlockingAgent(agent) &&
       (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
     );
     if (activeInterruptedAgents.length > 0 && this.isRecoverableAgentLaunchError(error)) {
@@ -7280,9 +7280,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private hasActiveWorkflowAgent(project: LoadedProject, categories?: AgentCategory[]): boolean {
     const categorySet = categories ? new Set<AgentCategory>(categories) : undefined;
     return project.record.agents.some((agent) =>
-      agent.category !== "manual" &&
-      (!categorySet || categorySet.has(agent.category)) &&
-      isAgentActive(agent)
+      categorySet
+        ? categorySet.has(agent.category) && isAgentActive(agent)
+        : isWorkflowAutomationBlockingAgent(agent)
     );
   }
 
@@ -7565,7 +7565,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (previousMode !== nextMode) {
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
-        status: project.record.agents.some((agent) => agent.category !== "manual" && isAgentActive(agent))
+        status: this.hasActiveWorkflowAgent(project)
           ? "waiting"
           : "completed",
         title: nextMode === "fast" ? "Fast Mode enabled" : "Normal Mode enabled",
@@ -7577,7 +7577,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     this.syncWorkflowState(project);
-    const hasActiveWorkflowAgent = project.record.agents.some((agent) => agent.category !== "manual" && isAgentActive(agent));
+    const hasActiveWorkflowAgent = this.hasActiveWorkflowAgent(project);
     const shouldContinueAutomation =
       !hasActiveWorkflowAgent &&
       project.record.localState.autopilotEnabled &&
@@ -7616,7 +7616,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     this.syncWorkflowState(project);
-    const hasActiveWorkflowAgent = project.record.agents.some((agent) => agent.category !== "manual" && isAgentActive(agent));
+    const hasActiveWorkflowAgent = this.hasActiveWorkflowAgent(project);
     const shouldContinueAutomation =
       !hasActiveWorkflowAgent &&
       workflow.autopilotPolicy.enabled &&

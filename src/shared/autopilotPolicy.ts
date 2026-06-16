@@ -269,6 +269,20 @@ export interface AutopilotPauseDecision {
 
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
 
+const isUltimateGoalDetectionAgent = (agent: AgentState): boolean =>
+  agent.category === "goal" &&
+  (agent.name === "Ultimate Goal Agent" || Boolean(agent.currentPhase?.toLowerCase().includes("ultimate goal")));
+
+const isWorkflowAutomationBlockingAgent = (agent: AgentState): boolean =>
+  isAgentActive(agent) &&
+  (
+    agent.category === "recommendation" ||
+    agent.category === "coding" ||
+    agent.category === "integrity" ||
+    agent.category === "merge" ||
+    (agent.category === "goal" && !isUltimateGoalDetectionAgent(agent))
+  );
+
 const hasBlockingHumanIntervention = (workflow: ProjectWorkflowState): boolean =>
   workflow.humanInterventions.some((intervention) => intervention.blocking && intervention.status === "pending");
 
@@ -276,7 +290,7 @@ const hasPendingWorkflowAgentApproval = (agents: AgentState[] = []): boolean =>
   agents.some((agent) => agent.category !== "manual" && agent.approvals.some((approval) => approval.status === "pending"));
 
 const hasActiveWorkflowAgent = (agents: AgentState[] = []): boolean =>
-  agents.some((agent) => agent.category !== "manual" && isAgentActive(agent));
+  agents.some(isWorkflowAutomationBlockingAgent);
 
 const isWorkflowAppealFinished = (workflow: ProjectWorkflowState): boolean =>
   workflow.appeal.status === "completed" || workflow.appeal.status === "not_applicable";

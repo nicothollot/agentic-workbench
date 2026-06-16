@@ -1533,6 +1533,8 @@ describe("schema validation and IPC", () => {
     expect(projectLogFeedRequestSchema.parse({ projectId: "p" }).commandLimit).toBe(50);
     expect(projectRepositoryChildrenRequestSchema.parse({ projectId: "p" }).limit).toBe(120);
     expect(projectRepositorySearchRequestSchema.parse({ projectId: "p", query: "src" }).limit).toBe(120);
+    expect(projectRepositoryChildrenRequestSchema.parse({ projectId: "p", limit: 5_000 }).limit).toBe(5_000);
+    expect(projectRepositorySearchRequestSchema.parse({ projectId: "p", query: "src", limit: 5_000 }).limit).toBe(5_000);
     expect(projectRepositoryExcludedPathsRequestSchema.parse({ projectId: "p" }).limit).toBe(120);
     expect(repositoryScanSettingsRequestSchema.parse({
       projectId: "p",
@@ -3242,6 +3244,13 @@ describe("workflow state", () => {
     expect(getNextWorkflowAutomationAction(workflow, [], "folder")).toBe("generate_recommendations");
     expect(getNextWorkflowAutomationAction(workflow, [
       {
+        ...createAgentSkeleton("goal", "Ultimate Goal Agent", "Detect the goal.", "gpt-5.4-mini"),
+        status: "running",
+        currentPhase: "Detecting ultimate goal"
+      }
+    ], "folder")).toBe("generate_recommendations");
+    expect(getNextWorkflowAutomationAction(workflow, [
+      {
         ...createAgentSkeleton("recommendation", "Recommendation Agent", "Prompt", "gpt-5.4-mini"),
         status: "running"
       }
@@ -3280,6 +3289,13 @@ describe("workflow state", () => {
     workflow.workflowCycle.approvedRecommendationId = "rec-1";
 
     expect(getNextWorkflowAutomationAction(workflow, [], "folder")).toBe("create_scoped_goal");
+    expect(getNextWorkflowAutomationAction(workflow, [
+      {
+        ...createAgentSkeleton("goal", "Ultimate Goal Agent", "Detect the goal.", "gpt-5.4-mini"),
+        status: "running",
+        currentPhase: "Detecting ultimate goal"
+      }
+    ], "folder")).toBe("create_scoped_goal");
     expect(getNextWorkflowAutomationAction(workflow, [
       {
         ...createAgentSkeleton("goal", "Goal Agent", "Prompt", "gpt-5.4-mini"),

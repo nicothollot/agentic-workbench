@@ -800,6 +800,24 @@ p {
   width: 12px;
 }
 
+.tree-row__kind {
+  flex: 0 0 auto;
+  min-width: 54px;
+  border: 1px solid rgba(25, 40, 68, 0.14);
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.46);
+}
+
+.tree-row__kind--directory {
+  color: var(--brand);
+  border-color: rgba(31, 54, 92, 0.2);
+}
+
 .tree-row__label {
   min-width: 0;
   overflow: hidden;
