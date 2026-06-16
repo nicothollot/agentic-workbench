@@ -1013,29 +1013,29 @@ describe("repository tree rows", () => {
     ]);
   });
 
-  it("shows full relative paths for repository search result rows", () => {
-    const rows = buildRepositoryTreeRows({
-      childrenByParent: {},
-      expandedPaths: [],
-      query: "package",
-      searchResults: {
+  it("keeps search navigation separate from expandable tree rows", () => {
+    const childrenByParent = {
+      [REPOSITORY_ROOT_PARENT]: {
         projectId: "project",
-        query: "package",
-        limit: 500,
+        parentPath: REPOSITORY_ROOT_PARENT,
+        limit: 2,
         total: 2,
-        truncated: false,
-        searchScope: "full_deep_index",
-        resultCap: 500,
-        results: [
-          { path: "package.json", name: "package.json", type: "file", size: 100, language: "JSON" },
-          { path: "node_modules/pkg/package.json", name: "package.json", type: "file", size: 200, language: "JSON" }
-        ]
+        children: [
+          { path: "src", name: "src", type: "directory" as const, childCount: 1 },
+          { path: "package.json", name: "package.json", type: "file" as const, size: 100, language: "JSON" }
+        ],
+        truncated: false
       }
+    };
+
+    const rows = buildRepositoryTreeRows({
+      childrenByParent,
+      expandedPaths: []
     });
 
-    expect(rows.map((row) => row.name)).toEqual([
-      "package.json",
-      "node_modules/pkg/package.json"
+    expect(rows.map((row) => row.path)).toEqual([
+      "src",
+      "package.json"
     ]);
   });
 });

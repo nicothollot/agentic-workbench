@@ -304,6 +304,8 @@ const HISTORY_OLDER_CYCLE_PAGE_SIZE = 20;
 const LOG_ACTIVITY_PAGE_SIZE = 80;
 const LOG_COMMAND_PAGE_SIZE = 50;
 const RUN_DETAIL_PREVIEW_TEXT_LIMIT = 4_000;
+const REPOSITORY_TREE_PAGE_SIZE = 20_000;
+const REPOSITORY_SEARCH_RESULT_LIMIT = 5_000;
 const WORKSPACE_VISUAL_TABS: VisualExportTab[] = [
   { id: "overview", label: "Overview" },
   { id: "workflow", label: "Workflow" },
@@ -1322,6 +1324,15 @@ const repositoryTreeRowMeta = (row: RepositoryTreeEntry, loading = false): strin
   ].filter(Boolean).join(" · ");
 };
 
+const repositoryPathParentDirectories = (relativePath: string): string[] => {
+  const parts = relativePath.split("/").filter(Boolean);
+  const parents: string[] = [];
+  for (let index = 1; index < parts.length; index += 1) {
+    parents.push(parts.slice(0, index).join("/"));
+  }
+  return parents;
+};
+
 const runResultSummary = (agent: AgentState, workflow?: ProjectWorkflowState): string => {
   if (agent.status === "waiting_approval") {
     return "Waiting for an explicit approval before continuing.";
@@ -1728,27 +1739,21 @@ const RepoTree = ({
   childrenByParent,
   expandedPaths,
   loadingParents,
-  searchResults,
   searchLoading,
-  filter,
   selected,
   onSelect,
   onToggleDirectory,
-  onLoadMore,
-  onClearFilter
+  onLoadMore
 }: {
   projectId: string;
   childrenByParent: RepositoryChildrenByParent;
   expandedPaths: string[];
   loadingParents: Record<string, boolean>;
-  searchResults: RepositorySearchResponse | null;
   searchLoading: boolean;
-  filter: string;
   selected?: string;
   onSelect: (path: string) => void;
   onToggleDirectory: (path: string) => void;
   onLoadMore: (parentPath: string) => void;
-  onClearFilter: () => void;
 }) => {
   const treeRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -1760,11 +1765,9 @@ const RepoTree = ({
     () => buildRepositoryTreeRows({
       childrenByParent,
       expandedPaths,
-      loadingParents,
-      searchResults,
-      query: filter
+      loadingParents
     }),
-    [childrenByParent, expandedPaths, filter, loadingParents, searchResults]
+    [childrenByParent, expandedPaths, loadingParents]
   );
 
   const loadMorePages = useMemo(() => {
@@ -1794,7 +1797,20 @@ const RepoTree = ({
   useEffect(() => {
     setScrollTop(0);
     treeRef.current?.scrollTo({ top: 0 });
-  }, [filter, projectId]);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!selected) {
+      return;
+    }
+    const selectedIndex = rows.findIndex((row) => row.path === selected);
+    if (selectedIndex < 0) {
+      return;
+    }
+    const nextTop = Math.max(0, selectedIndex * rowHeight - rowHeight * 3);
+    setScrollTop(nextTop);
+    treeRef.current?.scrollTo({ top: nextTop });
+  }, [rows, selected]);
 
   const totalHeight = rows.length * rowHeight;
   const visibleStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
@@ -1831,17 +1847,7 @@ const RepoTree = ({
               ))}
             </div>
           </div>
-          {filter.trim() ? (
-            <div className="tree__load-more">
-              <button
-                className="secondary-button secondary-button--compact"
-                type="button"
-                onClick={onClearFilter}
-              >
-                Clear filter
-              </button>
-            </div>
-          ) : loadMorePages.length ? (
+          {loadMorePages.length ? (
             <div className="tree__load-more">
               {loadMorePages.slice(0, 3).map((page) => (
                 <button
@@ -1857,7 +1863,7 @@ const RepoTree = ({
           ) : null}
         </>
       ) : (
-        <div className="empty-copy">{searchLoading ? "Searching repository." : "No files match the current filter."}</div>
+        <div className="empty-copy">{searchLoading ? "Searching repository." : "No repository entries are loaded yet."}</div>
       )}
     </div>
   );
@@ -3813,7 +3819,9 @@ const RepositoryPanel = ({
   onTreeFilterChange,
   onSelectFile,
   onToggleDirectory,
-  onLoadMoreRepositoryChildren
+  onLoadMoreRepositoryChildren,
+  searchResultIndex,
+  onSelectSearchResult
 }: {
   project: LoadedProjectView;
   repositoryData: RepositoryDataView;
@@ -3831,6 +3839,8 @@ const RepositoryPanel = ({
   onSelectFile: (relativePath: string) => void;
   onToggleDirectory: (relativePath: string) => void;
   onLoadMoreRepositoryChildren: (relativePath: string) => void;
+  searchResultIndex: number;
+  onSelectSearchResult: (index: number) => void;
 }) => {
   const [deepScanPreset, setDeepScanPreset] = useState<"broader" | "maximum">("broader");
   const { record } = project;
@@ -3861,6 +3871,12 @@ const RepositoryPanel = ({
     ? stats.truncationReason ?? "Repository scan was truncated."
     : undefined;
   const scanSearchScope = repositoryData.searchResults?.searchScope ?? repositoryScanStatus?.searchScope;
+  const searchResults = repositoryData.searchResults;
+  const visibleSearchResults = searchResults?.results ?? [];
+  const selectedSearchResultIndex = visibleSearchResults.length
+    ? Math.min(Math.max(searchResultIndex, 0), visibleSearchResults.length - 1)
+    : -1;
+  const selectedSearchResult = selectedSearchResultIndex >= 0 ? visibleSearchResults[selectedSearchResultIndex] : undefined;
   const deepScanSettings = deepScanPreset === "maximum"
     ? repositoryScanLimits?.hardMaximums
     : repositoryScanLimits?.deepDefaults;
@@ -4037,6 +4053,133 @@ const RepositoryPanel = ({
         </details>
       </article>
 
+      <section className="repository-browser-layout">
+        <article className="repository-section repository-tree-panel repository-tree-panel--primary">
+          <SectionTitle
+            eyebrow="Files"
+            title="Repository tree"
+            meta={<span className="badge">{stats?.includedFiles ?? 0} indexed</span>}
+          />
+          <div className="panel-toolbar__summary">
+            <span>{formatBytes(stats?.includedSizeBytes ?? 0)} indexed</span>
+            <span>{stats?.testsPresent ? "Tests detected" : "No tests detected"}</span>
+            <span>Search: {repositorySearchScopeLabel(scanSearchScope)}</span>
+          </div>
+          {repositoryData.loading ? (
+            <LoadingIndicator label="Loading repository tree" compact />
+          ) : (
+            <>
+              {repositoryData.treeError ? <div className="notice notice--compact notice--error">{repositoryData.treeError}</div> : null}
+              <RepoTree
+                key={record.id}
+                projectId={record.id}
+                childrenByParent={repositoryData.childrenByParent}
+                expandedPaths={repositoryData.expandedPaths}
+                loadingParents={repositoryData.loadingParents}
+                searchLoading={repositoryData.searchLoading}
+                selected={selectedFile}
+                onSelect={onSelectFile}
+                onToggleDirectory={onToggleDirectory}
+                onLoadMore={onLoadMoreRepositoryChildren}
+              />
+            </>
+          )}
+        </article>
+
+        <aside className="repository-browser-side">
+          <article className="repository-section repository-search-panel">
+            <SectionTitle
+              eyebrow="Find"
+              title="Search files"
+              meta={searchResults ? <span className="badge">{searchResults.total}</span> : null}
+            />
+            <input
+              className="input"
+              placeholder="Search file names or paths"
+              value={treeFilterDraft}
+              onChange={(event) => onTreeFilterChange(event.target.value)}
+            />
+            <div className="actions-row">
+              <button
+                className="secondary-button secondary-button--compact"
+                type="button"
+                disabled={visibleSearchResults.length <= 1}
+                onClick={() => onSelectSearchResult(selectedSearchResultIndex - 1)}
+              >
+                Previous
+              </button>
+              <button
+                className="secondary-button secondary-button--compact"
+                type="button"
+                disabled={visibleSearchResults.length <= 1}
+                onClick={() => onSelectSearchResult(selectedSearchResultIndex + 1)}
+              >
+                Next
+              </button>
+              {treeFilterDraft.trim() ? (
+                <button
+                  className="secondary-button secondary-button--compact"
+                  type="button"
+                  onClick={() => onTreeFilterChange("")}
+                >
+                  Clear
+                </button>
+              ) : null}
+            </div>
+            {repositoryData.searchLoading ? <LoadingIndicator label="Searching repository" compact /> : null}
+            {deferredTreeFilter.trim() && searchResults ? (
+              <div className="notice notice--compact">
+                {searchResults.truncated
+                  ? `Showing ${visibleSearchResults.length} of ${searchResults.total} matching files from ${repositorySearchScopeLabel(searchResults.searchScope)}.`
+                  : `Found ${visibleSearchResults.length} matching file${visibleSearchResults.length === 1 ? "" : "s"} in ${repositorySearchScopeLabel(searchResults.searchScope)}.`}
+              </div>
+            ) : null}
+            {selectedSearchResult ? (
+              <div className="repository-search-current">
+                <span className="workflow-option__label">Selected result</span>
+                <strong>{selectedSearchResultIndex + 1} of {visibleSearchResults.length}</strong>
+                <code>{selectedSearchResult.path}</code>
+              </div>
+            ) : null}
+            <div className="repository-search-results">
+              {visibleSearchResults.length ? visibleSearchResults.slice(0, 80).map((result, index) => (
+                <button
+                  key={result.path}
+                  className={`repository-search-result ${index === selectedSearchResultIndex ? "repository-search-result--selected" : ""}`}
+                  type="button"
+                  onClick={() => onSelectSearchResult(index)}
+                >
+                  <strong>{result.name}</strong>
+                  <span>{result.path}</span>
+                </button>
+              )) : (
+                <CompactEmptyState>{deferredTreeFilter.trim() ? "No matching files found." : "Search by file name or path."}</CompactEmptyState>
+              )}
+            </div>
+          </article>
+
+          <article className="repository-section repository-file-panel">
+            <div className="candidate-card__title-row">
+              <h3>File details</h3>
+              {fileSummary ? <SourceBadge source={fileSummary.source} /> : null}
+            </div>
+            {fileSummary ? (
+              <>
+                <div className="file-summary__title">{fileSummary.relativePath}</div>
+                <p>{redactSensitiveText(fileSummary.purpose)}</p>
+                <p>{redactSensitiveText(fileSummary.summary)}</p>
+                <div className="tag-row">
+                  {fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>)}
+                </div>
+                <LongTextDisclosure title="Related files" value={fileSummary.relatedFiles.join("\n")} code />
+              </>
+            ) : (
+              <CompactEmptyState>Select a file in the repository tree to load its summary and related symbols.</CompactEmptyState>
+            )}
+          </article>
+        </aside>
+      </section>
+
       <section className="repository-report-layout">
         <div className="repository-report-main">
           <article className="repository-section">
@@ -4203,89 +4346,6 @@ const RepositoryPanel = ({
           </article>
         </div>
 
-        <aside className="repository-side-panel">
-          <article className="repository-section repository-tree-panel">
-            <SectionTitle
-              eyebrow="Files"
-              title="Repository tree"
-              meta={<span className="badge">{stats?.includedFiles ?? 0} indexed</span>}
-            />
-            <div className="panel-toolbar panel-toolbar--compact">
-              <div className="panel-toolbar__summary">
-                <span>{formatBytes(stats?.includedSizeBytes ?? 0)} indexed</span>
-                <span>{stats?.testsPresent ? "Tests detected" : "No tests detected"}</span>
-                <span>Search: {repositorySearchScopeLabel(scanSearchScope)}</span>
-              </div>
-              <input
-                className="input"
-                placeholder="Filter files"
-                value={treeFilterDraft}
-                onChange={(event) => onTreeFilterChange(event.target.value)}
-              />
-              {treeFilterDraft.trim() ? (
-                <button
-                  className="secondary-button secondary-button--compact"
-                  type="button"
-                  onClick={() => onTreeFilterChange("")}
-                >
-                  Clear filter
-                </button>
-              ) : null}
-            </div>
-            {repositoryData.loading ? (
-              <LoadingIndicator label="Loading repository tree" compact />
-            ) : (
-              <>
-                {repositoryData.treeError ? <div className="notice notice--compact notice--error">{repositoryData.treeError}</div> : null}
-                {deferredTreeFilter.trim() && repositoryData.searchResults?.truncated ? (
-                  <div className="notice notice--compact">
-                    Search results are capped at {repositoryData.searchResults.resultCap}; showing {repositoryData.searchResults.results.length} of {repositoryData.searchResults.total} matching files from {repositorySearchScopeLabel(repositoryData.searchResults.searchScope)}.
-                  </div>
-                ) : null}
-                {deferredTreeFilter.trim() && repositoryData.searchResults && !repositoryData.searchResults.truncated ? (
-                  <div className="notice notice--compact">
-                    Search checked {repositorySearchScopeLabel(repositoryData.searchResults.searchScope)} and returned {repositoryData.searchResults.results.length} matching files.
-                  </div>
-                ) : null}
-                <RepoTree
-                  key={record.id}
-                  projectId={record.id}
-                  childrenByParent={repositoryData.childrenByParent}
-                  expandedPaths={repositoryData.expandedPaths}
-                  loadingParents={repositoryData.loadingParents}
-                  searchResults={repositoryData.searchResults}
-                  searchLoading={repositoryData.searchLoading}
-                  filter={deferredTreeFilter}
-                  selected={selectedFile}
-                  onSelect={onSelectFile}
-                  onToggleDirectory={onToggleDirectory}
-                  onLoadMore={onLoadMoreRepositoryChildren}
-                  onClearFilter={() => onTreeFilterChange("")}
-                />
-              </>
-            )}
-          </article>
-
-          <article className="repository-section repository-file-panel">
-            <div className="candidate-card__title-row">
-              <h3>File details</h3>
-              {fileSummary ? <SourceBadge source={fileSummary.source} /> : null}
-            </div>
-            {fileSummary ? (
-              <>
-                <div className="file-summary__title">{fileSummary.relativePath}</div>
-                <p>{redactSensitiveText(fileSummary.purpose)}</p>
-                <p>{redactSensitiveText(fileSummary.summary)}</p>
-                <div className="tag-row">
-                  {fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>)}
-                </div>
-                <LongTextDisclosure title="Related files" value={fileSummary.relatedFiles.join("\n")} code />
-              </>
-            ) : (
-              <CompactEmptyState>Select a file in the repository tree to load its summary and related symbols.</CompactEmptyState>
-            )}
-          </article>
-        </aside>
       </section>
     </section>
   );
@@ -6809,6 +6869,7 @@ export const App = () => {
   const [notice, setNotice] = useState<NoticeState>();
   const [launchIntent, setLaunchIntent] = useState<"open" | "create">("open");
   const [treeFilterDraft, setTreeFilterDraft] = useState("");
+  const [repositorySearchResultIndex, setRepositorySearchResultIndex] = useState(0);
   const [focusedAgentId, setFocusedAgentId] = useState<string>();
   const [ultimateGoalDraft, setUltimateGoalDraft] = useState({
     summary: "",
@@ -6856,6 +6917,7 @@ export const App = () => {
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
   const [repositoryData, setRepositoryData] = useState<RepositoryDataView>(() => emptyRepositoryData());
+  const revealRepositoryPathRef = useRef<(relativePath: string) => Promise<void>>(() => Promise.resolve());
   const [repositoryScanStatus, setRepositoryScanStatus] = useState<RepositoryScanStatus | null>(null);
   const [repositoryScanLimits, setRepositoryScanLimits] = useState<RepositoryScanLimitsResponse | null>(null);
   const [repositoryRescanBusy, setRepositoryRescanBusy] = useState<"normal" | "deep">();
@@ -7686,7 +7748,7 @@ export const App = () => {
 
   const loadRepositoryChildren = (parentPath: string, cursor?: string) => {
     if (!activeProjectId) {
-      return;
+      return Promise.resolve();
     }
     const projectId = activeProjectId;
     setRepositoryData((current) => ({
@@ -7697,7 +7759,7 @@ export const App = () => {
       },
       treeError: undefined
     }));
-    void window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: 5_000 })
+    return window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: REPOSITORY_TREE_PAGE_SIZE })
       .then((page) => {
         setRepositoryData((current) =>
           current.projectId === projectId
@@ -7727,7 +7789,7 @@ export const App = () => {
         : [...current.expandedPaths, relativePath]
     }));
     if (!isExpanded && !repositoryData.childrenByParent[relativePath] && !repositoryData.loadingParents[relativePath]) {
-      loadRepositoryChildren(relativePath);
+      void loadRepositoryChildren(relativePath);
     }
   };
 
@@ -7736,7 +7798,34 @@ export const App = () => {
     if (!page?.nextCursor || repositoryData.loadingParents[relativePath]) {
       return;
     }
-    loadRepositoryChildren(relativePath, page.nextCursor);
+    void loadRepositoryChildren(relativePath, page.nextCursor);
+  };
+
+  const revealRepositoryPath = async (relativePath: string) => {
+    const parentDirectories = repositoryPathParentDirectories(relativePath);
+    setRepositoryData((current) => ({
+      ...current,
+      expandedPaths: [...new Set([...current.expandedPaths, ...parentDirectories])]
+    }));
+
+    for (const parentPath of parentDirectories) {
+      if (!repositoryData.childrenByParent[parentPath] && !repositoryData.loadingParents[parentPath]) {
+        await loadRepositoryChildren(parentPath);
+      }
+    }
+
+    await loadSummary(relativePath);
+  };
+  revealRepositoryPathRef.current = revealRepositoryPath;
+
+  const selectRepositorySearchResult = (requestedIndex: number) => {
+    const results = repositoryData.searchResults?.results ?? [];
+    if (!results.length) {
+      return;
+    }
+    const nextIndex = ((requestedIndex % results.length) + results.length) % results.length;
+    setRepositorySearchResultIndex(nextIndex);
+    void revealRepositoryPath(results[nextIndex].path);
   };
 
   useEffect(() => {
@@ -7746,6 +7835,7 @@ export const App = () => {
 
     const query = deferredTreeFilter.trim();
     if (!query) {
+      setRepositorySearchResultIndex(0);
       setRepositoryData((current) => ({
         ...current,
         searchResults: null,
@@ -7763,12 +7853,16 @@ export const App = () => {
       treeError: undefined
     }));
     const timeoutId = window.setTimeout(() => {
-      void window.workbench.searchRepositoryFiles(projectId, query, { limit: 5_000 })
+      void window.workbench.searchRepositoryFiles(projectId, query, { limit: REPOSITORY_SEARCH_RESULT_LIMIT })
         .then((results) => {
           if (!cancelled) {
+            setRepositorySearchResultIndex(0);
             setRepositoryData((current) => current.projectId === projectId
               ? { ...current, searchResults: results, searchLoading: false }
               : current);
+            if (results.results[0]) {
+              void revealRepositoryPathRef.current(results.results[0].path);
+            }
           }
         })
         .catch((error) => {
@@ -10304,6 +10398,8 @@ export const App = () => {
             onSelectFile={(relativePath) => void loadSummary(relativePath)}
             onToggleDirectory={toggleRepositoryDirectory}
             onLoadMoreRepositoryChildren={loadMoreRepositoryChildren}
+            searchResultIndex={repositorySearchResultIndex}
+            onSelectSearchResult={selectRepositorySearchResult}
           />
         ) : null}
 

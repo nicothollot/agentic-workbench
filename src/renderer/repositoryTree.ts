@@ -1,4 +1,4 @@
-import type { RepositoryChildrenResponse, RepositorySearchResponse, RepositoryTreeEntry } from "@shared/types";
+import type { RepositoryChildrenResponse, RepositoryTreeEntry } from "@shared/types";
 
 export const REPOSITORY_ROOT_PARENT = "";
 
@@ -13,27 +13,12 @@ export type RepositoryChildrenByParent = Record<string, RepositoryChildrenRespon
 export const buildRepositoryTreeRows = ({
   childrenByParent,
   expandedPaths,
-  loadingParents = {},
-  searchResults,
-  query
+  loadingParents = {}
 }: {
   childrenByParent: RepositoryChildrenByParent;
   expandedPaths: Iterable<string>;
   loadingParents?: Record<string, boolean>;
-  searchResults?: RepositorySearchResponse | null;
-  query?: string;
 }): RepositoryTreeRow[] => {
-  const normalizedQuery = query?.trim() ?? "";
-  if (normalizedQuery && searchResults) {
-    return searchResults.results.map((entry) => ({
-      ...entry,
-      name: entry.path,
-      depth: 0,
-      expanded: false,
-      loading: false
-    }));
-  }
-
   const expanded = new Set(expandedPaths);
   const rows: RepositoryTreeRow[] = [];
   const visitedParents = new Set<string>();

@@ -835,6 +835,8 @@ p {
 .tree {
   position: relative;
   overflow: auto;
+  height: min(70vh, 820px);
+  min-height: 520px;
   max-height: min(68vh, 960px);
   contain: strict;
   overscroll-behavior: contain;
@@ -5543,10 +5545,35 @@ select.input {
 
 .repository-report-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.34fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   align-items: start;
   min-width: 0;
+}
+
+.repository-browser-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+  gap: 14px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.repository-browser-side {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  min-width: 0;
+}
+
+.repository-tree-panel--primary {
+  min-height: 0;
+}
+
+.repository-tree-panel--primary .tree {
+  height: min(72vh, 860px);
+  min-height: 560px;
+  max-height: none;
 }
 
 .repository-section {
@@ -5578,6 +5605,56 @@ select.input {
 
 .repository-file-panel {
   align-content: start;
+}
+
+.repository-search-panel {
+  align-content: start;
+}
+
+.repository-search-current {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid rgba(25, 40, 68, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.repository-search-current code {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.repository-search-results {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.repository-search-result {
+  width: 100%;
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid rgba(25, 40, 68, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.54);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.repository-search-result:hover,
+.repository-search-result--selected {
+  border-color: rgba(184, 154, 106, 0.48);
+  background: rgba(184, 154, 106, 0.16);
+}
+
+.repository-search-result span {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .panel-toolbar--compact {
@@ -6195,8 +6272,15 @@ select.input {
   .logs-toolbar,
   .logs-main-grid,
   .credentials-layout,
+  .repository-browser-layout,
   .repository-report-layout {
     grid-template-columns: 1fr;
+  }
+
+  .repository-tree-panel--primary .tree,
+  .tree {
+    height: min(68vh, 720px);
+    min-height: 420px;
   }
 
   .logs-header__stats {
