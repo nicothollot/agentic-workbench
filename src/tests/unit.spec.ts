@@ -925,6 +925,35 @@ describe("repo stats", () => {
     expect(scan.stats.totalSizeBytes).toBeGreaterThan(scan.stats.includedSizeBytes);
   });
 
+  it("can disable ignore rules for full deep scans", async () => {
+    const root = await createTempDir("scan-no-ignore-rules");
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await mkdir(path.join(root, "node_modules", "pkg"), { recursive: true });
+    await writeFile(path.join(root, ".gitignore"), "ignored.log\n");
+    await writeFile(path.join(root, "src/index.ts"), "export const value = 1;\n");
+    await writeFile(path.join(root, "ignored.log"), "normally ignored\n");
+    await writeFile(path.join(root, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
+
+    const metadata = {
+      isGit: false,
+      normalizedRemotes: []
+    };
+    const normalScan = await scanRepository(root, metadata, root);
+    const fullScan = await scanRepository(root, metadata, root, {}, { ignoreMode: "none" });
+    const fullScanPaths = fullScan.files.map((file) => file.relativePath);
+
+    expect(normalScan.files.some((file) => file.relativePath.startsWith("node_modules/"))).toBe(false);
+    expect(normalScan.files.some((file) => file.relativePath === "ignored.log")).toBe(false);
+    expect(normalScan.stats.excludedPaths.some((entry) => entry.path === "node_modules")).toBe(true);
+    expect(normalScan.stats.excludedPaths.some((entry) => entry.path === "ignored.log")).toBe(true);
+    expect(fullScanPaths).toContain("node_modules/pkg/index.js");
+    expect(fullScanPaths).toContain("ignored.log");
+    expect(fullScan.stats.excludedFiles).toBe(0);
+    expect(fullScan.stats.excludedFolders).toBe(0);
+    expect(fullScan.stats.excludedPaths).toHaveLength(0);
+    expect(fullScan.stats.includedFiles).toBeGreaterThan(normalScan.stats.includedFiles);
+  });
+
   it("skips dependency parsing for oversized manifests", async () => {
     const root = await createTempDir("scan-huge-manifest");
     await writeFile(path.join(root, "package.json"), "{".repeat(128));
@@ -7581,6 +7610,58 @@ describe("AppService workflow performance guards", () => {
     expect(deepStatus.searchScope).toBe("full_deep_index");
     expect(deepStatus.limitHits.map((hit) => hit.code)).toContain("included_file_limit");
     expect(deepStatus.limits.includedFileLimit).toBe(2);
+  });
+
+  it("uses no ignore rules for deep repository rescans", async () => {
+    const repoRoot = await createTempDir("repository-deep-rescan-no-ignore");
+    await mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await mkdir(path.join(repoRoot, "node_modules", "pkg"), { recursive: true });
+    await writeFile(path.join(repoRoot, ".gitignore"), "ignored.log\n");
+    await writeFile(path.join(repoRoot, "package.json"), JSON.stringify({ name: "repository-deep-rescan-no-ignore" }));
+    await writeFile(path.join(repoRoot, "src/index.ts"), "export const value = 1;\n");
+    await writeFile(path.join(repoRoot, "ignored.log"), "normally ignored\n");
+    await writeFile(path.join(repoRoot, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
+    const service = new AppService(await createTempDir("repository-deep-rescan-no-ignore-appdata")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      rescanRepository: AppService["rescanRepository"];
+      getRepositoryScanStatus: AppService["getRepositoryScanStatus"];
+    };
+    const project = makeAppServiceLoadedProject("repo-deep-no-ignore-project");
+    project.record.displayPath = repoRoot;
+    project.record.wslPath = repoRoot;
+    project.record.projectRoot = repoRoot;
+    project.record.hostPath = repoRoot;
+    service.projects.set(project.record.id, project);
+
+    await service.rescanRepository(project.record.id, { mode: "normal" });
+    const normalStatus = service.getRepositoryScanStatus(project.record.id);
+    const normalPaths = project.scan.files.map((file) => file.relativePath);
+
+    await service.rescanRepository(project.record.id, {
+      mode: "deep",
+      settings: {
+        maxIncludedFiles: 100,
+        maxIncludedDirectories: 100,
+        maxDepth: 20,
+        maxManifestFileSizeBytes: 100_000,
+        maxScanDurationMs: 10_000,
+        maxExcludedPathRecords: 100
+      }
+    });
+    const deepStatus = service.getRepositoryScanStatus(project.record.id);
+    const deepPaths = project.scan.files.map((file) => file.relativePath);
+
+    expect(normalStatus.excludedPaths.some((entry) => entry.path === "node_modules")).toBe(true);
+    expect(normalStatus.excludedPaths.some((entry) => entry.path === "ignored.log")).toBe(true);
+    expect(normalPaths).not.toContain("node_modules/pkg/index.js");
+    expect(normalPaths).not.toContain("ignored.log");
+    expect(deepStatus.status).toBe("indexed");
+    expect(deepStatus.searchScope).toBe("full_deep_index");
+    expect(deepStatus.excludedFiles).toBe(0);
+    expect(deepStatus.excludedFolders).toBe(0);
+    expect(deepStatus.excludedPaths).toHaveLength(0);
+    expect(deepPaths).toContain("node_modules/pkg/index.js");
+    expect(deepPaths).toContain("ignored.log");
   });
 
   it("skips Codex readiness and update checks in mock mode", async () => {

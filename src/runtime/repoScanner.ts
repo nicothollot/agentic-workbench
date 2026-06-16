@@ -48,6 +48,10 @@ export interface RepositoryScanLimits {
   maxExcludedPathRecords: number;
 }
 
+export interface RepositoryScanOptions {
+  ignoreMode?: "standard" | "none";
+}
+
 export const DEFAULT_REPOSITORY_SCAN_LIMITS: RepositoryScanLimits = {
   maxIncludedFiles: 12_000,
   maxIncludedDirectories: 6_000,
@@ -395,12 +399,15 @@ export const scanRepository = async (
   projectRootHostPath: string,
   gitMetadata: GitMetadata,
   executionProjectRoot = projectRootHostPath,
-  scanLimits: Partial<RepositoryScanLimits> = {}
+  scanLimits: Partial<RepositoryScanLimits> = {},
+  options: RepositoryScanOptions = {}
 ): Promise<RepoScanResult> => {
   const limits = mergeScanLimits(scanLimits);
   const scanStartedAtIso = new Date().toISOString();
   const scanStartedAt = performance.now();
-  const matcher = await buildIgnoreMatcher(projectRootHostPath);
+  const matcher = options.ignoreMode === "none"
+    ? { match: (): ExclusionRule | null => null }
+    : await buildIgnoreMatcher(projectRootHostPath);
   const files: ScannedFile[] = [];
   const folders = new Set<string>();
   const manifestFiles = new Set<string>();

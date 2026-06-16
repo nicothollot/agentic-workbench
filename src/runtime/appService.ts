@@ -5341,7 +5341,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
         : existing.record.hostPath ?? existing.record.projectRoot;
       const scan = this.annotateRepositoryScan(
-        await scanRepository(projectHostPath, gitMetadata, projectRoot, mode === "deep" ? effectiveSettings : undefined),
+        await scanRepository(
+          projectHostPath,
+          gitMetadata,
+          projectRoot,
+          mode === "deep" ? effectiveSettings : undefined,
+          { ignoreMode: mode === "deep" ? "none" : "standard" }
+        ),
         mode
       );
       const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
