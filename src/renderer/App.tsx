@@ -1711,7 +1711,8 @@ const RepoTree = ({
   selected,
   onSelect,
   onToggleDirectory,
-  onLoadMore
+  onLoadMore,
+  onClearFilter
 }: {
   projectId: string;
   childrenByParent: RepositoryChildrenByParent;
@@ -1724,6 +1725,7 @@ const RepoTree = ({
   onSelect: (path: string) => void;
   onToggleDirectory: (path: string) => void;
   onLoadMore: (parentPath: string) => void;
+  onClearFilter: () => void;
 }) => {
   const treeRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -1805,7 +1807,17 @@ const RepoTree = ({
               ))}
             </div>
           </div>
-          {!filter.trim() && loadMorePages.length ? (
+          {filter.trim() ? (
+            <div className="tree__load-more">
+              <button
+                className="secondary-button secondary-button--compact"
+                type="button"
+                onClick={onClearFilter}
+              >
+                Clear filter
+              </button>
+            </div>
+          ) : loadMorePages.length ? (
             <div className="tree__load-more">
               {loadMorePages.slice(0, 3).map((page) => (
                 <button
@@ -4186,6 +4198,15 @@ const RepositoryPanel = ({
                 value={treeFilterDraft}
                 onChange={(event) => onTreeFilterChange(event.target.value)}
               />
+              {treeFilterDraft.trim() ? (
+                <button
+                  className="secondary-button secondary-button--compact"
+                  type="button"
+                  onClick={() => onTreeFilterChange("")}
+                >
+                  Clear filter
+                </button>
+              ) : null}
             </div>
             {repositoryData.loading ? (
               <LoadingIndicator label="Loading repository tree" compact />
@@ -4215,6 +4236,7 @@ const RepositoryPanel = ({
                   onSelect={onSelectFile}
                   onToggleDirectory={onToggleDirectory}
                   onLoadMore={onLoadMoreRepositoryChildren}
+                  onClearFilter={() => onTreeFilterChange("")}
                 />
               </>
             )}
@@ -7650,7 +7672,7 @@ export const App = () => {
       },
       treeError: undefined
     }));
-    void window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: 120 })
+    void window.workbench.listRepositoryChildren(projectId, parentPath, { cursor, limit: 500 })
       .then((page) => {
         setRepositoryData((current) =>
           current.projectId === projectId
@@ -7716,7 +7738,7 @@ export const App = () => {
       treeError: undefined
     }));
     const timeoutId = window.setTimeout(() => {
-      void window.workbench.searchRepositoryFiles(projectId, query, { limit: 120 })
+      void window.workbench.searchRepositoryFiles(projectId, query, { limit: 500 })
         .then((results) => {
           if (!cancelled) {
             setRepositoryData((current) => current.projectId === projectId

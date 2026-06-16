@@ -1012,6 +1012,32 @@ describe("repository tree rows", () => {
       "README.md"
     ]);
   });
+
+  it("shows full relative paths for repository search result rows", () => {
+    const rows = buildRepositoryTreeRows({
+      childrenByParent: {},
+      expandedPaths: [],
+      query: "package",
+      searchResults: {
+        projectId: "project",
+        query: "package",
+        limit: 500,
+        total: 2,
+        truncated: false,
+        searchScope: "full_deep_index",
+        resultCap: 500,
+        results: [
+          { path: "package.json", name: "package.json", type: "file", size: 100, language: "JSON" },
+          { path: "node_modules/pkg/package.json", name: "package.json", type: "file", size: 200, language: "JSON" }
+        ]
+      }
+    });
+
+    expect(rows.map((row) => row.name)).toEqual([
+      "package.json",
+      "node_modules/pkg/package.json"
+    ]);
+  });
 });
 
 describe("reasoning defaults", () => {
@@ -7565,6 +7591,45 @@ describe("AppService workflow performance guards", () => {
     expect(excluded.paths).toHaveLength(1);
     expect(excluded.total).toBe(2);
     expect(excluded.truncated).toBe(true);
+  });
+
+  it("uses larger paged repository tree batches for broad indexes", async () => {
+    const service = new AppService(await createTempDir("repository-large-page")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      getRepositorySummary: AppService["getRepositorySummary"];
+      listRepositoryChildren: AppService["listRepositoryChildren"];
+    };
+    const project = makeAppServiceLoadedProject("repo-large-page-project");
+    const files = Array.from({ length: 600 }, (_, index) => ({
+      absolutePath: `/repo/file-${index}.ts`,
+      relativePath: `file-${index}.ts`,
+      size: 20,
+      language: "TypeScript"
+    }));
+    project.scan = {
+      ...project.scan,
+      files,
+      stats: {
+        ...project.scan.stats,
+        totalFiles: files.length,
+        includedFiles: files.length,
+        includedSizeBytes: files.reduce((sum, file) => sum + file.size, 0),
+        excludedFiles: 0,
+        excludedFolders: 0,
+        excludedPaths: []
+      }
+    };
+    project.record.stats = project.scan.stats;
+    service.projects.set(project.record.id, project);
+
+    const summary = service.getRepositorySummary(project.record.id);
+    const nextPage = service.listRepositoryChildren(project.record.id, "", { cursor: summary.rootChildren.nextCursor });
+
+    expect(summary.rootChildren.children).toHaveLength(500);
+    expect(summary.rootChildren.total).toBe(600);
+    expect(summary.rootChildren.nextCursor).toBe("500");
+    expect(nextPage.children).toHaveLength(100);
+    expect(nextPage.nextCursor).toBeUndefined();
   });
 
   it("rescans normally and supports persisted deep scan settings", async () => {

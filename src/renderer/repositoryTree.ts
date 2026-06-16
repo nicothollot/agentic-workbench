@@ -27,6 +27,7 @@ export const buildRepositoryTreeRows = ({
   if (normalizedQuery && searchResults) {
     return searchResults.results.map((entry) => ({
       ...entry,
+      name: entry.path,
       depth: 0,
       expanded: false,
       loading: false
