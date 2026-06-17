@@ -364,6 +364,12 @@ export const fileSummarySchema = z.object({
   generatedAt: isoDatetime()
 });
 
+export const repositoryPathSummaryTargetSchema = z.object({
+  relativePath: z.string().min(1),
+  pathKind: z.enum(["file", "directory"]),
+  contentHash: z.string().min(1)
+});
+
 export const projectSubsystemSummarySchema = z.object({
   name: z.string().min(1),
   summary: z.string().min(1),
@@ -1242,12 +1248,13 @@ export const agentStateSchema = z.object({
   events: z.array(runtimeEventSchema),
   disconnectedReason: z.string().optional(),
   recoveryHandledAt: isoDatetime().optional(),
+  repositorySummaryTarget: repositoryPathSummaryTargetSchema.optional(),
   integrityReport: integrityReportSchema.optional(),
   mergeReport: mergeReportSchema.optional(),
   recommendationReport: recommendationReportSchema.optional(),
   appliedStructuredOutputs: z.array(
     z.object({
-      kind: z.enum(["recommendation", "scoped_goal"]),
+      kind: z.enum(["recommendation", "scoped_goal", "repository_path_summary"]),
       contentHash: z.string().min(1),
       appliedAt: isoDatetime(),
       source: z.string().optional()

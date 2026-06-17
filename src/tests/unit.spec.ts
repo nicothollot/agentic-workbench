@@ -34,6 +34,9 @@ import {
   projectRepositoryExcludedPathsRequestSchema,
   projectRepositorySearchRequestSchema,
   refreshOverviewRequestSchema,
+  repositoryPathQuestionRequestSchema,
+  repositoryPathSummaryRequestSchema,
+  repositoryPathWindowRequestSchema,
   repositoryRescanRequestSchema,
   repositoryScanSettingsRequestSchema,
   requestWorkflowPreviewRequestSchema,
@@ -1544,6 +1547,23 @@ describe("schema validation and IPC", () => {
       projectId: "p",
       options: { mode: "deep", settings: { maxIncludedFiles: 24_000 } }
     }).options.mode).toBe("deep");
+    expect(repositoryPathSummaryRequestSchema.parse({
+      projectId: "p",
+      relativePath: "src\\renderer\\App.tsx",
+      model: "gpt-5.4",
+      reasoningMode: "manual",
+      reasoningEffort: "high"
+    }).relativePath).toBe("src/renderer/App.tsx");
+    expect(repositoryPathQuestionRequestSchema.parse({
+      projectId: "p",
+      relativePath: "src/runtime",
+      question: "What does this folder do?",
+      model: "gpt-5.4"
+    }).question).toBe("What does this folder do?");
+    expect(repositoryPathWindowRequestSchema.parse({ projectId: "p", relativePath: "src/runtime" }).relativePath).toBe("src/runtime");
+    expect(() => repositoryPathSummaryRequestSchema.parse({ projectId: "p", relativePath: "../secret.txt", model: "gpt-5.4" })).toThrow();
+    expect(() => repositoryPathSummaryRequestSchema.parse({ projectId: "p", relativePath: "/etc/passwd", model: "gpt-5.4" })).toThrow();
+    expect(() => repositoryPathWindowRequestSchema.parse({ projectId: "p", relativePath: "C:\\repo\\file.ts" })).toThrow();
   });
 
   it("validates the project review log bundle format", () => {
@@ -7682,6 +7702,55 @@ describe("AppService workflow performance guards", () => {
     expect(summary.rootChildren.children.map((entry) => entry.path)).toEqual(["src"]);
   });
 
+  it("creates and caches deterministic summaries for repository folders", async () => {
+    const service = new AppService(await createTempDir("repository-folder-summary")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      getFileSummary: AppService["getFileSummary"];
+      persistProjectUpdate: (project: ReturnType<typeof makeAppServiceLoadedProject>) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("repo-folder-summary-project");
+    const files = [
+      { absolutePath: "/repo/src/runtime/appService.ts", relativePath: "src/runtime/appService.ts", size: 120, language: "TypeScript" },
+      { absolutePath: "/repo/src/runtime/fileSummary.ts", relativePath: "src/runtime/fileSummary.ts", size: 80, language: "TypeScript" },
+      { absolutePath: "/repo/src/runtime/styles.css", relativePath: "src/runtime/styles.css", size: 40, language: "CSS" }
+    ];
+    project.scan = {
+      ...project.scan,
+      files,
+      stats: {
+        ...project.scan.stats,
+        totalFiles: files.length,
+        includedFiles: files.length,
+        includedSizeBytes: files.reduce((sum, file) => sum + file.size, 0),
+        languageBreakdown: { TypeScript: 2, CSS: 1 },
+        entryPoints: ["src/runtime/appService.ts"]
+      }
+    };
+    project.record.stats = project.scan.stats;
+    service.projects.set(project.record.id, project);
+    let saves = 0;
+    service.persistProjectUpdate = async (updatedProject) => {
+      saves += 1;
+      updatedProject.record.summaryCache = updatedProject.summaryCache.list();
+    };
+
+    const summary = await service.getFileSummary(project.record.id, "src/runtime");
+    const cached = await service.getFileSummary(project.record.id, "src/runtime");
+
+    expect(summary.pathKind).toBe("directory");
+    expect(summary.relativePath).toBe("src/runtime");
+    expect(summary.summary).toContain("src/runtime contains 3 indexed files");
+    expect(summary.keySymbols).toContain("TypeScript (2)");
+    expect(summary.relatedFiles).toEqual([
+      "src/runtime/appService.ts",
+      "src/runtime/fileSummary.ts",
+      "src/runtime/styles.css"
+    ]);
+    expect(cached.contentHash).toBe(summary.contentHash);
+    expect(project.record.summaryCache).toHaveLength(1);
+    expect(saves).toBe(1);
+  });
+
   it("rescans normally and supports persisted deep scan settings", async () => {
     const repoRoot = await createTempDir("repository-rescan-action");
     await mkdir(path.join(repoRoot, "src"), { recursive: true });
@@ -7948,6 +8017,74 @@ describe("AppService workflow performance guards", () => {
     expect(project.record.workflow.scopedGoal?.sourceRecommendationId).toBe(approved.recommendationId);
     expect(goalAgent.appliedStructuredOutputs).toHaveLength(1);
     expect(saves).toBe(2);
+  });
+
+  it("applies repository path summary outputs once and persists sanitized related files", async () => {
+    const service = new AppService(await createTempDir("repository-summary-output")) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      applyRepositoryPathSummaryOutput: (
+        project: ReturnType<typeof makeAppServiceLoadedProject>,
+        agent: AgentState,
+        rawText: string,
+        source: string
+      ) => Promise<void>;
+      persistProjectUpdate: (project: ReturnType<typeof makeAppServiceLoadedProject>, options?: unknown) => Promise<void>;
+    };
+    const project = makeAppServiceLoadedProject("repository-summary-output-project");
+    project.scan = {
+      ...project.scan,
+      files: [
+        { absolutePath: "/repo/src/runtime/appService.ts", relativePath: "src/runtime/appService.ts", size: 120, language: "TypeScript" },
+        { absolutePath: "/repo/src/runtime/fileSummary.ts", relativePath: "src/runtime/fileSummary.ts", size: 80, language: "TypeScript" },
+        { absolutePath: "/repo/src/shared/types.ts", relativePath: "src/shared/types.ts", size: 60, language: "TypeScript" }
+      ],
+      stats: {
+        ...project.scan.stats,
+        totalFiles: 3,
+        includedFiles: 3,
+        includedSizeBytes: 260,
+        entryPoints: ["src/runtime/appService.ts"]
+      }
+    };
+    project.record.stats = project.scan.stats;
+    service.projects.set(project.record.id, project);
+    const agent = createAgentSkeleton("manual", "Repository Summary", "Summarize src/runtime.", "gpt-5.4");
+    agent.repositorySummaryTarget = {
+      relativePath: "src/runtime",
+      pathKind: "directory",
+      contentHash: "runtime-hash"
+    };
+    project.record.agents.push(agent);
+    let saves = 0;
+    service.persistProjectUpdate = async (updatedProject) => {
+      saves += 1;
+      updatedProject.record.summaryCache = updatedProject.summaryCache.list();
+    };
+    const output = [
+      "The model wrapped this response in prose.",
+      JSON.stringify({
+        title: "Runtime services",
+        purpose: "Owns privileged project operations and repository-aware workflows.",
+        summary: "The runtime folder coordinates repository scanning, summary persistence, and agent lifecycle orchestration.",
+        keySymbols: ["AppService", "buildDeterministicDirectorySummary"],
+        relatedFiles: ["src/runtime/appService.ts", "src/shared/types.ts", "missing.ts", "../secret.txt"],
+        confidence: 1.4
+      })
+    ].join("\n");
+
+    await service.applyRepositoryPathSummaryOutput(project, agent, output, "item/completed");
+    await service.applyRepositoryPathSummaryOutput(project, agent, output, "rawResponseItem/completed");
+
+    const summary = project.summaryCache.get("src/runtime", "runtime-hash");
+    expect(summary).toBeTruthy();
+    expect(summary?.source).toBe("codex");
+    expect(summary?.pathKind).toBe("directory");
+    expect(summary?.confidence).toBe(1);
+    expect(summary?.relatedFiles).toEqual(["src/runtime/appService.ts", "src/shared/types.ts"]);
+    expect(project.record.summaryCache).toHaveLength(1);
+    expect(agent.currentPhase).toBe("Repository summary saved");
+    expect(agent.appliedStructuredOutputs).toHaveLength(1);
+    expect(saves).toBe(1);
   });
 
   it("skips unchanged project writes and trims renderer snapshots", async () => {

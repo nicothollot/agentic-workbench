@@ -1830,16 +1830,22 @@ const RepoTree = ({
               {visibleRows.map((row) => (
                 <button
                   key={row.path}
-                  className={`tree-row ${selected === row.path ? "tree-row--selected" : ""}`}
+                  className={`tree-row tree-row--${row.type} ${selected === row.path ? "tree-row--selected" : ""}`}
                   style={{ paddingLeft: `${row.depth * 16 + 14}px` }}
                   type="button"
                   aria-expanded={row.type === "directory" ? row.expanded : undefined}
                   title={row.path}
-                  onClick={() => row.type === "directory" ? onToggleDirectory(row.path) : onSelect(row.path)}
+                  onClick={() => {
+                    onSelect(row.path);
+                    if (row.type === "directory") {
+                      onToggleDirectory(row.path);
+                    }
+                  }}
                 >
-                  <span className="tree-row__marker">
-                    {row.type === "directory" ? row.expanded ? "▾" : "▸" : "•"}
+                  <span className="tree-row__marker" aria-hidden="true">
+                    {row.type === "directory" ? row.expanded ? "▾" : "▸" : ""}
                   </span>
+                  <span className="tree-row__icon" aria-hidden="true">{row.type === "directory" ? "DIR" : repositoryFileExtensionLabel(row.path) || "FILE"}</span>
                   <span className={`tree-row__kind tree-row__kind--${row.type}`}>{repositoryTreeRowKindLabel(row)}</span>
                   <span className="tree-row__label">{row.name}</span>
                   <span className="tree-row__meta">{repositoryTreeRowMeta(row, row.loading)}</span>
@@ -3814,12 +3820,29 @@ const RepositoryPanel = ({
   selectedFile,
   fileSummary,
   importantPathSummaries,
+  availableModels,
+  modelOptionsByName,
+  summaryModel,
+  summaryReasoningMode,
+  summaryReasoningEffort,
+  summaryAgent,
+  summaryActionBusy,
+  questionDraft,
+  agentActionsBlocked,
   onRescanRepository,
   onDeepScanRepository,
   onTreeFilterChange,
   onSelectFile,
   onToggleDirectory,
   onLoadMoreRepositoryChildren,
+  onSummaryModelChange,
+  onSummaryReasoningModeChange,
+  onSummaryReasoningEffortChange,
+  onGenerateSummary,
+  onQuestionDraftChange,
+  onAskQuestion,
+  onOpenPathWindow,
+  onOpenSummaryAgentOutput,
   searchResultIndex,
   onSelectSearchResult
 }: {
@@ -3833,12 +3856,29 @@ const RepositoryPanel = ({
   selectedFile?: string;
   fileSummary: FileSummary | null;
   importantPathSummaries: FileSummary[];
+  availableModels: DiscoveredModel[];
+  modelOptionsByName: Map<string, DiscoveredModel>;
+  summaryModel: string;
+  summaryReasoningMode: AgentReasoningMode;
+  summaryReasoningEffort: InterfaceReasoningEffort;
+  summaryAgent?: AgentState;
+  summaryActionBusy?: { path: string; action: "summary" | "question" | "window" };
+  questionDraft: string;
+  agentActionsBlocked: boolean;
   onRescanRepository: () => void;
   onDeepScanRepository: (settings?: RepositoryScanSettings) => void;
   onTreeFilterChange: (value: string) => void;
   onSelectFile: (relativePath: string) => void;
   onToggleDirectory: (relativePath: string) => void;
   onLoadMoreRepositoryChildren: (relativePath: string) => void;
+  onSummaryModelChange: (model: string) => void;
+  onSummaryReasoningModeChange: (mode: AgentReasoningMode) => void;
+  onSummaryReasoningEffortChange: (effort: InterfaceReasoningEffort) => void;
+  onGenerateSummary: () => void;
+  onQuestionDraftChange: (value: string) => void;
+  onAskQuestion: () => void;
+  onOpenPathWindow: () => void;
+  onOpenSummaryAgentOutput: (agent: Pick<AgentState, "id" | "name">) => void;
   searchResultIndex: number;
   onSelectSearchResult: (index: number) => void;
 }) => {
@@ -3896,6 +3936,11 @@ const RepositoryPanel = ({
     `Manifest files: ${stats?.manifestFiles.join(", ") || "None detected"}`,
     `Entry points: ${stats?.entryPoints.join(", ") || "None detected"}`
   ].filter(Boolean).join("\n");
+  const selectedPathKind = fileSummary?.pathKind ?? (selectedFile && rootChildren.some((entry) => entry.path === selectedFile && entry.type === "directory") ? "directory" : "file");
+  const summaryAgentRunning = summaryAgent ? isWorkflowAgentActive(summaryAgent) : false;
+  const selectedPathBusyAction = summaryActionBusy && summaryActionBusy.path === selectedFile ? summaryActionBusy.action : undefined;
+  const summaryControlsDisabled = !selectedFile || !summaryModel || agentActionsBlocked || summaryAgentRunning || Boolean(selectedPathBusyAction);
+  const questionDisabled = summaryControlsDisabled || !questionDraft.trim();
 
   return (
     <section className="workspace-summary repository-workspace repository-intelligence-page">
@@ -4158,23 +4203,84 @@ const RepositoryPanel = ({
             </div>
           </article>
 
-          <article className="repository-section repository-file-panel">
+          <article className="repository-section repository-file-panel repository-path-inspector">
             <div className="candidate-card__title-row">
-              <h3>File details</h3>
-              {fileSummary ? <SourceBadge source={fileSummary.source} /> : null}
+              <h3>Path details</h3>
+              {fileSummary ? <SourceBadge source={fileSummary.source} /> : selectedFile ? <span className="badge">{selectedPathKind}</span> : null}
             </div>
-            {fileSummary ? (
+            {selectedFile ? (
               <>
-                <div className="file-summary__title">{fileSummary.relativePath}</div>
-                <p>{redactSensitiveText(fileSummary.purpose)}</p>
-                <p>{redactSensitiveText(fileSummary.summary)}</p>
-                <div className="tag-row">
-                  {fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>)}
+                <div className="repository-path-card">
+                  <div className="repository-path-card__header">
+                    <span className={`repository-path-card__kind repository-path-card__kind--${fileSummary?.pathKind ?? selectedPathKind}`}>
+                      {fileSummary?.pathKind ?? selectedPathKind}
+                    </span>
+                    <strong>{fileSummary?.relativePath ?? selectedFile}</strong>
+                  </div>
+                  {fileSummary ? (
+                    <>
+                      <p>{redactSensitiveText(fileSummary.purpose)}</p>
+                      <p>{redactSensitiveText(fileSummary.summary)}</p>
+                      <div className="tag-row">
+                        {fileSummary.keySymbols.length ? fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>) : <span className="tag">No symbols cached</span>}
+                      </div>
+                      <LongTextDisclosure title="Related files" value={fileSummary.relatedFiles.join("\n")} code />
+                    </>
+                  ) : (
+                    <LoadingIndicator label="Loading path summary" compact />
+                  )}
                 </div>
-                <LongTextDisclosure title="Related files" value={fileSummary.relatedFiles.join("\n")} code />
+
+                <div className="repository-agent-card">
+                  <div className="candidate-card__title-row">
+                    <h4>Summary agent</h4>
+                    {summaryAgent ? <StatusChip label={summaryAgent.status} tone={summaryAgent.status === "completed" ? "completed" : summaryAgent.status === "failed" ? "error" : "running"} /> : null}
+                  </div>
+                  <label className="form-field">
+                    <span>Model</span>
+                    <select className="input" value={summaryModel} onChange={(event) => onSummaryModelChange(event.target.value)} disabled={agentActionsBlocked || !availableModels.length}>
+                      {availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
+                    </select>
+                  </label>
+                  <AgentReasoningPicker
+                    category="manual"
+                    model={modelOptionsByName.get(summaryModel)}
+                    taskPrompt={`Repository path summary: ${selectedFile}`}
+                    mode={summaryReasoningMode}
+                    effort={summaryReasoningEffort}
+                    onModeChange={onSummaryReasoningModeChange}
+                    onEffortChange={onSummaryReasoningEffortChange}
+                  />
+                  {summaryAgentRunning ? <LoadingIndicator label="Summary agent running" compact /> : null}
+                  <div className="actions-row">
+                    <button className="primary-button" type="button" disabled={summaryControlsDisabled} onClick={onGenerateSummary}>
+                      {selectedPathBusyAction === "summary" ? "Starting..." : "Generate LLM Summary"}
+                    </button>
+                    <button className="secondary-button" type="button" disabled={!selectedFile || selectedPathBusyAction === "window"} onClick={onOpenPathWindow}>
+                      {selectedPathBusyAction === "window" ? "Opening..." : "Open in New Window"}
+                    </button>
+                    {summaryAgent ? (
+                      <button className="secondary-button" type="button" onClick={() => onOpenSummaryAgentOutput(summaryAgent)}>
+                        Open Agent Output
+                      </button>
+                    ) : null}
+                  </div>
+                  <textarea
+                    className="textarea repository-question-input"
+                    placeholder="Ask about this path"
+                    value={questionDraft}
+                    onChange={(event) => onQuestionDraftChange(event.target.value)}
+                    disabled={agentActionsBlocked || !selectedFile}
+                  />
+                  <div className="actions-row">
+                    <button className="secondary-button" type="button" disabled={questionDisabled} onClick={onAskQuestion}>
+                      {selectedPathBusyAction === "question" ? "Starting..." : "Ask"}
+                    </button>
+                  </div>
+                </div>
               </>
             ) : (
-              <CompactEmptyState>Select a file in the repository tree to load its summary and related symbols.</CompactEmptyState>
+              <CompactEmptyState>Select a file or folder in the repository tree to load its summary and related symbols.</CompactEmptyState>
             )}
           </article>
         </aside>
@@ -6846,6 +6952,11 @@ export const App = () => {
   const [manualAgentModel, setManualAgentModel] = useState("");
   const [manualAgentReasoningMode, setManualAgentReasoningMode] = useState<AgentReasoningMode>("auto");
   const [manualAgentReasoningEffort, setManualAgentReasoningEffort] = useState<InterfaceReasoningEffort>(DEFAULT_AGENT_REASONING_EFFORTS.manual);
+  const [repositorySummaryModel, setRepositorySummaryModel] = useState("");
+  const [repositorySummaryReasoningMode, setRepositorySummaryReasoningMode] = useState<AgentReasoningMode>("auto");
+  const [repositorySummaryReasoningEffort, setRepositorySummaryReasoningEffort] = useState<InterfaceReasoningEffort>(DEFAULT_AGENT_REASONING_EFFORTS.manual);
+  const [repositoryQuestionDraft, setRepositoryQuestionDraft] = useState("");
+  const [repositoryPathActionBusy, setRepositoryPathActionBusy] = useState<{ path: string; action: "summary" | "question" | "window" }>();
   const [customRecommendationPrompt, setCustomRecommendationPrompt] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showExistingChoice, setShowExistingChoice] = useState(false);
@@ -6941,6 +7052,20 @@ export const App = () => {
   });
   const [workflowDetailsMounted, setWorkflowDetailsMounted] = useState(false);
   const workflowCommandBusyRef = useRef<string | undefined>(undefined);
+  const repositoryLaunchRef = useRef<{
+    projectId?: string;
+    path?: string;
+    openingProject: boolean;
+    pathApplied: boolean;
+  }>((() => {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      projectId: params.get("projectId") ?? undefined,
+      path: params.get("repositoryPath") ?? undefined,
+      openingProject: false,
+      pathApplied: false
+    };
+  })());
   const visualExportReadinessRef = useRef<VisualExportReadiness>({
     activeProjectId: undefined,
     activeWorkspaceTab: "overview",
@@ -7329,6 +7454,12 @@ export const App = () => {
   const selectedRunAgent = agentDetail
     ?? runsPageAgents.find((agent) => agent.id === focusedAgentId)
     ?? activeAgentForDetail;
+  const selectedRepositorySummaryAgent = useMemo(
+    () => selectedFile
+      ? sortAgentsByActivity(allAgents.filter((agent) => agent.repositorySummaryTarget?.relativePath === selectedFile))[0]
+      : undefined,
+    [allAgents, selectedFile]
+  );
   const selectedWorkspaceTab: WorkspaceVisualTabId = activeWorkspaceTabOverride ?? normalizeWorkspaceTab(activeProject?.record.layout.activeCenterTab);
   const activeWorkspaceTab = useDeferredValue(selectedWorkspaceTab);
   const workflowRunState = workflow && activeProject
@@ -7483,15 +7614,40 @@ export const App = () => {
     setManualAgentReasoningEffort((current) =>
       resolveAgentReasoningEffort(modelOptionsByName.get(manualAgentModel || recommendedModel), "manual", manualAgentPrompt, "manual", current)
     );
+    setRepositorySummaryModel((current) => current && availableModels.some((model) => model.model === current) ? current : recommendedModel);
+    setRepositorySummaryReasoningEffort((current) =>
+      resolveAgentReasoningEffort(
+        modelOptionsByName.get(repositorySummaryModel || recommendedModel),
+        "manual",
+        selectedFile ? `Repository path summary: ${selectedFile}` : "Repository path summary",
+        "manual",
+        current
+      )
+    );
     if (!interfaceCreationConfiguredAt) {
       setShowSettings(true);
     }
-  }, [availableModels, interfaceCreationConfiguredAt, manualAgentModel, manualAgentPrompt, modelOptionsByName, recommendedModel, stateLoaded]);
+  }, [
+    availableModels,
+    interfaceCreationConfiguredAt,
+    manualAgentModel,
+    manualAgentPrompt,
+    modelOptionsByName,
+    recommendedModel,
+    repositorySummaryModel,
+    selectedFile,
+    stateLoaded
+  ]);
 
   useEffect(() => {
     setManualAgentPrompt("");
     setCustomRecommendationPrompt("");
+    setRepositoryQuestionDraft("");
   }, [activeProject?.record.id]);
+
+  useEffect(() => {
+    setRepositoryQuestionDraft("");
+  }, [selectedFile]);
 
   useEffect(() => {
     if (!stateLoaded || !showSettings) {
@@ -7745,6 +7901,68 @@ export const App = () => {
       cancelled = true;
     };
   }, [activeProjectId, repositoryData.projectId]);
+
+  useEffect(() => {
+    const launch = repositoryLaunchRef.current;
+    if (!stateLoaded || !launch.projectId || activeProjectId === launch.projectId || launch.openingProject) {
+      return;
+    }
+
+    launch.openingProject = true;
+    void window.workbench.openProject(launch.projectId)
+      .catch(handleError)
+      .finally(() => {
+        launch.openingProject = false;
+      });
+  }, [activeProjectId, stateLoaded]);
+
+  useEffect(() => {
+    const launch = repositoryLaunchRef.current;
+    if (
+      !launch.projectId ||
+      !launch.path ||
+      launch.pathApplied ||
+      activeProjectId !== launch.projectId ||
+      repositoryData.projectId !== activeProjectId ||
+      repositoryData.loading
+    ) {
+      return;
+    }
+
+    launch.pathApplied = true;
+    setActiveWorkspaceTabOverride("repository");
+    void revealRepositoryPathRef.current(launch.path);
+  }, [activeProjectId, repositoryData.loading, repositoryData.projectId]);
+
+  useEffect(() => {
+    if (!activeProject || repositoryData.projectId !== activeProject.record.id) {
+      return;
+    }
+
+    setRepositoryData((current) => {
+      if (
+        current.projectId !== activeProject.record.id ||
+        (current.summaryCache === activeProject.record.summaryCache && current.summaryCacheTotal === activeProject.record.summaryCache.length)
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        summaryCache: activeProject.record.summaryCache,
+        summaryCacheTotal: activeProject.record.summaryCache.length
+      };
+    });
+  }, [activeProject, repositoryData.projectId]);
+
+  useEffect(() => {
+    if (!activeProject || !selectedFile) {
+      return;
+    }
+    const cachedSummary = activeProject.record.summaryCache.find((summary) => summary.relativePath === selectedFile);
+    if (cachedSummary && cachedSummary.generatedAt !== fileSummary?.generatedAt) {
+      setFileSummary(cachedSummary);
+    }
+  }, [activeProject, fileSummary?.generatedAt, selectedFile]);
 
   const loadRepositoryChildren = (parentPath: string, cursor?: string) => {
     if (!activeProjectId) {
@@ -8622,6 +8840,72 @@ export const App = () => {
       setFileSummary(summary);
     } catch (error) {
       handleError(error);
+    }
+  };
+
+  const generateRepositoryPathSummary = async () => {
+    if (!activeProject || !selectedFile || !repositorySummaryModel) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      setRepositoryPathActionBusy({ path: selectedFile, action: "summary" });
+      const agent = await window.workbench.summarizeRepositoryPath(
+        activeProject.record.id,
+        selectedFile,
+        repositorySummaryModel,
+        repositorySummaryReasoningMode,
+        repositorySummaryReasoningEffort
+      );
+      setFocusedAgentId(agent.id);
+      showInfoNotice(`Summary agent started for ${selectedFile}.`);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setRepositoryPathActionBusy((current) => current?.path === selectedFile && current.action === "summary" ? undefined : current);
+    }
+  };
+
+  const askRepositoryPathQuestion = async () => {
+    if (!activeProject || !selectedFile || !repositorySummaryModel || !repositoryQuestionDraft.trim()) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      setRepositoryPathActionBusy({ path: selectedFile, action: "question" });
+      const agent = await window.workbench.askRepositoryPath(
+        activeProject.record.id,
+        selectedFile,
+        repositoryQuestionDraft.trim(),
+        repositorySummaryModel,
+        repositorySummaryReasoningMode,
+        repositorySummaryReasoningEffort
+      );
+      setRepositoryQuestionDraft("");
+      setFocusedAgentId(agent.id);
+      openAgentOutputById(agent, { loadTranscript: true });
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setRepositoryPathActionBusy((current) => current?.path === selectedFile && current.action === "question" ? undefined : current);
+    }
+  };
+
+  const openRepositoryPathWindow = async () => {
+    if (!activeProject || !selectedFile) {
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      setRepositoryPathActionBusy({ path: selectedFile, action: "window" });
+      await window.workbench.openRepositoryPathWindow(activeProject.record.id, selectedFile);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setRepositoryPathActionBusy((current) => current?.path === selectedFile && current.action === "window" ? undefined : current);
     }
   };
 
@@ -10392,12 +10676,29 @@ export const App = () => {
             selectedFile={selectedFile}
             fileSummary={fileSummary}
             importantPathSummaries={importantPathSummaries}
+            availableModels={state.availableModels}
+            modelOptionsByName={modelOptionsByName}
+            summaryModel={repositorySummaryModel}
+            summaryReasoningMode={repositorySummaryReasoningMode}
+            summaryReasoningEffort={repositorySummaryReasoningEffort}
+            summaryAgent={selectedRepositorySummaryAgent}
+            summaryActionBusy={repositoryPathActionBusy}
+            questionDraft={repositoryQuestionDraft}
+            agentActionsBlocked={agentActionsBlocked}
             onRescanRepository={() => void rescanRepository("normal")}
             onDeepScanRepository={(settings) => void rescanRepository("deep", settings)}
             onTreeFilterChange={setTreeFilterDraft}
             onSelectFile={(relativePath) => void loadSummary(relativePath)}
             onToggleDirectory={toggleRepositoryDirectory}
             onLoadMoreRepositoryChildren={loadMoreRepositoryChildren}
+            onSummaryModelChange={setRepositorySummaryModel}
+            onSummaryReasoningModeChange={setRepositorySummaryReasoningMode}
+            onSummaryReasoningEffortChange={setRepositorySummaryReasoningEffort}
+            onGenerateSummary={() => void generateRepositoryPathSummary()}
+            onQuestionDraftChange={setRepositoryQuestionDraft}
+            onAskQuestion={() => void askRepositoryPathQuestion()}
+            onOpenPathWindow={() => void openRepositoryPathWindow()}
+            onOpenSummaryAgentOutput={(agent) => openAgentOutputById(agent, { loadTranscript: true })}
             searchResultIndex={repositorySearchResultIndex}
             onSelectSearchResult={selectRepositorySearchResult}
           />

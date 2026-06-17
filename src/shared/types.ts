@@ -1181,6 +1181,12 @@ export interface FileSummary {
   generatedAt: string;
 }
 
+export interface RepositoryPathSummaryTarget {
+  relativePath: string;
+  pathKind: "file" | "directory";
+  contentHash: string;
+}
+
 export interface ProjectSubsystemSummary {
   name: string;
   summary: string;
@@ -1333,7 +1339,7 @@ export interface RecommendationReport {
 }
 
 export interface StructuredOutputApplication {
-  kind: "recommendation" | "scoped_goal";
+  kind: "recommendation" | "scoped_goal" | "repository_path_summary";
   contentHash: string;
   appliedAt: string;
   source?: string;
@@ -1372,6 +1378,7 @@ export interface AgentState {
   events: RuntimeEventRecord[];
   disconnectedReason?: string;
   recoveryHandledAt?: string;
+  repositorySummaryTarget?: RepositoryPathSummaryTarget;
   integrityReport?: IntegrityReport;
   mergeReport?: MergeReport;
   recommendationReport?: RecommendationReport;

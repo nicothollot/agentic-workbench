@@ -73,6 +73,47 @@ export const buildDeterministicFileSummary = async (
   };
 };
 
+export const buildDeterministicDirectorySummary = (
+  relativePath: string,
+  files: ScannedFile[],
+  contentHash: string
+): FileSummary => {
+  const childFiles = files.filter((file) => file.relativePath.startsWith(`${relativePath}/`));
+  const immediateChildren = new Set<string>();
+  const languages = new Map<string, number>();
+  for (const file of childFiles) {
+    const remainder = file.relativePath.slice(relativePath.length + 1);
+    const childName = remainder.split("/")[0];
+    if (childName) {
+      immediateChildren.add(childName);
+    }
+    languages.set(file.language, (languages.get(file.language) ?? 0) + 1);
+  }
+  const topLanguages = [...languages.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 4)
+    .map(([language, count]) => `${language} (${count})`);
+  const relatedFiles = childFiles
+    .slice()
+    .sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+    .slice(0, 8)
+    .map((file) => file.relativePath);
+
+  return {
+    relativePath,
+    pathKind: "directory",
+    contentHash,
+    title: path.basename(relativePath),
+    purpose: "This folder groups related repository files.",
+    summary: `${relativePath} contains ${childFiles.length} indexed file${childFiles.length === 1 ? "" : "s"} across ${immediateChildren.size} immediate entr${immediateChildren.size === 1 ? "y" : "ies"}${topLanguages.length ? `, led by ${topLanguages.join(", ")}.` : "."}`,
+    keySymbols: topLanguages,
+    relatedFiles,
+    confidence: childFiles.length > 0 ? 0.58 : 0.25,
+    source: "deterministic",
+    generatedAt: nowIso()
+  };
+};
+
 export const buildDeterministicOverview = (summaryInput: {
   projectName: string;
   explanation: string;

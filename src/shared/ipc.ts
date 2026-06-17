@@ -150,6 +150,12 @@ export const projectRepositorySummaryRequestSchema = z.object({
 });
 
 const repositoryTreePageLimit = 20_000;
+const repositoryRelativePathSchema = z.string().min(1).transform((value) => value.replace(/\\/g, "/")).refine((value) => {
+  if (!value || value === "." || value.startsWith("/") || /^[A-Za-z]:\//.test(value)) {
+    return false;
+  }
+  return !value.split("/").some((segment) => segment === "..");
+}, "Repository paths must stay inside the opened project.");
 
 export const projectRepositoryChildrenRequestSchema = z.object({
   projectId: z.string().min(1),
@@ -162,6 +168,23 @@ export const projectRepositorySearchRequestSchema = z.object({
   projectId: z.string().min(1),
   query: z.string().default(""),
   limit: z.number().int().min(1).max(repositoryTreePageLimit).default(120)
+});
+
+export const repositoryPathSummaryRequestSchema = z.object({
+  projectId: z.string().min(1),
+  relativePath: repositoryRelativePathSchema,
+  model: z.string().min(1),
+  reasoningMode: agentReasoningModeSchema.optional(),
+  reasoningEffort: interfaceReasoningEffortSchema.optional()
+});
+
+export const repositoryPathQuestionRequestSchema = repositoryPathSummaryRequestSchema.extend({
+  question: z.string().min(1)
+});
+
+export const repositoryPathWindowRequestSchema = z.object({
+  projectId: z.string().min(1),
+  relativePath: repositoryRelativePathSchema
 });
 
 export const repositoryScanSettingsRequestSchema = z.object({

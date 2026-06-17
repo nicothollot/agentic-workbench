@@ -92,6 +92,22 @@ export interface WorkbenchApi {
   updateRepositoryScanSettings(projectId: string, settings: RepositoryScanSettings): Promise<RepositoryScanLimitsResponse>;
   listExcludedPaths(projectId: string, options?: { cursor?: string; limit?: number }): Promise<RepositoryExcludedPathsResponse>;
   rescanRepository(projectId: string, options?: { mode?: "normal" | "deep"; settings?: RepositoryScanSettings }): Promise<ProjectRepositorySummary>;
+  summarizeRepositoryPath(
+    projectId: string,
+    relativePath: string,
+    model: string,
+    reasoningMode?: AgentReasoningMode,
+    reasoningEffort?: InterfaceReasoningEffort
+  ): Promise<AgentState>;
+  askRepositoryPath(
+    projectId: string,
+    relativePath: string,
+    question: string,
+    model: string,
+    reasoningMode?: AgentReasoningMode,
+    reasoningEffort?: InterfaceReasoningEffort
+  ): Promise<AgentState>;
+  openRepositoryPathWindow(projectId: string, relativePath: string): Promise<void>;
   listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
   listWorkflowCycles(projectId: string, options?: { cursor?: string; limit?: number }): Promise<WorkflowCycleListResponse>;
@@ -259,6 +275,12 @@ const api: WorkbenchApi = {
     await invoke<RepositoryExcludedPathsResponse>("project:listExcludedPaths", { projectId, ...options }),
   rescanRepository: async (projectId, options = {}) =>
     await invoke<ProjectRepositorySummary>("project:rescanRepository", { projectId, options }),
+  summarizeRepositoryPath: async (projectId, relativePath, model, reasoningMode, reasoningEffort) =>
+    await invoke<AgentState>("project:summarizeRepositoryPath", { projectId, relativePath, model, reasoningMode, reasoningEffort }),
+  askRepositoryPath: async (projectId, relativePath, question, model, reasoningMode, reasoningEffort) =>
+    await invoke<AgentState>("project:askRepositoryPath", { projectId, relativePath, question, model, reasoningMode, reasoningEffort }),
+  openRepositoryPathWindow: async (projectId, relativePath) =>
+    await invoke<void>("project:openRepositoryPathWindow", { projectId, relativePath }),
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),

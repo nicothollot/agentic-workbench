@@ -56,6 +56,7 @@ import type {
   CredentialRequestStatus,
   DiscoveredModel,
   ExecutionEnvironmentStatus,
+  FileSummary,
   GitHubStatus,
   ChecklistChange,
   CycleRetrospective,
@@ -85,6 +86,7 @@ import type {
   PlannerDecision,
   RepositoryChildrenResponse,
   RepositorySearchResponse,
+  RepositoryPathSummaryTarget,
   ProjectStats,
   RepositoryTreeEntry,
   RepoTreeNode,
@@ -129,7 +131,7 @@ import {
   validateAutopilotPolicy,
   workPackageRequiresModelScoping
 } from "@shared/workflow";
-import { buildDeterministicFileSummary, buildDeterministicOverview } from "./fileSummary";
+import { buildDeterministicDirectorySummary, buildDeterministicFileSummary, buildDeterministicOverview } from "./fileSummary";
 import {
   applyBranchToProjectCheckout,
   attemptMerge,
@@ -270,7 +272,7 @@ type WorkflowAutomationTimer = {
   timer: ReturnType<typeof setTimeout>;
   generation: number;
 };
-type StructuredOutputKind = "recommendation" | "scoped_goal";
+type StructuredOutputKind = "recommendation" | "scoped_goal" | "repository_path_summary";
 type StructuredOutputGuard = {
   key: string;
   kind: StructuredOutputKind;
@@ -7235,25 +7237,308 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return status;
   }
 
+  private async buildRepositoryPathSummaryTarget(project: LoadedProject, relativePath: string): Promise<RepositoryPathSummaryTarget> {
+    const normalizedPath = this.normalizeProjectRelativePath(relativePath);
+    if (!normalizedPath) {
+      throw new Error(`Invalid repository path: ${relativePath}`);
+    }
+
+    const file = project.scan.files.find((entry) => entry.relativePath === normalizedPath);
+    if (file) {
+      const safeFilePath = await assertProjectRelativeHostPath(project.record.hostPath, file.relativePath, "Repository path summary read");
+      return {
+        relativePath: file.relativePath,
+        pathKind: "file",
+        contentHash: sha256(await readFile(safeFilePath, "utf8"))
+      };
+    }
+
+    if (project.scan.files.some((entry) => entry.relativePath.startsWith(`${normalizedPath}/`))) {
+      return {
+        relativePath: normalizedPath,
+        pathKind: "directory",
+        contentHash: getPathContentHash(project.scan, normalizedPath, "directory")
+      };
+    }
+
+    throw new Error(`Unknown repository path: ${relativePath}`);
+  }
+
+  private repositoryPathFiles(project: LoadedProject, target: RepositoryPathSummaryTarget) {
+    return target.pathKind === "file"
+      ? project.scan.files.filter((entry) => entry.relativePath === target.relativePath)
+      : project.scan.files.filter((entry) => entry.relativePath.startsWith(`${target.relativePath}/`));
+  }
+
+  private compactRepositorySnippet(value: string, maxLength: number): string {
+    const normalized = value
+      .replaceAll("\u0000", "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .trim();
+    return normalized.length <= maxLength
+      ? normalized
+      : `${normalized.slice(0, Math.max(0, maxLength - 24)).trimEnd()}\n...[truncated]`;
+  }
+
+  private async readRepositoryFileSnippet(project: LoadedProject, relativePath: string, maxLength: number): Promise<string | undefined> {
+    try {
+      const hostPath = await assertProjectRelativeHostPath(project.record.hostPath, relativePath, "Repository path context read");
+      return this.compactRepositorySnippet(await readFile(hostPath, "utf8"), maxLength);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async buildRepositoryPathEvidence(project: LoadedProject, target: RepositoryPathSummaryTarget): Promise<string> {
+    const files = this.repositoryPathFiles(project, target);
+    const languageCounts = new Map<string, number>();
+    for (const file of files) {
+      languageCounts.set(file.language, (languageCounts.get(file.language) ?? 0) + 1);
+    }
+    const languageSummary = [...languageCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, 8)
+      .map(([language, count]) => `${language}: ${count}`)
+      .join(", ");
+    const entryPointSet = new Set(project.scan.stats.entryPoints);
+    const sortedFiles = files
+      .slice()
+      .sort((left, right) =>
+        Number(entryPointSet.has(right.relativePath)) - Number(entryPointSet.has(left.relativePath))
+        || left.relativePath.localeCompare(right.relativePath)
+      );
+    const outline = sortedFiles
+      .slice(0, 120)
+      .map((file) => `- ${file.relativePath} (${file.language}, ${file.size} bytes)`)
+      .join("\n");
+    const snippetFiles = target.pathKind === "file"
+      ? sortedFiles.slice(0, 1)
+      : sortedFiles
+        .filter((file) => file.size <= 250_000)
+        .slice(0, 10);
+    const snippets: string[] = [];
+    let remainingSnippetBudget = target.pathKind === "file" ? 24_000 : 18_000;
+    for (const file of snippetFiles) {
+      if (remainingSnippetBudget <= 0) {
+        break;
+      }
+      const snippet = await this.readRepositoryFileSnippet(project, file.relativePath, Math.min(3_600, remainingSnippetBudget));
+      if (!snippet) {
+        continue;
+      }
+      snippets.push(`--- ${file.relativePath} ---\n${snippet}`);
+      remainingSnippetBudget -= snippet.length;
+    }
+
+    const cachedSummary = project.summaryCache.get(target.relativePath, target.contentHash);
+    return [
+      `Project: ${project.record.identity.projectName}`,
+      `Repository overview: ${project.record.overview?.summary ?? project.scan.stats.explanation}`,
+      `Selected ${target.pathKind}: ${target.relativePath}`,
+      `Indexed files under selection: ${files.length}`,
+      languageSummary ? `Languages: ${languageSummary}` : "",
+      cachedSummary ? `Existing stored summary: ${cachedSummary.summary}` : "",
+      outline ? `Path outline:\n${outline}${sortedFiles.length > 120 ? "\n- ...[truncated]" : ""}` : "",
+      snippets.length ? `Content excerpts:\n${snippets.join("\n\n")}` : "No readable text excerpts were available from the selected path."
+    ].filter((entry) => entry.trim().length > 0).join("\n\n");
+  }
+
+  private buildRepositoryPathSummaryOutputSchema(): JsonValue {
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["title", "purpose", "summary", "keySymbols", "relatedFiles", "confidence"],
+      properties: {
+        title: { type: "string", maxLength: 120 },
+        purpose: { type: "string", maxLength: 420 },
+        summary: { type: "string", maxLength: 1_800 },
+        keySymbols: { type: "array", maxItems: 12, items: { type: "string", maxLength: 120 } },
+        relatedFiles: { type: "array", maxItems: 8, items: { type: "string", maxLength: 500 } },
+        confidence: { type: "number", minimum: 0, maximum: 1 }
+      }
+    } satisfies JsonValue;
+  }
+
+  private buildRepositoryPathSummaryPrompt(project: LoadedProject, target: RepositoryPathSummaryTarget, evidence: string): string {
+    return [
+      "Generate a durable repository memory summary for exactly the selected file or folder.",
+      "Use only the provided repository evidence. Do not invent behavior or mention files outside the selected path except in relatedFiles.",
+      "Do not include raw secrets, API keys, tokens, passwords, or private credential values in any field.",
+      "Return only valid JSON matching the supplied schema.",
+      evidence
+    ].join("\n\n");
+  }
+
+  private buildRepositoryPathQuestionPrompt(target: RepositoryPathSummaryTarget, evidence: string, question: string): string {
+    return [
+      `Answer the user's question about the selected ${target.pathKind}: ${target.relativePath}.`,
+      "Stay scoped to this path unless the answer needs a directly related file. Cite concrete paths and symbols when useful.",
+      "If the evidence is insufficient, say what is missing instead of guessing.",
+      "Do not expose raw secrets, API keys, tokens, passwords, or private credential values.",
+      `Question: ${question}`,
+      evidence
+    ].join("\n\n");
+  }
+
+  private repositoryKnownPathSet(project: LoadedProject): Set<string> {
+    const known = new Set(project.scan.files.map((entry) => entry.relativePath));
+    for (const file of project.scan.files) {
+      const segments = file.relativePath.split("/");
+      let current = "";
+      for (let index = 0; index < segments.length - 1; index += 1) {
+        current = current ? `${current}/${segments[index]}` : segments[index];
+        known.add(current);
+      }
+    }
+    return known;
+  }
+
+  private normalizeRepositorySummaryStrings(value: unknown, maxItems: number): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value
+      .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+      .map((entry) => compactText(entry, 160))
+      .slice(0, maxItems);
+  }
+
+  private parseRepositoryPathSummaryOutput(rawText: string): Omit<FileSummary, "relativePath" | "pathKind" | "contentHash" | "source" | "generatedAt"> | undefined {
+    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+      const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
+      const purpose = typeof parsed.purpose === "string" ? parsed.purpose.trim() : "";
+      const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+      if (!title || !purpose || !summary) {
+        continue;
+      }
+      const confidence = typeof parsed.confidence === "number" && Number.isFinite(parsed.confidence)
+        ? Math.min(1, Math.max(0, parsed.confidence))
+        : 0.72;
+      return {
+        title: compactText(title, 120),
+        purpose: compactText(purpose, 420),
+        summary: compactText(summary, 1_800),
+        keySymbols: this.normalizeRepositorySummaryStrings(parsed.keySymbols, 12),
+        relatedFiles: this.normalizeRepositorySummaryStrings(parsed.relatedFiles, 8),
+        confidence
+      };
+    }
+    return undefined;
+  }
+
+  private async applyRepositoryPathSummaryOutput(project: LoadedProject, agent: AgentState, rawText: string, source: string): Promise<void> {
+    const target = agent.repositorySummaryTarget;
+    if (!target) {
+      return;
+    }
+    const guard = this.beginStructuredOutputApplication(project, agent, "repository_path_summary", rawText, source);
+    if (!guard) {
+      return;
+    }
+    const parsed = this.parseRepositoryPathSummaryOutput(rawText);
+    if (!parsed) {
+      reduceAgentRuntimeEvent(agent, {
+        kind: "raw",
+        title: "Repository path summary rejected",
+        detail: "The model response did not include a valid path summary JSON object.",
+        raw: { source }
+      });
+      this.abortStructuredOutputApplication(guard);
+      await this.persistProjectUpdate(project, { reason: "repository path summary rejected" });
+      return;
+    }
+
+    const knownPaths = this.repositoryKnownPathSet(project);
+    const relatedFiles = parsed.relatedFiles
+      .map((entry) => this.normalizeProjectRelativePath(entry))
+      .filter((entry): entry is string => Boolean(entry && knownPaths.has(entry)))
+      .slice(0, 8);
+    const summary = fileSummarySchema.parse({
+      ...parsed,
+      relativePath: target.relativePath,
+      pathKind: target.pathKind,
+      contentHash: target.contentHash,
+      relatedFiles,
+      source: "codex",
+      generatedAt: nowIso()
+    });
+    project.summaryCache.upsert(summary);
+    agent.currentPhase = "Repository summary saved";
+    agent.lastMessageSnippet = summary.summary.slice(0, 240);
+    this.finishStructuredOutputApplication(agent, guard);
+    await this.persistProjectUpdate(project, { reason: "repository path summary saved" });
+  }
+
+  async summarizeRepositoryPath(
+    projectId: string,
+    relativePath: string,
+    model: string,
+    options?: {
+      reasoningMode?: AgentReasoningMode;
+      reasoningEffort?: InterfaceReasoningEffort;
+    }
+  ): Promise<AgentState> {
+    await this.ensureRepositoryIndexLoaded(projectId);
+    const project = this.findProject(projectId);
+    const target = await this.buildRepositoryPathSummaryTarget(project, relativePath);
+    const evidence = await this.buildRepositoryPathEvidence(project, target);
+    const agentName = `Summarize ${target.pathKind}: ${path.posix.basename(target.relativePath)}`;
+    return await this.createAgent(projectId, "manual", agentName, this.buildRepositoryPathSummaryPrompt(project, target, evidence), model || this.getDefaultAgentModel(), {
+      sandbox: "read-only",
+      outputSchema: this.buildRepositoryPathSummaryOutputSchema(),
+      reasoningMode: options?.reasoningMode,
+      effort: options?.reasoningEffort,
+      initialPhase: `Summarizing ${target.pathKind}`,
+      repositorySummaryTarget: target
+    });
+  }
+
+  async askRepositoryPath(
+    projectId: string,
+    relativePath: string,
+    question: string,
+    model: string,
+    options?: {
+      reasoningMode?: AgentReasoningMode;
+      reasoningEffort?: InterfaceReasoningEffort;
+    }
+  ): Promise<AgentState> {
+    await this.ensureRepositoryIndexLoaded(projectId);
+    const project = this.findProject(projectId);
+    const target = await this.buildRepositoryPathSummaryTarget(project, relativePath);
+    const evidence = await this.buildRepositoryPathEvidence(project, target);
+    const agentName = `Ask ${target.pathKind}: ${path.posix.basename(target.relativePath)}`;
+    return await this.createAgent(projectId, "manual", agentName, this.buildRepositoryPathQuestionPrompt(target, evidence, question), model || this.getDefaultAgentModel(), {
+      sandbox: "read-only",
+      reasoningMode: options?.reasoningMode,
+      effort: options?.reasoningEffort,
+      initialPhase: `Answering question about ${target.pathKind}`
+    });
+  }
+
   async getFileSummary(projectId: string, relativePath: string) {
     await this.ensureRepositoryIndexLoaded(projectId);
     const project = this.findProject(projectId);
-    const file = project.scan.files.find((entry) => entry.relativePath === relativePath);
-    if (!file) {
-      throw new Error(`Unknown file: ${relativePath}`);
-    }
-
-    const safeFilePath = await assertProjectRelativeHostPath(project.record.hostPath, file.relativePath, "File summary read");
-    const contentHash = sha256(await (await import("node:fs/promises")).readFile(safeFilePath, "utf8"));
-    const cached = project.summaryCache.get(relativePath, contentHash);
+    const target = await this.buildRepositoryPathSummaryTarget(project, relativePath);
+    const cached = project.summaryCache.get(target.relativePath, target.contentHash);
     if (cached) {
       return cached;
     }
 
-    const siblings = project.scan.files
-      .filter((entry) => path.dirname(entry.relativePath) === path.dirname(relativePath) && entry.relativePath !== relativePath)
-      .map((entry) => entry.relativePath);
-    const summary = fileSummarySchema.parse(await buildDeterministicFileSummary(project.record.hostPath, file, siblings));
+    const summary = target.pathKind === "file"
+      ? fileSummarySchema.parse(await buildDeterministicFileSummary(
+        project.record.hostPath,
+        project.scan.files.find((entry) => entry.relativePath === target.relativePath)!,
+        project.scan.files
+          .filter((entry) => path.dirname(entry.relativePath) === path.dirname(target.relativePath) && entry.relativePath !== target.relativePath)
+          .map((entry) => entry.relativePath)
+      ))
+      : fileSummarySchema.parse(buildDeterministicDirectorySummary(
+        target.relativePath,
+        project.scan.files,
+        target.contentHash
+      ));
     project.summaryCache.upsert(summary);
     await this.persistProjectUpdate(project);
     return summary;
@@ -10907,17 +11192,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       launchThread?: boolean;
       targetBranch?: string;
       persistOnCreate?: boolean;
+      repositorySummaryTarget?: RepositoryPathSummaryTarget;
     }
   ): Promise<AgentState> {
     const project = this.findProject(projectId);
     const launchThread = options?.launchThread !== false;
+    const writeEnabled = isWriteEnabledAgentCategory(category) && options?.sandbox !== "read-only";
     if (launchThread) {
       this.assertGitHubLinked();
       await this.ensureAgentBackedRuntimeReady(project, "agent creation runtime check");
     }
 
     const accessProbe = project.record.validation.projectAccess;
-    if (isWriteEnabledAgentCategory(category) && accessProbe?.status === "failed") {
+    if (writeEnabled && accessProbe?.status === "failed") {
       throw new Error(
         accessProbe.error
           ? `Write-enabled agents are blocked until project access is fixed. ${accessProbe.error}`
@@ -10925,7 +11212,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       );
     }
 
-    if (project.scan.kind === "folder" && isWriteEnabledAgentCategory(category)) {
+    if (project.scan.kind === "folder" && writeEnabled) {
       const writeAgents = project.record.agents.filter(
         (agent) => isWriteEnabledAgentCategory(agent.category) && agent.status !== "completed" && agent.status !== "disconnected"
       );
@@ -10947,13 +11234,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     agent.reasoningEffortSource = reasoningConfig.source;
     agent.workflowCycleNumber = category === "manual" ? undefined : workflow.workflowCycle.cycleNumber;
     agent.taskPrompt = `${agentRoles[category].instructions}\n\n${prompt}`;
+    agent.repositorySummaryTarget = options?.repositorySummaryTarget;
     agent.status = launchThread ? "starting" : "running";
     agent.startedAt = launchThread ? undefined : nowIso();
     agent.currentPhase = options?.initialPhase ?? (category === "manual" ? "Handling manual request" : undefined);
     this.assertResolvedPathCompatible(project.record.distroName);
     const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
 
-    if (isWriteEnabledAgentCategory(category) && project.scan.kind === "git") {
+    if (writeEnabled && project.scan.kind === "git") {
       const targetBranch = options?.targetBranch ?? (await determineDefaultBranch(project.record.projectRoot, runtimeSettings));
       const worktreeStartedAt = performance.now();
       agent.worktree = await createWorktreeAssignment(
@@ -11048,7 +11336,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     await this.startAgentThread(project, agent, {
-      sandbox: options?.sandbox ?? (isWriteEnabledAgentCategory(category) ? "workspace-write" : "read-only"),
+      sandbox: options?.sandbox ?? (writeEnabled ? "workspace-write" : "read-only"),
       prompt: options?.turnPrompt ?? prompt,
       outputSchema: options?.outputSchema,
       effort: options?.effort
@@ -13571,6 +13859,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               "item/completed"
             ).catch(() => undefined);
           }
+          if (agent.repositorySummaryTarget) {
+            void this.applyRepositoryPathSummaryOutput(project, agent, agentMessageText, "item/completed").catch(() => undefined);
+          }
           this.appendAgentTranscriptEntry(project, agent, {
             id: `${agent.id}:message:${notification.params.item.id}`,
             timestamp: nowIso(),
@@ -13675,6 +13966,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
               true,
               "rawResponseItem/completed"
             ).catch(() => undefined);
+        }
+        if (agent.repositorySummaryTarget && rawResponseText) {
+          void this.applyRepositoryPathSummaryOutput(project, agent, rawResponseText, "rawResponseItem/completed").catch(() => undefined);
         }
         if (rawResponseText) {
           this.appendAgentTranscriptEntry(project, agent, {

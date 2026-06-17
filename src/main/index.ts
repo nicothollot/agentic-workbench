@@ -41,6 +41,9 @@ import {
   projectRepositorySearchRequestSchema,
   projectRepositorySummaryRequestSchema,
   projectRepositoryViewRequestSchema,
+  repositoryPathQuestionRequestSchema,
+  repositoryPathSummaryRequestSchema,
+  repositoryPathWindowRequestSchema,
   repositoryRescanRequestSchema,
   repositoryScanSettingsRequestSchema,
   projectSelectionDecisionSchema,
@@ -76,6 +79,7 @@ import { AppService } from "@runtime/appService";
 let mainWindow: BrowserWindow | undefined;
 let appService: AppService | undefined;
 let quitRequested = false;
+const secondaryWindows = new Set<BrowserWindow>();
 
 type VisualExportCapture = {
   target: VisualExportCaptureTarget;
@@ -354,6 +358,57 @@ const createMainWindow = async (): Promise<void> => {
   });
 };
 
+const createRepositoryPathWindow = async (projectId: string, relativePath: string): Promise<void> => {
+  const appPath = app.getAppPath();
+  const preloadEntryPath = getPreloadEntryPath(appPath);
+  const rendererEntryPath = getRendererEntryPath(appPath);
+  const repositoryWindow = new BrowserWindow({
+    width: 1220,
+    height: 840,
+    minWidth: 920,
+    minHeight: 640,
+    title: `${relativePath} · ${APP_NAME}`,
+    icon: windowIconPath(),
+    show: false,
+    autoHideMenuBar: true,
+    backgroundColor: "#f0e7da",
+    webPreferences: {
+      preload: preloadEntryPath,
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      devTools: true
+    }
+  });
+
+  secondaryWindows.add(repositoryWindow);
+  attachWindowDiagnostics(repositoryWindow, preloadEntryPath, rendererEntryPath);
+  repositoryWindow.once("ready-to-show", () => repositoryWindow.show());
+  repositoryWindow.on("closed", () => {
+    secondaryWindows.delete(repositoryWindow);
+  });
+  repositoryWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void shell.openExternal(url);
+    return { action: "deny" };
+  });
+
+  const query = {
+    projectId,
+    repositoryPath: relativePath,
+    tab: "repository"
+  };
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  if (devServerUrl) {
+    const url = new URL(devServerUrl);
+    for (const [key, value] of Object.entries(query)) {
+      url.searchParams.set(key, value);
+    }
+    await repositoryWindow.loadURL(url.toString());
+  } else {
+    await repositoryWindow.loadFile(rendererEntryPath, { query });
+  }
+};
+
 const registerIpc = (): void => {
   ipcMain.handle("app:getState", () => appService?.getRendererState());
   ipcMain.handle("github:refreshStatus", async () => await appService?.refreshGitHubStatus());
@@ -566,6 +621,24 @@ const registerIpc = (): void => {
   ipcMain.handle("project:rescanRepository", async (_event, payload) => {
     const parsed = repositoryRescanRequestSchema.parse(payload);
     return await appService?.rescanRepository(parsed.projectId, parsed.options);
+  });
+  ipcMain.handle("project:summarizeRepositoryPath", async (_event, payload) => {
+    const parsed = repositoryPathSummaryRequestSchema.parse(payload);
+    return await appService?.summarizeRepositoryPath(parsed.projectId, parsed.relativePath, parsed.model, {
+      reasoningMode: parsed.reasoningMode,
+      reasoningEffort: parsed.reasoningEffort
+    });
+  });
+  ipcMain.handle("project:askRepositoryPath", async (_event, payload) => {
+    const parsed = repositoryPathQuestionRequestSchema.parse(payload);
+    return await appService?.askRepositoryPath(parsed.projectId, parsed.relativePath, parsed.question, parsed.model, {
+      reasoningMode: parsed.reasoningMode,
+      reasoningEffort: parsed.reasoningEffort
+    });
+  });
+  ipcMain.handle("project:openRepositoryPathWindow", async (_event, payload) => {
+    const parsed = repositoryPathWindowRequestSchema.parse(payload);
+    await createRepositoryPathWindow(parsed.projectId, parsed.relativePath);
   });
   ipcMain.handle("project:listAgents", (_event, payload) => {
     const parsed = agentListRequestSchema.parse(payload);
