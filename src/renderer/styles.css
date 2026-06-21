@@ -5707,6 +5707,18 @@ select.input {
   min-width: 0;
 }
 
+.formatted-summary-text {
+  display: grid;
+  gap: 8px;
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.formatted-summary-text p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .repository-agent-card {
   border-top: 1px solid rgba(15, 39, 71, 0.12);
   padding-top: 12px;
@@ -5748,6 +5760,195 @@ select.input {
 
 .repository-question-input {
   min-height: 92px;
+  resize: vertical;
+}
+
+.repository-chat-shell {
+  height: 100vh;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  background:
+    radial-gradient(circle at 10% 0, rgba(125, 216, 186, 0.18), transparent 34%),
+    linear-gradient(180deg, #071526 0%, #0b1a29 58%, #06101d 100%);
+  color: #edf8ff;
+}
+
+.repository-chat-header,
+.repository-chat-summary,
+.repository-chat-composer {
+  margin: 12px;
+  border: 1px solid rgba(237, 248, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 250, 242, 0.96);
+  color: var(--ink);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.18);
+}
+
+.repository-chat-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 0;
+  padding: 16px;
+}
+
+.repository-chat-header h1 {
+  margin: 0;
+  font-size: clamp(1.25rem, 3vw, 1.75rem);
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.repository-chat-header p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.repository-chat-header__status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.repository-chat-summary {
+  margin-bottom: 0;
+  padding: 14px 16px;
+}
+
+.repository-chat-summary .formatted-summary-text {
+  color: var(--muted);
+}
+
+.repository-chat-messages {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 16px 12px;
+  scrollbar-color: rgba(125, 196, 175, 0.56) rgba(255, 255, 255, 0.06);
+}
+
+.repository-chat-empty {
+  border: 1px dashed rgba(237, 248, 255, 0.22);
+  border-radius: 10px;
+  padding: 18px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(237, 248, 255, 0.82);
+}
+
+.repository-chat-empty p {
+  margin: 6px 0 0;
+  color: rgba(237, 248, 255, 0.68);
+}
+
+.repository-chat-message {
+  width: min(92%, 680px);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 8px;
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.16);
+}
+
+.repository-chat-message--assistant {
+  justify-self: start;
+  background: rgba(255, 250, 242, 0.96);
+  color: var(--ink);
+  border: 1px solid rgba(184, 154, 106, 0.26);
+}
+
+.repository-chat-message--user {
+  justify-self: end;
+  background: linear-gradient(135deg, rgba(74, 144, 184, 0.98), rgba(39, 112, 114, 0.98));
+  color: #ffffff;
+  border: 1px solid rgba(237, 248, 255, 0.2);
+}
+
+.repository-chat-message__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+}
+
+.repository-chat-message__meta span:last-child {
+  color: inherit;
+  opacity: 0.72;
+}
+
+.repository-chat-message__text {
+  min-width: 0;
+}
+
+.repository-chat-message--user .formatted-summary-text {
+  color: #ffffff;
+}
+
+.repository-chat-message--assistant .formatted-summary-text {
+  color: var(--ink);
+}
+
+.repository-chat-composer {
+  margin-top: 0;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.repository-chat-model-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+.repository-chat-options {
+  border: 1px solid rgba(15, 39, 71, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.34);
+}
+
+.repository-chat-options summary {
+  min-height: 40px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  cursor: pointer;
+}
+
+.repository-chat-options summary span {
+  color: var(--warm);
+  font-weight: 800;
+}
+
+.repository-chat-options summary strong {
+  color: var(--ink);
+}
+
+.repository-chat-options summary em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.repository-chat-options .repository-chat-model-bar {
+  padding: 0 10px 10px;
+}
+
+.repository-chat-model-bar .agent-reasoning-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.repository-chat-input {
+  min-height: 76px;
   resize: vertical;
 }
 
@@ -6457,6 +6658,14 @@ select.input {
 @media (max-width: 760px) {
   .shell--workspace {
     padding: 12px;
+  }
+
+  .repository-chat-header {
+    flex-direction: column;
+  }
+
+  .repository-chat-model-bar .agent-reasoning-picker {
+    grid-template-columns: 1fr;
   }
 
   .top-app-bar__identity,

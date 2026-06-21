@@ -107,7 +107,7 @@ export interface WorkbenchApi {
     reasoningMode?: AgentReasoningMode,
     reasoningEffort?: InterfaceReasoningEffort
   ): Promise<AgentState>;
-  openRepositoryPathWindow(projectId: string, relativePath: string): Promise<void>;
+  openRepositoryPathWindow(projectId: string, relativePath: string, initialQuestion?: string): Promise<void>;
   listAgents(projectId: string, scope?: AgentHistoryScope, offset?: number, limit?: number): Promise<AgentListResponse>;
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
   listWorkflowCycles(projectId: string, options?: { cursor?: string; limit?: number }): Promise<WorkflowCycleListResponse>;
@@ -279,8 +279,8 @@ const api: WorkbenchApi = {
     await invoke<AgentState>("project:summarizeRepositoryPath", { projectId, relativePath, model, reasoningMode, reasoningEffort }),
   askRepositoryPath: async (projectId, relativePath, question, model, reasoningMode, reasoningEffort) =>
     await invoke<AgentState>("project:askRepositoryPath", { projectId, relativePath, question, model, reasoningMode, reasoningEffort }),
-  openRepositoryPathWindow: async (projectId, relativePath) =>
-    await invoke<void>("project:openRepositoryPathWindow", { projectId, relativePath }),
+  openRepositoryPathWindow: async (projectId, relativePath, initialQuestion) =>
+    await invoke<void>("project:openRepositoryPathWindow", { projectId, relativePath, initialQuestion }),
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),

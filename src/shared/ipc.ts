@@ -184,7 +184,8 @@ export const repositoryPathQuestionRequestSchema = repositoryPathSummaryRequestS
 
 export const repositoryPathWindowRequestSchema = z.object({
   projectId: z.string().min(1),
-  relativePath: repositoryRelativePathSchema
+  relativePath: repositoryRelativePathSchema,
+  initialQuestion: z.string().trim().max(4_000).optional()
 });
 
 export const repositoryScanSettingsRequestSchema = z.object({

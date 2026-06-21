@@ -30,6 +30,7 @@ import type {
   AgentFullOutputResponse,
   AgentHistorySummary,
   AgentListResponse,
+  AgentLifecycleStatus,
   AgentReasoningEfforts,
   AgentReasoningMode,
   AgentState,
@@ -3842,7 +3843,6 @@ const RepositoryPanel = ({
   onQuestionDraftChange,
   onAskQuestion,
   onOpenPathWindow,
-  onOpenSummaryAgentOutput,
   searchResultIndex,
   onSelectSearchResult
 }: {
@@ -3878,7 +3878,6 @@ const RepositoryPanel = ({
   onQuestionDraftChange: (value: string) => void;
   onAskQuestion: () => void;
   onOpenPathWindow: () => void;
-  onOpenSummaryAgentOutput: (agent: Pick<AgentState, "id" | "name">) => void;
   searchResultIndex: number;
   onSelectSearchResult: (index: number) => void;
 }) => {
@@ -4218,14 +4217,7 @@ const RepositoryPanel = ({
                     <strong>{fileSummary?.relativePath ?? selectedFile}</strong>
                   </div>
                   {fileSummary ? (
-                    <>
-                      <p>{redactSensitiveText(fileSummary.purpose)}</p>
-                      <p>{redactSensitiveText(fileSummary.summary)}</p>
-                      <div className="tag-row">
-                        {fileSummary.keySymbols.length ? fileSummary.keySymbols.map((symbol) => <span key={symbol} className="tag">{symbol}</span>) : <span className="tag">No symbols cached</span>}
-                      </div>
-                      <LongTextDisclosure title="Related files" value={fileSummary.relatedFiles.join("\n")} code />
-                    </>
+                    <FormattedSummaryText value={fileSummary.summary} />
                   ) : (
                     <LoadingIndicator label="Loading path summary" compact />
                   )}
@@ -4259,11 +4251,6 @@ const RepositoryPanel = ({
                     <button className="secondary-button" type="button" disabled={!selectedFile || selectedPathBusyAction === "window"} onClick={onOpenPathWindow}>
                       {selectedPathBusyAction === "window" ? "Opening..." : "Open in New Window"}
                     </button>
-                    {summaryAgent ? (
-                      <button className="secondary-button" type="button" onClick={() => onOpenSummaryAgentOutput(summaryAgent)}>
-                        Open Agent Output
-                      </button>
-                    ) : null}
                   </div>
                   <textarea
                     className="textarea repository-question-input"
@@ -4274,7 +4261,7 @@ const RepositoryPanel = ({
                   />
                   <div className="actions-row">
                     <button className="secondary-button" type="button" disabled={questionDisabled} onClick={onAskQuestion}>
-                      {selectedPathBusyAction === "question" ? "Starting..." : "Ask"}
+                      {selectedPathBusyAction === "question" ? "Opening chat..." : "Ask in Chat"}
                     </button>
                   </div>
                 </div>
@@ -6933,7 +6920,459 @@ const LauncherActionCard = ({
   </article>
 );
 
-export const App = () => {
+type RepositoryPathChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  status?: AgentLifecycleStatus | "pending";
+  agentId?: string;
+  updatedAt?: string;
+};
+
+const repositoryPathChatParams = (): {
+  enabled: boolean;
+  projectId: string;
+  relativePath: string;
+  initialQuestion: string;
+} => {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    enabled: params.get("view") === "repositoryPathChat",
+    projectId: params.get("projectId") ?? "",
+    relativePath: params.get("repositoryPath") ?? "",
+    initialQuestion: params.get("initialQuestion") ?? ""
+  };
+};
+
+const repositoryChatMessageId = (): string =>
+  `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const isRepositoryChatTerminalStatus = (status: AgentLifecycleStatus): boolean =>
+  status === "completed" || status === "failed" || status === "conflicted" || status === "disconnected";
+
+const parseJsonCandidate = (value: string): Record<string, unknown> | undefined => {
+  const trimmed = value.trim();
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed)?.[1]?.trim();
+  const candidates = [
+    fenced,
+    trimmed,
+    trimmed.includes("{") && trimmed.includes("}")
+      ? trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1)
+      : undefined
+  ].filter((candidate): candidate is string => Boolean(candidate?.trim()));
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+};
+
+const humanizeStructuredAgentPayload = (value?: Record<string, unknown>): string | undefined => {
+  if (!value) {
+    return undefined;
+  }
+  const record = value;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  const purpose = typeof record.purpose === "string" ? record.purpose.trim() : "";
+  const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+  const answer = typeof record.answer === "string" ? record.answer.trim() : "";
+  const keySymbols = Array.isArray(record.keySymbols)
+    ? record.keySymbols.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).slice(0, 8)
+    : [];
+  const relatedFiles = Array.isArray(record.relatedFiles)
+    ? record.relatedFiles.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).slice(0, 6)
+    : [];
+  const confidence = typeof record.confidence === "number" && Number.isFinite(record.confidence)
+    ? `Confidence: ${Math.round(Math.max(0, Math.min(1, record.confidence)) * 100)}%.`
+    : "";
+  const sections = [
+    title,
+    answer,
+    purpose ? `Purpose: ${purpose}` : "",
+    summary ? `Summary: ${summary}` : "",
+    keySymbols.length ? `Important symbols: ${keySymbols.join(", ")}.` : "",
+    relatedFiles.length ? `Related files: ${relatedFiles.join(", ")}.` : "",
+    confidence
+  ].filter((entry) => entry.trim().length > 0);
+  return sections.length ? sections.join("\n\n") : undefined;
+};
+
+const cleanAgentAnswerText = (value: string): string => value
+  .replace(/^\[[^\]]+\]\s+[A-Z_ -]+$/gm, "")
+  .replace(/^\[[^\]]+\]\s+[A-Z_ -]+\s*$/gm, "")
+  .replace(/^MESSAGE\s+-\s+Agent output\s*$/gim, "")
+  .replace(/^Agent output\s*$/gim, "")
+  .replace(/```(?:json)?/gi, "")
+  .replace(/```/g, "")
+  .trim();
+
+const formatRepositoryChatAnswer = (
+  agent: AgentState,
+  transcript?: AgentTranscriptResponse,
+  output?: AgentFullOutputResponse
+): string => {
+  const transcriptMessages = (transcript?.entries ?? [])
+    .filter((entry) => entry.kind === "message" && entry.text?.trim())
+    .map((entry) => entry.text?.trim() ?? "");
+  const transcriptText = transcriptMessages.length ? transcriptMessages[transcriptMessages.length - 1] : "";
+  const rawText = transcriptText || output?.output || agent.lastMessageSnippet || agent.currentPhase || "";
+  const cleaned = cleanAgentAnswerText(rawText);
+  const structured = humanizeStructuredAgentPayload(parseJsonCandidate(cleaned));
+  return redactSensitiveText(structured ?? cleaned) || "The agent finished, but no readable answer was captured.";
+};
+
+const buildRepositoryChatQuestion = (messages: RepositoryPathChatMessage[], question: string): string => {
+  const conversation = messages
+    .filter((message) => message.role === "user" || (message.role === "assistant" && message.status === "completed"))
+    .slice(-8)
+    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`)
+    .join("\n\n");
+  return conversation
+    ? `Previous conversation about this repository path:\n\n${conversation}\n\nCurrent question: ${question}`
+    : question;
+};
+
+const FormattedSummaryText = ({ value }: { value?: string }) => {
+  const safeValue = redactSensitiveText(value);
+  const paragraphs = safeValue
+    .split(/\n{2,}/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return (
+    <div className="formatted-summary-text">
+      {paragraphs.length ? paragraphs.map((paragraph, index) => <p key={`${index}:${paragraph.slice(0, 32)}`}>{paragraph}</p>) : <p>No summary is available yet.</p>}
+    </div>
+  );
+};
+
+const RepositoryPathChatApp = () => {
+  const params = useMemo(repositoryPathChatParams, []);
+  const [state, setState] = useState<WorkbenchState | null>(null);
+  const [initialStateLoading, setInitialStateLoading] = useState(true);
+  const [fileSummary, setFileSummary] = useState<FileSummary | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [messages, setMessages] = useState<RepositoryPathChatMessage[]>([]);
+  const [draft, setDraft] = useState(params.initialQuestion);
+  const [busyAgentId, setBusyAgentId] = useState<string>();
+  const [error, setError] = useState<string>();
+  const [summaryModel, setSummaryModel] = useState("");
+  const [reasoningMode, setReasoningMode] = useState<AgentReasoningMode>("auto");
+  const [reasoningEffort, setReasoningEffort] = useState<InterfaceReasoningEffort>(DEFAULT_AGENT_REASONING_EFFORTS.manual);
+  const autoQuestionSentRef = useRef(false);
+  const mountedRef = useRef(true);
+  const submitQuestionRef = useRef<(questionOverride?: string) => Promise<void>>(() => Promise.resolve());
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void window.workbench.getState()
+      .then((result) => {
+        if (mountedRef.current) {
+          setState(result);
+        }
+      })
+      .finally(() => {
+        if (mountedRef.current) {
+          setInitialStateLoading(false);
+        }
+      });
+    const unsubscribe = window.workbench.onStateUpdated((nextState) => {
+      if (mountedRef.current) {
+        setState(nextState);
+      }
+    });
+    return () => {
+      mountedRef.current = false;
+      unsubscribe();
+    };
+  }, []);
+
+  const activeProject = state?.projects.find((project) => project.record.id === params.projectId);
+  const availableModels = useMemo(() => state?.availableModels ?? [], [state?.availableModels]);
+  const recommendedModel = useMemo(
+    () => availableModels.find((model) => model.recommendedForInterfaceCreation)?.model ?? availableModels[0]?.model ?? "",
+    [availableModels]
+  );
+  const modelOptionsByName = useMemo(() => new Map(availableModels.map((model) => [model.model, model])), [availableModels]);
+  const agentActionsBlocked = Boolean(state?.runtimeReadiness.blockAgentActions);
+
+  useEffect(() => {
+    if (!state || !params.projectId || state.activeProjectId === params.projectId || activeProject) {
+      return;
+    }
+    void window.workbench.openProject(params.projectId)
+      .then(() => window.workbench.getState())
+      .then(setState)
+      .catch((caught) => setError(caught instanceof Error ? caught.message : String(caught)));
+  }, [activeProject, params.projectId, state]);
+
+  useEffect(() => {
+    if (!recommendedModel) {
+      return;
+    }
+    setSummaryModel((current) => current && availableModels.some((model) => model.model === current) ? current : recommendedModel);
+  }, [availableModels, recommendedModel]);
+
+  useEffect(() => {
+    setReasoningEffort((current) =>
+      resolveAgentReasoningEffort(
+        modelOptionsByName.get(summaryModel || recommendedModel),
+        "manual",
+        `Repository path chat: ${params.relativePath}`,
+        "manual",
+        current
+      )
+    );
+  }, [modelOptionsByName, params.relativePath, recommendedModel, summaryModel]);
+
+  useEffect(() => {
+    if (!activeProject || !params.relativePath) {
+      return;
+    }
+    let cancelled = false;
+    setSummaryLoading(true);
+    setError(undefined);
+    void window.workbench.getFileSummary(activeProject.record.id, params.relativePath)
+      .then((summary) => {
+        if (!cancelled) {
+          setFileSummary(summary);
+        }
+      })
+      .catch((caught) => {
+        if (!cancelled) {
+          setError(caught instanceof Error ? caught.message : String(caught));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setSummaryLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject, params.relativePath]);
+
+  const updateChatMessage = (messageId: string, patch: Partial<RepositoryPathChatMessage>) => {
+    setMessages((current) => current.map((message) => message.id === messageId ? { ...message, ...patch } : message));
+  };
+
+  const pollRepositoryChatAgent = async (agentId: string, messageId: string): Promise<void> => {
+    for (let attempt = 0; attempt < 180 && mountedRef.current; attempt += 1) {
+      await delay(attempt < 8 ? 1_250 : 2_000);
+      const agent = await window.workbench.getAgent(params.projectId, agentId);
+      if (!mountedRef.current) {
+        return;
+      }
+      updateChatMessage(messageId, {
+        status: agent.status,
+        updatedAt: agent.lastActivityAt ?? agent.completedAt ?? agent.startedAt,
+        text: agent.status === "completed"
+          ? "Finishing answer..."
+          : agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected"
+            ? agent.disconnectedReason ?? agent.currentPhase ?? "The agent could not finish cleanly."
+            : agent.currentSubtask ?? agent.currentPhase ?? agent.lastMessageSnippet ?? "Thinking about this path..."
+      });
+      if (!isRepositoryChatTerminalStatus(agent.status)) {
+        continue;
+      }
+      const [transcriptResult, outputResult] = await Promise.allSettled([
+        window.workbench.getAgentTranscript(params.projectId, agentId),
+        window.workbench.getAgentFullOutput(params.projectId, agentId)
+      ]);
+      const transcript = transcriptResult.status === "fulfilled" ? transcriptResult.value : undefined;
+      const output = outputResult.status === "fulfilled" ? outputResult.value : undefined;
+      const answer = agent.status === "completed"
+        ? formatRepositoryChatAnswer(agent, transcript, output)
+        : redactSensitiveText(agent.disconnectedReason ?? agent.currentPhase ?? "The agent could not finish cleanly.");
+      updateChatMessage(messageId, {
+        text: answer,
+        status: agent.status,
+        updatedAt: agent.completedAt ?? agent.lastActivityAt ?? agent.startedAt
+      });
+      setBusyAgentId((current) => current === agentId ? undefined : current);
+      return;
+    }
+    updateChatMessage(messageId, {
+      status: "disconnected",
+      text: "The agent is still running or stopped reporting progress. You can ask again or inspect the run from the main History tab."
+    });
+    setBusyAgentId((current) => current === agentId ? undefined : current);
+  };
+
+  const submitQuestion = async (questionOverride?: string): Promise<void> => {
+    const question = (questionOverride ?? draft).trim();
+    if (!activeProject || !params.relativePath || !question || !summaryModel || busyAgentId || agentActionsBlocked) {
+      return;
+    }
+    setDraft("");
+    setError(undefined);
+    const userMessage: RepositoryPathChatMessage = {
+      id: repositoryChatMessageId(),
+      role: "user",
+      text: question,
+      status: "completed",
+      updatedAt: new Date().toISOString()
+    };
+    const assistantMessage: RepositoryPathChatMessage = {
+      id: repositoryChatMessageId(),
+      role: "assistant",
+      text: "Starting a path-scoped agent...",
+      status: "pending",
+      updatedAt: new Date().toISOString()
+    };
+    const contextQuestion = buildRepositoryChatQuestion(messages, question);
+    setMessages((current) => [...current, userMessage, assistantMessage]);
+    try {
+      const agent = await window.workbench.askRepositoryPath(
+        activeProject.record.id,
+        params.relativePath,
+        contextQuestion,
+        summaryModel,
+        reasoningMode,
+        reasoningEffort
+      );
+      setBusyAgentId(agent.id);
+      updateChatMessage(assistantMessage.id, {
+        agentId: agent.id,
+        status: agent.status,
+        text: agent.currentPhase ?? "Reading the selected path and preparing an answer...",
+        updatedAt: agent.startedAt ?? agent.createdAt
+      });
+      void pollRepositoryChatAgent(agent.id, assistantMessage.id).catch((caught) => {
+        updateChatMessage(assistantMessage.id, {
+          status: "failed",
+          text: caught instanceof Error ? caught.message : String(caught)
+        });
+        setBusyAgentId((current) => current === agent.id ? undefined : current);
+      });
+    } catch (caught) {
+      setBusyAgentId(undefined);
+      updateChatMessage(assistantMessage.id, {
+        status: "failed",
+        text: caught instanceof Error ? caught.message : String(caught)
+      });
+    }
+  };
+  submitQuestionRef.current = submitQuestion;
+
+  useEffect(() => {
+    if (autoQuestionSentRef.current || !params.initialQuestion.trim() || !activeProject || !summaryModel || summaryLoading) {
+      return;
+    }
+    autoQuestionSentRef.current = true;
+    void submitQuestionRef.current(params.initialQuestion);
+  }, [activeProject, params.initialQuestion, summaryLoading, summaryModel]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: "end" });
+  }, [messages]);
+
+  const chatBusy = Boolean(busyAgentId);
+  const title = fileSummary?.title || params.relativePath.split("/").pop() || params.relativePath || "Repository path";
+  const selectedModel = modelOptionsByName.get(summaryModel);
+  const selectedModelLabel = selectedModel?.displayName ?? (summaryModel || "Select model");
+
+  return (
+    <main className="repository-chat-shell">
+      <header className="repository-chat-header">
+        <div>
+          <div className="eyebrow">Repository path chat</div>
+          <h1>{title}</h1>
+          <p>{params.relativePath || "No repository path provided."}</p>
+        </div>
+        <div className="repository-chat-header__status">
+          {fileSummary ? <SourceBadge source={fileSummary.source} /> : null}
+          {chatBusy ? <LoadingIndicator label="Agent thinking" compact /> : <span className="badge">Ready</span>}
+        </div>
+      </header>
+
+      <section className="repository-chat-summary" aria-label="Path summary">
+        <div className="candidate-card__title-row">
+          <strong>Summary</strong>
+          {fileSummary ? <span className="badge">{fileSummary.pathKind}</span> : null}
+        </div>
+        {summaryLoading ? <LoadingIndicator label="Loading path summary" compact /> : <FormattedSummaryText value={fileSummary?.summary} />}
+      </section>
+
+      <section className="repository-chat-messages" aria-label="Conversation">
+        {initialStateLoading ? <LoadingIndicator label="Loading repository chat" /> : null}
+        {error ? <div className="notice notice--error">{error}</div> : null}
+        {!messages.length && !initialStateLoading ? (
+          <div className="repository-chat-empty">
+            <strong>Ask about this file or folder.</strong>
+            <p>Questions stay scoped to the selected repository path and use the stored summary plus fresh path evidence.</p>
+          </div>
+        ) : null}
+        {messages.map((message) => {
+          const status = message.status && message.status !== "pending" ? agentLifecycleStatusChip(message.status) : undefined;
+          return (
+            <article key={message.id} className={`repository-chat-message repository-chat-message--${message.role}`}>
+              <div className="repository-chat-message__meta">
+                <strong>{message.role === "user" ? "You" : "Agent"}</strong>
+                {status ? <StatusChip label={status.label} tone={status.tone} /> : message.status === "pending" ? <span className="badge">Starting</span> : null}
+                {message.updatedAt ? <span>{formatClockTime(message.updatedAt)}</span> : null}
+              </div>
+              <div className="repository-chat-message__text">
+                {message.status && message.status !== "completed" && message.role === "assistant" ? <LoadingIndicator label={message.text} compact /> : <FormattedSummaryText value={message.text} />}
+              </div>
+            </article>
+          );
+        })}
+        <div ref={messagesEndRef} aria-hidden="true" />
+      </section>
+
+      <footer className="repository-chat-composer">
+        <details className="repository-chat-options">
+          <summary>
+            <span>Model</span>
+            <strong>{selectedModelLabel}</strong>
+            <em>{reasoningMode === "auto" ? "Automatic reasoning" : `${reasoningEffortLabel(reasoningEffort)} reasoning`}</em>
+          </summary>
+          <div className="repository-chat-model-bar">
+            <label className="form-field">
+              <span>Model</span>
+              <select className="input" value={summaryModel} onChange={(event) => setSummaryModel(event.target.value)} disabled={agentActionsBlocked || !availableModels.length || chatBusy}>
+                {availableModels.map((model) => <option key={model.id} value={model.model}>{model.displayName} ({model.model})</option>)}
+              </select>
+            </label>
+            <AgentReasoningPicker
+              category="manual"
+              model={selectedModel}
+              taskPrompt={`Repository path chat: ${params.relativePath}`}
+              mode={reasoningMode}
+              effort={reasoningEffort}
+              onModeChange={setReasoningMode}
+              onEffortChange={setReasoningEffort}
+            />
+          </div>
+        </details>
+        <textarea
+          className="textarea repository-chat-input"
+          placeholder="Ask a question about this file or folder"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          disabled={agentActionsBlocked || chatBusy || !activeProject}
+        />
+        <div className="actions-row">
+          <button className="primary-button" type="button" disabled={agentActionsBlocked || chatBusy || !draft.trim() || !activeProject || !summaryModel} onClick={() => void submitQuestion()}>
+            {chatBusy ? "Thinking..." : "Ask"}
+          </button>
+          <button className="secondary-button" type="button" onClick={() => window.close()}>Close</button>
+        </div>
+      </footer>
+    </main>
+  );
+};
+
+const WorkbenchApp = () => {
   const [state, setState] = useState<WorkbenchState | null>(null);
   const [pendingLoad, setPendingLoad] = useState<ProjectLoadResult | null>(null);
   const [initialStateLoading, setInitialStateLoading] = useState(true);
@@ -8875,17 +9314,9 @@ export const App = () => {
     try {
       setNotice(undefined);
       setRepositoryPathActionBusy({ path: selectedFile, action: "question" });
-      const agent = await window.workbench.askRepositoryPath(
-        activeProject.record.id,
-        selectedFile,
-        repositoryQuestionDraft.trim(),
-        repositorySummaryModel,
-        repositorySummaryReasoningMode,
-        repositorySummaryReasoningEffort
-      );
+      await window.workbench.openRepositoryPathWindow(activeProject.record.id, selectedFile, repositoryQuestionDraft.trim());
       setRepositoryQuestionDraft("");
-      setFocusedAgentId(agent.id);
-      openAgentOutputById(agent, { loadTranscript: true });
+      showInfoNotice(`Opened chat for ${selectedFile}.`);
     } catch (error) {
       handleError(error);
     } finally {
@@ -10698,7 +11129,6 @@ export const App = () => {
             onQuestionDraftChange={setRepositoryQuestionDraft}
             onAskQuestion={() => void askRepositoryPathQuestion()}
             onOpenPathWindow={() => void openRepositoryPathWindow()}
-            onOpenSummaryAgentOutput={(agent) => openAgentOutputById(agent, { loadTranscript: true })}
             searchResultIndex={repositorySearchResultIndex}
             onSelectSearchResult={selectRepositorySearchResult}
           />
@@ -11835,4 +12265,9 @@ export const App = () => {
       {settingsDialog}
     </div>
   );
+};
+
+export const App = () => {
+  const params = useMemo(repositoryPathChatParams, []);
+  return params.enabled ? <RepositoryPathChatApp /> : <WorkbenchApp />;
 };

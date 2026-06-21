@@ -358,20 +358,22 @@ const createMainWindow = async (): Promise<void> => {
   });
 };
 
-const createRepositoryPathWindow = async (projectId: string, relativePath: string): Promise<void> => {
+const createRepositoryPathWindow = async (projectId: string, relativePath: string, initialQuestion?: string): Promise<void> => {
   const appPath = app.getAppPath();
   const preloadEntryPath = getPreloadEntryPath(appPath);
   const rendererEntryPath = getRendererEntryPath(appPath);
   const repositoryWindow = new BrowserWindow({
-    width: 1220,
-    height: 840,
-    minWidth: 920,
-    minHeight: 640,
+    width: 780,
+    height: 860,
+    minWidth: 560,
+    minHeight: 620,
+    parent: mainWindow,
+    modal: false,
     title: `${relativePath} · ${APP_NAME}`,
     icon: windowIconPath(),
     show: false,
     autoHideMenuBar: true,
-    backgroundColor: "#f0e7da",
+    backgroundColor: "#071526",
     webPreferences: {
       preload: preloadEntryPath,
       contextIsolation: true,
@@ -393,9 +395,10 @@ const createRepositoryPathWindow = async (projectId: string, relativePath: strin
   });
 
   const query = {
+    view: "repositoryPathChat",
     projectId,
     repositoryPath: relativePath,
-    tab: "repository"
+    ...(initialQuestion ? { initialQuestion } : {})
   };
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
@@ -638,7 +641,7 @@ const registerIpc = (): void => {
   });
   ipcMain.handle("project:openRepositoryPathWindow", async (_event, payload) => {
     const parsed = repositoryPathWindowRequestSchema.parse(payload);
-    await createRepositoryPathWindow(parsed.projectId, parsed.relativePath);
+    await createRepositoryPathWindow(parsed.projectId, parsed.relativePath, parsed.initialQuestion);
   });
   ipcMain.handle("project:listAgents", (_event, payload) => {
     const parsed = agentListRequestSchema.parse(payload);

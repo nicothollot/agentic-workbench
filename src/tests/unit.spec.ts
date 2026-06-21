@@ -1560,7 +1560,11 @@ describe("schema validation and IPC", () => {
       question: "What does this folder do?",
       model: "gpt-5.4"
     }).question).toBe("What does this folder do?");
-    expect(repositoryPathWindowRequestSchema.parse({ projectId: "p", relativePath: "src/runtime" }).relativePath).toBe("src/runtime");
+    expect(repositoryPathWindowRequestSchema.parse({
+      projectId: "p",
+      relativePath: "src/runtime",
+      initialQuestion: "Explain this folder."
+    }).initialQuestion).toBe("Explain this folder.");
     expect(() => repositoryPathSummaryRequestSchema.parse({ projectId: "p", relativePath: "../secret.txt", model: "gpt-5.4" })).toThrow();
     expect(() => repositoryPathSummaryRequestSchema.parse({ projectId: "p", relativePath: "/etc/passwd", model: "gpt-5.4" })).toThrow();
     expect(() => repositoryPathWindowRequestSchema.parse({ projectId: "p", relativePath: "C:\\repo\\file.ts" })).toThrow();
