@@ -21,6 +21,7 @@ import {
   approvalDecisionRequestSchema,
   agentDetailRequestSchema,
   agentListRequestSchema,
+  chooseFolderRequestSchema,
   credentialEntrySaveRequestSchema,
   credentialRequestSubmitToAgentSchema,
   credentialRequestUpdateSchema,
@@ -1499,6 +1500,9 @@ describe("schema validation and IPC", () => {
     });
     expect(portable.identity.projectName).toBe("repo");
     expect(projectLoadRequestSchema.parse({ inputPath: "/repo" }).inputPath).toBe("/repo");
+    expect(projectLoadRequestSchema.parse({ inputPath: "/repo" }).creationMode).toBe("initialize_github");
+    expect(projectLoadRequestSchema.parse({ inputPath: "/repo", intent: "create", creationMode: "use_folder_as_is" }).creationMode).toBe("use_folder_as_is");
+    expect(chooseFolderRequestSchema.parse({ title: "Select the folder to use for this workspace", buttonLabel: "Use this folder" }).buttonLabel).toBe("Use this folder");
     expect(projectOpenRequestSchema.parse({ projectId: "saved-project" }).projectId).toBe("saved-project");
     expect(createAgentRequestSchema.parse({ projectId: "p", category: "coding", name: "Agent", prompt: "Do it", model: "gpt-5.4" }).category).toBe("coding");
     expect(credentialEntrySaveRequestSchema.parse({

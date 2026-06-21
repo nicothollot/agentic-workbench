@@ -70,6 +70,7 @@ import type {
   LoadedProjectView,
   LocalProjectRecord,
   OpenProjectShellResult,
+  ProjectCreationMode,
   ProjectAccessProbe,
   ProjectLogFeedResponse,
   ProjectOverview,
@@ -82,6 +83,7 @@ import type {
   RepositoryScanSettings,
   RepositoryScanStatus,
   ProjectWorkflowState,
+  ProjectLoadIntent,
   ProjectLoadResult,
   PlannerDecision,
   RepositoryChildrenResponse,
@@ -6307,19 +6309,20 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
   }
 
-  async loadProject(inputPath: string, intent: "open" | "create" = "open"): Promise<ProjectLoadResult> {
+  async loadProject(
+    inputPath: string,
+    intent: ProjectLoadIntent = "open",
+    creationMode: ProjectCreationMode = "initialize_github"
+  ): Promise<ProjectLoadResult> {
     const resolvedPath = resolveProjectPath(inputPath, this.settings);
     this.assertResolvedPathCompatible(resolvedPath.distroName);
     const runtimeSettings = this.getRuntimeSettings(resolvedPath.distroName);
     let gitMetadata = await readGitMetadata(resolvedPath.wslPath, runtimeSettings);
 
     const hasGitHubRemote = gitMetadata.normalizedRemotes.some(isGitHubRemote);
-    if (!hasGitHubRemote) {
-      if (intent !== "create") {
-        this.assertGitHubLinked();
-        throw new Error("This platform only opens GitHub-backed repositories. Use Create New Workspace to initialize a folder as a GitHub SSH repository.");
-      }
-
+    const shouldInitializeGitHub = intent === "create" && creationMode === "initialize_github";
+    const shouldUseFolderAsIs = intent === "create" && creationMode === "use_folder_as_is";
+    if (!hasGitHubRemote && shouldInitializeGitHub) {
       const linkedAccount = this.assertGitHubLinked(true);
       await ensureGitHubRepositoryForCreation(
         resolvedPath.wslPath,
@@ -6333,7 +6336,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       if (!gitMetadata.normalizedRemotes.some(isGitHubRemote)) {
         throw new Error("The selected folder could not be prepared as a GitHub-backed repository.");
       }
-    } else {
+    } else if (!hasGitHubRemote && !shouldUseFolderAsIs) {
+      this.assertGitHubLinked();
+      throw new Error("This platform only opens GitHub-backed repositories. Use Create New Workspace to initialize a folder as a GitHub SSH repository.");
+    } else if (intent === "open" || creationMode === "initialize_github") {
       this.assertGitHubLinked();
     }
 
@@ -6399,15 +6405,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   async openProject(projectId: string): Promise<LoadedProjectView> {
-    this.assertGitHubLinked();
     const existing = this.findProject(projectId);
+    const savedAsGitHubBacked = existing.record.identity.normalizedRemotes.some(isGitHubRemote);
+    if (savedAsGitHubBacked) {
+      this.assertGitHubLinked();
+    }
     this.activeProjectId = projectId;
     existing.record.localState.lastOpenedAt = nowIso();
     this.emitState();
     this.assertResolvedPathCompatible(existing.record.distroName);
     const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
     const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
-    if (!gitMetadata.normalizedRemotes.some(isGitHubRemote)) {
+    if (savedAsGitHubBacked && !gitMetadata.normalizedRemotes.some(isGitHubRemote)) {
       throw new Error("This saved workspace no longer points at a GitHub-backed repository.");
     }
     const projectRoot = gitMetadata.gitRoot ?? existing.record.projectRoot;

@@ -1,6 +1,13 @@
 export type ValidationStatus = "exact" | "stale" | "incompatible" | "unvalidated";
 export type ProjectPathKind = "windows" | "wsl-unc" | "linux";
 export type ProjectKind = "git" | "folder";
+export type ProjectLoadIntent = "open" | "create";
+export type ProjectCreationMode = "initialize_github" | "use_folder_as_is";
+export interface ChooseFolderOptions {
+  title?: string;
+  buttonLabel?: string;
+  message?: string;
+}
 export type SummarySource = "deterministic" | "codex" | "hybrid" | "mock";
 export type AgentCategory = "bootstrap" | "goal" | "coding" | "integrity" | "merge" | "recommendation" | "manual";
 export type AgentLifecycleStatus =

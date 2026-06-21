@@ -48,9 +48,18 @@ export const credentialRequestSubmitToAgentSchema = z.object({
   requestId: z.string().min(1)
 });
 
+export const chooseFolderRequestSchema = z.object({
+  title: z.string().min(1).max(160).optional(),
+  buttonLabel: z.string().min(1).max(80).optional(),
+  message: z.string().min(1).max(240).optional()
+}).default({});
+
+export const projectCreationModeSchema = z.enum(["initialize_github", "use_folder_as_is"]);
+
 export const projectLoadRequestSchema = z.object({
   inputPath: z.string().min(1),
-  intent: z.enum(["open", "create"]).default("open")
+  intent: z.enum(["open", "create"]).default("open"),
+  creationMode: projectCreationModeSchema.default("initialize_github")
 });
 
 export const projectOpenRequestSchema = z.object({

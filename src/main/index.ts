@@ -21,6 +21,7 @@ import {
   credentialEntrySaveRequestSchema,
   credentialRequestSubmitToAgentSchema,
   credentialRequestUpdateSchema,
+  chooseFolderRequestSchema,
   downloadInterfaceRequestSchema,
   downloadLogsRequestSchema,
   detectUltimateGoalRequestSchema,
@@ -437,7 +438,7 @@ const registerIpc = (): void => {
   ipcMain.handle("app:getExecutionEnvironmentStatus", () => appService?.getExecutionEnvironmentStatus());
   ipcMain.handle("project:load", async (_event, payload) => {
     const parsed = projectLoadRequestSchema.parse(payload);
-    return await appService?.loadProject(parsed.inputPath, parsed.intent);
+    return await appService?.loadProject(parsed.inputPath, parsed.intent, parsed.creationMode);
   });
   ipcMain.handle("project:open", async (_event, payload) => appService?.openProject(projectOpenRequestSchema.parse(payload).projectId));
   ipcMain.handle("project:selectInterface", async (_event, payload) => {
@@ -877,9 +878,12 @@ const registerIpc = (): void => {
   ipcMain.handle("app:quit", async () => {
     await requestAppQuit();
   });
-  ipcMain.handle("app:chooseFolder", async () => {
+  ipcMain.handle("app:chooseFolder", async (_event, payload) => {
+    const options = chooseFolderRequestSchema.parse(payload);
     const result = await dialog.showOpenDialog({
-      title: "Select a GitHub repository or a folder for a new GitHub workspace",
+      title: options.title ?? "Select a repository or workspace folder",
+      buttonLabel: options.buttonLabel,
+      message: options.message,
       properties: ["openDirectory"]
     });
     if (result.canceled || result.filePaths.length === 0) {

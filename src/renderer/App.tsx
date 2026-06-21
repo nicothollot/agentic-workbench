@@ -50,7 +50,9 @@ import type {
   InterfaceReasoningEffort,
   InterfaceCandidate,
   LoadedProjectView,
+  ProjectCreationMode,
   ProjectLoadResult,
+  ProjectLoadIntent,
   ProjectCommandLogEntry,
   ProjectLogFeedResponse,
   ProjectRepositorySummary,
@@ -6465,10 +6467,10 @@ const SettingsDialog = ({
           <div className="settings-card">
             <div className="settings-section__heading">
               <strong>GitHub access</strong>
-              <span className="badge">Required</span>
+              <span className="badge">Repository actions</span>
             </div>
             <p className="settings-card__copy">
-              The workbench now requires a linked GitHub account. Existing workspaces must point at GitHub, and new workspaces create SSH-backed repositories automatically.
+              GitHub-backed repository actions need a linked account. New workspaces can either initialize a GitHub SSH repository or use the selected folder as-is.
             </p>
             <div className={github.state === "linked" ? "notice notice--status notice--completed" : github.state === "needs_ssh" ? "notice" : "notice notice--error"}>
               {github.message}
@@ -7417,7 +7419,8 @@ const WorkbenchApp = () => {
     considerPaidServices: false
   });
   const [notice, setNotice] = useState<NoticeState>();
-  const [launchIntent, setLaunchIntent] = useState<"open" | "create">("open");
+  const [launchIntent, setLaunchIntent] = useState<ProjectLoadIntent>("open");
+  const [projectCreationMode, setProjectCreationMode] = useState<ProjectCreationMode>("initialize_github");
   const [treeFilterDraft, setTreeFilterDraft] = useState("");
   const [repositorySearchResultIndex, setRepositorySearchResultIndex] = useState(0);
   const [focusedAgentId, setFocusedAgentId] = useState<string>();
@@ -7579,7 +7582,8 @@ const WorkbenchApp = () => {
   const githubLinked = githubStatus?.state === "linked" || githubStatus?.state === "needs_ssh";
   const githubSshReady = githubStatus?.sshReady ?? false;
   const launcherActionsLocked = !githubLinked;
-  const createWorkspaceLocked = !githubSshReady;
+  const createWorkspaceUsesGitHub = projectCreationMode === "initialize_github";
+  const createWorkspaceLocked = createWorkspaceUsesGitHub && !githubSshReady;
   const activeProjectId = activeProject?.record.id;
   const runtimeReadiness = state?.runtimeReadiness;
   const agentActionsBlocked = Boolean(runtimeReadiness?.blockAgentActions);
@@ -8943,9 +8947,26 @@ const WorkbenchApp = () => {
     }
   };
 
-  const openFolder = async (intent: "open" | "create" = "open") => {
+  const openFolder = async (
+    intent: ProjectLoadIntent = "open",
+    creationMode: ProjectCreationMode = projectCreationMode
+  ) => {
     try {
-      const folder = await window.workbench.chooseFolder();
+      const folder = await window.workbench.chooseFolder(
+        intent === "create"
+          ? {
+            title: "Select the folder to use for this workspace",
+            buttonLabel: creationMode === "initialize_github" ? "Create workspace here" : "Use this folder",
+            message: creationMode === "initialize_github"
+              ? "Choose the project folder. The workbench will initialize a GitHub SSH repository there if needed."
+              : "Choose the project folder. The workbench will scan and use it without creating a GitHub repository."
+          }
+          : {
+            title: "Select a GitHub repository folder",
+            buttonLabel: "Open repository",
+            message: "Choose an existing GitHub-backed repository folder to open in this window."
+          }
+      );
       if (!folder) {
         return;
       }
@@ -8955,7 +8976,7 @@ const WorkbenchApp = () => {
       setShowExistingChoice(false);
       setFileSummary(null);
       setSelectedFile(undefined);
-      setPendingLoad(await window.workbench.loadProject(folder, intent));
+      setPendingLoad(await window.workbench.loadProject(folder, intent, creationMode));
     } catch (error) {
       handleError(error);
     } finally {
@@ -10364,6 +10385,12 @@ const WorkbenchApp = () => {
   }
 
   if (!activeProject) {
+    const createModeTitle = createWorkspaceUsesGitHub ? "Initialize new GitHub repo" : "Use folder as-is";
+    const createModeCopy = createWorkspaceUsesGitHub
+      ? "Select a project folder and prepare it as an SSH-backed GitHub repository when needed."
+      : "Select a project folder, scan it, and keep it local without creating or pushing a GitHub repository.";
+    const createActionLabel = createWorkspaceUsesGitHub ? "Select Folder & Initialize GitHub" : "Select Folder & Use As-Is";
+
     return (
       <div className="shell shell--launcher">
         <div className="loader-card loader-card--wide launcher-shell">
@@ -10380,16 +10407,39 @@ const WorkbenchApp = () => {
           <section className="hero-card launcher-hero">
             <div className="hero-card__content">
               <div className="eyebrow">Start here</div>
-              <h2>Open a GitHub repository, create a new GitHub workspace, or resume a recent workspace.</h2>
+              <h2>Open a repository, create a workspace, or resume a recent project.</h2>
               <p className="hero-card__lead">
-                The workbench now starts from a proper launcher so GitHub linking, project selection, imports, and settings all begin from one clear home screen.
+                Choose whether a new workspace should create a GitHub repository or use the selected folder exactly as it is.
               </p>
+              <div className="workspace-create-mode" aria-label="New workspace creation mode">
+                <div className="workspace-create-mode__header">
+                  <span>New workspace mode</span>
+                  <strong>{createModeTitle}</strong>
+                </div>
+                <div className="segmented-control">
+                  <button
+                    className={createWorkspaceUsesGitHub ? "segmented-control__button segmented-control__button--active" : "segmented-control__button"}
+                    type="button"
+                    onClick={() => setProjectCreationMode("initialize_github")}
+                  >
+                    Initialize GitHub Repo
+                  </button>
+                  <button
+                    className={!createWorkspaceUsesGitHub ? "segmented-control__button segmented-control__button--active" : "segmented-control__button"}
+                    type="button"
+                    onClick={() => setProjectCreationMode("use_folder_as_is")}
+                  >
+                    Use Folder As-Is
+                  </button>
+                </div>
+                <p>{createModeCopy}</p>
+              </div>
               <div className="actions-row">
                 <button className="primary-button" disabled={launcherActionsLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("open")}>
                   {projectLoadBusy === "open" ? <LoadingIndicator label="Opening" compact /> : "Open GitHub Repo"}
                 </button>
                 <button className="secondary-button" disabled={createWorkspaceLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("create")}>
-                  {projectLoadBusy === "create" ? <LoadingIndicator label="Creating" compact /> : "Create New Workspace"}
+                  {projectLoadBusy === "create" ? <LoadingIndicator label={createWorkspaceUsesGitHub ? "Initializing" : "Scanning"} compact /> : createActionLabel}
                 </button>
               </div>
             </div>
@@ -10417,7 +10467,9 @@ const WorkbenchApp = () => {
               <LoadingIndicator
                 label={
                   projectLoadBusy === "create"
-                    ? "Preparing workspace and scanning repository"
+                    ? createWorkspaceUsesGitHub
+                      ? "Preparing GitHub repository and scanning workspace"
+                      : "Scanning selected folder without creating a GitHub repository"
                     : projectLoadBusy === "import"
                       ? "Importing portable interface"
                       : "Opening project and scanning repository"
@@ -10425,7 +10477,13 @@ const WorkbenchApp = () => {
               />
             </div>
           ) : null}
-          {!githubLinked && githubStatus ? <div className="notice notice--error">{githubStatus.message}</div> : null}
+          {!githubLinked && githubStatus ? (
+            <div className={createWorkspaceUsesGitHub ? "notice notice--error" : "notice"}>
+              {createWorkspaceUsesGitHub
+                ? githubStatus.message
+                : "GitHub is not linked. Local-only workspace creation is still available; GitHub-backed opening, imports, and initialization remain disabled."}
+            </div>
+          ) : null}
           {githubStatus?.state === "needs_ssh" ? <div className="notice">{githubStatus.message}</div> : null}
           <section className="launcher-grid">
             <div className="launcher-actions">
@@ -10440,9 +10498,9 @@ const WorkbenchApp = () => {
               />
               <LauncherActionCard
                 eyebrow="Create"
-                title="New GitHub Workspace"
-                copy="Start from a folder selection, initialize a GitHub SSH repository when needed, and generate a fresh interface or deliberately replace an older saved version."
-                actionLabel="Start New Workspace"
+                title="New Workspace"
+                copy={createModeCopy}
+                actionLabel={createActionLabel}
                 onAction={() => void openFolder("create")}
                 disabled={createWorkspaceLocked || Boolean(projectLoadBusy)}
               />

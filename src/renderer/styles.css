@@ -424,6 +424,42 @@ p {
   align-items: stretch;
 }
 
+.workspace-create-mode {
+  display: grid;
+  gap: 12px;
+  max-width: 680px;
+  padding: 14px;
+  border: 1px solid rgba(184, 154, 106, 0.32);
+  border-radius: 8px;
+  background: rgba(255, 250, 242, 0.86);
+  box-shadow: 0 10px 24px rgba(8, 18, 32, 0.08);
+}
+
+.workspace-create-mode__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  color: var(--brand-ink);
+}
+
+.workspace-create-mode__header span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.workspace-create-mode__header strong {
+  text-align: right;
+}
+
+.workspace-create-mode p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 .project-hero {
   display: grid;
   grid-template-columns: minmax(0, 1.3fr) minmax(420px, 0.9fr);
@@ -2898,6 +2934,21 @@ code {
   .app-header > .actions-row {
     width: 100%;
     display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-create-mode__header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .workspace-create-mode__header strong {
+    text-align: left;
+  }
+
+  .workspace-create-mode .segmented-control {
+    display: grid;
+    width: 100%;
     grid-template-columns: 1fr;
   }
 

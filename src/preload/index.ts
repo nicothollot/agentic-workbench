@@ -11,6 +11,7 @@ import type {
   AutopilotPolicy,
   AutopilotStrategy,
   ApprovalDecision,
+  ChooseFolderOptions,
   CodexReadinessReport,
   CodexUpdateCheckResult,
   CodexUpdateRunResult,
@@ -30,7 +31,9 @@ import type {
   LocalProjectState,
   LoadedProjectView,
   OpenProjectShellResult,
+  ProjectCreationMode,
   ProjectLogFeedResponse,
+  ProjectLoadIntent,
   ProjectLoadResult,
   ProjectRepositoryView,
   ProjectRepositorySummary,
@@ -62,7 +65,7 @@ export interface WorkbenchApi {
   getState(): Promise<WorkbenchState>;
   onStateUpdated(listener: (state: WorkbenchState) => void): () => void;
   refreshGitHubStatus(): Promise<GitHubStatus>;
-  chooseFolder(): Promise<string | null>;
+  chooseFolder(options?: ChooseFolderOptions): Promise<string | null>;
   chooseImportBundle(): Promise<{ projectRootPath: string; importPath: string } | null>;
   importInterfaceBundle(): Promise<LoadedProjectView | null>;
   showLauncher(): Promise<void>;
@@ -74,7 +77,7 @@ export interface WorkbenchApi {
   runCodexUpdate(approvedCommand?: string): Promise<CodexUpdateRunResult>;
   getExecutionEnvironmentStatus(): Promise<ExecutionEnvironmentStatus>;
   quit(): Promise<void>;
-  loadProject(inputPath: string, intent?: "open" | "create"): Promise<ProjectLoadResult>;
+  loadProject(inputPath: string, intent?: ProjectLoadIntent, creationMode?: ProjectCreationMode): Promise<ProjectLoadResult>;
   openProject(projectId: string): Promise<LoadedProjectView>;
   selectInterface(source: "portable" | "local" | "fresh", path?: string, freshBehavior?: "replace" | "duplicate"): Promise<LoadedProjectView>;
   updateSettings(payload: Record<string, unknown>): Promise<unknown>;
@@ -241,7 +244,7 @@ const api: WorkbenchApi = {
       ipcRenderer.removeListener("state:updated", wrapped);
     };
   },
-  chooseFolder: async () => await invoke<string | null>("app:chooseFolder"),
+  chooseFolder: async (options) => await invoke<string | null>("app:chooseFolder", options),
   chooseImportBundle: async () => await invoke<{ projectRootPath: string; importPath: string } | null>("app:chooseImportBundle"),
   importInterfaceBundle: async () => await invoke<LoadedProjectView | null>("app:importInterfaceBundle"),
   showLauncher: async () => await invoke<void>("app:showLauncher"),
@@ -253,7 +256,8 @@ const api: WorkbenchApi = {
   runCodexUpdate: async (approvedCommand) => await invoke<CodexUpdateRunResult>("app:runCodexUpdate", { approvedCommand }),
   getExecutionEnvironmentStatus: async () => await invoke<ExecutionEnvironmentStatus>("app:getExecutionEnvironmentStatus"),
   quit: async () => await invoke<void>("app:quit"),
-  loadProject: async (inputPath, intent = "open") => await invoke<ProjectLoadResult>("project:load", { inputPath, intent }),
+  loadProject: async (inputPath, intent = "open", creationMode = "initialize_github") =>
+    await invoke<ProjectLoadResult>("project:load", { inputPath, intent, creationMode }),
   openProject: async (projectId) => await invoke<LoadedProjectView>("project:open", { projectId }),
   selectInterface: async (source, path, freshBehavior) =>
     await invoke<LoadedProjectView>("project:selectInterface", { projectId: "pending", source, path, freshBehavior }),

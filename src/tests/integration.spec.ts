@@ -223,6 +223,23 @@ describe("integration flows", () => {
     });
   });
 
+  it("can create a workspace from a folder as-is without initializing GitHub", async () => {
+    const root = await createSampleFolder("new-local-workspace");
+    const appData = await createTempDir("appdata-new-local-workspace");
+    const service = await createService(appData);
+
+    const loadResult = await service.loadProject(root, "create", "use_folder_as_is");
+    await expect(access(path.join(root, ".git"))).rejects.toThrow();
+
+    const selected = await service.selectPendingInterface("fresh");
+    const reopened = await service.openProject(selected.record.id);
+
+    expect(loadResult.validation.projectKind).toBe("folder");
+    expect(loadResult.identity.normalizedRemotes).toEqual([]);
+    expect(reopened.record.id).toBe(selected.record.id);
+    expect(reopened.record.validation.projectKind).toBe("folder");
+  });
+
   it("keeps create-mode scans and write checks inside the exact selected folder when it sits under another git repo", async () => {
     const parentRoot = await createTempDir("parent-git-root");
     const childRoot = path.join(parentRoot, "nested-workspace");
