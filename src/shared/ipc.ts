@@ -458,6 +458,7 @@ export const rendererStateSchema = z.object({
     checkedAt: z.string(),
     currentVersion: z.string().optional(),
     latestVersion: z.string().optional(),
+    targetVersion: z.string().optional(),
     updateAvailable: z.boolean(),
     updateCommand: z.string().optional(),
     status: z.enum(["up-to-date", "outdated", "unavailable", "skipped"]),

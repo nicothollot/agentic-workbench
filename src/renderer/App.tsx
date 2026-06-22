@@ -7469,6 +7469,8 @@ const WorkbenchApp = () => {
   const [activeWorkspaceTabOverride, setActiveWorkspaceTabOverride] = useState<WorkspaceVisualTabId>();
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
+  const promptedCodexUpdateCommandsRef = useRef<Set<string>>(new Set());
+  const runCodexUpdateRef = useRef<(approvedCommand?: string) => Promise<void>>(() => Promise.resolve());
   const [repositoryData, setRepositoryData] = useState<RepositoryDataView>(() => emptyRepositoryData());
   const revealRepositoryPathRef = useRef<(relativePath: string) => Promise<void>>(() => Promise.resolve());
   const [repositoryScanStatus, setRepositoryScanStatus] = useState<RepositoryScanStatus | null>(null);
@@ -8936,6 +8938,31 @@ const WorkbenchApp = () => {
       setCodexUpdateBusy(false);
     }
   };
+
+  const codexUpdateForPrompt = state?.codexUpdate;
+  runCodexUpdateRef.current = runCodexUpdate;
+
+  useEffect(() => {
+    const update = codexUpdateForPrompt;
+    const updateCommand = update?.updateCommand;
+    if (!update?.updateAvailable || !updateCommand || codexUpdateBusy) {
+      return;
+    }
+    if (promptedCodexUpdateCommandsRef.current.has(updateCommand)) {
+      return;
+    }
+    promptedCodexUpdateCommandsRef.current.add(updateCommand);
+
+    const versionLabel = update.latestVersion ? ` to ${update.latestVersion}` : "";
+    const currentLabel = update.currentVersion ? ` from ${update.currentVersion}` : "";
+    const approved = window.confirm(`A Codex CLI update${versionLabel} is available${currentLabel}.\n\nRun this command now?\n\n${updateCommand}`);
+    if (approved) {
+      void runCodexUpdateRef.current(updateCommand);
+    }
+  }, [
+    codexUpdateBusy,
+    codexUpdateForPrompt
+  ]);
 
   const refreshGitHubStatus = async () => {
     try {

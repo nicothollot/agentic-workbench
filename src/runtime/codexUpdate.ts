@@ -36,6 +36,7 @@ export interface CodexUpdateCommandRunner {
 
 export interface CodexUpdateOptions {
   supportedProtocolVersion?: string;
+  targetVersion?: string;
   commandRunner?: CodexUpdateCommandRunner;
 }
 
@@ -124,10 +125,10 @@ export const assessCodexProtocolCompatibility = (
   if (comparison > 0) {
     return {
       status: "installed-newer",
-      compatible: false,
+      compatible: true,
       installedVersion,
       generatedProtocolVersion,
-      message: `Installed Codex CLI ${installedVersion} is newer than the app-server protocol bundled with this Workbench build (${generatedProtocolVersion}). Update Codex Agent Workbench before running live agents, or install Codex CLI ${generatedProtocolVersion}.`
+      message: `Installed Codex CLI ${installedVersion} is newer than the app-server protocol bundled with this Workbench build (${generatedProtocolVersion}). Workbench will use the installed CLI.`
     };
   }
 
@@ -275,37 +276,8 @@ export const checkCodexCliUpdate = async (
     }
 
     const supportedProtocolVersion = options.supportedProtocolVersion;
-    const targetVersion = supportedProtocolVersion && compareCodexVersions(latestVersion, supportedProtocolVersion) >= 0
-      ? supportedProtocolVersion
-      : latestVersion;
+    const targetVersion = options.targetVersion ?? latestVersion;
     const updateAvailable = compareCodexVersions(currentVersion, targetVersion) < 0;
-
-    if (supportedProtocolVersion && compareCodexVersions(currentVersion, supportedProtocolVersion) > 0) {
-      return {
-        status: "skipped",
-        currentVersion,
-        latestVersion,
-        targetVersion: supportedProtocolVersion,
-        updateAvailable: false,
-        supportedProtocolVersion,
-        message: `Installed Codex CLI ${currentVersion} is newer than this Workbench app-server protocol (${supportedProtocolVersion}). Update Workbench before changing the CLI.`
-      };
-    }
-
-    if (supportedProtocolVersion && compareCodexVersions(latestVersion, supportedProtocolVersion) > 0) {
-      return {
-        status: updateAvailable ? "outdated" : "up-to-date",
-        currentVersion,
-        latestVersion,
-        targetVersion,
-        updateAvailable,
-        updateCommand: updateAvailable ? buildCodexUpdateCommand(settings, platform, targetVersion) : undefined,
-        supportedProtocolVersion,
-        message: updateAvailable
-          ? `Codex CLI ${latestVersion} is available, and this Workbench build can safely update to its compatible app-server protocol ${targetVersion}.`
-          : `Codex CLI ${latestVersion} is available, but this Workbench build already has compatible CLI ${currentVersion}. Update Workbench to use newer protocol ${latestVersion}.`
-      };
-    }
 
     if (!updateAvailable) {
       return {

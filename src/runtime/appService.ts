@@ -150,7 +150,6 @@ import {
 import { shouldAutoApproveApproval } from "./approvalPolicy";
 import { CodexAppServerTransport, type CodexTransport } from "./codexTransport";
 import {
-  GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION,
   assessCodexProtocolCompatibility,
   checkCodexCliUpdate,
   type CodexUpdateCommandRunner,
@@ -941,10 +940,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private buildCodexInstallCommand(): string | undefined {
-    const version = this.codexAvailability.generatedProtocolVersion ?? GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION;
-    if (!version) {
-      return undefined;
-    }
+    const version = this.codexUpdateCheck?.latestVersion ?? "latest";
     if (process.platform === "win32" && this.settings.executionMode === "wsl") {
       return `wsl -d ${this.quotePowerShellArgument(this.settings.distroName)} -- npm install -g @openai/codex@${version}`;
     }
@@ -1181,13 +1177,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return skipped;
     }
 
-    const result = await checkCodexCliUpdate(this.settings, process.platform, {
-      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION
-    });
+    const result = await checkCodexCliUpdate(this.settings, process.platform);
     const checked: CodexUpdateCheckResult = {
       checkedAt: nowIso(),
       currentVersion: result.currentVersion,
       latestVersion: result.latestVersion,
+      targetVersion: result.targetVersion,
       updateAvailable: result.updateAvailable,
       updateCommand: result.updateCommand,
       status: result.status,
@@ -1267,7 +1262,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const result = await updateCodexCliIfAvailable(this.settings, process.platform, {
-      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION,
+      targetVersion: before.targetVersion ?? before.latestVersion,
       commandRunner: options.commandRunner
     });
     const updateResult: CodexUpdateRunResult = {
@@ -1279,6 +1274,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       command: before.updateCommand,
       message: result.message
     };
+    if (updateResult.status === "updated") {
+      await this.restartTransportAfterCodexUpdate();
+    }
     await this.refreshCodexReadiness("Codex CLI update completed");
     await this.checkCodexUpdate();
     return updateResult;
@@ -4175,6 +4173,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
+  private async restartTransportAfterCodexUpdate(): Promise<void> {
+    this.threadToAgent.clear();
+    if (this.transport) {
+      const transport = this.transport;
+      this.transport = undefined;
+      try {
+        this.suppressTransportExitHandling = true;
+        await transport.dispose();
+      } catch (error) {
+        this.diagnostics.unshift(`Failed to restart Codex app-server after updating Codex CLI. ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        this.suppressTransportExitHandling = false;
+      }
+    }
+
+    this.availableModels = [];
+    this.codexAvailability = { source: "unavailable", message: "Restarting Codex app-server after Codex CLI update." };
+    await this.initializeTransport();
+    for (const project of this.projects.values()) {
+      await this.resumeSavedAgents(project);
+    }
+  }
+
   private compactRendererAgent(agent: AgentState, options?: { detail?: boolean; summaryOnly?: boolean }): AgentState {
     const eventLimit = options?.summaryOnly
       ? 0
@@ -4561,18 +4582,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
 
-    const result = await updateCodexCliIfAvailable(this.settings, process.platform, {
-      supportedProtocolVersion: GENERATED_CODEX_APP_SERVER_PROTOCOL_VERSION
-    });
-    if (result.status === "updated") {
-      this.diagnostics.unshift(result.message);
+    const result = await this.checkCodexUpdate();
+    if (result.updateAvailable) {
+      this.diagnostics.unshift(`${result.message} Workbench will ask before running ${result.updateCommand ?? "the update command"}.`);
       return;
     }
-    if (result.status === "skipped") {
-      this.diagnostics.unshift(result.message);
-      return;
-    }
-    if (result.status === "failed") {
+    if (result.status === "unavailable") {
       this.diagnostics.unshift(`${result.message} Continuing with the installed Codex CLI.`);
     }
   }

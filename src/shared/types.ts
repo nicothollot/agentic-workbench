@@ -536,6 +536,7 @@ export interface CodexUpdateCheckResult {
   checkedAt: string;
   currentVersion?: string;
   latestVersion?: string;
+  targetVersion?: string;
   updateAvailable: boolean;
   updateCommand?: string;
   status: "up-to-date" | "outdated" | "unavailable" | "skipped";

@@ -1862,7 +1862,7 @@ describe("schema validation and IPC", () => {
     });
   });
 
-  it("reports Codex installed and outdated with a safe compatible update command", async () => {
+  it("reports Codex installed and outdated with the latest update command", async () => {
     const settings = {
       ...defaultSettings(),
       executionMode: "local" as const
@@ -1878,9 +1878,9 @@ describe("schema validation and IPC", () => {
     expect(check.status).toBe("outdated");
     expect(check.currentVersion).toBe("0.127.0");
     expect(check.latestVersion).toBe("0.129.0");
-    expect(check.targetVersion).toBe("0.128.0");
+    expect(check.targetVersion).toBe("0.129.0");
     expect(check.updateAvailable).toBe(true);
-    expect(check.updateCommand).toBe("npm install -g @openai/codex@0.128.0");
+    expect(check.updateCommand).toBe("npm install -g @openai/codex@0.129.0");
   });
 
   it("reports Codex missing when the installed version command fails", async () => {
@@ -1956,20 +1956,21 @@ describe("schema validation and IPC", () => {
         runCodexVersion: async () => `codex-cli ${installedVersion}`,
         runNpmCommand: async (args) => {
           if (args[0] === "view") {
-            return "0.128.0\n";
+            return "0.129.0\n";
           }
           installArgs = args;
-          installedVersion = "0.128.0";
+          installedVersion = "0.129.0";
           return "updated\n";
         }
       }
     });
 
-    expect(installArgs).toEqual(["install", "-g", "@openai/codex@0.128.0"]);
+    expect(installArgs).toEqual(["install", "-g", "@openai/codex@0.129.0"]);
     expect(result).toMatchObject({
       status: "updated",
       currentVersion: "0.127.0",
-      updatedVersion: "0.128.0"
+      latestVersion: "0.129.0",
+      updatedVersion: "0.129.0"
     });
   });
 
@@ -2005,7 +2006,39 @@ describe("schema validation and IPC", () => {
     });
   });
 
-  it("runs the Codex CLI updater during non-mock startup before readiness checks", async () => {
+  it("updates Codex to the approved target when npm latest changes after preview", async () => {
+    const settings = {
+      ...defaultSettings(),
+      executionMode: "local" as const
+    };
+    let installedVersion = "0.127.0";
+    let installArgs: string[] | undefined;
+
+    const result = await updateCodexCliIfAvailable(settings, "linux", {
+      targetVersion: "0.128.0",
+      commandRunner: {
+        runCodexVersion: async () => `codex-cli ${installedVersion}`,
+        runNpmCommand: async (args) => {
+          if (args[0] === "view") {
+            return "0.129.0\n";
+          }
+          installArgs = args;
+          installedVersion = "0.128.0";
+          return "updated\n";
+        }
+      }
+    });
+
+    expect(installArgs).toEqual(["install", "-g", "@openai/codex@0.128.0"]);
+    expect(result).toMatchObject({
+      status: "updated",
+      currentVersion: "0.127.0",
+      latestVersion: "0.129.0",
+      updatedVersion: "0.128.0"
+    });
+  });
+
+  it("checks Codex CLI updates during non-mock startup before readiness checks", async () => {
     const service = new AppService(await createTempDir("codex-startup-update")) as unknown as {
       settings: ReturnType<typeof defaultSettings>;
       refreshGitHubStatus: (emitState: boolean) => Promise<void>;
@@ -2098,6 +2131,7 @@ describe("schema validation and IPC", () => {
       runCodexUpdate: AppService["runCodexUpdate"];
       refreshCodexReadiness: AppService["refreshCodexReadiness"];
       checkCodexUpdate: AppService["checkCodexUpdate"];
+      restartTransportAfterCodexUpdate: () => Promise<void>;
     };
     service.settings = {
       ...defaultSettings(),
@@ -2119,6 +2153,10 @@ describe("schema validation and IPC", () => {
 
     let readinessRefreshes = 0;
     let updateRechecks = 0;
+    let transportRestarts = 0;
+    service.restartTransportAfterCodexUpdate = async () => {
+      transportRestarts += 1;
+    };
     service.refreshCodexReadiness = async () => {
       readinessRefreshes += 1;
       return {
@@ -2161,18 +2199,19 @@ describe("schema validation and IPC", () => {
     });
 
     expect(approved.status).toBe("updated");
+    expect(transportRestarts).toBe(1);
     expect(readinessRefreshes).toBe(1);
     expect(updateRechecks).toBe(1);
   });
 
-  it("detects Codex app-server protocol drift before live agents launch", () => {
+  it("allows newer Codex CLI protocol drift and blocks older CLIs", () => {
     expect(assessCodexProtocolCompatibility("0.128.0", "0.128.0")).toMatchObject({
       status: "compatible",
       compatible: true
     });
     expect(assessCodexProtocolCompatibility("0.129.0", "0.128.0")).toMatchObject({
       status: "installed-newer",
-      compatible: false
+      compatible: true
     });
     expect(assessCodexProtocolCompatibility("0.127.0", "0.128.0")).toMatchObject({
       status: "installed-older",
