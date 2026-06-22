@@ -26,6 +26,9 @@ import type {
   CycleRetrospective,
   GoalChangeRecord,
   GoalCharter,
+  GoalCharterDraftTextField,
+  GoalCharterGenerateResult,
+  GoalCharterPolishResult,
   HumanInterventionRecord,
   InterfaceReasoningEffort,
   LocalProjectState,
@@ -156,6 +159,25 @@ export interface WorkbenchApi {
   importUltimateGoalText(projectId: string): Promise<UltimateGoalImportPreview | null>;
   getGoalCharter(projectId: string): Promise<GoalCharter>;
   updateGoalCharter(projectId: string, patch: Partial<GoalCharter>): Promise<GoalCharter>;
+  polishGoalCharterField(
+    projectId: string,
+    payload: {
+      field: GoalCharterDraftTextField;
+      value: string;
+      currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>;
+      model: string;
+      reasoningEffort?: InterfaceReasoningEffort;
+    }
+  ): Promise<GoalCharterPolishResult>;
+  generateGoalCharterDraft(
+    projectId: string,
+    payload: {
+      prompt: string;
+      currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>;
+      model: string;
+      reasoningEffort?: InterfaceReasoningEffort;
+    }
+  ): Promise<GoalCharterGenerateResult>;
   getAutopilotStrategy(projectId: string): Promise<AutopilotStrategy>;
   updateAutopilotStrategy(projectId: string, strategy: AutopilotStrategy): Promise<AutopilotStrategy>;
   listAutopilotPresets(): Promise<AutopilotPreset[]>;
@@ -304,6 +326,10 @@ const api: WorkbenchApi = {
   getGoalCharter: async (projectId) => await invoke<GoalCharter>("workflow:getGoalCharter", { projectId }),
   updateGoalCharter: async (projectId, patch) =>
     await invoke<GoalCharter>("workflow:updateGoalCharter", { projectId, patch }),
+  polishGoalCharterField: async (projectId, payload) =>
+    await invoke<GoalCharterPolishResult>("workflow:polishGoalCharterField", { projectId, ...payload }),
+  generateGoalCharterDraft: async (projectId, payload) =>
+    await invoke<GoalCharterGenerateResult>("workflow:generateGoalCharterDraft", { projectId, ...payload }),
   getAutopilotStrategy: async (projectId) =>
     await invoke<AutopilotStrategy>("workflow:getAutopilotStrategy", { projectId }),
   updateAutopilotStrategy: async (projectId, strategy) =>

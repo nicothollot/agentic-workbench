@@ -28,6 +28,7 @@ export interface CodexTransport {
   respond(serverRequestId: string | number, result: unknown): Promise<void>;
   dispose(): Promise<void>;
   on<E extends keyof TransportEventMap>(event: E, listener: (...args: TransportEventMap[E]) => void): this;
+  off<E extends keyof TransportEventMap>(event: E, listener: (...args: TransportEventMap[E]) => void): this;
 }
 
 interface CodexLaunchPlan {

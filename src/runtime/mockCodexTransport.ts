@@ -74,6 +74,74 @@ const createMockUltimateGoalPayload = (cwd: string): string =>
     qualityBar: "Clear, test-backed, security-preserving changes that establish a durable orchestration foundation."
   });
 
+const createMockGoalCharterDraftPayload = (cwd: string): string =>
+  JSON.stringify({
+    summary: `Advance ${path.basename(cwd)} toward a production-ready, workflow-driven implementation.`,
+    detailedIntent:
+      "Preserve the repository's secure architecture, keep deterministic runtime boundaries intact, and steadily improve the product through explicit workflow cycles.",
+    successCriteria: [
+      "The project can move through recommendation, goal, coding, integrity, and merge stages with persisted workflow state.",
+      "Architecture and security boundaries remain explicit and intact.",
+      "Each cycle produces a scoped goal and deterministic validation before merge."
+    ],
+    constraints: [
+      "Do not bypass typed IPC.",
+      "Do not expose Node APIs in the renderer.",
+      "Keep privileged repository operations in runtime or the main process."
+    ],
+    nonGoals: [
+      "Do not implement fake full autonomy in a single pass.",
+      "Do not replace the Codex app-server stdio transport."
+    ],
+    targetAudience: "Developers extending and operating the local workflow orchestrator.",
+    qualityBar: "Clear, test-backed, security-preserving changes that establish a durable orchestration foundation.",
+    nonNegotiableRequirements: [
+      "Preserve typed IPC and renderer sandboxing.",
+      "Keep repository mutations in runtime-managed workflows."
+    ],
+    flexibleRequirements: [
+      "Improve user-facing workflow guidance where it reduces operator confusion."
+    ],
+    niceToHaveIdeas: [
+      "Add compact review affordances for generated drafts."
+    ],
+    explicitNonGoals: [
+      "Do not replace the Codex app-server stdio transport.",
+      "Do not add unrelated project management features."
+    ],
+    userConstraints: [
+      "Keep approvals visible and explicit.",
+      "Treat WSL as execution truth for repository work."
+    ],
+    aestheticPreferences: [
+      "Use a quiet, dense, work-focused interface."
+    ],
+    technicalPreferences: [
+      "Prefer deterministic code for deterministic tasks.",
+      "Use generated protocol types as source of truth."
+    ],
+    definitionOfDone: [
+      "The workflow can run through a complete validated cycle.",
+      "New path, persistence, reducer, and workflow logic has focused test coverage."
+    ]
+  });
+
+const createMockGoalCharterPolishPayload = (input: TurnStartParams["input"]): string => {
+  const text = input
+    .map((entry) => entry.type === "text" ? entry.text : "")
+    .join("\n");
+  const match = /Text to polish:\n([\s\S]*)$/u.exec(text);
+  const value = (match?.[1] ?? "Define a clear, observable project outcome.").trim();
+  return JSON.stringify({
+    value: value
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => line.replace(/^[-*]\s*/, ""))
+      .join("\n")
+  });
+};
+
 type MockRecommendationMode = "deliver" | "optimize" | "appeal";
 
 const createMockRecommendationPayload = (cwd: string, objective: MockRecommendationMode = "deliver"): string => {
@@ -255,6 +323,24 @@ const isUltimateGoalSchema = (value: unknown): boolean => {
 
   const properties = (value as { properties?: Record<string, unknown> }).properties;
   return Boolean(properties?.summary && properties?.detailedIntent && properties?.successCriteria && properties?.qualityBar);
+};
+
+const isGoalCharterDraftSchema = (value: unknown): boolean => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const properties = (value as { properties?: Record<string, unknown> }).properties;
+  return Boolean(properties?.summary && properties?.nonNegotiableRequirements && properties?.definitionOfDone);
+};
+
+const isGoalCharterPolishSchema = (value: unknown): boolean => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const properties = (value as { properties?: Record<string, unknown> }).properties;
+  return Boolean(properties?.value);
 };
 
 const isRecommendationSchema = (value: unknown): boolean => {
@@ -566,8 +652,12 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       ? extractWorkflowObjective(params.input)
       : "deliver";
     const responseText = params.outputSchema
-      ? isUltimateGoalSchema(params.outputSchema)
-        ? createMockUltimateGoalPayload(thread?.cwd ?? "/tmp")
+      ? isGoalCharterPolishSchema(params.outputSchema)
+        ? createMockGoalCharterPolishPayload(params.input)
+        : isGoalCharterDraftSchema(params.outputSchema)
+          ? createMockGoalCharterDraftPayload(thread?.cwd ?? "/tmp")
+          : isUltimateGoalSchema(params.outputSchema)
+            ? createMockUltimateGoalPayload(thread?.cwd ?? "/tmp")
         : isRecommendationSchema(params.outputSchema)
           ? customRecommendationFocus
             ? createCustomMockRecommendationPayload(thread?.cwd ?? "/tmp", customRecommendationFocus, workflowObjective)

@@ -630,11 +630,11 @@ export const workflowActionGuide = (
   if (!hasConfirmedUltimateGoal(workflow.ultimateGoal)) {
     return {
       kind: "confirm_goal",
-      title: "Enter or confirm the Ultimate Goal",
+      title: "Set the Ultimate Goal in Settings",
       description: workflow.ultimateGoalDraft?.summary
-        ? "A detected draft is ready. Confirm or edit it so the workflow can rely on it."
-        : "Start by defining the Ultimate Goal for this project.",
-      actionLabel: "Confirm Ultimate Goal"
+        ? "A detected draft is ready. Open Settings to confirm, edit, or generate the Goal Charter."
+        : "Open Settings to define the Goal Charter before running workflow automation.",
+      actionLabel: "Open Settings"
     };
   }
 

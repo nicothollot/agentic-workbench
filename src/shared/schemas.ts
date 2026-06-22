@@ -165,6 +165,23 @@ export const approvalDecisionSchema = z.enum(["accept", "acceptForSession", "dec
 export const credentialEntryStatusSchema = z.enum(["active", "needs_attention", "disabled"]);
 export const credentialRequestStatusSchema = z.enum(["pending", "fulfilled", "dismissed"]);
 export const agentReasoningModeSchema = z.enum(["auto", "manual"]);
+export const goalCharterDraftTextFieldSchema = z.enum([
+  "currentSummary",
+  "currentDetailedIntent",
+  "currentSuccessCriteria",
+  "currentConstraints",
+  "currentNonGoals",
+  "currentTargetAudience",
+  "currentQualityBar",
+  "nonNegotiableRequirements",
+  "flexibleRequirements",
+  "niceToHaveIdeas",
+  "explicitNonGoals",
+  "userConstraints",
+  "aestheticPreferences",
+  "technicalPreferences",
+  "definitionOfDone"
+]);
 export const agentReasoningEffortsSchema = z.object({
   bootstrap: interfaceReasoningEffortSchema.optional(),
   goal: interfaceReasoningEffortSchema.optional(),

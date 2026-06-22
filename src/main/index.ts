@@ -28,6 +28,7 @@ import {
   exportInterfaceRequestSchema,
   fileSummaryRequestSchema,
   autopilotStrategyRequestSchema,
+  generateGoalCharterDraftRequestSchema,
   goalCharterRequestSchema,
   importUltimateGoalTextRequestSchema,
   importInterfaceRequestSchema,
@@ -48,6 +49,7 @@ import {
   repositoryRescanRequestSchema,
   repositoryScanSettingsRequestSchema,
   projectSelectionDecisionSchema,
+  polishGoalCharterFieldRequestSchema,
   refreshOverviewRequestSchema,
   goalChangeDecisionRequestSchema,
   goalChangeProposalRequestSchema,
@@ -736,6 +738,25 @@ const registerIpc = (): void => {
   ipcMain.handle("workflow:updateGoalCharter", async (_event, payload) => {
     const parsed = updateGoalCharterRequestSchema.parse(payload);
     return await appService?.updateGoalCharter(parsed.projectId, parsed.patch);
+  });
+  ipcMain.handle("workflow:polishGoalCharterField", async (_event, payload) => {
+    const parsed = polishGoalCharterFieldRequestSchema.parse(payload);
+    return await appService?.polishGoalCharterField(parsed.projectId, {
+      field: parsed.field,
+      value: parsed.value,
+      currentDraft: parsed.currentDraft,
+      model: parsed.model,
+      reasoningEffort: parsed.reasoningEffort
+    });
+  });
+  ipcMain.handle("workflow:generateGoalCharterDraft", async (_event, payload) => {
+    const parsed = generateGoalCharterDraftRequestSchema.parse(payload);
+    return await appService?.generateGoalCharterDraft(parsed.projectId, {
+      prompt: parsed.prompt,
+      currentDraft: parsed.currentDraft,
+      model: parsed.model,
+      reasoningEffort: parsed.reasoningEffort
+    });
   });
   ipcMain.handle("workflow:getAutopilotStrategy", (_event, payload) => {
     const parsed = autopilotStrategyRequestSchema.parse(payload);

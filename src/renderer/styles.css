@@ -2364,6 +2364,11 @@ p {
   border-color: rgba(170, 110, 68, 0.24);
 }
 
+.notice--pending {
+  border-color: rgba(170, 110, 68, 0.28);
+  background: rgba(255, 246, 231, 0.84);
+}
+
 .notice--completed {
   border-color: rgba(63, 106, 77, 0.24);
 }
@@ -6174,6 +6179,61 @@ select.input {
 
 .goal-charter-settings {
   gap: 12px;
+}
+
+.goal-charter-ai-panel,
+.goal-charter-draft-field {
+  min-width: 0;
+}
+
+.goal-charter-ai-panel {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid rgba(36, 92, 137, 0.16);
+  border-radius: 8px;
+  background: rgba(223, 231, 236, 0.28);
+}
+
+.goal-charter-draft-field__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.goal-charter-draft-field__header > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.goal-charter-draft-field__polish {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.button-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.button-icon path:first-child,
+.button-icon path:nth-child(2) {
+  fill: currentColor;
+  stroke: none;
+}
+
+.workflow-goal-setup-notice {
+  margin: 0;
 }
 
 .strategy-slider-field input[type="range"] {

@@ -28,6 +28,8 @@ import {
   createAgentRequestSchema,
   downloadInterfaceRequestSchema,
   downloadLogsRequestSchema,
+  generateGoalCharterDraftRequestSchema,
+  polishGoalCharterFieldRequestSchema,
   projectLogFeedRequestSchema,
   projectLoadRequestSchema,
   projectOpenRequestSchema,
@@ -1513,6 +1515,21 @@ describe("schema validation and IPC", () => {
     }).status).toBe("active");
     expect(credentialRequestUpdateSchema.parse({ projectId: "p", requestId: "r", status: "dismissed" }).status).toBe("dismissed");
     expect(credentialRequestSubmitToAgentSchema.parse({ projectId: "p", requestId: "r" }).requestId).toBe("r");
+    expect(polishGoalCharterFieldRequestSchema.parse({
+      projectId: "p",
+      field: "currentConstraints",
+      value: "keep it secure",
+      currentDraft: { currentSummary: "Ship the app" },
+      model: "gpt-5.4",
+      reasoningEffort: "medium"
+    }).field).toBe("currentConstraints");
+    expect(generateGoalCharterDraftRequestSchema.parse({
+      projectId: "p",
+      prompt: "Build a complete platform game",
+      currentDraft: { currentSummary: "Platform game" },
+      model: "gpt-5.4",
+      reasoningEffort: "high"
+    }).reasoningEffort).toBe("high");
     expect(approvalDecisionRequestSchema.parse({ projectId: "p", agentId: "a", approvalId: "x", decision: "accept" }).decision).toBe("accept");
     expect(downloadInterfaceRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(downloadLogsRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
@@ -3648,9 +3665,9 @@ describe("workflow view helpers", () => {
     };
     expect(workflowActionGuide(charterNeeded)).toMatchObject({
       kind: "confirm_goal",
-      actionLabel: "Confirm Ultimate Goal"
+      actionLabel: "Open Settings"
     });
-    expect(workflowActionGuide(charterNeeded).description).toContain("detected draft");
+    expect(workflowActionGuide(charterNeeded).description).toContain("Open Settings");
 
     const chooseRecommendation = defaultProjectWorkflowState();
     chooseRecommendation.ultimateGoal = {

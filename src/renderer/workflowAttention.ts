@@ -55,7 +55,7 @@ const attentionTime = (value?: string): number => {
 const workflowStopReasonAttentionLabel = (reason?: string): string =>
   ({
     none: "No blocker",
-    charter_missing: "Ultimate Goal needs confirmation",
+    charter_missing: "Open Settings to set the Ultimate Goal",
     recommendation_missing: "Run recommendations for the next cycle",
     awaiting_recommendation_approval: "Approve one recommended next step",
     goal_not_scoped: "Turn the approved recommendation into a scoped goal",

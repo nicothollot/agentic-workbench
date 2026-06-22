@@ -8,6 +8,7 @@ import {
   gitHubStatusSchema,
   goalChangeRecordSchema,
   goalCharterSchema,
+  goalCharterDraftTextFieldSchema,
   humanInterventionKindSchema,
   humanInterventionSeveritySchema,
   interfaceReasoningEffortSchema,
@@ -305,6 +306,23 @@ export const updateGoalCharterRequestSchema = z.object({
   patch: goalCharterSchema.partial()
 });
 
+export const polishGoalCharterFieldRequestSchema = z.object({
+  projectId: z.string().min(1),
+  field: goalCharterDraftTextFieldSchema,
+  value: z.string().min(1).max(8_000),
+  currentDraft: z.record(goalCharterDraftTextFieldSchema, z.string().max(8_000)).optional(),
+  model: z.string().min(1),
+  reasoningEffort: interfaceReasoningEffortSchema.optional()
+});
+
+export const generateGoalCharterDraftRequestSchema = z.object({
+  projectId: z.string().min(1),
+  prompt: z.string().min(1).max(12_000),
+  currentDraft: z.record(goalCharterDraftTextFieldSchema, z.string().max(8_000)).optional(),
+  model: z.string().min(1),
+  reasoningEffort: interfaceReasoningEffortSchema.optional()
+});
+
 export const autopilotStrategyRequestSchema = z.object({
   projectId: z.string().min(1)
 });
@@ -536,6 +554,8 @@ export type IpcChannel =
   | "workflow:importUltimateGoalText"
   | "workflow:getGoalCharter"
   | "workflow:updateGoalCharter"
+  | "workflow:polishGoalCharterField"
+  | "workflow:generateGoalCharterDraft"
   | "workflow:getAutopilotStrategy"
   | "workflow:updateAutopilotStrategy"
   | "workflow:listAutopilotPresets"

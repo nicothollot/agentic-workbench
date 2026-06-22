@@ -177,6 +177,54 @@ export interface GoalCharter {
   createdAt: string;
   updatedAt: string;
 }
+
+export type GoalCharterDraftTextField =
+  | "currentSummary"
+  | "currentDetailedIntent"
+  | "currentSuccessCriteria"
+  | "currentConstraints"
+  | "currentNonGoals"
+  | "currentTargetAudience"
+  | "currentQualityBar"
+  | "nonNegotiableRequirements"
+  | "flexibleRequirements"
+  | "niceToHaveIdeas"
+  | "explicitNonGoals"
+  | "userConstraints"
+  | "aestheticPreferences"
+  | "technicalPreferences"
+  | "definitionOfDone";
+
+export interface GoalCharterAiDraft {
+  currentSummary: string;
+  currentDetailedIntent: string;
+  currentSuccessCriteria: string[];
+  currentConstraints: string[];
+  currentNonGoals: string[];
+  currentTargetAudience: string;
+  currentQualityBar: string;
+  nonNegotiableRequirements: string[];
+  flexibleRequirements: string[];
+  niceToHaveIdeas: string[];
+  explicitNonGoals: string[];
+  userConstraints: string[];
+  aestheticPreferences: string[];
+  technicalPreferences: string[];
+  definitionOfDone: string[];
+}
+
+export interface GoalCharterPolishResult {
+  field: GoalCharterDraftTextField;
+  value: string;
+  model: string;
+  reasoningEffort?: InterfaceReasoningEffort;
+}
+
+export interface GoalCharterGenerateResult {
+  draft: GoalCharterAiDraft;
+  model: string;
+  reasoningEffort?: InterfaceReasoningEffort;
+}
 export type ChecklistChangeAction =
   | "add"
   | "remove"

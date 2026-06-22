@@ -63,6 +63,10 @@ import type {
   GoalChangeRecord,
   GoalChangeProposal,
   GoalCharter,
+  GoalCharterAiDraft,
+  GoalCharterDraftTextField,
+  GoalCharterGenerateResult,
+  GoalCharterPolishResult,
   GoalAttainmentCheck,
   HumanInterventionRecord,
   InterfaceCandidate,
@@ -8034,6 +8038,430 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       pendingUserInputRequests,
       pendingHumanInterventions
     });
+  }
+
+  private goalCharterFieldLabel(field: GoalCharterDraftTextField): string {
+    const labels: Record<GoalCharterDraftTextField, string> = {
+      currentSummary: "Current Effective Goal",
+      currentDetailedIntent: "Detailed intent",
+      currentSuccessCriteria: "Success criteria",
+      currentConstraints: "Constraints",
+      currentNonGoals: "Explicit non-goals",
+      currentTargetAudience: "Target audience",
+      currentQualityBar: "Quality bar",
+      nonNegotiableRequirements: "Non-negotiable requirements",
+      flexibleRequirements: "Flexible requirements",
+      niceToHaveIdeas: "Nice-to-have ideas",
+      explicitNonGoals: "Explicit non-goals",
+      userConstraints: "User constraints",
+      aestheticPreferences: "Aesthetic preferences",
+      technicalPreferences: "Technical preferences",
+      definitionOfDone: "Definition of done"
+    };
+    return labels[field];
+  }
+
+  private buildGoalCharterPolishOutputSchema(): JsonValue {
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: ["value"],
+      properties: {
+        value: { type: "string", maxLength: 8_000 }
+      }
+    } satisfies JsonValue;
+  }
+
+  private buildGoalCharterDraftOutputSchema(): JsonValue {
+    const list = { type: "array", items: { type: "string", maxLength: 500 }, maxItems: 12 };
+    return {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "summary",
+        "detailedIntent",
+        "successCriteria",
+        "constraints",
+        "nonGoals",
+        "targetAudience",
+        "qualityBar",
+        "nonNegotiableRequirements",
+        "flexibleRequirements",
+        "niceToHaveIdeas",
+        "explicitNonGoals",
+        "userConstraints",
+        "aestheticPreferences",
+        "technicalPreferences",
+        "definitionOfDone"
+      ],
+      properties: {
+        summary: { type: "string", maxLength: 520 },
+        detailedIntent: { type: "string", maxLength: 2_500 },
+        successCriteria: list,
+        constraints: list,
+        nonGoals: list,
+        targetAudience: { type: "string", maxLength: 500 },
+        qualityBar: { type: "string", maxLength: 1_200 },
+        nonNegotiableRequirements: list,
+        flexibleRequirements: list,
+        niceToHaveIdeas: list,
+        explicitNonGoals: list,
+        userConstraints: list,
+        aestheticPreferences: list,
+        technicalPreferences: list,
+        definitionOfDone: list
+      }
+    } satisfies JsonValue;
+  }
+
+  private goalCharterDraftContext(currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>): string {
+    if (!currentDraft) {
+      return "No existing draft field values were supplied.";
+    }
+    const entries = (Object.entries(currentDraft) as Array<[GoalCharterDraftTextField, string]>)
+      .map(([field, value]) => [this.goalCharterFieldLabel(field), value.trim()] as const)
+      .filter(([, value]) => value.length > 0)
+      .map(([label, value]) => `${label}:\n${compactText(value, 1_200)}`);
+    return entries.length ? entries.join("\n\n") : "No existing draft field values were supplied.";
+  }
+
+  private buildGoalCharterPolishPrompt(
+    project: LoadedProject,
+    field: GoalCharterDraftTextField,
+    value: string,
+    currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>
+  ): string {
+    const listLike = [
+      "currentSuccessCriteria",
+      "currentConstraints",
+      "currentNonGoals",
+      "nonNegotiableRequirements",
+      "flexibleRequirements",
+      "niceToHaveIdeas",
+      "explicitNonGoals",
+      "userConstraints",
+      "aestheticPreferences",
+      "technicalPreferences",
+      "definitionOfDone"
+    ].includes(field);
+    return [
+      "Improve one Goal Charter field for Codex Agent Workbench.",
+      "Preserve the user's intent. Do not add unrelated scope, secrets, credentials, local machine paths, or unverifiable promises.",
+      listLike
+        ? "Return one item per line. Use concrete, observable phrasing where possible."
+        : "Return polished prose for the same field. Keep it concise and directly usable.",
+      "Make success criteria and definition-of-done items testable or inspectable. Put hard rules in constraints, and excluded work in non-goals.",
+      "",
+      `Project: ${project.record.identity.projectName}`,
+      `Repository overview: ${project.record.overview?.summary ?? project.scan.stats.explanation}`,
+      `Field: ${this.goalCharterFieldLabel(field)}`,
+      `Existing draft context:\n${this.goalCharterDraftContext(currentDraft)}`,
+      `Text to polish:\n${value.trim()}`
+    ].join("\n\n");
+  }
+
+  private buildGoalCharterGeneratePrompt(
+    project: LoadedProject,
+    prompt: string,
+    currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>
+  ): string {
+    return [
+      "Generate a complete Goal Charter draft for Codex Agent Workbench from the user's project prompt.",
+      "The draft is used to guide repeated recommendation, scoped planning, coding, integrity validation, and merge cycles.",
+      "Write an ambitious but bounded ultimate goal. Criteria must describe observable end states, not tiny implementation chores.",
+      "Keep hard rules in constraints, excluded work in non-goals, and excellent-outcome standards in the quality bar and definition of done.",
+      "Do not include secrets, credentials, account-specific details, local machine paths, or paid-service assumptions unless the prompt explicitly requires them.",
+      "If the user asks for a game, app, site, or tool, make the charter concrete about the user-facing finished experience and validation expectations.",
+      "",
+      `Project: ${project.record.identity.projectName}`,
+      `Repository overview: ${project.record.overview?.summary ?? project.scan.stats.explanation}`,
+      `Entry points: ${project.scan.stats.entryPoints.slice(0, 6).join(", ") || "None detected"}`,
+      `Primary managers: ${project.scan.stats.primaryManagers.join(", ") || "None detected"}`,
+      `Existing draft context:\n${this.goalCharterDraftContext(currentDraft)}`,
+      `User project prompt:\n${prompt.trim()}`
+    ].join("\n\n");
+  }
+
+  private normalizeGoalCharterList(value: unknown, fallback: string[] = []): string[] {
+    if (Array.isArray(value)) {
+      return value
+        .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+        .map((entry) => compactText(entry, 500))
+        .slice(0, 12);
+    }
+    if (typeof value === "string") {
+      return value
+        .split(/\r?\n/)
+        .map((entry) => entry.replace(/^[-*]\s*/, "").trim())
+        .filter((entry) => entry.length > 0)
+        .map((entry) => compactText(entry, 500))
+        .slice(0, 12);
+    }
+    return fallback.slice(0, 12);
+  }
+
+  private normalizeGoalCharterString(value: unknown, fallback = "", maxLength = 2_500): string {
+    return typeof value === "string" && value.trim().length > 0
+      ? compactText(value, maxLength)
+      : fallback;
+  }
+
+  private parseGoalCharterPolishOutput(rawText: string): string | undefined {
+    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+      const value = typeof parsed.value === "string" ? parsed.value.trim() : "";
+      if (value) {
+        return compactText(value, 8_000);
+      }
+    }
+    const fallback = rawText.trim();
+    return fallback ? compactText(fallback, 8_000) : undefined;
+  }
+
+  private parseGoalCharterDraftOutput(rawText: string, prompt: string): GoalCharterAiDraft | undefined {
+    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+      const currentSummary = this.normalizeGoalCharterString(
+        parsed.summary ?? parsed.currentSummary,
+        compactText(prompt, 520),
+        520
+      );
+      const currentDetailedIntent = this.normalizeGoalCharterString(
+        parsed.detailedIntent ?? parsed.currentDetailedIntent,
+        "",
+        2_500
+      );
+      const currentSuccessCriteria = this.normalizeGoalCharterList(parsed.successCriteria ?? parsed.currentSuccessCriteria);
+      const currentConstraints = this.normalizeGoalCharterList(parsed.constraints ?? parsed.currentConstraints);
+      const currentNonGoals = this.normalizeGoalCharterList(parsed.nonGoals ?? parsed.currentNonGoals);
+      const currentQualityBar = this.normalizeGoalCharterString(parsed.qualityBar ?? parsed.currentQualityBar, "", 1_200);
+      if (!currentSummary || !currentDetailedIntent || currentSuccessCriteria.length === 0 || !currentQualityBar) {
+        continue;
+      }
+      return {
+        currentSummary,
+        currentDetailedIntent,
+        currentSuccessCriteria,
+        currentConstraints,
+        currentNonGoals,
+        currentTargetAudience: this.normalizeGoalCharterString(parsed.targetAudience ?? parsed.currentTargetAudience, "", 500),
+        currentQualityBar,
+        nonNegotiableRequirements: this.normalizeGoalCharterList(parsed.nonNegotiableRequirements, currentSuccessCriteria),
+        flexibleRequirements: this.normalizeGoalCharterList(parsed.flexibleRequirements),
+        niceToHaveIdeas: this.normalizeGoalCharterList(parsed.niceToHaveIdeas),
+        explicitNonGoals: this.normalizeGoalCharterList(parsed.explicitNonGoals, currentNonGoals),
+        userConstraints: this.normalizeGoalCharterList(parsed.userConstraints, currentConstraints),
+        aestheticPreferences: this.normalizeGoalCharterList(parsed.aestheticPreferences),
+        technicalPreferences: this.normalizeGoalCharterList(parsed.technicalPreferences, currentConstraints),
+        definitionOfDone: this.normalizeGoalCharterList(parsed.definitionOfDone, currentSuccessCriteria)
+      };
+    }
+    return undefined;
+  }
+
+  private async runGoalCharterStructuredTurn(
+    project: LoadedProject,
+    options: {
+      prompt: string;
+      model: string;
+      reasoningEffort?: InterfaceReasoningEffort;
+      outputSchema: JsonValue;
+    }
+  ): Promise<string> {
+    await this.ensureAgentBackedRuntimeReady(project, "goal charter AI drafting runtime check");
+    if (!this.transport) {
+      throw new Error("Codex transport is not initialized.");
+    }
+    if (!this.availableModels.some((entry) => entry.model === options.model)) {
+      throw new Error(`Model is not available: ${options.model}`);
+    }
+    const modelRecord = this.availableModels.find((entry) => entry.model === options.model);
+    const effort = resolveInterfaceCreationReasoningEffort(modelRecord, options.reasoningEffort);
+    const cwd = project.record.projectRoot;
+    await assertExecutionPathWithinProjectRoot(
+      project.record.projectRoot,
+      cwd,
+      project.record.hostPath,
+      this.getRuntimeSettings(project.record.distroName),
+      project.record.distroName,
+      "Goal Charter AI drafting"
+    );
+
+    const thread = await this.transport.startThread({
+      cwd,
+      model: options.model,
+      approvalPolicy: "on-request",
+      sandbox: "read-only",
+      baseInstructions: [
+        "You improve project goal charters for Codex Agent Workbench.",
+        "When an output schema is supplied, return only valid JSON matching that schema exactly.",
+        "Do not include markdown fences, commentary, greetings, or raw chain-of-thought."
+      ].join("\n"),
+      developerInstructions: this.buildProjectBoundaryDeveloperInstructions(project, cwd, "read-only"),
+      personality: "pragmatic",
+      ephemeral: true,
+      experimentalRawEvents: false
+    });
+
+    const threadId = thread.thread.id;
+    const sandboxPolicy = this.buildRestrictedSandboxPolicy(project, "read-only");
+    let capturedText = "";
+    let turnId: string | undefined;
+
+    return await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("Goal Charter AI drafting timed out before the model returned a result."));
+      }, 240_000);
+      timeout.unref();
+
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        this.transport?.off("notification", onNotification);
+      };
+
+      const finishFromThread = async (): Promise<void> => {
+        try {
+          if (capturedText.trim()) {
+            cleanup();
+            resolve(capturedText);
+            return;
+          }
+          const threadRead = await this.transport?.readThread(threadId, true);
+          const turns = [...(threadRead?.thread.turns ?? [])].reverse();
+          for (const turn of turns) {
+            for (const item of [...turn.items].reverse()) {
+              if (item.type === "agentMessage" && item.text.trim()) {
+                cleanup();
+                resolve(item.text);
+                return;
+              }
+            }
+          }
+          cleanup();
+          reject(new Error("Goal Charter AI drafting completed without a model message."));
+        } catch (error) {
+          cleanup();
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      };
+
+      const onNotification = (notification: ServerNotification): void => {
+        const params = "params" in notification ? notification.params as { threadId?: string; turnId?: string } : undefined;
+        if (!params || params.threadId !== threadId) {
+          return;
+        }
+        switch (notification.method) {
+          case "turn/started":
+            turnId = notification.params.turn.id;
+            break;
+          case "item/agentMessage/delta":
+            if (!turnId || notification.params.turnId === turnId) {
+              capturedText += notification.params.delta;
+            }
+            break;
+          case "item/completed":
+            if (notification.params.item.type === "agentMessage" && (!turnId || notification.params.turnId === turnId)) {
+              capturedText = notification.params.item.text;
+            }
+            break;
+          case "rawResponseItem/completed": {
+            const rawResponseText = this.extractTextFromRawResponseItem(notification.params.item);
+            if (rawResponseText && (!turnId || notification.params.turnId === turnId)) {
+              capturedText = rawResponseText;
+            }
+            break;
+          }
+          case "turn/completed":
+            if (!turnId || notification.params.turn.id === turnId) {
+              void finishFromThread();
+            }
+            break;
+          case "error":
+            cleanup();
+            reject(new Error(notification.params.error.message || "Goal Charter AI drafting failed."));
+            break;
+          default:
+            break;
+        }
+      };
+
+      this.transport?.on("notification", onNotification);
+      this.transport?.startTurn({
+        threadId,
+        input: [
+          {
+            type: "text",
+            text: options.prompt,
+            text_elements: []
+          }
+        ],
+        cwd,
+        sandboxPolicy,
+        model: options.model,
+        effort,
+        outputSchema: options.outputSchema
+      }).then((turnResponse) => {
+        turnId = turnResponse.turn.id;
+      }).catch((error) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+
+  async polishGoalCharterField(
+    projectId: string,
+    input: {
+      field: GoalCharterDraftTextField;
+      value: string;
+      currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>;
+      model: string;
+      reasoningEffort?: InterfaceReasoningEffort;
+    }
+  ): Promise<GoalCharterPolishResult> {
+    const project = this.findProject(projectId);
+    const rawText = await this.runGoalCharterStructuredTurn(project, {
+      prompt: this.buildGoalCharterPolishPrompt(project, input.field, input.value, input.currentDraft),
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      outputSchema: this.buildGoalCharterPolishOutputSchema()
+    });
+    const value = this.parseGoalCharterPolishOutput(rawText);
+    if (!value) {
+      throw new Error("The model did not return polished Goal Charter text.");
+    }
+    return {
+      field: input.field,
+      value,
+      model: input.model,
+      reasoningEffort: input.reasoningEffort
+    };
+  }
+
+  async generateGoalCharterDraft(
+    projectId: string,
+    input: {
+      prompt: string;
+      currentDraft?: Partial<Record<GoalCharterDraftTextField, string>>;
+      model: string;
+      reasoningEffort?: InterfaceReasoningEffort;
+    }
+  ): Promise<GoalCharterGenerateResult> {
+    const project = this.findProject(projectId);
+    const rawText = await this.runGoalCharterStructuredTurn(project, {
+      prompt: this.buildGoalCharterGeneratePrompt(project, input.prompt, input.currentDraft),
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      outputSchema: this.buildGoalCharterDraftOutputSchema()
+    });
+    const draft = this.parseGoalCharterDraftOutput(rawText, input.prompt);
+    if (!draft) {
+      throw new Error("The model did not return a usable Goal Charter draft.");
+    }
+    return {
+      draft,
+      model: input.model,
+      reasoningEffort: input.reasoningEffort
+    };
   }
 
   getGoalCharter(projectId: string): GoalCharter {

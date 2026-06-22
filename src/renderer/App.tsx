@@ -48,6 +48,8 @@ import type {
   GoalChangeRecord,
   HumanInterventionRecord,
   InterfaceReasoningEffort,
+  GoalCharterDraftTextField,
+  GoalCharterAiDraft,
   InterfaceCandidate,
   LoadedProjectView,
   ProjectCreationMode,
@@ -278,6 +280,10 @@ type GoalCharterDraftState = {
 type GoalCharterDraftUpdate = Partial<Omit<GoalCharterDraftState, "autopilotStrategy">> & {
   autopilotStrategy?: AutopilotStrategy;
 };
+
+type GoalCharterAiBusyState =
+  | { kind: "polish"; field: GoalCharterDraftTextField }
+  | { kind: "generate" };
 
 type StatusChipTone =
   | "running"
@@ -1522,6 +1528,45 @@ const toLineList = (value: string): string[] =>
     .filter((entry) => entry.length > 0);
 
 const fromLineList = (entries: string[] | undefined): string => (entries ?? []).join("\n");
+
+const goalCharterTextFields: GoalCharterDraftTextField[] = [
+  "currentSummary",
+  "currentDetailedIntent",
+  "currentSuccessCriteria",
+  "currentConstraints",
+  "currentNonGoals",
+  "currentTargetAudience",
+  "currentQualityBar",
+  "nonNegotiableRequirements",
+  "flexibleRequirements",
+  "niceToHaveIdeas",
+  "explicitNonGoals",
+  "userConstraints",
+  "aestheticPreferences",
+  "technicalPreferences",
+  "definitionOfDone"
+];
+
+const goalCharterDraftAiPayload = (draft: GoalCharterDraftState): Record<GoalCharterDraftTextField, string> =>
+  Object.fromEntries(goalCharterTextFields.map((field) => [field, draft[field]])) as Record<GoalCharterDraftTextField, string>;
+
+const goalCharterDraftUpdateFromAi = (draft: GoalCharterAiDraft): GoalCharterDraftUpdate => ({
+  currentSummary: draft.currentSummary,
+  currentDetailedIntent: draft.currentDetailedIntent,
+  currentSuccessCriteria: fromLineList(draft.currentSuccessCriteria),
+  currentConstraints: fromLineList(draft.currentConstraints),
+  currentNonGoals: fromLineList(draft.currentNonGoals),
+  currentTargetAudience: draft.currentTargetAudience,
+  currentQualityBar: draft.currentQualityBar,
+  nonNegotiableRequirements: fromLineList(draft.nonNegotiableRequirements),
+  flexibleRequirements: fromLineList(draft.flexibleRequirements),
+  niceToHaveIdeas: fromLineList(draft.niceToHaveIdeas),
+  explicitNonGoals: fromLineList(draft.explicitNonGoals),
+  userConstraints: fromLineList(draft.userConstraints),
+  aestheticPreferences: fromLineList(draft.aestheticPreferences),
+  technicalPreferences: fromLineList(draft.technicalPreferences),
+  definitionOfDone: fromLineList(draft.definitionOfDone)
+});
 
 const cloneStrategy = (strategy?: AutopilotStrategy): AutopilotStrategy => {
   const base = strategy ?? createDefaultAutopilotStrategy();
@@ -6010,30 +6055,113 @@ const GoalCharterOverviewCard = ({
   );
 };
 
+const WandIcon = () => (
+  <svg className="button-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+    <path d="M15 4l1.1 2.4L18.5 7.5l-2.4 1.1L15 11l-1.1-2.4-2.4-1.1 2.4-1.1L15 4z" />
+    <path d="M6 14l1.1 2.4 2.4 1.1-2.4 1.1L6 21l-1.1-2.4-2.4-1.1 2.4-1.1L6 14z" />
+    <path d="M14.5 13.5l6 6" />
+    <path d="M12.5 15.5l2-2" />
+  </svg>
+);
+
+const GoalCharterDraftField = ({
+  field,
+  label,
+  value,
+  onChange,
+  onPolish,
+  busy,
+  disabled = false,
+  multiline = true
+}: {
+  field: GoalCharterDraftTextField;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  onPolish: (field: GoalCharterDraftTextField) => void;
+  busy?: GoalCharterAiBusyState;
+  disabled?: boolean;
+  multiline?: boolean;
+}) => {
+  const polishBusy = busy?.kind === "polish" && busy.field === field;
+  const polishDisabled = disabled || Boolean(busy) || !value.trim();
+  return (
+    <label className="form-field goal-charter-draft-field">
+      <span className="goal-charter-draft-field__header">
+        <span>{label}</span>
+        <button
+          className="secondary-button secondary-button--compact goal-charter-draft-field__polish"
+          type="button"
+          title={`Pollish ${label}`}
+          onClick={(event) => {
+            event.preventDefault();
+            onPolish(field);
+          }}
+          disabled={polishDisabled}
+        >
+          <WandIcon />
+          {polishBusy ? "Pollishing..." : "Pollish"}
+        </button>
+      </span>
+      {multiline ? (
+        <textarea className="textarea" value={value} onChange={(event) => onChange(event.target.value)} />
+      ) : (
+        <input className="input" value={value} onChange={(event) => onChange(event.target.value)} />
+      )}
+    </label>
+  );
+};
+
 const GoalCharterSettingsPanel = ({
   project,
   draft,
   presets,
+  availableModels,
+  aiModel,
+  aiReasoningEffort,
+  generatePrompt,
+  aiBusy,
   onChange,
   onSave,
   onApplyPreset,
   onDetectGoal,
-  onRejectDetectedGoal
+  onRejectDetectedGoal,
+  onPolishField,
+  onGeneratePromptChange,
+  onAiModelChange,
+  onAiReasoningEffortChange,
+  onGenerateDraft,
+  onDownloadFormat
 }: {
   project?: LoadedProjectView;
   draft: GoalCharterDraftState;
   presets: AutopilotPreset[];
+  availableModels: DiscoveredModel[];
+  aiModel: string;
+  aiReasoningEffort: InterfaceReasoningEffort;
+  generatePrompt: string;
+  aiBusy?: GoalCharterAiBusyState;
   onChange: (next: GoalCharterDraftUpdate) => void;
   onSave: () => void;
   onApplyPreset: (preset: AutopilotPreset) => void;
   onDetectGoal: () => void;
   onRejectDetectedGoal: () => void;
+  onPolishField: (field: GoalCharterDraftTextField) => void;
+  onGeneratePromptChange: (value: string) => void;
+  onAiModelChange: (model: string) => void;
+  onAiReasoningEffortChange: (effort: InterfaceReasoningEffort) => void;
+  onGenerateDraft: () => void;
+  onDownloadFormat: () => void;
 }) => {
   if (!project) {
     return null;
   }
   const charter = project.record.workflow.goalCharter;
   const strategy = draft.autopilotStrategy;
+  const selectedAiModel = availableModels.find((model) => model.model === aiModel);
+  const aiReasoningEfforts = selectedAiModel?.supportedReasoningEfforts.length
+    ? selectedAiModel.supportedReasoningEfforts
+    : INTERFACE_REASONING_EFFORTS;
   const updateStrategy = (patch: Partial<AutopilotStrategy>) =>
     onChange({
       autopilotStrategy: {
@@ -6088,72 +6216,213 @@ const GoalCharterSettingsPanel = ({
               <button className="secondary-button" type="button" onClick={onDetectGoal}>Auto-detect Ultimate Goal</button>
             </div>
           ) : null}
-          <label className="form-field">
-            <span>Current Effective Goal</span>
-            <input className="input" value={draft.currentSummary} onChange={(event) => onChange({ currentSummary: event.target.value })} />
-          </label>
-          <label className="form-field">
-            <span>Detailed intent</span>
-            <textarea className="textarea" value={draft.currentDetailedIntent} onChange={(event) => onChange({ currentDetailedIntent: event.target.value })} />
-          </label>
+          <div className="goal-charter-ai-panel">
+            <div className="settings-section__heading">
+              <strong>Generate Goal Charter</strong>
+              <span className="badge">AI draft</span>
+            </div>
+            <p className="settings-card__copy">
+              Type the project you want, choose a model and effort, then generate a full draft. Review it before saving.
+            </p>
+            <label className="form-field">
+              <span>Project prompt</span>
+              <textarea
+                className="textarea"
+                value={generatePrompt}
+                onChange={(event) => onGeneratePromptChange(event.target.value)}
+                placeholder="Example: Create a new super mario-style platform game with polished controls, levels, enemies, audio, and a complete validation path."
+              />
+            </label>
+            <div className="strategy-field-grid">
+              <label className="form-field">
+                <span>Model</span>
+                <select
+                  className="input"
+                  value={aiModel}
+                  onChange={(event) => onAiModelChange(event.target.value)}
+                  disabled={!availableModels.length || Boolean(aiBusy)}
+                >
+                  {availableModels.map((model) => (
+                    <option key={model.id} value={model.model}>{model.displayName || model.model}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="form-field">
+                <span>Effort</span>
+                <select
+                  className="input"
+                  value={aiReasoningEffort}
+                  onChange={(event) => onAiReasoningEffortChange(event.target.value as InterfaceReasoningEffort)}
+                  disabled={!availableModels.length || Boolean(aiBusy)}
+                >
+                  {aiReasoningEfforts.map((effort) => (
+                    <option key={effort} value={effort}>{reasoningEffortLabel(effort)}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="actions-row">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={onGenerateDraft}
+                disabled={!generatePrompt.trim() || !aiModel || Boolean(aiBusy)}
+              >
+                {aiBusy?.kind === "generate" ? "Generating..." : "Generate full charter"}
+              </button>
+              <button className="secondary-button" type="button" onClick={onDownloadFormat}>
+                Download Ultimate Goal format
+              </button>
+            </div>
+          </div>
+          <GoalCharterDraftField
+            field="currentSummary"
+            label="Current Effective Goal"
+            value={draft.currentSummary}
+            onChange={(value) => onChange({ currentSummary: value })}
+            onPolish={onPolishField}
+            busy={aiBusy}
+            disabled={!availableModels.length}
+            multiline={false}
+          />
+          <GoalCharterDraftField
+            field="currentDetailedIntent"
+            label="Detailed intent"
+            value={draft.currentDetailedIntent}
+            onChange={(value) => onChange({ currentDetailedIntent: value })}
+            onPolish={onPolishField}
+            busy={aiBusy}
+            disabled={!availableModels.length}
+          />
           <div className="workflow-two-column">
-            <label className="form-field">
-              <span>Success criteria</span>
-              <textarea className="textarea" value={draft.currentSuccessCriteria} onChange={(event) => onChange({ currentSuccessCriteria: event.target.value })} />
-            </label>
-            <label className="form-field">
-              <span>Constraints</span>
-              <textarea className="textarea" value={draft.currentConstraints} onChange={(event) => onChange({ currentConstraints: event.target.value })} />
-            </label>
+            <GoalCharterDraftField
+              field="currentSuccessCriteria"
+              label="Success criteria"
+              value={draft.currentSuccessCriteria}
+              onChange={(value) => onChange({ currentSuccessCriteria: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
+            <GoalCharterDraftField
+              field="currentConstraints"
+              label="Constraints"
+              value={draft.currentConstraints}
+              onChange={(value) => onChange({ currentConstraints: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
           </div>
           <div className="workflow-two-column">
-            <label className="form-field">
-              <span>Explicit non-goals</span>
-              <textarea className="textarea" value={draft.currentNonGoals} onChange={(event) => onChange({ currentNonGoals: event.target.value })} />
-            </label>
-            <label className="form-field">
-              <span>Definition of done</span>
-              <textarea className="textarea" value={draft.definitionOfDone} onChange={(event) => onChange({ definitionOfDone: event.target.value })} />
-            </label>
+            <GoalCharterDraftField
+              field="currentNonGoals"
+              label="Explicit non-goals"
+              value={draft.currentNonGoals}
+              onChange={(value) => onChange({ currentNonGoals: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
+            <GoalCharterDraftField
+              field="definitionOfDone"
+              label="Definition of done"
+              value={draft.definitionOfDone}
+              onChange={(value) => onChange({ definitionOfDone: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
           </div>
           <div className="workflow-two-column">
-            <label className="form-field">
-              <span>Target audience</span>
-              <input className="input" value={draft.currentTargetAudience} onChange={(event) => onChange({ currentTargetAudience: event.target.value })} />
-            </label>
-            <label className="form-field">
-              <span>Quality bar</span>
-              <input className="input" value={draft.currentQualityBar} onChange={(event) => onChange({ currentQualityBar: event.target.value })} />
-            </label>
+            <GoalCharterDraftField
+              field="currentTargetAudience"
+              label="Target audience"
+              value={draft.currentTargetAudience}
+              onChange={(value) => onChange({ currentTargetAudience: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+              multiline={false}
+            />
+            <GoalCharterDraftField
+              field="currentQualityBar"
+              label="Quality bar"
+              value={draft.currentQualityBar}
+              onChange={(value) => onChange({ currentQualityBar: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+              multiline={false}
+            />
           </div>
-          <label className="form-field">
-            <span>Non-negotiable requirements</span>
-            <textarea className="textarea" value={draft.nonNegotiableRequirements} onChange={(event) => onChange({ nonNegotiableRequirements: event.target.value })} />
-          </label>
+          <GoalCharterDraftField
+            field="nonNegotiableRequirements"
+            label="Non-negotiable requirements"
+            value={draft.nonNegotiableRequirements}
+            onChange={(value) => onChange({ nonNegotiableRequirements: value })}
+            onPolish={onPolishField}
+            busy={aiBusy}
+            disabled={!availableModels.length}
+          />
+          <GoalCharterDraftField
+            field="explicitNonGoals"
+            label="Charter non-goals"
+            value={draft.explicitNonGoals}
+            onChange={(value) => onChange({ explicitNonGoals: value })}
+            onPolish={onPolishField}
+            busy={aiBusy}
+            disabled={!availableModels.length}
+          />
           <div className="workflow-two-column">
-            <label className="form-field">
-              <span>Flexible requirements</span>
-              <textarea className="textarea" value={draft.flexibleRequirements} onChange={(event) => onChange({ flexibleRequirements: event.target.value })} />
-            </label>
-            <label className="form-field">
-              <span>Nice-to-have ideas</span>
-              <textarea className="textarea" value={draft.niceToHaveIdeas} onChange={(event) => onChange({ niceToHaveIdeas: event.target.value })} />
-            </label>
+            <GoalCharterDraftField
+              field="flexibleRequirements"
+              label="Flexible requirements"
+              value={draft.flexibleRequirements}
+              onChange={(value) => onChange({ flexibleRequirements: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
+            <GoalCharterDraftField
+              field="niceToHaveIdeas"
+              label="Nice-to-have ideas"
+              value={draft.niceToHaveIdeas}
+              onChange={(value) => onChange({ niceToHaveIdeas: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
           </div>
           <div className="workflow-two-column">
-            <label className="form-field">
-              <span>User constraints</span>
-              <textarea className="textarea" value={draft.userConstraints} onChange={(event) => onChange({ userConstraints: event.target.value })} />
-            </label>
-            <label className="form-field">
-              <span>Technical preferences</span>
-              <textarea className="textarea" value={draft.technicalPreferences} onChange={(event) => onChange({ technicalPreferences: event.target.value })} />
-            </label>
+            <GoalCharterDraftField
+              field="userConstraints"
+              label="User constraints"
+              value={draft.userConstraints}
+              onChange={(value) => onChange({ userConstraints: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
+            <GoalCharterDraftField
+              field="technicalPreferences"
+              label="Technical preferences"
+              value={draft.technicalPreferences}
+              onChange={(value) => onChange({ technicalPreferences: value })}
+              onPolish={onPolishField}
+              busy={aiBusy}
+              disabled={!availableModels.length}
+            />
           </div>
-          <label className="form-field">
-            <span>Aesthetic preferences</span>
-            <textarea className="textarea" value={draft.aestheticPreferences} onChange={(event) => onChange({ aestheticPreferences: event.target.value })} />
-          </label>
+          <GoalCharterDraftField
+            field="aestheticPreferences"
+            label="Aesthetic preferences"
+            value={draft.aestheticPreferences}
+            onChange={(value) => onChange({ aestheticPreferences: value })}
+            onPolish={onPolishField}
+            busy={aiBusy}
+            disabled={!availableModels.length}
+          />
         </div>
         <div className="settings-card">
           <div className="settings-section__heading">
@@ -6375,15 +6644,25 @@ const SettingsDialog = ({
   activeProject,
   settingsDraft,
   goalCharterDraft,
+  goalCharterAiModel,
+  goalCharterAiReasoningEffort,
+  goalCharterGeneratePrompt,
+  goalCharterAiBusy,
   autopilotPresets,
   github,
   onChange,
   onGoalCharterChange,
+  onGoalCharterAiModelChange,
+  onGoalCharterAiReasoningEffortChange,
+  onGoalCharterGeneratePromptChange,
+  onPolishGoalCharterField,
+  onGenerateGoalCharterDraft,
   onSave,
   onSaveGoalCharter,
   onApplyAutopilotPreset,
   onDetectGoal,
   onRejectDetectedGoal,
+  onDownloadUltimateGoalFormat,
   onClose,
   onOpenDevTools,
   onRefreshGitHubStatus,
@@ -6399,15 +6678,25 @@ const SettingsDialog = ({
   activeProject?: LoadedProjectView;
   settingsDraft: SettingsDraftState;
   goalCharterDraft: GoalCharterDraftState;
+  goalCharterAiModel: string;
+  goalCharterAiReasoningEffort: InterfaceReasoningEffort;
+  goalCharterGeneratePrompt: string;
+  goalCharterAiBusy?: GoalCharterAiBusyState;
   autopilotPresets: AutopilotPreset[];
   github: GitHubStatus;
   onChange: (next: SettingsDraftUpdate) => void;
   onGoalCharterChange: (next: GoalCharterDraftUpdate) => void;
+  onGoalCharterAiModelChange: (model: string) => void;
+  onGoalCharterAiReasoningEffortChange: (effort: InterfaceReasoningEffort) => void;
+  onGoalCharterGeneratePromptChange: (prompt: string) => void;
+  onPolishGoalCharterField: (field: GoalCharterDraftTextField) => void;
+  onGenerateGoalCharterDraft: () => void;
   onSave: () => void;
   onSaveGoalCharter: () => void;
   onApplyAutopilotPreset: (preset: AutopilotPreset) => void;
   onDetectGoal: () => void;
   onRejectDetectedGoal: () => void;
+  onDownloadUltimateGoalFormat: () => void;
   onClose: () => void;
   onOpenDevTools: () => void;
   onRefreshGitHubStatus: () => void;
@@ -6444,11 +6733,22 @@ const SettingsDialog = ({
           project={activeProject}
           draft={goalCharterDraft}
           presets={autopilotPresets}
+          availableModels={state.availableModels}
+          aiModel={goalCharterAiModel}
+          aiReasoningEffort={goalCharterAiReasoningEffort}
+          generatePrompt={goalCharterGeneratePrompt}
+          aiBusy={goalCharterAiBusy}
           onChange={onGoalCharterChange}
           onSave={onSaveGoalCharter}
           onApplyPreset={onApplyAutopilotPreset}
           onDetectGoal={onDetectGoal}
           onRejectDetectedGoal={onRejectDetectedGoal}
+          onPolishField={onPolishGoalCharterField}
+          onGeneratePromptChange={onGoalCharterGeneratePromptChange}
+          onAiModelChange={onGoalCharterAiModelChange}
+          onAiReasoningEffortChange={onGoalCharterAiReasoningEffortChange}
+          onGenerateDraft={onGenerateGoalCharterDraft}
+          onDownloadFormat={onDownloadUltimateGoalFormat}
         />
         <RuntimeReadinessPanel
           report={state.runtimeReadiness}
@@ -7434,6 +7734,10 @@ const WorkbenchApp = () => {
     qualityBar: ""
   });
   const [goalCharterDraft, setGoalCharterDraft] = useState<GoalCharterDraftState>(() => goalCharterDraftFromWorkflow());
+  const [goalCharterAiModel, setGoalCharterAiModel] = useState("");
+  const [goalCharterAiReasoningEffort, setGoalCharterAiReasoningEffort] = useState<InterfaceReasoningEffort>("medium");
+  const [goalCharterGeneratePrompt, setGoalCharterGeneratePrompt] = useState("");
+  const [goalCharterAiBusy, setGoalCharterAiBusy] = useState<GoalCharterAiBusyState>();
   const [autopilotPresets, setAutopilotPresets] = useState<AutopilotPreset[]>(() => defaultAutopilotPresets());
   const [ultimateGoalImportPreview, setUltimateGoalImportPreview] = useState<UltimateGoalImportPreview | null>(null);
   const [interventionNotes, setInterventionNotes] = useState<Record<string, string>>({});
@@ -7607,8 +7911,23 @@ const WorkbenchApp = () => {
     [state?.availableModels]
   );
   const modelOptionsByName = useMemo(() => new Map(availableModels.map((model) => [model.model, model])), [availableModels]);
+  useEffect(() => {
+    if (!availableModels.length) {
+      return;
+    }
+    if (!goalCharterAiModel || !availableModels.some((model) => model.model === goalCharterAiModel)) {
+      setGoalCharterAiModel(recommendedModel || availableModels[0].model);
+    }
+  }, [availableModels, goalCharterAiModel, recommendedModel]);
+  useEffect(() => {
+    const modelRecord = modelOptionsByName.get(goalCharterAiModel);
+    if (modelRecord?.supportedReasoningEfforts.length && !modelRecord.supportedReasoningEfforts.includes(goalCharterAiReasoningEffort)) {
+      setGoalCharterAiReasoningEffort(modelRecord.defaultReasoningEffort ?? modelRecord.supportedReasoningEfforts[0]);
+    }
+  }, [goalCharterAiModel, goalCharterAiReasoningEffort, modelOptionsByName]);
   const deferredTreeFilter = useDeferredValue(treeFilterDraft);
   const workflow = activeProject?.record.workflow;
+  const ultimateGoalMissing = !workflow?.ultimateGoal.confirmedAt;
   const autopilotPolicy = workflow?.autopilotPolicy;
   const autopilotStatus = workflow?.autopilotStatus;
   const currentPlannerDecision = useMemo(() => {
@@ -9786,6 +10105,77 @@ const WorkbenchApp = () => {
     }));
   };
 
+  const polishGoalCharterField = async (field: GoalCharterDraftTextField) => {
+    if (!activeProject || goalCharterAiBusy) {
+      return;
+    }
+    const value = goalCharterDraft[field].trim();
+    if (!value) {
+      return;
+    }
+    if (!goalCharterAiModel) {
+      setNotice({ message: "Choose an available model before using Pollish.", tone: "error" });
+      setWorkspaceTab("settings");
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      setGoalCharterAiBusy({ kind: "polish", field });
+      const result = await window.workbench.polishGoalCharterField(activeProject.record.id, {
+        field,
+        value,
+        currentDraft: goalCharterDraftAiPayload(goalCharterDraft),
+        model: goalCharterAiModel,
+        reasoningEffort: goalCharterAiReasoningEffort
+      });
+      setGoalCharterDraft((current) => ({
+        ...current,
+        [result.field]: result.value
+      }));
+      showInfoNotice("Pollished the Goal Charter field. Review before saving.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setGoalCharterAiBusy(undefined);
+    }
+  };
+
+  const generateGoalCharterDraft = async () => {
+    if (!activeProject || goalCharterAiBusy) {
+      return;
+    }
+    const prompt = goalCharterGeneratePrompt.trim();
+    if (!prompt) {
+      return;
+    }
+    if (!goalCharterAiModel) {
+      setNotice({ message: "Choose an available model before generating a Goal Charter.", tone: "error" });
+      setWorkspaceTab("settings");
+      return;
+    }
+
+    try {
+      setNotice(undefined);
+      setGoalCharterAiBusy({ kind: "generate" });
+      const result = await window.workbench.generateGoalCharterDraft(activeProject.record.id, {
+        prompt,
+        currentDraft: goalCharterDraftAiPayload(goalCharterDraft),
+        model: goalCharterAiModel,
+        reasoningEffort: goalCharterAiReasoningEffort
+      });
+      setGoalCharterDraft((current) => ({
+        ...current,
+        ...goalCharterDraftUpdateFromAi(result.draft)
+      }));
+      showInfoNotice("Generated a Goal Charter draft. Review and save it when it matches your intent.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setGoalCharterAiBusy(undefined);
+    }
+  };
+
   const saveGoalCharter = async () => {
     if (!activeProject) {
       return;
@@ -10263,14 +10653,24 @@ const WorkbenchApp = () => {
       github={state.github}
       settingsDraft={settingsDraft}
       goalCharterDraft={goalCharterDraft}
+      goalCharterAiModel={goalCharterAiModel}
+      goalCharterAiReasoningEffort={goalCharterAiReasoningEffort}
+      goalCharterGeneratePrompt={goalCharterGeneratePrompt}
+      goalCharterAiBusy={goalCharterAiBusy}
       autopilotPresets={autopilotPresets}
       onChange={updateSettingsDraft}
       onGoalCharterChange={updateGoalCharterDraft}
+      onGoalCharterAiModelChange={setGoalCharterAiModel}
+      onGoalCharterAiReasoningEffortChange={setGoalCharterAiReasoningEffort}
+      onGoalCharterGeneratePromptChange={setGoalCharterGeneratePrompt}
+      onPolishGoalCharterField={(field) => void polishGoalCharterField(field)}
+      onGenerateGoalCharterDraft={() => void generateGoalCharterDraft()}
       onSave={saveSettings}
       onSaveGoalCharter={() => void saveGoalCharter()}
       onApplyAutopilotPreset={applyAutopilotPreset}
       onDetectGoal={() => void detectUltimateGoal()}
       onRejectDetectedGoal={() => void rejectDetectedGoal()}
+      onDownloadUltimateGoalFormat={downloadUltimateGoalFormat}
       onClose={() => setShowSettings(false)}
       onOpenDevTools={() => void openDevTools()}
       onRefreshGitHubStatus={() => void refreshGitHubStatus()}
@@ -10614,7 +11014,12 @@ const WorkbenchApp = () => {
           disabled: shellLaunchBusy || !workflow?.manualHandoff?.shellSupported,
           onClick: () => void openProjectShell()
         }
-        : workflowAction?.kind === "confirm_goal" || workflowAction?.kind === "choose_recommendation" || workflowAction?.kind === "resolve_blocker"
+        : workflowAction?.kind === "confirm_goal"
+          ? {
+            label: "Set Ultimate Goal",
+            onClick: () => void setWorkspaceTab("settings")
+          }
+        : workflowAction?.kind === "choose_recommendation" || workflowAction?.kind === "resolve_blocker"
           ? {
             label: workflowAction.actionLabel ?? "Review workflow",
             onClick: () => void setWorkspaceTab("workflow")
@@ -10700,9 +11105,8 @@ const WorkbenchApp = () => {
       }
       : workflowAction?.kind === "confirm_goal"
         ? {
-          label: "Confirm Ultimate Goal",
-          disabled: !ultimateGoalDraft.summary.trim(),
-          onClick: () => void saveUltimateGoal()
+          label: "Set Ultimate Goal in Settings",
+          onClick: () => void setWorkspaceTab("settings")
         }
         : workflowAction?.kind === "choose_recommendation"
         ? {
@@ -10977,6 +11381,20 @@ const WorkbenchApp = () => {
           {activeProject.record.interfaceCreation.lastError ? <div>{activeProject.record.interfaceCreation.lastError}</div> : null}
         </section>
       ) : null}
+      {ultimateGoalMissing ? (
+        <section className="notice notice--status notice--pending">
+          <div className="candidate-card__title-row">
+            <strong>Recommended next step: set the Ultimate Goal</strong>
+            <span className="badge">Required before workflow automation</span>
+          </div>
+          <p>Open Settings, write or generate the Goal Charter, then save it so Workflow has a durable target.</p>
+          <div className="actions-row">
+            <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("settings")}>Open Settings</button>
+            <button className="secondary-button" type="button" onClick={downloadUltimateGoalFormat}>Download format file</button>
+            <button className="secondary-button" type="button" onClick={() => void detectUltimateGoal()}>Auto-detect draft</button>
+          </div>
+        </section>
+      ) : null}
 
       <main className="project-workbench">
         <div className="workspace-tabs">
@@ -11054,15 +11472,16 @@ const WorkbenchApp = () => {
               </div>
             </section>
 
-            {!workflow?.ultimateGoal.confirmedAt ? (
+            {ultimateGoalMissing ? (
               <section className="overview-goal-empty-state">
                 <div>
                   <strong>No Ultimate Goal is set</strong>
-                  <p>Auto-detect a draft from the repository or open Workflow to write one manually. Nothing runs automatically until you confirm the goal.</p>
+                  <p>Open Settings to write, generate, import, or save the Goal Charter. Nothing runs automatically until you confirm the goal.</p>
                 </div>
                 <div className="actions-row">
-                  <button className="primary-button" type="button" onClick={() => void detectUltimateGoal()}>Auto-detect Ultimate Goal</button>
-                  <button className="secondary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>Enter Manually</button>
+                  <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("settings")}>Open Settings</button>
+                  <button className="secondary-button" type="button" onClick={downloadUltimateGoalFormat}>Download format file</button>
+                  <button className="secondary-button" type="button" onClick={() => void detectUltimateGoal()}>Auto-detect draft</button>
                 </div>
               </section>
             ) : null}
@@ -11244,6 +11663,21 @@ const WorkbenchApp = () => {
               secondaryActions={workflowSecondaryActions}
             />
 
+            {ultimateGoalMissing ? (
+              <section className="notice notice--status notice--pending workflow-goal-setup-notice">
+                <div className="candidate-card__title-row">
+                  <strong>Set the Ultimate Goal in Settings first</strong>
+                  <span className="badge">Workflow prerequisite</span>
+                </div>
+                <p>The workflow needs a saved Goal Charter before recommendations, coding, integrity, or merge steps can run.</p>
+                <div className="actions-row">
+                  <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("settings")}>Open Settings</button>
+                  <button className="secondary-button" type="button" onClick={downloadUltimateGoalFormat}>Download format file</button>
+                  <button className="secondary-button" type="button" onClick={() => void detectUltimateGoal()}>Auto-detect draft</button>
+                </div>
+              </section>
+            ) : null}
+
             <WorkflowStageTimeline steps={workflowTimeline} nowTime={clockNow} />
 
             <section className="workflow-operator-grid workflow-operator-grid--top">
@@ -11414,8 +11848,8 @@ const WorkbenchApp = () => {
                     {workflowNextGuidance ? <p className="workflow-primary-action__next">{workflowNextGuidance}</p> : null}
                   </div>
                   {workflowAction?.kind === "confirm_goal" ? (
-                    <button className="primary-button" onClick={() => void saveUltimateGoal()} disabled={!ultimateGoalDraft.summary.trim()}>
-                      {workflowAction.actionLabel ?? "Confirm Ultimate Goal"}
+                    <button className="primary-button" onClick={() => void setWorkspaceTab("settings")}>
+                      Set Ultimate Goal in Settings
                     </button>
                   ) : workflowAction?.kind === "resume_workflow" ? (
                     <button className="primary-button" disabled={workflowCommandBusy} onClick={() => void toggleWorkflowPause()}>
@@ -12315,14 +12749,24 @@ const WorkbenchApp = () => {
               github={state.github}
               settingsDraft={settingsDraft}
               goalCharterDraft={goalCharterDraft}
+              goalCharterAiModel={goalCharterAiModel}
+              goalCharterAiReasoningEffort={goalCharterAiReasoningEffort}
+              goalCharterGeneratePrompt={goalCharterGeneratePrompt}
+              goalCharterAiBusy={goalCharterAiBusy}
               autopilotPresets={autopilotPresets}
               onChange={updateSettingsDraft}
               onGoalCharterChange={updateGoalCharterDraft}
+              onGoalCharterAiModelChange={setGoalCharterAiModel}
+              onGoalCharterAiReasoningEffortChange={setGoalCharterAiReasoningEffort}
+              onGoalCharterGeneratePromptChange={setGoalCharterGeneratePrompt}
+              onPolishGoalCharterField={(field) => void polishGoalCharterField(field)}
+              onGenerateGoalCharterDraft={() => void generateGoalCharterDraft()}
               onSave={saveSettings}
               onSaveGoalCharter={() => void saveGoalCharter()}
               onApplyAutopilotPreset={applyAutopilotPreset}
               onDetectGoal={() => void detectUltimateGoal()}
               onRejectDetectedGoal={() => void rejectDetectedGoal()}
+              onDownloadUltimateGoalFormat={downloadUltimateGoalFormat}
               onClose={() => void setWorkspaceTab("overview")}
               onOpenDevTools={() => void openDevTools()}
               onRefreshGitHubStatus={() => void refreshGitHubStatus()}
