@@ -1,0 +1,27 @@
+{
+  "summary": {
+    "projectName": "AW_Trends"
+  },
+  "cycles": [
+    {
+      "cycleNumber": 21,
+      "goalPrompt": "Satisfy work package: source provenance and access policy",
+      "selectedTask": "Satisfy work package: source provenance and access policy",
+      "triedToDo": "Satisfy work package: source provenance and access policy",
+      "completedTask": "Satisfy work package: source provenance and access policy",
+      "nextRecommendedTasks": [
+        "Satisfy work package: core portfolio analytics"
+      ]
+    },
+    {
+      "cycleNumber": 22,
+      "goalPrompt": "Satisfy work package: core portfolio analytics",
+      "selectedTask": "Satisfy work package: core portfolio analytics",
+      "triedToDo": "Satisfy work package: core portfolio analytics",
+      "completedTask": "Satisfy work package: core portfolio analytics",
+      "nextRecommendedTasks": [
+        "Satisfy work package: source provenance and access policy"
+      ]
+    }
+  ]
+}

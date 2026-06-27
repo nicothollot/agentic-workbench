@@ -11,6 +11,7 @@ import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/
 import {
   buildWorkflowGoalView,
   buildWorkflowTimelineSteps,
+  deriveUserFacingWorkflowStatus,
   deriveWorkflowRuntimeStatus,
   getWorkflowRecoveryCandidate,
   workflowActionGuide,
@@ -20,6 +21,7 @@ import {
   workflowStageLabel,
   workflowStatusSummary
 } from "@shared/workflowView";
+import { buildOperatorWorkflowViewModel, suspiciousPathReason, type OperatorChangedFileGroup, type OperatorWorkflowViewModel } from "@shared/operatorWorkflowView";
 import { isWorkflowAutomationBlockingAgent } from "@shared/workflow";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
@@ -1185,32 +1187,6 @@ const getCurrentCycleChangedFiles = (workflow: ProjectWorkflowState | undefined,
     agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
   );
   return uniqueSortedStrings(currentCycleAgents.flatMap((agent) => agent.changedFiles));
-};
-
-const summarizeWorkflowChecksStatus = (
-  agent?: AgentState,
-  workflow?: ProjectWorkflowState,
-  activeStep?: ReturnType<typeof buildWorkflowTimelineSteps>[number]
-): string => {
-  const integrityReport = agent?.integrityReport;
-  if (integrityReport) {
-    const failed = integrityReport.checks.filter((check) => check.status === "failed").length;
-    const passed = integrityReport.checks.filter((check) => check.status === "passed").length;
-    if (failed > 0) {
-      return `${failed} failed, ${passed} passed`;
-    }
-    return integrityReport.checks.length ? `${passed}/${integrityReport.checks.length} checks passed` : "Integrity report recorded";
-  }
-  if (workflow?.stepProgress.integrity.status === "failed" || workflow?.workflowStopReason === "integrity_failed") {
-    return "Integrity needs repair";
-  }
-  if (workflow?.stepProgress.integrity.status === "completed") {
-    return "Integrity completed";
-  }
-  if (activeStep?.id === "integrity") {
-    return activeStep.displayStatusLabel;
-  }
-  return workflow?.scopedGoal?.testStrategy.length ? `${workflow.scopedGoal.testStrategy.length} validations planned` : "No validation result yet";
 };
 
 const workflowAttentionKindLabel = (kind: WorkflowAttentionItem["kind"]): string =>
@@ -2977,6 +2953,113 @@ const HistoryNarrativeField = ({
   </div>
 );
 
+const historyCycleCompletedTask = (cycle: WorkflowCycleSummaryView, detail?: WorkflowCycleDetail): string | undefined =>
+  detail?.retrospectiveRecord?.triedToDo ?? cycle.selectedTask;
+
+const historyValidationStatus = (cycle: WorkflowCycleSummaryView): { label: string; tone: StatusChipTone; detail: string } => {
+  const ledger = cycle.validationLedger;
+  if (!ledger) {
+    const hasCommandEvidence = cycle.commandsRun.length > 0 || cycle.errorSummaries.length > 0;
+    return {
+      label: hasCommandEvidence ? "No final ledger" : "Not run",
+      tone: hasCommandEvidence ? "warning" : "pending",
+      detail: cycle.validationOutcome ?? (hasCommandEvidence ? "Commands were recorded, but no final validation ledger is attached." : "Validation has not run for this cycle.")
+    };
+  }
+  if (ledger.finalValidationStatus === "passed" && ledger.unresolvedValidationFailures.length === 0) {
+    return { label: "Final passed", tone: "success", detail: ledger.summaryForHumans };
+  }
+  if (ledger.finalValidationStatus === "failed") {
+    return { label: "Final failed", tone: "error", detail: ledger.summaryForHumans };
+  }
+  if (ledger.finalValidationStatus === "partial") {
+    return { label: "Final partial", tone: "warning", detail: ledger.summaryForHumans };
+  }
+  return { label: ledger.finalValidationStatus.replace(/_/g, " "), tone: "warning", detail: ledger.summaryForHumans };
+};
+
+const historyMergeOutcome = (cycle: WorkflowCycleSummaryView): string => {
+  if (cycle.status === "merged") {
+    return "Merge completed.";
+  }
+  if (cycle.validationLedger?.mergeAllowed) {
+    return "Merge allowed by final validation ledger.";
+  }
+  const blocked = [
+    ...(cycle.validationLedger?.mergeBlockedReasons ?? []),
+    ...(cycle.repoHygieneReport?.mergeBlockingFindings ?? [])
+  ];
+  if (blocked.length) {
+    return `Merge blocked: ${blocked.slice(0, 3).join("; ")}`;
+  }
+  return "Merge outcome not recorded.";
+};
+
+const historyRepeatMessage = (cycle: WorkflowCycleSummaryView): string | undefined => {
+  if (!cycle.selectedTask || !cycle.nextStepRecommendation) {
+    return undefined;
+  }
+  const selected = cycle.selectedTask.toLowerCase().replace(/^satisfy work package:\s*/i, "").trim();
+  const next = cycle.nextStepRecommendation.toLowerCase().replace(/^satisfy work package:\s*/i, "").trim();
+  if (!selected || !next.includes(selected.slice(0, Math.min(40, selected.length)))) {
+    return undefined;
+  }
+  const unknown = cycle.validationLedger?.finalValidationStatus !== "passed" || /unknown|no delta|not consumed|did not reconcile/i.test([
+    cycle.validationOutcome,
+    cycle.retrospective,
+    cycle.checklistChanges.join(" ")
+  ].filter(Boolean).join(" "));
+  return unknown
+    ? "Next recommendation repeats this package because checklist or validation evidence is still unresolved."
+    : "Next recommendation repeats this package even though evidence changed; review whether reconciliation consumed the evidence.";
+};
+
+const HistoryValidationLedgerDetail = ({ cycle }: { cycle: WorkflowCycleSummaryView }) => {
+  const ledger = cycle.validationLedger;
+  if (!ledger) {
+    return (
+      <div className="history-narrative-field">
+        <span>Validation ledger</span>
+        <p>{historyValidationStatus(cycle).detail}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="history-narrative-field">
+      <span>Validation ledger</span>
+      <p>{ledger.summaryForHumans}</p>
+      <div className="operator-command-list">
+        {ledger.commandResults.slice(0, 10).map((result) => (
+          <OperatorCommandDisclosure key={result.commandId} command={result.command} result={result} label={result.phase} />
+        ))}
+      </div>
+      <OperatorMiniList label="Repaired failures" items={ledger.repairedFailures} empty="No repaired validation failures recorded." />
+      <OperatorMiniList label="Unresolved failures" items={ledger.unresolvedValidationFailures} empty="No unresolved validation failures recorded." tone={ledger.unresolvedValidationFailures.length ? "danger" : undefined} />
+    </div>
+  );
+};
+
+const HistoryHygieneDetail = ({ cycle }: { cycle: WorkflowCycleSummaryView }) => {
+  const suspiciousFiles = uniqueSortedStrings([
+    ...cycle.filesChanged.filter((file) => suspiciousPathReason(file)),
+    ...(cycle.repoHygieneReport?.forbiddenFiles ?? []).filter((file) => suspiciousPathReason(file))
+  ]);
+  return (
+    <div className="history-narrative-field">
+      <span>Merge and hygiene</span>
+      <p>{historyMergeOutcome(cycle)}</p>
+      <p>{cycle.repoHygieneReport?.summaryForHumans ?? "No repository hygiene report was attached to this cycle."}</p>
+      <OperatorMiniList
+        label="Suspicious/blocked paths"
+        items={suspiciousFiles.map((file) => `${file} - ${suspiciousPathReason(file) ?? "Blocked by hygiene scan"}`)}
+        empty="No suspicious changed paths recorded."
+        tone={suspiciousFiles.length ? "danger" : undefined}
+      />
+      <OperatorMiniList label="Cleaned generated artifacts" items={cycle.repoHygieneReport?.cleanedFiles ?? []} empty="No generated artifacts were cleaned." />
+    </div>
+  );
+};
+
 const HistoryAgentCard = ({
   agent,
   onOpenOutput,
@@ -3229,6 +3312,10 @@ const HistoryPage = ({
         const expanded = history.expandedCycleIds.includes(cycle.id);
         const agents = history.agentsByCycleId[cycle.id];
         const detail = history.detailsByCycleId[cycle.id];
+        const validationStatus = historyValidationStatus(cycle);
+        const completedTask = historyCycleCompletedTask(cycle, detail);
+        const repeatMessage = historyRepeatMessage(cycle);
+        const suspiciousFiles = cycle.filesChanged.filter((file) => suspiciousPathReason(file));
         const statusTone: StatusChipTone = cycle.hasErrors
           ? "error"
           : cycle.status === "completed" || cycle.status === "merged"
@@ -3243,9 +3330,11 @@ const HistoryPage = ({
                 <div className="candidate-card__title-row">
                   <strong>Cycle {cycle.cycleNumber}</strong>
                   <StatusChip label={cycleStatusLabel(cycle.status)} tone={statusTone} />
+                  <StatusChip label={validationStatus.label} tone={validationStatus.tone} />
+                  {suspiciousFiles.length ? <StatusChip label="Suspicious paths" tone="error" /> : null}
                 </div>
-                <p>{cycle.summary}</p>
-                <span className="agent-card__subtle">{redactSensitiveText(cycle.goalPrompt)}</span>
+                <p>Attempted: {redactSensitiveText(cycle.selectedTask ?? cycle.goalPrompt)}</p>
+                <span className="agent-card__subtle">{redactSensitiveText(cycle.summary)}</span>
               </div>
               <div className="history-cycle-card__facts">
                 <RunDetailField label="Started" value={formatDateTime(cycle.startedAt)} />
@@ -3254,35 +3343,58 @@ const HistoryPage = ({
                 <RunDetailField label="Agents" value={cycle.agentCount} />
                 <RunDetailField label="Files" value={cycle.filesChanged.length} />
                 <RunDetailField label="Commands/tests" value={cycle.commandsRun.length} />
+                <RunDetailField label="Validation" value={validationStatus.label} />
+                <RunDetailField label="Merge" value={cycle.validationLedger?.mergeAllowed ? "Allowed" : cycle.status === "merged" ? "Merged" : "Blocked/pending"} />
               </div>
             </button>
             <div className="history-cycle-card__insights">
-              <HistoryNarrativeField label="Selected task" value={cycle.selectedTask} />
+              <HistoryNarrativeField label="What this cycle attempted" value={cycle.selectedTask ?? cycle.goalPrompt} />
+              <HistoryNarrativeField label="What this cycle completed" value={completedTask} empty="Completion summary not retained." />
               <HistoryNarrativeField label="Why it was selected" value={cycle.selectionReason} />
-              <HistoryNarrativeField label="Validation outcome" value={cycle.validationOutcome} />
-              <HistoryNarrativeField label="Next-step recommendation" value={cycle.nextStepRecommendation} />
+              <HistoryNarrativeField label="Checklist delta" value={cycle.checklistChanges.join("\n") || detail?.retrospectiveRecord?.checklistDelta?.summaryForHumans} empty="No checklist delta recorded." />
+              <HistoryNarrativeField label="Final validation status" value={validationStatus.detail} />
+              <HistoryNarrativeField label="Merge outcome" value={historyMergeOutcome(cycle)} />
             </div>
             <div className="history-cycle-card__lists">
               <HistoryMiniList label="Models used" items={cycle.modelsUsed} empty="No model was recorded." />
               <HistoryMiniList label="Files changed" items={cycle.filesChanged} empty="No files changed." />
+              <HistoryMiniList label="Suspicious paths" items={suspiciousFiles.map((file) => `${file}: ${suspiciousPathReason(file)}`)} empty="No suspicious changed paths." />
               <HistoryMiniList label="Commands run" items={cycle.commandsRun} empty="No commands were recorded." />
               <HistoryMiniList label="Strategy settings used" items={cycle.strategySettingsUsed} empty="No planner strategy snapshot was recorded." />
               <HistoryMiniList label="Checklist/goal items targeted" items={cycle.checklistTargets} empty="No targeted checklist items were recorded." />
-              <HistoryMiniList label="Checklist changes" items={cycle.checklistChanges} empty="No checklist changes were proposed or recorded." />
+              <HistoryMiniList label="Checklist changes" items={cycle.checklistChanges} empty="No checklist changes are attached to this cycle." />
               <HistoryMiniList label="Goal proposals" items={cycle.goalChangeProposals} empty="No goal changes were proposed." />
               <HistoryMiniList label="Errors" items={cycle.errorSummaries} empty="No errors were recorded." />
               <HistoryMiniList label="Approvals" items={cycle.approvalSummaries} empty="No approvals were requested." />
               <HistoryMiniList label="User input requests" items={cycle.userInputRequestSummaries} empty="No user input was requested." />
             </div>
+            <div className="history-cycle-card__next">
+              <HistoryNarrativeField label="What the planner recommended next" value={cycle.nextStepRecommendation} empty="No next recommendation was retained." />
+              {repeatMessage ? <div className="notice notice--compact">{repeatMessage}</div> : null}
+            </div>
             {cycle.retrospective ? <HistoryNarrativeField label="Retrospective" value={cycle.retrospective} /> : null}
             {expanded ? (
               <div className="history-cycle-card__details">
                 {detail ? (
-                  <div className="history-cycle-detail-grid">
-                    <HistoryMiniList label="Accepted decisions" items={detail.decisions.map((decision) => `${decision.kind}: ${decision.title}`)} empty="No accepted decisions were retained." limit={8} />
-                    <HistoryMiniList label="Open issues" items={detail.openIssues.map((issue) => `${issue.title}: ${issue.detail}`)} empty="No open issues were attached." limit={8} />
-                    <HistoryMiniList label="Recent activity" items={detail.activity.map((event) => `${formatClockTime(event.timestamp)} ${event.title}${event.detail ? `: ${event.detail}` : ""}`)} empty="No detailed activity was retained." limit={10} />
-                  </div>
+                  <>
+                    <div className="history-cycle-detail-grid">
+                      <HistoryNarrativeField label="Cycle started with task" value={detail.retrospectiveRecord?.cycleContract?.selectedTaskTitle ?? detail.selectedTask ?? detail.goalPrompt} />
+                      <HistoryNarrativeField label="Cycle contract objective" value={detail.retrospectiveRecord?.cycleContract?.concreteGoalForThisCycle} empty="No cycle contract objective retained." />
+                      <HistoryNarrativeField label="Why it was selected" value={detail.plannerDecision?.whySelected ?? detail.selectionReason} />
+                      <HistoryNarrativeField label="Planner recommended next" value={detail.nextStepRecommendation} empty="No next recommendation retained." />
+                    </div>
+                    <div className="history-cycle-detail-grid">
+                      <HistoryMiniList label="Accepted decisions" items={detail.decisions.map((decision) => `${decision.kind}: ${decision.title}`)} empty="No accepted decisions were retained." limit={8} />
+                      <HistoryMiniList label="Open issues" items={detail.openIssues.map((issue) => `${issue.title}: ${issue.detail}`)} empty="No open issues were attached." limit={8} />
+                      <HistoryMiniList label="Recent activity" items={detail.activity.map((event) => `${formatClockTime(event.timestamp)} ${event.title}${event.detail ? `: ${event.detail}` : ""}`)} empty="No detailed activity was retained." limit={10} />
+                      <HistoryMiniList label="Score breakdown" items={detail.plannerDecision ? Object.entries(detail.plannerDecision.scoreBreakdown).map(([key, value]) => `${key}: ${value}`) : []} empty="No planner score breakdown retained." limit={10} />
+                    </div>
+                    <div className="history-cycle-detail-grid">
+                      <HistoryValidationLedgerDetail cycle={detail} />
+                      <HistoryHygieneDetail cycle={detail} />
+                    </div>
+                    <OperatorRawDetails title="Raw cycle summary" value={detail} />
+                  </>
                 ) : null}
                 {agents?.loading ? <LoadingIndicator label="Loading cycle agents" compact /> : null}
                 {agents?.error ? <div className="notice notice--error">{agents.error}</div> : null}
@@ -3877,6 +3989,7 @@ const RepositoryPanel = ({
   summaryActionBusy,
   questionDraft,
   agentActionsBlocked,
+  operatorView,
   onRescanRepository,
   onDeepScanRepository,
   onTreeFilterChange,
@@ -3912,6 +4025,7 @@ const RepositoryPanel = ({
   summaryActionBusy?: { path: string; action: "summary" | "question" | "window" };
   questionDraft: string;
   agentActionsBlocked: boolean;
+  operatorView: OperatorWorkflowViewModel;
   onRescanRepository: () => void;
   onDeepScanRepository: (settings?: RepositoryScanSettings) => void;
   onTreeFilterChange: (value: string) => void;
@@ -4030,6 +4144,81 @@ const RepositoryPanel = ({
           <p>{formatMilliseconds(repositoryScanStatus?.scanDurationMs ?? stats?.scanDurationMs)}</p>
         </article>
       </section>
+
+      <article className="repository-section repository-workflow-health">
+        <SectionTitle
+          eyebrow="Workflow safety"
+          title="Repository health for current cycle"
+          meta={<StatusChip label={operatorView.repositoryHealth.hygieneLabel} tone={operatorStatusTone(operatorView.repositoryHealth.hygieneStatus)} />}
+        />
+        <div className="repository-coverage-grid">
+          <div>
+            <span>Indexed status</span>
+            <strong>{operatorView.repositoryHealth.indexedLabel}</strong>
+          </div>
+          <div>
+            <span>Detected project type</span>
+            <strong>{operatorView.repositoryHealth.detectedProjectType}</strong>
+          </div>
+          <div>
+            <span>Validation status</span>
+            <strong>{operatorView.repositoryHealth.validationLabel}</strong>
+          </div>
+          <div>
+            <span>Hygiene status</span>
+            <strong>{operatorView.repositoryHealth.hygieneLabel}</strong>
+          </div>
+          <div>
+            <span>Runtime</span>
+            <strong>{operatorView.repositoryHealth.runtimeLabel}</strong>
+          </div>
+          <div>
+            <span>Changed-file groups</span>
+            <strong>{operatorView.repositoryHealth.changedFileGroups.map((group) => `${group.label}: ${group.files.length}`).join(" · ") || "No active changes"}</strong>
+          </div>
+        </div>
+        <div className="repository-two-column">
+          <OperatorMiniList
+            label="Suspicious paths"
+            items={operatorView.repositoryHealth.suspiciousPaths.map((file) => `${file} - ${suspiciousPathReason(file) ?? "Blocked by hygiene scan"}`)}
+            empty="No suspicious active-cycle paths detected."
+            tone={operatorView.repositoryHealth.suspiciousPaths.length ? "danger" : undefined}
+          />
+          <OperatorMiniList
+            label="Generated artifacts cleaned"
+            items={operatorView.repositoryHealth.cleanedGeneratedArtifacts}
+            empty="No generated artifacts were cleaned by hygiene."
+          />
+        </div>
+        <div className="repository-two-column">
+          <OperatorMiniList
+            label="Project-supported validation commands"
+            items={operatorView.repositoryHealth.testCommandCandidates}
+            empty="No validation command candidates are recorded in the cycle contract."
+          />
+          <OperatorMiniList
+            label="Project-supported evidence commands"
+            items={operatorView.repositoryHealth.evidenceCommandCandidates}
+            empty="No evidence command candidates discovered for this project."
+          />
+        </div>
+        <div className="operator-contract-section">
+          <span className="workflow-option__label">Current changed-file risk grouping</span>
+          <OperatorChangedFiles groups={operatorView.repositoryHealth.changedFileGroups} empty="No active workflow changed files are recorded." />
+        </div>
+        <div className="operator-contract-section">
+          <span className="workflow-option__label">Command readiness</span>
+          <div className="repository-coverage-grid">
+            {operatorView.repositoryHealth.commandAvailability.map((command) => (
+              <div key={command.label}>
+                <span>{command.label}</span>
+                <strong>{command.available === true ? "Available" : command.available === false ? "Not detected" : "Unknown"}</strong>
+                <p>{command.detail}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </article>
 
       <article className="repository-section repository-scan-status-card">
         <SectionTitle
@@ -5117,164 +5306,435 @@ const WorkflowStaleRecoveryPanel = ({
   </article>
 );
 
-const WorkflowPlanSummaryCard = ({
-  goalSummary,
-  recommendationSummary,
-  objective,
-  scope,
-  filesLikelyInvolved,
-  validationRequired,
-  constraints,
-  doneCondition,
-  rawPlan
+const operatorStatusTone = (status: string): StatusChipTone => {
+  if (status === "passed") {
+    return "success";
+  }
+  if (status === "failed") {
+    return "error";
+  }
+  if (status === "partial" || status === "warning") {
+    return "warning";
+  }
+  if (status === "running") {
+    return "running";
+  }
+  return "pending";
+};
+
+const operatorGroupTone = (group: OperatorChangedFileGroup): "warning" | "danger" | undefined =>
+  group.kind === "suspicious" ? "danger" : group.kind === "generated" ? "warning" : undefined;
+
+const OperatorMiniList = ({
+  label,
+  items,
+  empty,
+  limit = 8,
+  tone
 }: {
-  goalSummary: string;
-  recommendationSummary: string;
-  objective: string;
-  scope: string;
-  filesLikelyInvolved: string[];
-  validationRequired: string[];
-  constraints: string[];
-  doneCondition: string[];
-  rawPlan: string;
-}) => (
-  <article className="workflow-plan-card">
-    <SectionTitle eyebrow="Goal and scoped plan" title="Current goal" />
-    <p className="workflow-plan-card__goal">{goalSummary}</p>
-    <div className="workflow-plan-card__grid">
-      <div>
-        <span className="workflow-option__label">Recommendation summary</span>
-        <p>{recommendationSummary}</p>
-      </div>
-      <div>
-        <span className="workflow-option__label">Objective</span>
-        <p>{objective}</p>
-      </div>
-      <div>
-        <span className="workflow-option__label">Scope</span>
-        <p>{scope}</p>
-      </div>
-      <div>
-        <span className="workflow-option__label">Files likely involved</span>
-        {filesLikelyInvolved.length ? (
-          <div className="tag-row">
-            {filesLikelyInvolved.slice(0, 8).map((file) => <span key={file} className="tag">{file}</span>)}
-          </div>
-        ) : <p>No likely files identified yet.</p>}
-      </div>
-      <div>
-        <span className="workflow-option__label">Validation required</span>
-        {validationRequired.length ? (
-          <ul className="workflow-compact-list">
-            {validationRequired.slice(0, 4).map((item) => <li key={item}>{item}</li>)}
-          </ul>
-        ) : <p>No validation plan has been scoped yet.</p>}
-      </div>
-      <div>
-        <span className="workflow-option__label">Constraints</span>
-        {constraints.length ? (
-          <ul className="workflow-compact-list">
-            {constraints.slice(0, 4).map((item) => <li key={item}>{item}</li>)}
-          </ul>
-        ) : <p>No additional constraints captured for this plan.</p>}
-      </div>
-      <div className="workflow-plan-card__wide">
-        <span className="workflow-option__label">Done condition</span>
-        {doneCondition.length ? (
-          <ul className="workflow-compact-list">
-            {doneCondition.slice(0, 5).map((item) => <li key={item}>{item}</li>)}
-          </ul>
-        ) : <p>The done condition will appear after the goal is scoped.</p>}
-      </div>
+  label: string;
+  items: string[];
+  empty: string;
+  limit?: number;
+  tone?: "warning" | "danger";
+}) => {
+  const visible = items.slice(0, limit);
+  return (
+    <div className={`operator-mini-list ${tone ? `operator-mini-list--${tone}` : ""}`}>
+      <span className="workflow-option__label">{label}</span>
+      {visible.length ? (
+        <div className="tag-row">
+          {visible.map((item) => <span key={`${label}:${item}`} className="tag">{redactSensitiveText(item)}</span>)}
+          {items.length > visible.length ? <span className="tag">+{items.length - visible.length} more</span> : null}
+        </div>
+      ) : <p>{empty}</p>}
     </div>
-    <details className="workflow-inline-details">
-      <summary>View full plan</summary>
-      <p>{rawPlan}</p>
-    </details>
-  </article>
+  );
+};
+
+const OperatorRawDetails = ({
+  title,
+  value
+}: {
+  title: string;
+  value: unknown;
+}) => (
+  <details className="workflow-inline-details">
+    <summary>{title}</summary>
+    <pre className="long-text-block">{typeof value === "string" ? redactSensitiveText(value) : JSON.stringify(value, null, 2)}</pre>
+  </details>
 );
 
-const WorkflowChecklistSummaryCard = ({
-  overview,
-  checklist
+const OperatorChangedFiles = ({
+  groups,
+  empty = "No changed files are recorded for this cycle."
 }: {
-  overview: WorkflowChecklistOverview;
-  checklist: ProjectWorkflowState["goalChecklist"];
+  groups: OperatorChangedFileGroup[];
+  empty?: string;
 }) => (
-  <article className="workflow-checklist-card">
-    <SectionTitle
-      eyebrow="Goal progress"
-      title="Checklist summary"
-      meta={<span className="badge">{overview.requiredMet}/{overview.requiredTotal} checks met</span>}
-    />
-    {typeof overview.percentComplete === "number" ? (
-      <div className="workflow-goal-progress__bar" role="progressbar" aria-label="Estimated goal completion" aria-valuemin={0} aria-valuemax={100} aria-valuenow={overview.percentComplete}>
-        <div className="workflow-goal-progress__fill" style={{ width: `${overview.percentComplete}%` }} />
-      </div>
-    ) : null}
-    <div className="workflow-checklist-card__stats">
-      <div>
-        <span>Goal completion</span>
-        <strong>{typeof overview.percentComplete === "number" ? `${overview.percentComplete}%` : "Unknown"}</strong>
-      </div>
-      <div>
-        <span>Open checks</span>
-        <strong>{overview.openRequired}</strong>
-      </div>
-      <div>
-        <span>Unknown</span>
-        <strong>{overview.unknownCount}</strong>
-      </div>
-      <div>
-        <span>Groups</span>
-        <strong>{overview.groups.length}</strong>
-      </div>
-    </div>
-    <div className="workflow-checklist-card__groups">
-      <div>
-        <span className="workflow-option__label">Top open groups</span>
-        {overview.topOpenGroups.length ? overview.topOpenGroups.map((group) => (
-          <div key={group.id} className="workflow-group-row">
-            <strong>{group.title}</strong>
-            <span>{group.openCount} open</span>
-          </div>
-        )) : <p className="agent-card__subtle">No required checks are open.</p>}
-      </div>
-      <div>
-        <span className="workflow-option__label">Top met groups</span>
-        {overview.topMetGroups.length ? overview.topMetGroups.map((group) => (
-          <div key={group.id} className="workflow-group-row">
-            <strong>{group.title}</strong>
-            <span>{group.metCount} met</span>
-          </div>
-        )) : <p className="agent-card__subtle">No checks have been marked met yet.</p>}
-      </div>
-      <div>
-        <span className="workflow-option__label">Blocked/unknown groups</span>
-        {overview.topUnknownGroups.length ? overview.topUnknownGroups.map((group) => (
-          <div key={group.id} className="workflow-group-row">
-            <strong>{group.title}</strong>
-            <span>{group.blockedCount || group.unknownCount} attention</span>
-          </div>
-        )) : <p className="agent-card__subtle">No unknown groups stand out.</p>}
-      </div>
-    </div>
-    <details className="workflow-inline-details">
-      <summary>View full checklist</summary>
-      <div className="goal-checklist-preview">
-        {checklist.length ? checklist.map((check) => (
-          <div key={check.id} className="goal-checklist-preview__item">
-            <span className={`badge goal-check-badge goal-check-badge--${check.status}`}>{goalCheckStatusLabel(check.status)}</span>
-            <div className="goal-checklist-preview__copy">
-              <strong>{check.title}</strong>
-              <span>{check.required ? "Required" : "Optional"} · {goalCheckSourceLabel(check.source)}{check.evidence ? ` · ${check.evidence}` : ""}</span>
-            </div>
-          </div>
-        )) : <div className="empty-copy">No checklist has been generated yet.</div>}
-      </div>
-    </details>
-  </article>
+  <div className="operator-changed-files">
+    {groups.length ? groups.map((group) => (
+      <OperatorMiniList
+        key={group.kind}
+        label={group.label}
+        items={group.files.map((file) => {
+          const reason = suspiciousPathReason(file);
+          return reason ? `${file} - ${reason}` : file;
+        })}
+        empty="None"
+        limit={10}
+        tone={operatorGroupTone(group)}
+      />
+    )) : <p>{empty}</p>}
+  </div>
 );
+
+const OperatorCommandDisclosure = ({
+  command,
+  result,
+  label = "Command"
+}: {
+  command: string;
+  result?: NonNullable<OperatorWorkflowViewModel["currentCycle"]["validationLedger"]>["commandResults"][number];
+  label?: string;
+}) => (
+  <details className={`operator-command ${result?.status && result.status !== "passed" ? "operator-command--failed" : ""}`}>
+    <summary>
+      <span>{label}</span>
+      <code>{redactSensitiveText(command)}</code>
+      {result ? <StatusChip label={result.status} tone={result.status === "passed" ? "success" : result.status === "skipped" ? "warning" : "error"} /> : <span className="badge">planned</span>}
+    </summary>
+    <div className="operator-command__body">
+      <CopyButton value={command} label="Copy command" />
+      <div className="workflow-now-card__grid">
+        <div>
+          <span>Exit status</span>
+          <strong>{result?.exitCode ?? "Not run"}</strong>
+        </div>
+        <div>
+          <span>Phase</span>
+          <strong>{result?.phase ?? "Planned"}</strong>
+        </div>
+        <div>
+          <span>Failure class</span>
+          <strong>{result?.classifiedFailure?.kind?.replace(/_/g, " ") ?? "None"}</strong>
+        </div>
+      </div>
+      {result?.classifiedFailure ? <p>{result.classifiedFailure.summary}</p> : null}
+      {result?.stdoutSummary ? <pre className="long-text-block">{redactSensitiveText(result.stdoutSummary)}</pre> : null}
+      {result?.stderrSummary ? <pre className="long-text-block">{redactSensitiveText(result.stderrSummary)}</pre> : null}
+      {result?.fullOutputRef ? <p>Full output ref: {result.fullOutputRef}</p> : null}
+    </div>
+  </details>
+);
+
+const OperatorScoreBreakdown = ({
+  scores
+}: {
+  scores: OperatorWorkflowViewModel["planner"]["scoreBreakdown"];
+}) => (
+  <div className="operator-score-grid">
+    {scores.length ? scores.map((score) => (
+      <div key={score.key} className={score.value < 0 ? "operator-score-grid__item operator-score-grid__item--negative" : "operator-score-grid__item"}>
+        <span>{score.label}</span>
+        <strong>{score.value}</strong>
+      </div>
+    )) : <p>No planner score breakdown was recorded.</p>}
+  </div>
+);
+
+const WorkflowValidationLedgerCard = ({
+  view
+}: {
+  view: OperatorWorkflowViewModel;
+}) => {
+  const ledger = view.currentCycle.validationLedger;
+  const summary = view.currentCycle.validationSummary;
+  return (
+    <article className="workflow-checklist-card operator-validation-card">
+      <SectionTitle
+        eyebrow="Validation ledger"
+        title="Failed attempts, repairs, and final status"
+        meta={<StatusChip label={summary.finalStatusLabel} tone={operatorStatusTone(summary.finalStatus)} />}
+      />
+      <div className="workflow-checklist-card__stats">
+        <div>
+          <span>Planned</span>
+          <strong>{summary.planned.length}</strong>
+        </div>
+        <div>
+          <span>Attempted</span>
+          <strong>{summary.attempted.length}</strong>
+        </div>
+        <div>
+          <span>Failed attempts</span>
+          <strong>{summary.failedAttempts}</strong>
+        </div>
+        <div>
+          <span>Repaired</span>
+          <strong>{summary.repaired.length}</strong>
+        </div>
+        <div>
+          <span>Final</span>
+          <strong>{summary.finalStatusLabel}</strong>
+        </div>
+        <div>
+          <span>Merge</span>
+          <strong>{summary.mergeAllowed ? "Allowed" : "Blocked"}</strong>
+        </div>
+      </div>
+      {view.emptyStates.validationLedger ? <p>{view.emptyStates.validationLedger}</p> : <p>{ledger?.summaryForHumans}</p>}
+      <div className="operator-command-list">
+        {ledger?.commandResults.length ? ledger.commandResults.map((result) => (
+          <OperatorCommandDisclosure key={result.commandId} command={result.command} result={result} label={result.phase} />
+        )) : summary.planned.map((command) => (
+          <OperatorCommandDisclosure key={command} command={command} />
+        ))}
+      </div>
+      <OperatorMiniList label="Repaired failures" items={summary.repaired} empty="No failed validation attempts were repaired yet." />
+      <OperatorMiniList label="Merge blocked reasons" items={summary.mergeBlockedReasons} empty="No merge-blocking validation reasons recorded." tone={summary.mergeBlockedReasons.length ? "danger" : undefined} />
+      <OperatorMiniList label="Validation warnings" items={summary.warnings} empty="No validation warnings recorded." tone={summary.warnings.length ? "warning" : undefined} />
+      <OperatorRawDetails title="Raw validation ledger" value={ledger ?? view.emptyStates.validationLedger ?? "No validation ledger recorded."} />
+    </article>
+  );
+};
+
+const WorkflowChecklistProgressCard = ({
+  view
+}: {
+  view: OperatorWorkflowViewModel;
+}) => {
+  const delta = view.currentCycle.checklistDeltaSummary;
+  return (
+    <article className="workflow-checklist-card operator-checklist-card">
+      <SectionTitle
+        eyebrow="Checklist progress this cycle"
+        title="Evidence reconciliation"
+        meta={<span className="badge">{delta.newlyMet.length} newly met</span>}
+      />
+      <div className="workflow-checklist-card__stats">
+        <div>
+          <span>Newly met</span>
+          <strong>{delta.newlyMet.length}</strong>
+        </div>
+        <div>
+          <span>Still unknown</span>
+          <strong>{delta.stillUnknown.length}</strong>
+        </div>
+        <div>
+          <span>Needs attention</span>
+          <strong>{delta.needsAttention.length}</strong>
+        </div>
+        <div>
+          <span>Evidence observed</span>
+          <strong>{delta.evidenceObserved}</strong>
+        </div>
+        <div>
+          <span>Consumed</span>
+          <strong>{delta.evidenceConsumed}</strong>
+        </div>
+        <div>
+          <span>Not consumed</span>
+          <strong>{delta.evidenceNotConsumed}</strong>
+        </div>
+      </div>
+      <p>{delta.summary}</p>
+      {delta.emptyReason ? <div className="notice notice--compact">{delta.emptyReason}</div> : null}
+      <OperatorMiniList label="Newly met check IDs" items={delta.newlyMet} empty="No targeted checks became met in this cycle yet." />
+      <OperatorMiniList label="Still unknown check IDs" items={delta.stillUnknown} empty="No targeted checks remain unknown." tone={delta.stillUnknown.length ? "warning" : undefined} />
+      <OperatorMiniList label="Needs attention check IDs" items={delta.needsAttention} empty="No targeted checks are marked needs attention." tone={delta.needsAttention.length ? "danger" : undefined} />
+      <OperatorMiniList label="Evidence not consumed" items={delta.evidenceNotConsumedReasons} empty="No unconsumed evidence reasons recorded." tone={delta.evidenceNotConsumedReasons.length ? "warning" : undefined} />
+      <div className="operator-reason-list">
+        {Object.entries(delta.whyStillUnknownByCheckId).length ? Object.entries(delta.whyStillUnknownByCheckId).map(([checkId, reason]) => (
+          <div key={checkId} className="lane-note">
+            <strong>{checkId}</strong>
+            <span>{reason}</span>
+          </div>
+        )) : <p>No per-check unknown reasons have been recorded yet.</p>}
+      </div>
+      <OperatorRawDetails title="Raw checklist delta" value={view.currentCycle.checklistDelta ?? view.emptyStates.checklistDelta ?? "No checklist delta recorded."} />
+      <OperatorRawDetails title="Evidence observation summary" value={view.currentCycle.checklistDelta ? {
+        observed: view.currentCycle.checklistDelta.evidenceObservedCount,
+        consumed: view.currentCycle.checklistDelta.evidenceConsumedCount,
+        notConsumed: view.currentCycle.checklistDelta.evidenceNotConsumedCount,
+        whyStillUnknownByCheckId: view.currentCycle.checklistDelta.whyStillUnknownByCheckId
+      } : view.emptyStates.checklistDelta ?? "Evidence observations have not been reconciled for this cycle."} />
+    </article>
+  );
+};
+
+const WorkflowCycleContractCard = ({
+  view
+}: {
+  view: OperatorWorkflowViewModel;
+}) => {
+  const contract = view.currentCycle.cycleContract;
+  if (!contract) {
+    return (
+      <article className="workflow-plan-card operator-cycle-contract">
+        <SectionTitle eyebrow="Cycle Contract" title="No contract recorded" />
+        <p>{view.emptyStates.cycleContract ?? "No cycle contract has been recorded yet."}</p>
+      </article>
+    );
+  }
+  const validationResultsByCommand = new Map(
+    (view.currentCycle.validationLedger?.commandResults ?? []).map((result) => [result.command, result])
+  );
+  return (
+    <article className="workflow-plan-card operator-cycle-contract">
+      <SectionTitle
+        eyebrow="Cycle Contract"
+        title="Goal of this cycle"
+        meta={<span className="badge">Cycle {contract.cycleNumber}</span>}
+      />
+      <p className="workflow-plan-card__goal">
+        Goal of this cycle: {contract.concreteGoalForThisCycle}
+      </p>
+      <div className="operator-contract-section">
+        <span className="workflow-option__label">Plain English objective</span>
+        <p>{contract.plainEnglishObjective}</p>
+      </div>
+
+      <div className="operator-contract-section">
+        <div className="candidate-card__title-row">
+          <span className="workflow-option__label">Targeted required checks</span>
+          <span className="badge">{contract.targetedChecklistItems.length}</span>
+        </div>
+        <div className="operator-target-checks">
+          {contract.targetedChecklistItems.length ? contract.targetedChecklistItems.map((item) => (
+            <details key={item.checkId} className="operator-target-check" open>
+              <summary>
+                <span>{item.checkId}</span>
+                <strong>{item.title}</strong>
+                <StatusChip label={goalCheckStatusLabel(item.currentStatus)} tone={item.currentStatus === "met" ? "success" : item.currentStatus === "unmet" ? "error" : "warning"} />
+              </summary>
+              <p>{item.fullDescription}</p>
+              <div className="workflow-now-card__grid">
+                <div>
+                  <span>Previous</span>
+                  <strong>{goalCheckStatusLabel(item.previousStatus)}</strong>
+                </div>
+                <div>
+                  <span>Current</span>
+                  <strong>{goalCheckStatusLabel(item.currentStatus)}</strong>
+                </div>
+                <div>
+                  <span>Evidence history</span>
+                  <strong>{item.evidenceHistoryCount}</strong>
+                </div>
+              </div>
+              <div className="operator-contract-subgrid">
+                <div>
+                  <span className="workflow-option__label">Why targeted</span>
+                  <p>{item.whyTargeted}</p>
+                </div>
+                <div>
+                  <span className="workflow-option__label">Expected evidence</span>
+                  <p>{item.acceptanceHint}</p>
+                </div>
+                <div>
+                  <span className="workflow-option__label">Previous evidence</span>
+                  <p>{item.currentEvidence || "No previous evidence recorded."}</p>
+                </div>
+                <div>
+                  <span className="workflow-option__label">Observable signals</span>
+                  <div className="tag-row">
+                    {item.observableSignalsExpected.map((signal) => <span key={`${item.checkId}:${signal}`} className="tag">{signal}</span>)}
+                  </div>
+                </div>
+              </div>
+              <CopyButton value={`${item.checkId}\n${item.title}\n${item.fullDescription}\nExpected evidence: ${item.acceptanceHint}`} label="Copy check" />
+            </details>
+          )) : <p>No targeted checklist items were recorded in the cycle contract.</p>}
+        </div>
+      </div>
+
+      <div className="workflow-plan-card__grid">
+        <div>
+          <span className="workflow-option__label">Done when</span>
+          <ul className="workflow-compact-list">
+            {contract.doneWhen.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+        <div>
+          <span className="workflow-option__label">Expected files/areas</span>
+          <div className="tag-row">
+            {contract.expectedFilesOrAreas.length ? contract.expectedFilesOrAreas.map((file) => (
+              <span key={file} className="tag">{file}{view.currentCycle.changedFiles.includes(file) ? " · touched" : ""}</span>
+            )) : <span className="tag">No expected files recorded</span>}
+          </div>
+        </div>
+        <div>
+          <span className="workflow-option__label">Expected validation commands</span>
+          <div className="operator-command-list">
+            {contract.expectedValidationCommands.length ? contract.expectedValidationCommands.map((command) => (
+              <OperatorCommandDisclosure key={`validation:${command}`} command={command} result={validationResultsByCommand.get(command)} label="validation" />
+            )) : <p>No validation commands were scoped for this cycle.</p>}
+          </div>
+        </div>
+        <div>
+          <span className="workflow-option__label">Expected evidence commands</span>
+          <div className="operator-command-list">
+            {contract.expectedEvidenceCommands.length ? contract.expectedEvidenceCommands.map((command) => (
+              <OperatorCommandDisclosure key={`evidence:${command}`} command={command} result={validationResultsByCommand.get(command)} label="evidence" />
+            )) : <p>{view.emptyStates.evidenceCommands ?? "No evidence commands discovered for this project."}</p>}
+          </div>
+        </div>
+        <div className="workflow-plan-card__wide">
+          <span className="workflow-option__label">Why selected now</span>
+          <p>{contract.whySelectedNow}</p>
+          <OperatorScoreBreakdown scores={view.planner.scoreBreakdown} />
+          {view.planner.repeatedWorkWarning ? <div className="notice notice--compact">{view.planner.repeatedWorkWarning}</div> : null}
+          {view.planner.fallbackWarning ? <div className="notice notice--compact">{view.planner.fallbackWarning}</div> : null}
+        </div>
+        <div>
+          <span className="workflow-option__label">Prior similar attempts</span>
+          {contract.priorSimilarAttempts.length ? contract.priorSimilarAttempts.map((attempt) => (
+            <div key={`${attempt.cycleNumber}:${attempt.attemptedTaskTitle}`} className="lane-note">
+              <strong>Cycle {attempt.cycleNumber}: {attempt.attemptedTaskTitle}</strong>
+              <span>{attempt.validationSummary} · {attempt.checklistDeltaSummary}</span>
+            </div>
+          )) : <p>No prior similar attempts recorded.</p>}
+        </div>
+        <div>
+          <span className="workflow-option__label">Failure modes</span>
+          <ul className="workflow-compact-list">
+            {contract.failureModes.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+      </div>
+
+      <div className="operator-contract-section">
+        <span className="workflow-option__label">Actual changed files by risk group</span>
+        <OperatorChangedFiles groups={view.currentCycle.changedFilesSummary} />
+      </div>
+
+      <div className="operator-contract-section">
+        <span className="workflow-option__label">Planner health</span>
+        <div className="workflow-now-card__grid">
+          <div>
+            <span>Selected source</span>
+            <strong>{contract.selectedTaskSource.replace(/_/g, " ")}</strong>
+          </div>
+          <div>
+            <span>Structured failures</span>
+            <strong>{view.currentCycle.recommendationHealth?.consecutiveStructuredFailures ?? 0}</strong>
+          </div>
+          <div>
+            <span>Fallback</span>
+            <strong>{view.currentCycle.recommendationHealth?.fallbackUsedForCurrentRecommendation ? "Used" : "Not used"}</strong>
+          </div>
+        </div>
+      </div>
+
+      <div className="operator-raw-grid">
+        <OperatorRawDetails title="Full cycle contract JSON" value={contract} />
+        <OperatorRawDetails title="Raw recommendation health" value={view.currentCycle.recommendationHealth ?? view.emptyStates.recommendationHealth ?? "No recommendation health recorded."} />
+        <OperatorRawDetails title="Raw agent messages" value={view.currentCycle.currentAgentMessages.length ? view.currentCycle.currentAgentMessages : "No current agent messages captured."} />
+      </div>
+    </article>
+  );
+};
 
 const WorkflowStatusStrip = ({
   items
@@ -8109,6 +8569,33 @@ const WorkbenchApp = () => {
       ?? workflowAgents.find(isCurrentCycleAgent)
       ?? workflowAgents[0];
   }, [workflow, workflowAgents]);
+  const latestValidationLedger = useMemo(() => {
+    if (!workflow) {
+      return undefined;
+    }
+    return workflow.validationLedgers
+      .filter((ledger) => ledger.cycleNumber === workflow.workflowCycle.cycleNumber)
+      .slice()
+      .sort((left, right) => toTime(right.updatedAt) - toTime(left.updatedAt))[0];
+  }, [workflow]);
+  const latestRepoHygieneReport = useMemo(() => {
+    if (!workflow) {
+      return undefined;
+    }
+    return workflow.repoHygieneReports
+      .slice()
+      .sort((left, right) => toTime(right.scannedAt) - toTime(left.scannedAt))[0];
+  }, [workflow]);
+  const userFacingWorkflowStatus = useMemo(() =>
+    workflow
+      ? deriveUserFacingWorkflowStatus(workflow, {
+        agents: workflowAgents,
+        validationLedger: latestValidationLedger,
+        repoHygieneReport: latestRepoHygieneReport,
+        workflowPauseRequested
+      })
+      : undefined,
+  [latestRepoHygieneReport, latestValidationLedger, workflow, workflowAgents, workflowPauseRequested]);
   const workflowChecklistSummary = useMemo(() => {
     const checks = workflow?.goalChecklist ?? [];
     if (checks.length === 0) {
@@ -8120,49 +8607,6 @@ const WorkbenchApp = () => {
     return `${metChecks.length}/${requiredChecks.length} required met (${checks.length} total)`;
   }, [workflow]);
   const workflowGlanceGoal = workflowGoalView?.currentGoal ?? workflow?.ultimateGoal.summary ?? "Set the Ultimate Goal";
-  const workflowGlanceActivity = currentWorkflowAgent
-    ? agentPreviewText(currentWorkflowAgent, workflow)
-    : activeWorkflowStep?.currentActivity ?? workflowGoalView?.currentFocus ?? (
-      workflow ? workflowStatusSummary(workflow, autopilotEnabled, workflowObjective) : "Workflow state unavailable."
-    );
-  const workflowGlanceRecommendation = workflow?.approvedRecommendation?.title
-    ?? (workflow?.recommendations[0]?.title ? `Awaiting choice: ${workflow.recommendations[0].title}` : "No recommendation selected yet");
-  const workflowGlancePlan = workflow?.scopedGoal?.executionBrief
-    ?? workflowGoalView?.executionPlan
-    ?? workflow?.approvedRecommendation?.summary
-    ?? "Waiting for a scoped execution plan.";
-  const workflowGlanceSteps = useMemo(() => {
-    if (!workflow) {
-      return [];
-    }
-
-    if (workflow.scopedGoal) {
-      return [
-        workflow.scopedGoal.summary,
-        ...workflow.scopedGoal.acceptanceCriteria.slice(0, 3).map((criterion) => `Meet: ${criterion}`),
-        ...workflow.scopedGoal.testStrategy.slice(0, 2).map((strategy) => `Validate: ${strategy}`)
-      ].filter((step) => step.trim().length > 0);
-    }
-
-    if (workflow.approvedRecommendation) {
-      return [
-        "Turn the chosen recommendation into a scoped goal.",
-        "Run the coding agent against that scoped goal.",
-        "Run integrity checks against the scoped goal and Ultimate Goal.",
-        "Merge or finalize the validated result."
-      ];
-    }
-
-    if (workflow.recommendations.length > 0) {
-      return [
-        "Choose one recommendation.",
-        "Create a scoped implementation goal.",
-        "Run coding, validation, and integration for that goal."
-      ];
-    }
-
-    return [];
-  }, [workflow]);
   const repairAttemptReports = useMemo(
     () => workflow ? collectRepairAttemptReports(workflow, workflowAgents) : [],
     [workflow, workflowAgents]
@@ -8185,6 +8629,39 @@ const WorkbenchApp = () => {
   const currentWorkflowChangedFiles = useMemo(
     () => getCurrentCycleChangedFiles(workflow, workflowAgents),
     [workflow, workflowAgents]
+  );
+  const operatorWorkflowView = useMemo(
+    () => buildOperatorWorkflowViewModel({
+      workflow,
+      agents: workflowAgents,
+      projectName: activeProject?.record.identity.projectName,
+      branch: activeProject?.record.validation.branch ?? activeProject?.record.displayPath,
+      lastUpdated: workflowLastUpdatedAt ?? activeProject?.record.localState.lastOpenedAt,
+      workflowPauseRequested,
+      approvalCount: workflowPendingApprovals.length,
+      repositoryScanStatus,
+      repositorySummary: repositoryData.projectId === activeProject?.record.id ? repositoryData : null,
+      validationLedger: latestValidationLedger,
+      repoHygieneReport: latestRepoHygieneReport,
+      runtimeReady: state?.runtimeReadiness.status === "ready"
+    }),
+    [
+      activeProject?.record.displayPath,
+      activeProject?.record.id,
+      activeProject?.record.identity.projectName,
+      activeProject?.record.localState.lastOpenedAt,
+      activeProject?.record.validation.branch,
+      latestRepoHygieneReport,
+      latestValidationLedger,
+      repositoryData,
+      repositoryScanStatus,
+      state?.runtimeReadiness.status,
+      workflow,
+      workflowAgents,
+      workflowLastUpdatedAt,
+      workflowPauseRequested,
+      workflowPendingApprovals.length
+    ]
   );
   const workflowCredentialRequests = useMemo(
     () => activeProject?.record.credentials.requests.filter((request) => request.status === "pending") ?? [],
@@ -11174,97 +11651,118 @@ const WorkbenchApp = () => {
       onClick: () => void advanceWorkflowStage()
     }
   ];
-  const workflowStageText = workflow ? workflowStageLabel(workflow.workflowStage) : "Workflow unavailable";
+  const workflowStageText = userFacingWorkflowStatus?.label ?? (workflow ? workflowStageLabel(workflow.workflowStage) : "Workflow unavailable");
   const workflowAgentLabel = currentWorkflowAgent?.name ?? "Waiting for next workflow agent";
   const workflowCurrentFocus = summarizeText(
-    activeWorkflowStep?.currentActivity ?? workflowGlanceActivity,
+    operatorWorkflowView.currentStatus.primaryLabel,
     "Waiting for workflow activity.",
-    150
+    180
   );
   const workflowCurrentRunSummary = currentWorkflowAgent
-    ? summarizeText(agentPreviewText(currentWorkflowAgent, workflow), "No live run summary yet.", 170)
-    : workflowLead;
+    ? operatorWorkflowView.currentStatus.secondaryExplanation
+    : operatorWorkflowView.currentStatus.secondaryExplanation || workflowLead;
   const workflowCurrentPhase = summarizeText(
-    currentWorkflowAgent?.currentPhase ?? currentWorkflowAgent?.currentSubtask ?? activeWorkflowStep?.currentSubstep ?? activeWorkflowStep?.displayStatusLabel,
+    operatorWorkflowView.currentStatus.technicalStage,
     "No active phase",
-    95
+    120
   );
-  const workflowChecksStatus = summarizeWorkflowChecksStatus(currentWorkflowAgent, workflow, activeWorkflowStep);
-  const workflowFilesLikelyInvolved = uniqueSortedStrings([
-    ...(workflow?.approvedRecommendation?.relatedPaths ?? []),
-    ...currentWorkflowChangedFiles
-  ]);
-  const workflowValidationRequired = workflow?.scopedGoal?.testStrategy.length
-    ? workflow.scopedGoal.testStrategy
-    : currentWorkflowAgent?.integrityReport?.checks.map((check) => `${check.name}: ${check.status}`) ?? [];
-  const workflowPlanConstraints = workflow?.scopedGoal?.constraints.length
-    ? workflow.scopedGoal.constraints
-    : workflow?.ultimateGoal.constraints ?? [];
-  const workflowDoneCondition = workflow?.scopedGoal?.acceptanceCriteria.length
-    ? workflow.scopedGoal.acceptanceCriteria
-    : workflowGoalView?.acceptanceCriteria.length
-      ? workflowGoalView.acceptanceCriteria
-      : workflowGlanceSteps;
-  const workflowRawPlan = [
-    workflow?.ultimateGoal.summary ? `Ultimate Goal: ${workflow.ultimateGoal.summary}` : undefined,
-    workflow?.ultimateGoal.detailedIntent ? `Intent: ${workflow.ultimateGoal.detailedIntent}` : undefined,
-    workflow?.approvedRecommendation ? `Recommendation: ${workflow.approvedRecommendation.title}\n${workflow.approvedRecommendation.summary}\n${workflow.approvedRecommendation.rationale}` : undefined,
-    workflow?.scopedGoal ? `Scoped plan: ${workflow.scopedGoal.summary}\n${workflow.scopedGoal.executionBrief}` : undefined,
-    workflow?.scopedGoal?.acceptanceCriteria.length ? `Acceptance criteria:\n${workflow.scopedGoal.acceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n")}` : undefined,
-    workflow?.scopedGoal?.testStrategy.length ? `Validation:\n${workflow.scopedGoal.testStrategy.map((strategy) => `- ${strategy}`).join("\n")}` : undefined
-  ].filter((entry): entry is string => Boolean(entry)).join("\n\n") || "No scoped plan has been generated yet.";
-  const commandCenterCurrentCycleAgents = workflow
-    ? workflowAgents.filter((agent) =>
-      agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
-    )
-    : [];
-  const commandCenterCommands = uniqueSortedStrings(
-    commandCenterCurrentCycleAgents.flatMap((agent) => agent.commandLog.map((command) => command.command))
-  );
+  const workflowChecksStatus = operatorWorkflowView.currentCycle.validationSummary.finalStatusLabel;
+  const commandCenterFocusChips: CommandCenterHealthItem[] = [
+    operatorWorkflowView.currentCycle.cycleNumber ? { label: `Cycle ${operatorWorkflowView.currentCycle.cycleNumber}`, tone: "pending" } : undefined,
+    operatorWorkflowView.currentStatus.lastCompletedAction !== "None" ? { label: operatorWorkflowView.currentStatus.lastCompletedAction, tone: "success" } : undefined,
+    {
+      label: operatorWorkflowView.currentCycle.validationSummary.finalStatusLabel,
+      tone: operatorWorkflowView.currentCycle.validationSummary.finalStatus === "passed"
+        ? "success"
+        : operatorWorkflowView.currentCycle.validationSummary.finalStatus === "failed"
+          ? "blocked"
+          : operatorWorkflowView.currentCycle.validationSummary.finalStatus === "partial"
+            ? "warning"
+            : "pending"
+    },
+    operatorWorkflowView.planner.fallbackWarning ? { label: "Planner fallback used", tone: "warning" } : undefined,
+    operatorWorkflowView.repositoryHealth.suspiciousPaths.length || operatorWorkflowView.repositoryHealth.hygieneStatus === "failed" || operatorWorkflowView.repositoryHealth.hygieneStatus === "unknown"
+      ? { label: "Hygiene warning", tone: "blocked" }
+      : undefined
+  ].filter((item): item is CommandCenterHealthItem => Boolean(item));
+  const commandCenterPhaseDetails: CommandCenterItem[] = [
+    { label: "Technical stage", value: operatorWorkflowView.currentStatus.technicalStage },
+    { label: "Active agent", value: operatorWorkflowView.currentStatus.activeAgent },
+    { label: "Last completed", value: operatorWorkflowView.currentStatus.lastCompletedAction },
+    { label: "Next step", value: operatorWorkflowView.currentStatus.nextOperatorAction },
+    ...(operatorWorkflowView.currentStatus.pauseReason ? [{ label: "Pause reason", value: operatorWorkflowView.currentStatus.pauseReason }] : [])
+  ];
   const commandCenterProgress: CommandCenterItem[] = [
     {
-      label: "Stage",
-      value: workflowStageText,
-      detail: workflowCurrentPhase
-    },
-    {
       label: "Cycle",
-      value: workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No active cycle",
-      detail: workflowRunState
+      value: operatorWorkflowView.currentCycle.cycleNumber ? `Cycle ${operatorWorkflowView.currentCycle.cycleNumber}` : "No active cycle",
+      detail: operatorWorkflowView.currentCycle.cycleProgress
     },
     {
       label: "Goal progress",
-      value: typeof workflowChecklistOverview.percentComplete === "number"
-        ? `${workflowChecklistOverview.percentComplete}%`
+      value: typeof operatorWorkflowView.goalProgress.percent === "number"
+        ? `${operatorWorkflowView.goalProgress.percent}%`
         : workflowChecklistSummary,
-      detail: workflowChecklistOverview.requiredTotal
-        ? `${workflowChecklistOverview.requiredMet}/${workflowChecklistOverview.requiredTotal} required checks met`
+      detail: operatorWorkflowView.goalProgress.requiredTotal
+        ? `${operatorWorkflowView.goalProgress.requiredMet}/${operatorWorkflowView.goalProgress.requiredTotal} required checks met`
         : "Goal checklist not generated yet."
-    }
-  ];
-  const commandCenterChanges: CommandCenterItem[] = [
-    {
-      label: "Files changed",
-      value: String(currentWorkflowChangedFiles.length),
-      detail: currentWorkflowChangedFiles.slice(0, 4).join(", ") || "No file changes recorded in the current cycle."
     },
     {
-      label: "Commands run",
-      value: String(commandCenterCommands.length),
-      detail: commandCenterCommands.slice(0, 3).join(" | ") || "No commands recorded in the current cycle."
+      label: "Checklist this cycle",
+      value: operatorWorkflowView.currentCycle.checklistDeltaSummary.didGoalProgressChange ? "Advanced" : "No delta yet",
+      detail: operatorWorkflowView.currentCycle.checklistDeltaSummary.summary,
+      tone: operatorWorkflowView.currentCycle.checklistDeltaSummary.didGoalProgressChange ? "success" : "warning"
     },
     {
       label: "Validation",
-      value: workflowChecksStatus,
-      tone: /\b(fail|error|blocked)\b/i.test(workflowChecksStatus) ? "error" : "success"
+      value: operatorWorkflowView.currentCycle.validationSummary.finalStatusLabel,
+      detail: operatorWorkflowView.currentCycle.validationLedger?.summaryForHumans ?? operatorWorkflowView.emptyStates.validationLedger,
+      tone: operatorWorkflowView.currentCycle.validationSummary.finalStatus === "passed" ? "success" : operatorWorkflowView.currentCycle.validationSummary.finalStatus === "failed" ? "error" : "warning"
     }
   ];
-  const commandCenterAttention: CommandCenterItem[] = workflowAttentionItems.slice(0, 4).map((item) => ({
-    label: workflowAttentionKindLabel(item.kind),
-    value: item.title,
-    detail: item.detail,
-    tone: item.tone === "danger" ? "error" : item.tone === "neutral" ? "pending" : item.tone
-  }));
+  const changedGroupDetail = operatorWorkflowView.currentCycle.changedFilesSummary
+    .map((group) => `${group.label}: ${group.files.length}`)
+    .join(" · ");
+  const commandCenterChanges: CommandCenterItem[] = [
+    {
+      label: "Files changed",
+      value: String(operatorWorkflowView.currentCycle.changedFiles.length),
+      detail: changedGroupDetail || "No file changes recorded in the current cycle.",
+      tone: operatorWorkflowView.repositoryHealth.suspiciousPaths.length ? "error" : undefined
+    },
+    {
+      label: "Validation ledger",
+      value: `${operatorWorkflowView.currentCycle.validationSummary.attempted.length} attempted / ${operatorWorkflowView.currentCycle.validationSummary.failedAttempts} failed`,
+      detail: `${operatorWorkflowView.currentCycle.validationSummary.repaired.length} repaired. Final: ${operatorWorkflowView.currentCycle.validationSummary.finalStatusLabel}.`,
+      tone: operatorWorkflowView.currentCycle.validationSummary.finalStatus === "failed" ? "error" : operatorWorkflowView.currentCycle.validationSummary.finalStatus === "passed" ? "success" : "warning"
+    },
+    {
+      label: "Checklist delta",
+      value: `${operatorWorkflowView.currentCycle.checklistDeltaSummary.newlyMet.length} newly met`,
+      detail: `${operatorWorkflowView.currentCycle.checklistDeltaSummary.stillUnknown.length} still unknown · ${operatorWorkflowView.currentCycle.checklistDeltaSummary.evidenceConsumed}/${operatorWorkflowView.currentCycle.checklistDeltaSummary.evidenceObserved} evidence consumed`
+    },
+    {
+      label: "Repo hygiene",
+      value: operatorWorkflowView.repositoryHealth.hygieneLabel,
+      detail: operatorWorkflowView.currentCycle.repoHygiene?.summaryForHumans ?? "No hygiene scan has completed for this cycle.",
+      tone: operatorWorkflowView.repositoryHealth.hygieneStatus === "failed" || operatorWorkflowView.repositoryHealth.hygieneStatus === "unknown" ? "error" : operatorWorkflowView.repositoryHealth.hygieneStatus === "warning" ? "warning" : "success"
+    }
+  ];
+  const operatorActionNeedsAttention = !/^Continue monitoring; no validation, hygiene, checklist, or planner blocker is currently recorded\.$/i.test(operatorWorkflowView.currentStatus.nextOperatorAction);
+  const commandCenterAttention: CommandCenterItem[] = [
+    ...(operatorActionNeedsAttention ? [{
+      label: "Operator action",
+      value: operatorWorkflowView.currentStatus.nextOperatorAction,
+      detail: operatorWorkflowView.currentStatus.secondaryExplanation,
+      tone: operatorWorkflowView.currentStatus.severity === "danger" ? "error" : operatorWorkflowView.currentStatus.severity === "paused" ? "warning" : operatorWorkflowView.currentStatus.severity
+    } satisfies CommandCenterItem] : []),
+    ...workflowAttentionItems.slice(0, 4).map((item) => ({
+      label: workflowAttentionKindLabel(item.kind),
+      value: item.title,
+      detail: item.detail,
+      tone: item.tone === "danger" ? "error" : item.tone === "neutral" ? "pending" : item.tone
+    } satisfies CommandCenterItem))
+  ];
   const latestRun = allAgents[0];
   const commandCenterLastResult = latestRun
     ? `${latestRun.name}: ${runResultSummary(latestRun, workflow)}`
@@ -11272,19 +11770,32 @@ const WorkbenchApp = () => {
       ? `${recentActivity[0].title}${recentActivity[0].detail ? `: ${summarizeText(recentActivity[0].detail, "", 160)}` : ""}`
       : "No completed workflow result has been recorded yet.";
   const commandCenterWhy = summarizeText(
-    currentPlannerDecision?.whySelected ??
-      workflowGoalView?.whyThisMatters ??
-      workflow?.approvedRecommendation?.rationale ??
-      workflowLead,
+    [
+      operatorWorkflowView.planner.whySelectedNow,
+      operatorWorkflowView.planner.repeatedWorkWarning,
+      operatorWorkflowView.planner.fallbackWarning
+    ].filter(Boolean).join(" "),
     "The current workflow step is selected to advance the confirmed project goal.",
-    260
+    420
   );
+  const commandCenterWhyDetails: CommandCenterItem[] = [
+    ...(operatorWorkflowView.currentCycle.cycleContract?.targetedChecklistItems ?? []).map((item) => ({
+      label: item.checkId,
+      value: item.title,
+      detail: `${item.fullDescription}\nWhy targeted: ${item.whyTargeted}\nExpected evidence: ${item.acceptanceHint}`,
+      tone: item.currentStatus === "met" ? "success" : "warning"
+    } satisfies CommandCenterItem)),
+    ...(operatorWorkflowView.planner.repeatedWorkWarning ? [{
+      label: "Repetition",
+      value: "Repetition risk",
+      detail: operatorWorkflowView.planner.repeatedWorkWarning,
+      tone: "warning" as CommandCenterTone
+    }] : [])
+  ];
   const commandCenterNextStep = summarizeText(
-    workflowAction?.title
-      ? `${workflowAction.title}. ${workflowAction.description ?? ""}`
-      : workflowNextGuidance,
-    "No action is needed right now.",
-    220
+    operatorWorkflowView.currentStatus.nextOperatorAction,
+    "No validation, hygiene, checklist, or planner blocker is currently recorded.",
+    280
   );
   const repositoryHealth = repositoryScanStatus?.status === "failed"
     ? { label: "Repository scan failed", tone: "error" as CommandCenterTone }
@@ -11296,6 +11807,32 @@ const WorkbenchApp = () => {
           ? { label: "Repository indexed", tone: "success" as CommandCenterTone }
           : { label: "Repository scan pending", tone: "pending" as CommandCenterTone };
   const validationHealth = validationStatusChip(activeProject.validationStatus);
+  const ledgerValidationHealth: CommandCenterHealthItem = latestValidationLedger
+    ? latestValidationLedger.finalValidationStatus === "passed" && latestValidationLedger.unresolvedValidationFailures.length === 0
+      ? { label: "Validation passed", tone: "success" }
+      : latestValidationLedger.finalValidationStatus === "not_run"
+        ? { label: "Validation not run", tone: "pending" }
+        : latestValidationLedger.finalValidationStatus === "partial"
+          ? { label: "Validation partial", tone: "warning" }
+          : { label: "Validation blocked", tone: "blocked" }
+    : { label: `Validation ${validationHealth.label.toLowerCase()}`, tone: validationHealth.tone as CommandCenterTone };
+  const repoHygieneHealth: CommandCenterHealthItem = latestRepoHygieneReport
+    ? latestRepoHygieneReport.status === "failed"
+      ? { label: "Hygiene blocked", tone: "blocked" }
+      : latestRepoHygieneReport.status === "warnings"
+        ? { label: "Hygiene warnings", tone: "warning" }
+        : latestRepoHygieneReport.status === "unknown"
+          ? { label: "Hygiene not scanned", tone: "blocked" }
+          : { label: "Hygiene passed", tone: "success" }
+    : { label: "Hygiene pending", tone: "pending" };
+  const checklistHealth: CommandCenterHealthItem = operatorWorkflowView.currentCycle.checklistDelta
+    ? operatorWorkflowView.currentCycle.checklistDeltaSummary.didGoalProgressChange
+      ? { label: "Checklist advanced", tone: "success" }
+      : { label: "Checklist no delta", tone: "warning" }
+    : { label: "Checklist unknown", tone: "pending" };
+  const plannerHealth: CommandCenterHealthItem = operatorWorkflowView.planner.fallbackWarning
+    ? { label: "Planner fallback warning", tone: "warning" }
+    : { label: "Planner structured", tone: "success" };
   const codexHealth = codexReadinessStatusChip(state.codexReadiness.status);
   const runtimeHealth: CommandCenterHealthItem = state.runtimeReadiness.status === "blocked"
     ? { label: "Needs validation", tone: "blocked" }
@@ -11307,10 +11844,13 @@ const WorkbenchApp = () => {
     : undefined;
   const commandCenterHealth: CommandCenterHealthItem[] = [
     { label: workflowShellStatus.label, tone: workflowShellStatus.tone as CommandCenterTone },
-    { label: `Validation ${validationHealth.label.toLowerCase()}`, tone: validationHealth.tone as CommandCenterTone },
+    ledgerValidationHealth,
+    checklistHealth,
+    plannerHealth,
+    repoHygieneHealth,
+    runtimeHealth,
     repositoryHealth,
     { label: codexHealth.label === "Update available" ? "Codex outdated" : `Codex ${codexHealth.label.toLowerCase()}`, tone: codexHealth.tone as CommandCenterTone },
-    runtimeHealth,
     ...(diagnosticHealth ? [diagnosticHealth] : [])
   ];
   const commandCenterPrimaryAction = topBarPrimaryAction ? (
@@ -11435,14 +11975,19 @@ const WorkbenchApp = () => {
               projectName={activeProject.record.identity.projectName}
               projectContext={projectBranchOrPath}
               currentFocus={workflowCurrentFocus}
+              focusSummary={operatorWorkflowView.currentStatus.secondaryExplanation}
+              focusChips={commandCenterFocusChips}
+              phaseDetails={commandCenterPhaseDetails}
               currentPhase={workflowCurrentPhase}
               activeAgent={workflowAgentLabel}
               statusLabel={workflowShellStatus.label}
               statusTone={workflowShellStatus.tone as CommandCenterTone}
               whyThisMatters={commandCenterWhy}
+              whyDetails={commandCenterWhyDetails}
               progress={commandCenterProgress}
               changes={commandCenterChanges}
               attention={commandCenterAttention}
+              attentionEmpty="No validation, hygiene, checklist, or planner blocker is currently recorded."
               lastResult={commandCenterLastResult}
               nextStep={commandCenterNextStep}
               health={commandCenterHealth}
@@ -11467,6 +12012,12 @@ const WorkbenchApp = () => {
               </div>
               <div className="overview-executive-header__status">
                 <StatusChip label={workflowShellStatus.label} tone={workflowShellStatus.tone} />
+                {latestValidationLedger ? (
+                  <StatusChip
+                    label={ledgerValidationHealth.label}
+                    tone={ledgerValidationHealth.tone === "blocked" ? "error" : ledgerValidationHealth.tone as StatusChipTone}
+                  />
+                ) : null}
                 <ValidationBadge status={activeProject.validationStatus} />
                 {activeProject.record.overview ? <SourceBadge source={activeProject.record.overview.source} /> : <span className="badge">Overview pending</span>}
               </div>
@@ -11519,8 +12070,14 @@ const WorkbenchApp = () => {
               <OverviewMetricCard
                 label="Blockers / warnings"
                 value={workflowAttentionItems.length}
-                detail={workflowAttentionItems.length ? "Review attention items below." : "No urgent attention needed."}
+                detail={workflowAttentionItems.length ? "Review attention items below." : "No blocking attention item is currently recorded."}
                 tone={workflowAttentionItems.some((item) => item.tone === "danger") ? "danger" : workflowAttentionItems.length ? "warning" : "good"}
+              />
+              <OverviewMetricCard
+                label="Repo hygiene"
+                value={latestRepoHygieneReport?.status ?? "pending"}
+                detail={summarizeText(latestRepoHygieneReport?.summaryForHumans, "No hygiene scan has completed for this cycle.", 96)}
+                tone={latestRepoHygieneReport?.status === "failed" || latestRepoHygieneReport?.status === "unknown" ? "danger" : latestRepoHygieneReport?.status === "passed" ? "good" : latestRepoHygieneReport?.status === "warnings" ? "warning" : undefined}
               />
               <OverviewMetricCard
                 label="Last run status"
@@ -11561,7 +12118,7 @@ const WorkbenchApp = () => {
                 </div>
                 <div>
                   <span className="workflow-option__label">Next recommended action</span>
-                  <p>{summarizeText(workflowAction?.title ?? workflowNextGuidance, "No action needed right now.", 135)}</p>
+                  <p>{summarizeText(operatorWorkflowView.currentStatus.nextOperatorAction, "No validation, hygiene, checklist, or planner blocker is currently recorded.", 160)}</p>
                 </div>
                 <div className="actions-row">
                   <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>Open Workflow</button>
@@ -11620,6 +12177,7 @@ const WorkbenchApp = () => {
             summaryActionBusy={repositoryPathActionBusy}
             questionDraft={repositoryQuestionDraft}
             agentActionsBlocked={agentActionsBlocked}
+            operatorView={operatorWorkflowView}
             onRescanRepository={() => void rescanRepository("normal")}
             onDeepScanRepository={(settings) => void rescanRepository("deep", settings)}
             onTreeFilterChange={setTreeFilterDraft}
@@ -11690,7 +12248,7 @@ const WorkbenchApp = () => {
                 changedFilesCount={currentWorkflowChangedFiles.length}
                 checksStatus={workflowChecksStatus}
                 approvalsPending={workflowPendingApprovals.length}
-                nextAction={summarizeText(workflowAction?.title ?? workflowNextGuidance, "No action needed right now.", 130)}
+                nextAction={summarizeText(operatorWorkflowView.currentStatus.nextOperatorAction, "No validation, hygiene, checklist, or planner blocker is currently recorded.", 160)}
                 phase={workflowCurrentPhase}
               />
               <WorkflowCurrentAgentMessages
@@ -11731,21 +12289,9 @@ const WorkbenchApp = () => {
             </section>
 
             <section className="workflow-operator-grid workflow-operator-grid--plan">
-              <WorkflowPlanSummaryCard
-                goalSummary={summarizeText(workflowGlanceGoal, "Set the Ultimate Goal.", 260)}
-                recommendationSummary={summarizeText(workflow?.approvedRecommendation?.summary ?? workflowGlanceRecommendation, "No recommendation selected yet.", 190)}
-                objective={workflowObjectiveLabel(workflowObjective)}
-                scope={summarizeText(workflow?.scopedGoal?.executionBrief ?? workflowGlancePlan, "Waiting for a scoped execution plan.", 220)}
-                filesLikelyInvolved={workflowFilesLikelyInvolved}
-                validationRequired={workflowValidationRequired}
-                constraints={workflowPlanConstraints}
-                doneCondition={workflowDoneCondition}
-                rawPlan={workflowRawPlan}
-              />
-              <WorkflowChecklistSummaryCard
-                overview={workflowChecklistOverview}
-                checklist={workflow?.goalChecklist ?? []}
-              />
+              <WorkflowCycleContractCard view={operatorWorkflowView} />
+              <WorkflowChecklistProgressCard view={operatorWorkflowView} />
+              <WorkflowValidationLedgerCard view={operatorWorkflowView} />
             </section>
 
             <WorkflowStatusStrip
@@ -11844,7 +12390,7 @@ const WorkbenchApp = () => {
                   <div>
                     <div className="eyebrow">What needs your attention</div>
                     <h3>{workflowAction?.title ?? "Nothing right now; the system is working"}</h3>
-                    <p>{workflowAction?.description ?? "No action is needed. The workflow is progressing automatically."}</p>
+                    <p>{workflowAction?.description ?? "The workflow is progressing automatically; monitor validation, hygiene, and checklist status."}</p>
                     {workflowNextGuidance ? <p className="workflow-primary-action__next">{workflowNextGuidance}</p> : null}
                   </div>
                   {workflowAction?.kind === "confirm_goal" ? (

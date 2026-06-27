@@ -2,6 +2,9 @@ import type {
   AgentState,
   ProjectKind,
   ProjectWorkflowState,
+  RepoHygieneReport,
+  ValidationLedger,
+  WorkflowDerivedStatus,
   WorkflowObjective,
   WorkflowStage,
   WorkflowStepId,
@@ -423,6 +426,126 @@ export const workflowStageLabel = (stage: WorkflowStage): string =>
     cycle_complete: "Cycle Complete"
   })[stage];
 
+const latestWorkflowAgent = (agents: AgentState[], category: AgentState["category"]): AgentState | undefined =>
+  agents
+    .filter((agent) => agent.category === category)
+    .sort((left, right) =>
+      Date.parse(right.completedAt ?? right.lastActivityAt ?? right.startedAt ?? right.createdAt) -
+      Date.parse(left.completedAt ?? left.lastActivityAt ?? left.startedAt ?? left.createdAt)
+    )[0];
+
+const latestValidationLedger = (workflow: ProjectWorkflowState, explicit?: ValidationLedger): ValidationLedger | undefined =>
+  explicit ?? workflow.validationLedgers
+    .filter((ledger) => ledger.cycleNumber === workflow.workflowCycle.cycleNumber)
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
+
+const latestRepoHygieneReport = (workflow: ProjectWorkflowState, explicit?: RepoHygieneReport): RepoHygieneReport | undefined =>
+  explicit ?? workflow.repoHygieneReports
+    .slice()
+    .sort((left, right) => Date.parse(right.scannedAt) - Date.parse(left.scannedAt))[0];
+
+export const deriveUserFacingWorkflowStatus = (
+  workflow: ProjectWorkflowState,
+  options: {
+    agents?: AgentState[];
+    validationLedger?: ValidationLedger;
+    repoHygieneReport?: RepoHygieneReport;
+    workflowPauseRequested?: boolean;
+    pushed?: boolean;
+  } = {}
+): WorkflowDerivedStatus => {
+  const agents = options.agents ?? [];
+  const ledger = latestValidationLedger(workflow, options.validationLedger);
+  const hygiene = latestRepoHygieneReport(workflow, options.repoHygieneReport);
+  const codingAgent = latestWorkflowAgent(agents, "coding");
+  const integrityAgent = latestWorkflowAgent(agents, "integrity");
+  const mergeAgent = latestWorkflowAgent(agents, "merge");
+  const pausePrefix = options.workflowPauseRequested || workflow.autopilotStatus?.pausedReason === "manual_pause_requested"
+    ? "Paused by operator, "
+    : "";
+  const codingCheckpointed = Boolean(
+    codingAgent?.status === "completed" &&
+    /checkpointed worktree changes for merge|changes ready for merge/i.test(`${codingAgent.currentPhase ?? ""} ${codingAgent.lastMessageSnippet ?? ""}`)
+  );
+  const legacyCodingCheckpointed = Boolean(
+    workflow.workflowStage === "goal_ready" &&
+    workflow.autopilotStatus?.pausedReason &&
+    /start_coding|coding|checkpoint/i.test(workflow.autopilotStatus.lastCompletedAction ?? "")
+  );
+
+  if (hygiene?.mergeBlockingFindings.length) {
+    return {
+      label: "Merge blocked by repository hygiene",
+      explanation: hygiene.summaryForHumans,
+      tone: "danger"
+    };
+  }
+  if (ledger?.unresolvedValidationFailures.length || ledger?.finalValidationStatus === "failed" || ledger?.finalValidationStatus === "partial") {
+    return {
+      label: "Merge blocked by validation failure",
+      explanation: ledger.summaryForHumans,
+      tone: ledger.finalValidationStatus === "partial" ? "warning" : "danger"
+    };
+  }
+  if (workflow.workflowStage === "coding_running" || agents.some((agent) => agent.category === "coding" && isWorkflowAutomationBlockingAgent(agent))) {
+    return {
+      label: "Running coding pass",
+      explanation: codingAgent?.currentPhase ?? workflow.stepProgress.coding.message ?? "Implementation work is underway.",
+      tone: "running"
+    };
+  }
+  if (workflow.workflowStage === "integrity_running" || agents.some((agent) => agent.category === "integrity" && isWorkflowAutomationBlockingAgent(agent))) {
+    return {
+      label: "Integrity validation running",
+      explanation: integrityAgent?.currentPhase ?? workflow.stepProgress.integrity.message ?? "Deterministic validation is running.",
+      tone: "running"
+    };
+  }
+  if (
+    mergeAgent?.status === "completed" &&
+    (options.pushed || /pushed\s+\S+\s+to\s+origin/i.test(mergeAgent.mergeReport?.summary ?? ""))
+  ) {
+    return {
+      label: "Merged and pushed",
+      explanation: mergeAgent.mergeReport?.summary ?? "Integration completed and the branch was pushed.",
+      tone: "success"
+    };
+  }
+  if ((codingCheckpointed || legacyCodingCheckpointed) && (options.workflowPauseRequested || workflow.autopilotStatus?.pausedReason || workflow.workflowStage === "goal_ready" || workflow.stepProgress.integrity.status === "not_started")) {
+    return {
+      label: `${pausePrefix}Paused after coding checkpoint; awaiting integrity/merge`,
+      explanation: codingAgent?.currentPhase ?? "Coding changes were checkpointed and validation or merge has not completed yet.",
+      tone: "paused"
+    };
+  }
+  if (!ledger || ledger.finalValidationStatus === "not_run") {
+    return {
+      label: "Awaiting validation",
+      explanation: ledger?.summaryForHumans ?? "No validation ledger has been recorded for this cycle.",
+      tone: "warning"
+    };
+  }
+  if (workflow.workflowStage === "ready_to_merge") {
+    return {
+      label: "Ready to merge",
+      explanation: ledger.summaryForHumans,
+      tone: "success"
+    };
+  }
+  if (workflow.workflowStage === "merged") {
+    return {
+      label: "Merge complete",
+      explanation: mergeAgent?.mergeReport?.summary ?? "Integration finished.",
+      tone: "success"
+    };
+  }
+  return {
+    label: workflowStageLabel(workflow.workflowStage),
+    explanation: workflowStatusSummary(workflow),
+    tone: workflow.workflowStage === "blocked_human" ? "danger" : "running"
+  };
+};
+
 export const workflowStepStatusLabel = (status: WorkflowStepStatus): string =>
   ({
     not_started: "Not started",
@@ -467,43 +590,43 @@ export const workflowStageGuidance = (stage: WorkflowStage): WorkflowStageGuidan
     recommendation_approved: {
       meaning: "The chosen next step is being converted into a scoped plan.",
       systemAction: "The workflow is preparing a bounded execution plan.",
-      userAction: "No action is needed right now.",
+      userAction: "Monitor for approvals, validation blockers, or paused workflow state.",
       next: "Once the plan is ready, coding will start automatically."
     },
     goal_ready: {
       meaning: "A scoped execution plan is ready.",
       systemAction: "The workflow is preparing the implementation pass.",
-      userAction: "No action is needed right now.",
+      userAction: "Monitor for approvals, validation blockers, or paused workflow state.",
       next: "Coding will begin automatically."
     },
     coding_running: {
       meaning: "Implementation work is underway for the current execution plan.",
       systemAction: "The workflow is running the coding step.",
-      userAction: "No action is needed right now.",
+      userAction: "Monitor the coding pass and any approval requests.",
       next: "When coding finishes, validation will run automatically."
     },
     integrity_running: {
       meaning: "The system is checking whether the implementation satisfies the current plan and still aligns with the Ultimate Goal.",
       systemAction: "Deterministic validation is in progress.",
-      userAction: "No action is needed right now.",
+      userAction: "Review failures if validation reports a blocker.",
       next: "If checks pass, merge will begin automatically. If not, the workflow may enter a repair loop."
     },
     repair_loop: {
       meaning: "The system found issues and is attempting another fix cycle.",
       systemAction: "The workflow is preparing or running repair work.",
-      userAction: "No action is needed unless a blocker is raised or automatic repair is exhausted.",
+      userAction: "Watch for blockers or exhausted automatic repair.",
       next: "A repair pass will be followed by validation again."
     },
     ready_to_merge: {
       meaning: "Validation passed and the work is ready to integrate.",
       systemAction: "The workflow is preparing merge or finalization.",
-      userAction: "No action is needed right now.",
+      userAction: "Confirm merge remains allowed by validation and repository hygiene.",
       next: "The cycle will close after integration completes."
     },
     merged: {
       meaning: "Integration finished successfully.",
       systemAction: "The workflow is closing the current cycle.",
-      userAction: "No action is needed right now.",
+      userAction: "Review the cycle summary if you need audit details.",
       next: "The next recommendation set will be prepared automatically."
     },
     appeal_pending: {
@@ -521,7 +644,7 @@ export const workflowStageGuidance = (stage: WorkflowStage): WorkflowStageGuidan
     cycle_complete: {
       meaning: "This cycle is done.",
       systemAction: "The workflow is preparing the next recommendation.",
-      userAction: "No action is needed right now.",
+      userAction: "Review the completed cycle if you need audit details.",
       next: "You will be asked to choose the next recommendation when it is ready."
     }
   })[stage];
@@ -715,7 +838,7 @@ export const workflowActionGuide = (
     title: "Nothing right now; the system is working",
     description: agentsPendingApproval
       ? "The workflow is paused on an agent approval request in the details section."
-      : "No action is needed. The workflow is progressing automatically."
+      : "The workflow is progressing automatically; continue monitoring validation, hygiene, and checklist status."
   };
 };
 

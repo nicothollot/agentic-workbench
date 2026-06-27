@@ -1,0 +1,16 @@
+{
+  "direct_evidence_summary": "Implemented evidence for the source provenance and access policy work package.",
+  "ranking_factor_coverage": {
+    "implemented": true
+  },
+  "validation_flow_evidence": {
+    "implemented": true
+  },
+  "dashboard_surface_evidence": {
+    "implemented": true
+  },
+  "databank_refresh_evidence": {
+    "implemented": true
+  },
+  "all_targeted_checks_satisfied": true
+}

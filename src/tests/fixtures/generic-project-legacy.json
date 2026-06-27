@@ -1,0 +1,77 @@
+{
+  "summary": {
+    "projectName": "GenericInventory"
+  },
+  "workflow": {
+    "workflowStage": "goal_ready",
+    "workflowCycle": {
+      "cycleNumber": 4,
+      "approvedRecommendationTitle": "Satisfy work package: import validation"
+    },
+    "goalChecklist": [
+      {
+        "id": "success_criterion:import-validation",
+        "title": "CSV import validation is visible",
+        "description": "The importer reports rejected rows and accepted rows with deterministic validation evidence.",
+        "status": "unknown"
+      },
+      {
+        "id": "success_criterion:audit-summary",
+        "title": "Import audit summary is shown",
+        "description": "Operators can inspect a summary of import changes without reading raw logs.",
+        "status": "unknown"
+      }
+    ],
+    "workPackages": [
+      {
+        "id": "work-package:import-validation",
+        "title": "import validation work package",
+        "summary": "Close import validation checks.",
+        "primaryTopic": "import validation",
+        "likelyPaths": [
+          "src/importer.ts",
+          "tests/importer.test.ts"
+        ],
+        "acceptanceHints": [
+          "Validation evidence names rejected and accepted row behavior."
+        ],
+        "checkIds": [
+          "success_criterion:import-validation",
+          "success_criterion:audit-summary"
+        ],
+        "score": 220
+      }
+    ],
+    "strategicPlans": [
+      {
+        "id": "plan-cycle-4",
+        "cycleNumber": 4,
+        "candidateTasks": [
+          {
+            "id": "candidate:import-validation",
+            "kind": "work_package",
+            "title": "Satisfy work package: import validation",
+            "summary": "Close import validation checks with deterministic evidence.",
+            "sourceWorkPackageId": "work-package:import-validation",
+            "targetedCheckIds": [
+              "success_criterion:import-validation",
+              "success_criterion:audit-summary"
+            ],
+            "expectedFiles": [
+              "src/importer.ts",
+              "tests/importer.test.ts"
+            ],
+            "expectedValidationCommands": [
+              "npm test -- importer"
+            ],
+            "scoreBreakdown": {
+              "checklistImpact": 120,
+              "repetition": 0
+            }
+          }
+        ],
+        "recommendedTaskId": "candidate:import-validation"
+      }
+    ]
+  }
+}

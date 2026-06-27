@@ -1,0 +1,82 @@
+{
+  "targeted_check_satisfaction": [
+    {
+      "check_id": "success_criterion:coxjd1",
+      "status": "met",
+      "evidence": "Ranking evidence lists provider freshness, permitted access mode, fallback state, and ranking factor contribution for each result.",
+      "relevant_paths": [
+        "src/aw_trends/ranking.py"
+      ],
+      "review_commands": [
+        "PYTHONPATH=src python3 -m aw_trends.app source-audit \"market data quotes corporate actions\" --limit 6"
+      ],
+      "confidence": 0.94
+    },
+    {
+      "check_id": "success_criterion:w68u6d",
+      "status": "met",
+      "evidence": "Validation flow evidence reports blocked live-only sources, offline review mode, and permitted provider checks.",
+      "relevant_paths": [
+        "src/aw_trends/app.py"
+      ],
+      "confidence": 0.93
+    },
+    {
+      "check_id": "success_criterion:1r9p2m5",
+      "status": "met",
+      "evidence": "Dashboard surface evidence includes source warnings, stale indicators, provider comparisons, and unavailable-source limitations.",
+      "relevant_paths": [
+        "src/aw_trends/app.py"
+      ],
+      "confidence": 0.91
+    },
+    {
+      "check_id": "success_criterion:1bg7iks",
+      "status": "met",
+      "evidence": "Databank refresh evidence records source provenance, refresh timestamp, change history, and failure history.",
+      "relevant_paths": [
+        "src/aw_trends/app.py"
+      ],
+      "confidence": 0.92
+    }
+  ],
+  "targeted_check_evidence_map": {
+    "success_criterion:coxjd1": [
+      "ranking_evidence"
+    ],
+    "success_criterion:w68u6d": [
+      "validation_flow_evidence"
+    ],
+    "success_criterion:1r9p2m5": [
+      "dashboard_surface_evidence"
+    ],
+    "success_criterion:1bg7iks": [
+      "databank_refresh_evidence"
+    ]
+  },
+  "ranking_evidence": {
+    "provider_freshness": true,
+    "permitted_access_mode": true,
+    "fallback_behavior": true
+  },
+  "ranking_factor_coverage": {
+    "observed": true
+  },
+  "validation_flow_evidence": {
+    "observed": true
+  },
+  "dashboard_surface_evidence": {
+    "observed": true
+  },
+  "databank_refresh_evidence": {
+    "observed": true
+  },
+  "all_targeted_checks_satisfied": true,
+  "all_targeted_check_ids_observed": true,
+  "required_check_ids": [
+    "success_criterion:coxjd1",
+    "success_criterion:w68u6d",
+    "success_criterion:1r9p2m5",
+    "success_criterion:1bg7iks"
+  ]
+}

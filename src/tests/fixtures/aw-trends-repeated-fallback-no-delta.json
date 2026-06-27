@@ -1,0 +1,40 @@
+{
+  "cycleContract": {
+    "selectedTaskTitle": "Satisfy work package: source provenance and access policy",
+    "sourceDataRefs": {
+      "workPackageId": "work-package:source-provenance-access-policy"
+    },
+    "targetedCheckIds": [
+      "success_criterion:coxjd1",
+      "success_criterion:w68u6d",
+      "success_criterion:1r9p2m5",
+      "success_criterion:1bg7iks"
+    ]
+  },
+  "cycles": [
+    {
+      "cycleNumber": 20,
+      "recommendationTitle": "Satisfy work package: source provenance and access policy",
+      "structuredFallback": true,
+      "validationPassed": true,
+      "checklistMoved": false
+    },
+    {
+      "cycleNumber": 21,
+      "recommendationTitle": "Satisfy work package: source provenance and access policy",
+      "structuredFallback": true,
+      "validationPassed": true,
+      "checklistMoved": false
+    },
+    {
+      "cycleNumber": 23,
+      "recommendationTitle": "Satisfy work package: source provenance and access policy",
+      "structuredFallback": true,
+      "validationPassed": true,
+      "checklistMoved": false
+    }
+  ],
+  "recentAgentOutputs": [
+    "Structured recommendation output was invalid, so the workflow used the deterministic fallback."
+  ]
+}

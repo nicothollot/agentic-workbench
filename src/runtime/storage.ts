@@ -2,7 +2,7 @@ import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 
 import path from "node:path";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, REVIEW_LOG_BUNDLE_VERSION } from "@shared/constants";
 import { createPortableInterface } from "@shared/defaults";
-import { localProjectRecordSchema, portableInterfaceSchema, projectReviewLogBundleSchema } from "@shared/schemas";
+import { localProjectRecordSchema, portableInterfaceSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
 import type {
   AgentCategory,
   AgentLifecycleStatus,
@@ -11,11 +11,21 @@ import type {
   LocalProjectRecord,
   PortableProjectInterface,
   ProjectReviewLogBundle,
+  ReviewLogCycleDiagnostics,
+  ReviewLogEvidenceObservationSummary,
+  ReviewLogRedactionStatus,
   ReviewLogRuntimeContext,
   ReviewLogSummary,
-  ReviewLogTimelineEntry
+  ReviewLogTimelineEntry,
+  ReviewLogWorkflowDiagnostics
 } from "@shared/types";
 import { nowIso, stableStringify, unique } from "@shared/utils";
+import { deriveUserFacingWorkflowStatus } from "@shared/workflowView";
+import {
+  cycleContractForCycle,
+  deriveLegacyWorkflowDiagnostics,
+  workflowCycleTaskSeparation
+} from "@shared/workflowMigration";
 import { sha256 } from "./hashUtils";
 import { assertHostPathWithinProjectRoot } from "./projectBoundary";
 import { sanitizeProjectRecord, STATE_SANITIZER_VERSION, type StateSanitizerReport } from "./stateSanitizer";
@@ -223,6 +233,118 @@ const buildReviewTimeline = (record: LocalProjectRecord): ReviewLogTimelineEntry
   return [...workflowEntries, ...agentEntries].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
 };
 
+const reviewLogRedactionStatus = (): ReviewLogRedactionStatus => ({
+  localPathsRedacted: true,
+  secretsRedacted: true,
+  fullCommandOutputIncluded: false,
+  note: "Diagnostics include summarized/redacted workflow objects and command summaries; retained full-output sidecars are not embedded in this review log."
+});
+
+const latestByTime = <T,>(entries: T[], getTime: (entry: T) => string | undefined): T | undefined =>
+  entries.slice().sort((left, right) => (Date.parse(getTime(right) ?? "") || 0) - (Date.parse(getTime(left) ?? "") || 0))[0];
+
+const evidenceObservationSummary = (
+  observation: LocalProjectRecord["workflow"]["evidenceObservations"][number]
+): ReviewLogEvidenceObservationSummary => ({
+  observationId: observation.observationId,
+  cycleNumber: observation.cycleNumber,
+  checkId: observation.checkId,
+  status: observation.status,
+  evidenceText: observation.evidenceText,
+  evidenceSourceType: observation.evidenceSourceType,
+  sourceKey: observation.sourceRef.sourceKey,
+  relevantPaths: observation.relevantPaths,
+  validationCommands: observation.validationCommands,
+  confidence: observation.confidence,
+  consumedByChecklist: observation.consumedByChecklist,
+  notConsumedReason: observation.notConsumedReason
+});
+
+const reviewCycleDiagnostics = (
+  record: LocalProjectRecord,
+  cycleNumber: number,
+  redactionStatus: ReviewLogRedactionStatus
+): ReviewLogCycleDiagnostics => {
+  const workflow = record.workflow;
+  const taskSeparation = workflowCycleTaskSeparation(workflow, cycleNumber);
+  const cycleAgents = record.agents.filter((agent) =>
+    agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === cycleNumber
+  );
+  const validationLedger = latestByTime(
+    workflow.validationLedgers.filter((ledger) => ledger.cycleNumber === cycleNumber),
+    (ledger) => ledger.updatedAt
+  );
+  const repoHygieneReport = latestByTime(
+    workflow.repoHygieneReports.filter((report) => report.scannedRef.includes(`:${cycleNumber}`)),
+    (report) => report.scannedAt
+  ) ?? (cycleNumber === workflow.workflowCycle.cycleNumber ? latestByTime(workflow.repoHygieneReports, (report) => report.scannedAt) : undefined);
+  return {
+    cycleNumber,
+    cycleStartedWithTask: taskSeparation.cycleStartedWithTask,
+    completedTask: taskSeparation.completedTask,
+    nextRecommendedTask: taskSeparation.nextRecommendedTask,
+    cycleContract: cycleContractForCycle(workflow, cycleNumber),
+    checklistDelta: latestByTime(
+      [
+        ...workflow.checklistDeltas.filter((delta) => delta.cycleNumber === cycleNumber),
+        ...workflow.cycleRetrospectives.filter((entry) => entry.cycleNumber === cycleNumber).flatMap((entry) => entry.checklistDelta ? [entry.checklistDelta] : [])
+      ],
+      (delta) => delta.createdAt
+    ),
+    evidenceObservations: workflow.evidenceObservations
+      .filter((observation) => observation.cycleNumber === cycleNumber)
+      .slice(0, 80)
+      .map(evidenceObservationSummary),
+    validationLedger,
+    recommendationHealth: workflow.recommendationHealth,
+    repoHygieneReport,
+    derivedStatus: cycleNumber === workflow.workflowCycle.cycleNumber
+      ? deriveUserFacingWorkflowStatus(workflow, {
+        agents: cycleAgents,
+        validationLedger,
+        repoHygieneReport,
+        workflowPauseRequested: record.localState.workflowPauseRequested
+      })
+      : undefined,
+    evidenceCommands: workflow.evidenceCommands.slice(0, 30),
+    redactionStatus
+  };
+};
+
+const cloneRecordForReviewExport = (record: LocalProjectRecord, exportedAt: string): LocalProjectRecord => {
+  const workflow = projectWorkflowStateSchema.parse(JSON.parse(JSON.stringify(record.workflow)));
+  deriveLegacyWorkflowDiagnostics(workflow, {
+    agents: record.agents,
+    now: exportedAt,
+    deriveChecklistDelta: true,
+    deriveValidationLedger: true,
+    deriveRepoHygiene: true
+  });
+  return {
+    ...record,
+    workflow
+  };
+};
+
+const buildReviewWorkflowDiagnostics = (record: LocalProjectRecord): ReviewLogWorkflowDiagnostics => {
+  const redactionStatus = reviewLogRedactionStatus();
+  const activeCycleNumber = record.workflow.workflowCycle.cycleNumber;
+  const cycleNumbers = unique([
+    activeCycleNumber,
+    ...record.workflow.cycleRetrospectives.map((entry) => entry.cycleNumber),
+    ...record.workflow.validationLedgers.map((entry) => entry.cycleNumber),
+    ...record.workflow.checklistDeltas.map((entry) => entry.cycleNumber),
+    ...record.workflow.evidenceObservations.map((entry) => entry.cycleNumber)
+  ])
+    .sort((left, right) => right - left)
+    .slice(0, 40);
+  return {
+    activeCycle: reviewCycleDiagnostics(record, activeCycleNumber, redactionStatus),
+    cycles: cycleNumbers.map((cycleNumber) => reviewCycleDiagnostics(record, cycleNumber, redactionStatus)),
+    redactionStatus
+  };
+};
+
 const toPathVariants = (value: string | undefined): string[] => {
   if (!value) {
     return [];
@@ -277,6 +399,7 @@ const redactString = (value: string, replacements: PathReplacement[]): string =>
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b/g, "[redacted-secret]")
     .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_]{16,}\b/g, "[redacted-token]")
     .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[redacted-access-key]")
+    .replace(/\b(?:[A-Za-z]:\\Users\\[^\s"'`]+|\/(?:home|Users|mnt|var|tmp|private|Volumes)\/[^\s"'`]+)/g, "<local-path>")
     .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[redacted-token]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]")
     .replace(
@@ -353,35 +476,38 @@ export class WorkbenchStorage {
     settings: AppSettings,
     diagnostics: string[]
   ): ProjectReviewLogBundle {
+    const exportedAt = nowIso();
+    const exportRecord = cloneRecordForReviewExport(record, exportedAt);
     const bundle: ProjectReviewLogBundle = {
       schemaVersion: REVIEW_LOG_BUNDLE_VERSION,
       appVersion: APP_VERSION,
-      exportedAt: nowIso(),
+      exportedAt,
       context: buildReviewLogRuntimeContext(settings),
-      summary: buildReviewLogSummary(record),
-      redactions: buildRedactionNotes(record),
+      summary: buildReviewLogSummary(exportRecord),
+      redactions: buildRedactionNotes(exportRecord),
       warnings: [
         "Project/worktree paths and common secret-looking values were redacted, but repository content may still contain project-sensitive information.",
         "The bundle only includes the workflow, events, and command output currently retained by the app."
       ],
+      workflowDiagnostics: buildReviewWorkflowDiagnostics(exportRecord),
       project: {
-        id: record.id,
-        identity: record.identity,
-        validation: record.validation,
-        localState: record.localState,
-        workflow: record.workflow,
-        interfaceCreation: record.interfaceCreation,
-        overview: record.overview,
-        stats: record.stats,
-        dependencies: record.dependencies
+        id: exportRecord.id,
+        identity: exportRecord.identity,
+        validation: exportRecord.validation,
+        localState: exportRecord.localState,
+        workflow: exportRecord.workflow,
+        interfaceCreation: exportRecord.interfaceCreation,
+        overview: exportRecord.overview,
+        stats: exportRecord.stats,
+        dependencies: exportRecord.dependencies
       },
-      agents: record.agents,
-      userInputRequests: record.userInputRequests,
+      agents: exportRecord.agents,
+      userInputRequests: exportRecord.userInputRequests,
       diagnostics,
-      timeline: buildReviewTimeline(record)
+      timeline: buildReviewTimeline(exportRecord)
     };
 
-    const sanitized = sanitizeReviewValue(bundle, collectPathReplacements(record)) as ProjectReviewLogBundle;
+    const sanitized = sanitizeReviewValue(bundle, collectPathReplacements(exportRecord)) as ProjectReviewLogBundle;
     return projectReviewLogBundleSchema.parse(sanitized);
   }
 

@@ -51,7 +51,7 @@ import {
   visualExportStartRequestSchema
 } from "@shared/ipc";
 import { createAgentSkeleton, createLocalProjectRecord, defaultLayout, defaultLocalState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowStepProgressState, emptyUltimateGoal } from "@shared/defaults";
-import type { AgentState, AgentTranscriptEntry, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, RepositoryScanSettings, RepoTreeNode, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
+import type { AgentState, AgentTranscriptEntry, ApprovedRecommendation, DiscoveredModel, GoalAttainmentCheck, ProjectOverview, ProjectStats, ProjectWorkflowState, RepositoryScanSettings, RepoTreeNode, WorkflowRecommendationOption, WorkflowStage, WorkPackage } from "@shared/types";
 import {
   createScopedGoalFromWorkPackage,
   createScopedGoalFromRecommendation,
@@ -73,9 +73,20 @@ import {
   workPackageRequiresModelScoping
 } from "@shared/workflow";
 import {
+  applyChecklistEvidenceObservations,
+  buildCycleContract,
+  buildNoProgressReconciliationRecommendation,
+  computeChecklistDelta,
+  discoverProjectEvidenceCommands,
+  extractChecklistEvidenceObservations,
+  recordRecommendationFallbackUsed,
+  recordStructuredRecommendationFailure
+} from "@shared/workflowEvidence";
+import {
   buildWorkflowGoalView,
   buildWorkflowTimelineSteps,
   deriveWorkflowRuntimeStatus,
+  deriveUserFacingWorkflowStatus,
   getWorkflowRecoveryCandidate,
   getWorkflowRepairCounterView,
   workflowActionGuide,
@@ -85,6 +96,7 @@ import {
   workflowStageLabel,
   workflowStatusSummary
 } from "@shared/workflowView";
+import { buildOperatorWorkflowViewModel, suspiciousPathReason } from "@shared/operatorWorkflowView";
 import { reduceAgentRuntimeEvent } from "@runtime/runtimeEvents";
 import { AppService } from "@runtime/appService";
 import { WorkbenchStorage } from "@runtime/storage";
@@ -155,6 +167,18 @@ import {
   sanitizeRecommendationForCycle,
   sanitizeScopedGoalForSingleAgent
 } from "@runtime/workflowGuardrails";
+import {
+  buildValidationCommandResult,
+  createValidationLedger,
+  deriveMergeGateDecision,
+  finalizeValidationLedger
+} from "@shared/validationLedger";
+import {
+  deriveLegacyWorkflowDiagnostics,
+  workflowCycleTaskSeparation
+} from "@shared/workflowMigration";
+import { resolveEvidenceCommandsForExecution, resolveTargetProjectCommands } from "@runtime/targetProjectCommands";
+import { scanAndCleanRepoHygiene } from "@runtime/repoHygiene";
 import { buildWorkflowAttentionItems } from "@renderer/workflowAttention";
 import { buildRepairStrategyContext } from "@runtime/workflowRepairPlanner";
 import {
@@ -368,6 +392,36 @@ const makeGoalCheck = (overrides: Partial<GoalAttainmentCheck> = {}): GoalAttain
   createdAt: overrides.createdAt ?? "2026-04-07T00:00:00.000Z",
   updatedAt: overrides.updatedAt ?? "2026-04-07T00:00:00.000Z"
 });
+
+const readJsonFixture = async <T,>(name: string): Promise<T> =>
+  JSON.parse(await readFile(path.join(process.cwd(), "src/tests/fixtures", name), "utf8")) as T;
+
+const localRuntimeSettings = {
+  executionMode: "local" as const,
+  distroName: "Ubuntu"
+};
+
+let ledgerCommandCounter = 0;
+const makeLedgerCommandResult = (overrides: Partial<Parameters<typeof buildValidationCommandResult>[0]> = {}) => {
+  ledgerCommandCounter += 1;
+  return buildValidationCommandResult({
+    commandId: overrides.commandId ?? `cmd-${ledgerCommandCounter}`,
+    command: overrides.command ?? "npm test",
+    phase: overrides.phase ?? "integrity",
+    startedAt: overrides.startedAt ?? "2026-06-01T00:00:00.000Z",
+    endedAt: overrides.endedAt ?? "2026-06-01T00:00:01.000Z",
+    exitCode: overrides.exitCode ?? 0,
+    status: overrides.status,
+    stdout: overrides.stdout ?? "",
+    stderr: overrides.stderr ?? "",
+    cwdKind: overrides.cwdKind ?? "project_root",
+    fullOutputRef: overrides.fullOutputRef,
+    parsedJsonRef: overrides.parsedJsonRef,
+    relatedCheckIds: overrides.relatedCheckIds,
+    relatedFiles: overrides.relatedFiles,
+    classifiedFailure: overrides.classifiedFailure
+  });
+};
 
 const makeAppServiceLoadedProject = (projectId = "project-1") => {
   const workflow = defaultProjectWorkflowState();
@@ -652,6 +706,380 @@ describe("repo hygiene guardrails", () => {
     for (const sample of repoHygiene.gitignoreArtifactSamples) {
       expect(ignored.some((line) => line.endsWith(`\t${sample}`))).toBe(true);
     }
+  });
+});
+
+describe("validation ledger", () => {
+  it("treats pytest unavailable plus unittest passed as passed with an environment warning", () => {
+    const ledger = createValidationLedger({
+      cycleNumber: 1,
+      testCommands: ["python3 -m pytest", "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -q"]
+    });
+    ledger.commandResults = [
+      makeLedgerCommandResult({
+        commandId: "pytest-missing",
+        command: "python3 -m pytest",
+        exitCode: 1,
+        stderr: "/usr/bin/python3: No module named pytest"
+      }),
+      makeLedgerCommandResult({
+        commandId: "unittest-pass",
+        command: "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -q",
+        exitCode: 0,
+        stdout: "OK"
+      })
+    ];
+
+    const finalized = finalizeValidationLedger(ledger);
+
+    expect(finalized.finalValidationStatus).toBe("passed");
+    expect(finalized.mergeAllowed).toBe(false);
+    expect(finalized.mergeBlockedReasons.join(" ")).toContain("hygiene");
+    const withHygiene = finalizeValidationLedger(ledger, {
+      repoHygieneReport: {
+        status: "passed",
+        scannedAt: "2026-06-01T00:00:02.000Z",
+        scannedRef: "test",
+        forbiddenFiles: [],
+        cleanedFiles: [],
+        warnings: [],
+        mergeBlockingFindings: [],
+        summaryForHumans: "Repository hygiene passed."
+      }
+    });
+    expect(withHygiene.mergeAllowed).toBe(true);
+    expect(finalized.warnings.join(" ")).toContain("pytest unavailable");
+    expect(finalized.summaryForHumans).toContain("failed attempt");
+
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal.confirmedAt = "2026-06-01T00:00:00.000Z";
+    workflow.validationLedgers = [finalized];
+    const view = buildOperatorWorkflowViewModel({ workflow, validationLedger: finalized });
+    expect(view.currentCycle.validationSummary.finalStatusLabel).toBe("Final validation passed");
+    expect(view.currentCycle.validationSummary.warnings.join(" ")).toContain("pytest unavailable");
+    expect(view.currentCycle.validationSummary.repaired.length).toBeGreaterThan(0);
+  });
+
+  it("treats python unavailable plus python3 passed as passed with an environment warning", () => {
+    const ledger = createValidationLedger({
+      cycleNumber: 1,
+      testCommands: ["python -m unittest discover -s tests -q", "python3 -m unittest discover -s tests -q"]
+    });
+    ledger.commandResults = [
+      makeLedgerCommandResult({
+        commandId: "python-missing",
+        command: "python -m unittest discover -s tests -q",
+        exitCode: 127,
+        stderr: "python: command not found"
+      }),
+      makeLedgerCommandResult({
+        commandId: "python3-pass",
+        command: "python3 -m unittest discover -s tests -q",
+        exitCode: 0,
+        stdout: "OK"
+      })
+    ];
+
+    const finalized = finalizeValidationLedger(ledger);
+
+    expect(finalized.finalValidationStatus).toBe("passed");
+    expect(finalized.warnings.join(" ")).toContain("python unavailable");
+  });
+
+  it("keeps an unresolved assertion failure failed and merge-blocking", () => {
+    const ledger = createValidationLedger({ cycleNumber: 1, testCommands: ["npm test"] });
+    ledger.commandResults = [
+      makeLedgerCommandResult({
+        command: "npm test",
+        exitCode: 1,
+        stdout: "FAIL test/example.spec.ts\nAssertionError: expected true to be false"
+      })
+    ];
+
+    const finalized = finalizeValidationLedger(ledger);
+
+    expect(finalized.finalValidationStatus).toBe("failed");
+    expect(finalized.mergeAllowed).toBe(false);
+    expect(finalized.productFailures).toHaveLength(1);
+
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal.confirmedAt = "2026-06-01T00:00:00.000Z";
+    workflow.validationLedgers = [finalized];
+    const view = buildOperatorWorkflowViewModel({ workflow, validationLedger: finalized });
+    expect(view.currentCycle.validationSummary.finalStatusLabel).toBe("Final validation failed");
+    expect(view.currentCycle.validationSummary.mergeAllowed).toBe(false);
+    expect(view.currentStatus.nextOperatorAction).toBe("Fix validation failure before merge.");
+  });
+
+  it("marks an equivalent failed command repaired after a later pass", () => {
+    const ledger = createValidationLedger({ cycleNumber: 1, testCommands: ["npm test"] });
+    ledger.commandResults = [
+      makeLedgerCommandResult({
+        commandId: "npm-test-failed",
+        command: "npm test",
+        exitCode: 1,
+        stdout: "FAIL test/example.spec.ts\nAssertionError: expected true to be false"
+      }),
+      makeLedgerCommandResult({
+        commandId: "npm-test-passed",
+        command: "npm test",
+        exitCode: 0,
+        stdout: "Tests passed"
+      })
+    ];
+
+    const finalized = finalizeValidationLedger(ledger);
+
+    expect(finalized.finalValidationStatus).toBe("passed");
+    expect(finalized.repairedFailures).toHaveLength(1);
+    expect(finalized.unresolvedValidationFailures).toEqual([]);
+  });
+
+  it("reports not_run when no validation command ran", () => {
+    const finalized = finalizeValidationLedger(createValidationLedger({ cycleNumber: 1 }));
+
+    expect(finalized.finalValidationStatus).toBe("not_run");
+    expect(finalized.mergeAllowed).toBe(false);
+    expect(finalized.summaryForHumans).toContain("did not run");
+
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal.confirmedAt = "2026-06-01T00:00:00.000Z";
+    workflow.validationLedgers = [finalized];
+    const view = buildOperatorWorkflowViewModel({ workflow, validationLedger: finalized });
+    expect(view.currentCycle.validationSummary.finalStatusLabel).toBe("Validation not run");
+    expect(view.currentCycle.validationSummary.finalStatusLabel).not.toMatch(/success|passed/i);
+  });
+
+  it("classifies JSON evidence parse failure as evidence failure, not product failure", () => {
+    const ledger = createValidationLedger({ cycleNumber: 1, evidenceCommands: ["python3 -m aw_trends.app source-audit --limit 3"] });
+    ledger.commandResults = [
+      makeLedgerCommandResult({
+        command: "python3 -m aw_trends.app source-audit --limit 3",
+        phase: "evidence",
+        exitCode: 0,
+        status: "failed",
+        stderr: "JSON parse failure: unexpected token"
+      })
+    ];
+
+    const finalized = finalizeValidationLedger(ledger);
+
+    expect(finalized.evidenceFailures).toHaveLength(1);
+    expect(finalized.productFailures).toHaveLength(0);
+    expect(finalized.finalValidationStatus).toBe("partial");
+  });
+});
+
+describe("target project command resolver", () => {
+  it("uses src-layout unittest validation when pytest is not declared", async () => {
+    const root = await createTempDir("resolver-python-src");
+    await mkdir(path.join(root, "src", "sample"), { recursive: true });
+    await mkdir(path.join(root, "tests"), { recursive: true });
+    await writeFile(path.join(root, "src", "sample", "__init__.py"), "");
+    await writeFile(path.join(root, "tests", "test_sample.py"), "import unittest\n\nclass SampleTest(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n");
+
+    const resolution = await resolveTargetProjectCommands({ projectRoot: root, projectKind: "folder" });
+
+    expect(resolution.testCommands.map((command) => command.command)).toContain(
+      "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -q"
+    );
+  });
+
+  it("does not run python -m pytest after python command not found", async () => {
+    const root = await createTempDir("resolver-python3");
+    await mkdir(path.join(root, "tests"), { recursive: true });
+    await writeFile(path.join(root, "tests", "test_sample.py"), "import unittest\n");
+    const previous = makeLedgerCommandResult({
+      command: "python -m pytest",
+      exitCode: 127,
+      stderr: "python: command not found"
+    });
+
+    const resolution = await resolveTargetProjectCommands({
+      projectRoot: root,
+      projectKind: "folder",
+      previousCommandResults: [previous]
+    });
+
+    expect(resolution.testCommands.some((command) => command.command.includes("python -m pytest"))).toBe(false);
+    expect(resolution.testCommands.every((command) => !/\bpython\s+-m\b/.test(command.command))).toBe(true);
+  });
+
+  it("uses pytest when declared", async () => {
+    const root = await createTempDir("resolver-pytest");
+    await mkdir(path.join(root, "tests"), { recursive: true });
+    await writeFile(path.join(root, "pyproject.toml"), "[project]\ndependencies = ['pytest']\n");
+    await writeFile(path.join(root, "tests", "test_sample.py"), "def test_ok():\n    assert True\n");
+
+    const resolution = await resolveTargetProjectCommands({ projectRoot: root, projectKind: "folder" });
+
+    expect(resolution.testCommands.map((command) => command.command)).toContain("PYTHONDONTWRITEBYTECODE=1 python3 -m pytest");
+  });
+
+  it("marks live HTTP evidence commands approval-required", async () => {
+    const root = await createTempDir("resolver-evidence");
+    const resolved = await resolveEvidenceCommandsForExecution(root, [{
+      name: "live status",
+      command: "curl https://example.com/status",
+      purpose: "Live status",
+      expectedOutput: "json",
+      mapsToChecklistGroups: [],
+      mapsToCheckIds: ["check-live"],
+      safeDefault: false,
+      requiresNetwork: true,
+      requiresCredentials: false,
+      discoveredFrom: "manual",
+      confidence: 0.5
+    }]);
+
+    expect(resolved.runnable).toHaveLength(0);
+    expect(resolved.skipped[0]?.approvalRequired).toBe(true);
+    expect(resolved.skipped[0]?.skipReason).toContain("network");
+  });
+});
+
+describe("target repo hygiene scanner", () => {
+  const createGitTarget = async (name: string): Promise<string> => {
+    const root = await createTempDir(name);
+    await initGitRepo(root);
+    return root;
+  };
+
+  it("blocks EADME.md before merge", async () => {
+    const root = await createGitTarget("hygiene-eadme");
+    await writeFile(path.join(root, "EADME.md"), "typo\n");
+
+    const report = await scanAndCleanRepoHygiene({
+      projectRoot: root,
+      projectKind: "git",
+      runtimeSettings: localRuntimeSettings,
+      scannedRef: "test",
+      clean: true
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.mergeBlockingFindings.join(" ")).toContain("EADME.md");
+  });
+
+  it("blocks ocs when docs exists", async () => {
+    const root = await createGitTarget("hygiene-ocs");
+    await mkdir(path.join(root, "docs"), { recursive: true });
+    await mkdir(path.join(root, "ocs"), { recursive: true });
+    await writeFile(path.join(root, "ocs", "core-portfolio-analytics-evidence.md"), "evidence\n");
+
+    const report = await scanAndCleanRepoHygiene({
+      projectRoot: root,
+      projectKind: "git",
+      runtimeSettings: localRuntimeSettings,
+      scannedRef: "test",
+      clean: true
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.mergeBlockingFindings.join(" ")).toContain("ocs/");
+  });
+
+  it("cleans Python bytecode artifacts and records cleaned files", async () => {
+    const root = await createGitTarget("hygiene-pyc");
+    await mkdir(path.join(root, "src", "foo", "__pycache__"), { recursive: true });
+    await writeFile(path.join(root, "src", "foo", "__pycache__", "bar.pyc"), "bytecode");
+
+    const report = await scanAndCleanRepoHygiene({
+      projectRoot: root,
+      projectKind: "git",
+      runtimeSettings: localRuntimeSettings,
+      scannedRef: "test",
+      clean: true
+    });
+
+    expect(report.cleanedFiles.some((entry) => entry.includes("__pycache__"))).toBe(true);
+    expect(report.mergeBlockingFindings).toEqual([]);
+    await expect(stat(path.join(root, "src", "foo", "__pycache__"))).rejects.toThrow();
+  });
+
+  it("allows valid README and docs changes", async () => {
+    const root = await createGitTarget("hygiene-valid-docs");
+    await mkdir(path.join(root, "docs"), { recursive: true });
+    await writeFile(path.join(root, "README.md"), "readme\n");
+    await writeFile(path.join(root, "docs", "design.md"), "design\n");
+
+    const report = await scanAndCleanRepoHygiene({
+      projectRoot: root,
+      projectKind: "git",
+      runtimeSettings: localRuntimeSettings,
+      scannedRef: "test",
+      clean: true
+    });
+
+    expect(report.mergeBlockingFindings).toEqual([]);
+  });
+
+  it("blocks secret-looking values in changed files", async () => {
+    const root = await createGitTarget("hygiene-secret");
+    await writeFile(path.join(root, "config.env"), "API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n");
+
+    const report = await scanAndCleanRepoHygiene({
+      projectRoot: root,
+      projectKind: "git",
+      runtimeSettings: localRuntimeSettings,
+      scannedRef: "test",
+      clean: true
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.mergeBlockingFindings.join(" ")).toContain("secret-looking");
+  });
+});
+
+describe("merge gate decisions", () => {
+  const passedLedger = () => finalizeValidationLedger({
+    ...createValidationLedger({ cycleNumber: 1, testCommands: ["npm test"] }),
+    commandResults: [makeLedgerCommandResult({ command: "npm test", exitCode: 0, stdout: "passed" })]
+  });
+
+  it("blocks merge when validation failed", () => {
+    const ledger = finalizeValidationLedger({
+      ...createValidationLedger({ cycleNumber: 1, testCommands: ["npm test"] }),
+      commandResults: [makeLedgerCommandResult({ command: "npm test", exitCode: 1, stdout: "AssertionError" })]
+    });
+
+    expect(deriveMergeGateDecision({ ledger }).allowed).toBe(false);
+  });
+
+  it("blocks merge when hygiene failed", () => {
+    const report = {
+      status: "failed" as const,
+      scannedAt: "2026-06-01T00:00:00.000Z",
+      scannedRef: "test",
+      forbiddenFiles: ["EADME.md"],
+      cleanedFiles: [],
+      warnings: [],
+      mergeBlockingFindings: ["EADME.md looks like a typo."],
+      summaryForHumans: "Repository hygiene blocked merge."
+    };
+
+    expect(deriveMergeGateDecision({ ledger: passedLedger(), repoHygieneReport: report }).allowed).toBe(false);
+  });
+
+  it("allows merge when validation and hygiene passed", () => {
+    const report = {
+      status: "passed" as const,
+      scannedAt: "2026-06-01T00:00:00.000Z",
+      scannedRef: "test",
+      forbiddenFiles: [],
+      cleanedFiles: [],
+      warnings: [],
+      mergeBlockingFindings: [],
+      summaryForHumans: "Repository hygiene passed."
+    };
+
+    expect(deriveMergeGateDecision({ ledger: passedLedger(), repoHygieneReport: report }).allowed).toBe(true);
+  });
+
+  it("does not let auto-approve push semantics bypass gates", () => {
+    const ledger = finalizeValidationLedger(createValidationLedger({ cycleNumber: 1 }));
+
+    expect(deriveMergeGateDecision({ ledger }).allowed).toBe(false);
   });
 });
 
@@ -2454,7 +2882,7 @@ describe("workflow state", () => {
     expect(workflow.workflowMode).toBe("normal");
     expect(projectWorkflowStateSchema.parse({ workflowMode: undefined }).workflowMode).toBe("normal");
     expect(getWorkflowModeConfig("normal")).toMatchObject({
-      mode: "normal",
+      mode: "autopilot_balanced",
       maxChecksPerPackage: 4,
       useRecommendationAgent: "always",
       finalAppealEnabled: true
@@ -6378,6 +6806,1023 @@ describe("workflow recommendations", () => {
   });
 });
 
+describe("workflow planning evidence layer", () => {
+  type AwTrendsCycleFixture = {
+    cycleNumber: number;
+    selectedCandidate: {
+      id: string;
+      title: string;
+      summary: string;
+      expectedFiles: string[];
+      targetedCheckIds: string[];
+      scoreBreakdown: Record<string, number>;
+    };
+    workPackage: Pick<WorkPackage, "id" | "title" | "summary" | "primaryTopic" | "likelyPaths" | "acceptanceHints" | "checkIds" | "score">;
+    goalChecklist: Array<{
+      id: string;
+      title: string;
+      description: string;
+      status: GoalAttainmentCheck["status"];
+    }>;
+  };
+
+  const buildAwTrendsWorkflow = (fixture: AwTrendsCycleFixture) => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Deliver an offline-reviewable market trends assistant with source provenance and access policy evidence.",
+      successCriteria: fixture.goalChecklist.map((check) => check.description),
+      confirmedAt: "2026-06-01T00:00:00.000Z"
+    };
+    workflow.workflowCycle.cycleNumber = fixture.cycleNumber;
+    workflow.workflowStage = "goal_ready";
+    workflow.goalChecklist = fixture.goalChecklist.map((check) => makeGoalCheck({
+      id: check.id,
+      title: check.title,
+      description: check.description,
+      status: check.status,
+      source: "success_criterion",
+      relatedPaths: fixture.workPackage.likelyPaths
+    }));
+    workflow.workPackages = [{
+      ...fixture.workPackage,
+      estimatedBreadth: "medium",
+      estimatedImpact: "high",
+      confidence: 0.91,
+      riskLevel: "medium",
+      reason: "Grouped by source provenance and access policy plus shared likely paths.",
+      acceptanceHints: fixture.workPackage.acceptanceHints,
+      checkIds: fixture.workPackage.checkIds
+    }];
+    const recommendation = makeRecommendation({
+      id: "recommendation:source-provenance",
+      title: fixture.selectedCandidate.title,
+      summary: fixture.selectedCandidate.summary,
+      rationale: "Grouped by source provenance and access policy plus shared checklist semantics.",
+      expectedImpact: "This moves the Ultimate Goal percentage by producing shared repository evidence for multiple required checks.",
+      relatedPaths: fixture.workPackage.likelyPaths,
+      sourceWorkPackageId: fixture.workPackage.id,
+      targetedCheckIds: fixture.selectedCandidate.targetedCheckIds,
+      estimatedScope: "medium"
+    });
+    workflow.recommendations = [recommendation];
+    workflow.approvedRecommendation = approveRecommendation(recommendation);
+    workflow.workflowCycle.approvedRecommendationId = recommendation.id;
+    workflow.workflowCycle.approvedRecommendationTitle = recommendation.title;
+    workflow.scopedGoal = {
+      id: "scoped-source-provenance",
+      sourceRecommendationId: recommendation.id,
+      sourceWorkPackageId: fixture.workPackage.id,
+      summary: "Satisfy source provenance and access policy",
+      executionBrief: "Produce machine-checkable source provenance and access policy evidence.",
+      acceptanceCriteria: fixture.workPackage.acceptanceHints,
+      constraints: ["Keep offline/demo behavior safe."],
+      testStrategy: [
+        "PYTHONPATH=src python3 -m aw_trends.app source-audit \"market data quotes corporate actions\" --limit 6"
+      ],
+      targetedCheckIds: fixture.selectedCandidate.targetedCheckIds,
+      likelyPaths: fixture.workPackage.likelyPaths,
+      createdAt: "2026-06-01T00:00:00.000Z"
+    };
+    workflow.plannerDecisions = [{
+      id: "planner-cycle-23",
+      planId: "plan-cycle-23",
+      cycleNumber: fixture.cycleNumber,
+      selectedTaskId: fixture.selectedCandidate.id,
+      selectedRecommendationId: recommendation.id,
+      selectedTaskTitle: fixture.selectedCandidate.title,
+      whySelected: "Selected because it targets four unknown required checks, but prior cycles show repetition risk.",
+      score: 320,
+      scoreBreakdown: fixture.selectedCandidate.scoreBreakdown,
+      strategySettingsUsed: ["high validation strictness"],
+      targetedChecklistIds: fixture.selectedCandidate.targetedCheckIds,
+      expectedFiles: fixture.selectedCandidate.expectedFiles,
+      expectedValidationCommands: ["python3 -m unittest discover -s tests -q"],
+      approvalRequired: false,
+      goalChangeProposalIds: [],
+      checklistChangeIds: [],
+      visualDesignImpact: false,
+      createdAt: "2026-06-01T00:00:00.000Z"
+    }];
+    return workflow;
+  };
+
+  type LegacyWorkflowFixture = {
+    summary?: { projectName?: string };
+    workflow: {
+      workflowStage?: WorkflowStage;
+      autopilotStatus?: ProjectWorkflowState["autopilotStatus"];
+      workflowCycle?: Partial<ProjectWorkflowState["workflowCycle"]>;
+      ultimateGoalProgress?: { percentComplete: number; requiredMet?: number; requiredTotal?: number };
+      goalChecklist: Array<{
+        id: string;
+        title: string;
+        description: string;
+        status: GoalAttainmentCheck["status"];
+      }>;
+      workPackages?: Array<Pick<WorkPackage, "id" | "title" | "summary" | "primaryTopic" | "likelyPaths" | "acceptanceHints" | "checkIds" | "score">>;
+      strategicPlans?: Array<{
+        id: string;
+        cycleNumber: number;
+        recentAgentOutputs?: string[];
+        candidateTasks?: Array<{
+          id: string;
+          kind: "work_package" | "goal_check" | "validation" | "stabilization" | "custom";
+          title: string;
+          summary: string;
+          sourceWorkPackageId?: string;
+          targetedCheckIds: string[];
+          expectedFiles: string[];
+          expectedValidationCommands: string[];
+          scoreBreakdown: Record<string, number>;
+        }>;
+        recommendedTaskId?: string;
+      }>;
+    };
+  };
+
+  const buildWorkflowFromLegacyFixture = (fixture: LegacyWorkflowFixture): ProjectWorkflowState => {
+    const workflow = defaultProjectWorkflowState();
+    const cycleNumber = fixture.workflow.workflowCycle?.cycleNumber ?? fixture.workflow.autopilotStatus?.cycleNumber ?? 1;
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: `${fixture.summary?.projectName ?? "Project"} legacy workflow regression goal`,
+      successCriteria: fixture.workflow.goalChecklist.map((check) => check.description),
+      confirmedAt: "2026-06-01T00:00:00.000Z"
+    };
+    workflow.workflowStage = fixture.workflow.workflowStage ?? "goal_ready";
+    workflow.workflowCycle = {
+      ...workflow.workflowCycle,
+      ...fixture.workflow.workflowCycle,
+      cycleNumber
+    };
+    workflow.autopilotStatus = fixture.workflow.autopilotStatus;
+    workflow.ultimateGoalProgress = fixture.workflow.ultimateGoalProgress
+      ? {
+        percentComplete: fixture.workflow.ultimateGoalProgress.percentComplete,
+        rationale: `${fixture.workflow.ultimateGoalProgress.requiredMet ?? 0}/${fixture.workflow.ultimateGoalProgress.requiredTotal ?? fixture.workflow.goalChecklist.length} required checks met.`,
+        source: "deterministic",
+        updatedAt: "2026-06-01T00:00:00.000Z"
+      }
+      : undefined;
+    workflow.goalChecklist = fixture.workflow.goalChecklist.map((check) => makeGoalCheck({
+      id: check.id,
+      title: check.title,
+      description: check.description,
+      status: check.status,
+      source: "success_criterion",
+      relatedPaths: fixture.workflow.workPackages?.[0]?.likelyPaths ?? []
+    }));
+    workflow.workPackages = (fixture.workflow.workPackages ?? []).map((workPackage) => ({
+      ...workPackage,
+      estimatedBreadth: "medium" as const,
+      estimatedImpact: "high" as const,
+      confidence: 0.9,
+      riskLevel: "medium" as const,
+      reason: `Grouped by ${workPackage.primaryTopic}.`
+    }));
+    const selectedCandidate = fixture.workflow.strategicPlans?.flatMap((plan) => plan.candidateTasks ?? [])[0];
+    if (selectedCandidate) {
+      const recommendation = makeRecommendation({
+        id: `recommendation:${selectedCandidate.id}`,
+        title: selectedCandidate.title,
+        summary: selectedCandidate.summary,
+        relatedPaths: selectedCandidate.expectedFiles,
+        sourceWorkPackageId: selectedCandidate.sourceWorkPackageId,
+        targetedCheckIds: selectedCandidate.targetedCheckIds,
+        estimatedScope: "medium"
+      });
+      workflow.recommendations = [recommendation];
+      workflow.approvedRecommendation = approveRecommendation(recommendation);
+      workflow.scopedGoal = {
+        id: `scoped:${selectedCandidate.id}`,
+        sourceRecommendationId: recommendation.id,
+        sourceWorkPackageId: selectedCandidate.sourceWorkPackageId,
+        summary: selectedCandidate.title,
+        executionBrief: selectedCandidate.summary,
+        acceptanceCriteria: workflow.workPackages.find((entry) => entry.id === selectedCandidate.sourceWorkPackageId)?.acceptanceHints ?? [],
+        constraints: [],
+        testStrategy: selectedCandidate.expectedValidationCommands,
+        targetedCheckIds: selectedCandidate.targetedCheckIds,
+        likelyPaths: selectedCandidate.expectedFiles,
+        createdAt: "2026-06-01T00:00:00.000Z"
+      };
+      workflow.plannerDecisions = [{
+        id: `planner:${cycleNumber}`,
+        planId: fixture.workflow.strategicPlans?.[0]?.id ?? `plan:${cycleNumber}`,
+        cycleNumber,
+        selectedTaskId: selectedCandidate.id,
+        selectedRecommendationId: recommendation.id,
+        selectedTaskTitle: selectedCandidate.title,
+        whySelected: "Selected from retained legacy strategic plan.",
+        score: Object.values(selectedCandidate.scoreBreakdown).reduce((sum, value) => sum + value, 0),
+        scoreBreakdown: selectedCandidate.scoreBreakdown,
+        strategySettingsUsed: [],
+        targetedChecklistIds: selectedCandidate.targetedCheckIds,
+        expectedFiles: selectedCandidate.expectedFiles,
+        expectedValidationCommands: selectedCandidate.expectedValidationCommands,
+        approvalRequired: false,
+        goalChangeProposalIds: [],
+        checklistChangeIds: [],
+        visualDesignImpact: false,
+        createdAt: "2026-06-01T00:00:00.000Z"
+      }];
+    }
+    workflow.strategicPlans = (fixture.workflow.strategicPlans ?? []).map((plan) => ({
+      id: plan.id,
+      projectId: "fixture-project",
+      cycleNumber: plan.cycleNumber,
+      createdAt: "2026-06-01T00:00:00.000Z",
+      originalGoalSummary: workflow.ultimateGoal.summary,
+      currentEffectiveGoalSummary: workflow.ultimateGoal.summary,
+      mode: "autopilot_balanced",
+      strategySnapshot: workflow.goalCharter.autopilotStrategy,
+      strategyHighlights: [],
+      repoScanStatus: "fixture",
+      previousCycleOutcomes: [],
+      failedCommands: [],
+      changedFiles: [],
+      openBlockers: [],
+      userFeedback: [],
+      recentAgentOutputs: plan.recentAgentOutputs ?? [],
+      architectureNotes: [],
+      candidateTasks: (plan.candidateTasks ?? []).map((candidate) => ({
+        id: candidate.id,
+        kind: candidate.kind,
+        title: candidate.title,
+        summary: candidate.summary,
+        sourceWorkPackageId: candidate.sourceWorkPackageId,
+        targetedCheckIds: candidate.targetedCheckIds,
+        expectedChecklistImpact: "Fixture candidate targets retained checklist IDs.",
+        expectedFiles: candidate.expectedFiles,
+        expectedValidationCommands: candidate.expectedValidationCommands,
+        riskLevel: "medium",
+        whyNext: "Fixture candidate retained from legacy plan.",
+        approvalRequired: false,
+        goalChangeProposalIds: [],
+        checklistChangeIds: [],
+        visualDesignImpact: false,
+        shouldSplit: false,
+        score: Object.values(candidate.scoreBreakdown).reduce((sum, value) => sum + value, 0),
+        scoreBreakdown: candidate.scoreBreakdown,
+        confidence: 0.9
+      })),
+      candidateWorkPackages: workflow.workPackages,
+      proposedGoalChanges: [],
+      proposedChecklistChanges: [],
+      recommendedTaskId: plan.recommendedTaskId,
+      requiresApproval: false,
+      plannerSummary: "Fixture strategic plan.",
+      continueRecommendation: "continue"
+    }));
+    return workflow;
+  };
+
+  it("loads active-cycle legacy state and derives concrete diagnostics without generic status labels", async () => {
+    const fixture = await readJsonFixture<LegacyWorkflowFixture>("aw-trends-active-cycle-23-legacy.json");
+    const workflow = buildWorkflowFromLegacyFixture(fixture);
+
+    const report = deriveLegacyWorkflowDiagnostics(workflow, {
+      agents: [],
+      now: "2026-06-01T00:00:00.000Z",
+      deriveChecklistDelta: true,
+      deriveValidationLedger: true,
+      deriveRepoHygiene: true
+    });
+    const view = buildOperatorWorkflowViewModel({
+      workflow,
+      projectName: fixture.summary?.projectName,
+      workflowPauseRequested: true
+    });
+
+    expect(report.cycleContractDerived).toBe(true);
+    expect(workflow.cycleContract?.schemaVersion).toBe(1);
+    expect(workflow.cycleContract?.selectedTaskSource).toBe("derived_from_legacy_state");
+    expect(workflow.cycleContract?.plainEnglishObjective).toContain("Prove the source provenance and access policy slice");
+    expect(workflow.cycleContract?.plainEnglishObjective).not.toContain("Use this coherent work package");
+    expect(workflow.cycleContract?.targetedChecklistItems.map((item) => item.fullDescription).join("\n")).toContain("provider freshness");
+    expect(workflow.checklistDeltas[0]?.summaryForHumans).toContain("not recorded");
+    expect(workflow.validationLedgers[0]?.finalValidationStatus).toBe("not_run");
+    expect(workflow.repoHygieneReports[0]?.status).toBe("unknown");
+    expect(workflow.recommendationHealth.fallbackUsedForCurrentRecommendation).toBe(true);
+    expect(view.currentStatus.primaryLabel).toBe("Paused after coding checkpoint; awaiting integrity/merge");
+    expect(view.currentStatus.technicalStage).toBe("Preparing Coding");
+    expect(view.planner.fallbackWarning).toContain("Structured recommendation output was invalid");
+  });
+
+  it("reconciles source-audit evidence into targeted checklist delta from legacy state", async () => {
+    const fixture = await readJsonFixture<LegacyWorkflowFixture>("aw-trends-active-cycle-23-legacy.json");
+    const evidence = await readJsonFixture<unknown>("aw-trends-source-audit-evidence.json");
+    const workflow = buildWorkflowFromLegacyFixture(fixture);
+    deriveLegacyWorkflowDiagnostics(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      deriveChecklistDelta: false,
+      deriveValidationLedger: false,
+      deriveRepoHygiene: false
+    });
+    const targetIds = workflow.cycleContract?.targetedChecklistItems.map((item) => item.checkId) ?? [];
+    const before = workflow.goalChecklist;
+    const observations = extractChecklistEvidenceObservations(JSON.stringify(evidence), {
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      targetedCheckIds: targetIds,
+      knownCheckIds: workflow.goalChecklist.map((check) => check.id),
+      evidenceSourceType: "command_output",
+      sourceRef: { commandId: "source-audit" },
+      observedAt: "2026-06-01T00:05:00.000Z"
+    });
+    const applied = applyChecklistEvidenceObservations(workflow.goalChecklist, observations, {
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+    workflow.goalChecklist = applied.checklist;
+    const delta = computeChecklistDelta(before, workflow.goalChecklist, applied.observations, {
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+
+    expect(delta.targetedNewlyMet).toHaveLength(4);
+    expect(delta.evidenceConsumedCount).toBe(4);
+    expect(delta.goalProgressAfter).toBeGreaterThan(delta.goalProgressBefore);
+  });
+
+  it("rejects implementation prose evidence that omits check IDs", async () => {
+    const fixture = await readJsonFixture<LegacyWorkflowFixture>("aw-trends-active-cycle-23-legacy.json");
+    const evidence = await readJsonFixture<unknown>("aw-trends-evidence-missing-check-ids.json");
+    const workflow = buildWorkflowFromLegacyFixture(fixture);
+    deriveLegacyWorkflowDiagnostics(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      deriveChecklistDelta: false,
+      deriveValidationLedger: false,
+      deriveRepoHygiene: false
+    });
+    const targetIds = workflow.cycleContract?.targetedChecklistItems.map((item) => item.checkId) ?? [];
+    const observations = extractChecklistEvidenceObservations(JSON.stringify(evidence), {
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      targetedCheckIds: targetIds,
+      knownCheckIds: workflow.goalChecklist.map((check) => check.id),
+      evidenceSourceType: "artifact",
+      sourceRef: { artifactPath: "artifacts/source-audit.json" },
+      observedAt: "2026-06-01T00:05:00.000Z"
+    });
+    const applied = applyChecklistEvidenceObservations(workflow.goalChecklist, observations, {
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+    const delta = computeChecklistDelta(workflow.goalChecklist, applied.checklist, applied.observations, {
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+
+    expect(applied.checklist.filter((check) => targetIds.includes(check.id)).every((check) => check.status === "unknown")).toBe(true);
+    expect(delta.evidenceNotConsumedCount).toBeGreaterThan(0);
+    expect(delta.evidenceNotConsumedReasons.missing_check_id).toBeGreaterThan(0);
+    expect(Object.values(delta.whyStillUnknownByCheckId)).toContain("evidence emitted but missing check ID");
+  });
+
+  it("classifies repaired validation attempts and only allows merge when hygiene passed", async () => {
+    const fixture = await readJsonFixture<{
+      cycleNumber: number;
+      commands: Array<{ commandId: string; command: string; phase: "integrity"; exitCode: number; stdout?: string; stderr?: string }>;
+      repoHygiene: NonNullable<ReturnType<typeof buildOperatorWorkflowViewModel>["currentCycle"]["repoHygiene"]>;
+    }>("aw-trends-validation-repair.json");
+    const ledger = createValidationLedger({
+      cycleNumber: fixture.cycleNumber,
+      testCommands: fixture.commands.map((command) => command.command)
+    });
+    ledger.commandResults = fixture.commands.map((command) => makeLedgerCommandResult({
+      commandId: command.commandId,
+      command: command.command,
+      phase: command.phase,
+      exitCode: command.exitCode,
+      stdout: command.stdout,
+      stderr: command.stderr
+    }));
+
+    const withoutHygiene = finalizeValidationLedger(ledger);
+    const withHygiene = finalizeValidationLedger(ledger, { repoHygieneReport: fixture.repoHygiene });
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = fixture.cycleNumber;
+    workflow.validationLedgers = [withHygiene];
+    workflow.repoHygieneReports = [fixture.repoHygiene];
+    const view = buildOperatorWorkflowViewModel({ workflow, validationLedger: withHygiene, repoHygieneReport: fixture.repoHygiene });
+
+    expect(withoutHygiene.finalValidationStatus).toBe("passed");
+    expect(withoutHygiene.mergeAllowed).toBe(false);
+    expect(withHygiene.finalValidationStatus).toBe("passed");
+    expect(withHygiene.mergeAllowed).toBe(true);
+    expect(withHygiene.environmentFailures.join(" ")).toContain("pytest is unavailable");
+    expect(withHygiene.environmentFailures.join(" ")).toContain("Python executable was unavailable");
+    expect(view.currentCycle.validationSummary.repaired.length).toBeGreaterThanOrEqual(2);
+    expect(view.currentCycle.validationSummary.mergeAllowed).toBe(true);
+  });
+
+  it("blocks hygiene bad paths and surfaces exact paths", async () => {
+    const fixture = await readJsonFixture<{ changedFiles: string[] }>("aw-trends-hygiene-bad-paths.json");
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal.confirmedAt = "2026-06-01T00:00:00.000Z";
+    workflow.workflowCycle.cycleNumber = 23;
+    workflow.repoHygieneReports = [{
+      status: "failed",
+      scannedAt: "2026-06-01T00:00:00.000Z",
+      scannedRef: "fixture:23",
+      forbiddenFiles: fixture.changedFiles.filter((file) => suspiciousPathReason(file) || /__pycache__|\.pyc$/i.test(file)),
+      cleanedFiles: [],
+      warnings: [],
+      mergeBlockingFindings: fixture.changedFiles
+        .filter((file) => suspiciousPathReason(file) || /__pycache__|\.pyc$/i.test(file))
+        .map((file) => `${file}: ${suspiciousPathReason(file) ?? "generated Python bytecode cannot be merged"}`),
+      summaryForHumans: "Repository hygiene failed for suspicious changed paths."
+    }];
+    const agent = {
+      ...createAgentSkeleton("coding", "Coding Pass", "Implement source evidence", "gpt-5.4"),
+      workflowCycleNumber: 23,
+      changedFiles: fixture.changedFiles
+    };
+    const view = buildOperatorWorkflowViewModel({ workflow, agents: [agent] });
+
+    expect(view.currentStatus.primaryLabel).toBe("Merge blocked by repository hygiene");
+    expect(view.repositoryHealth.suspiciousPaths).toEqual(expect.arrayContaining(["EADME.md", "ocs/core-portfolio-analytics-evidence.md"]));
+    expect(view.currentCycle.changedFilesSummary.find((group) => group.kind === "generated")?.files).toContain("src/aw_trends/__pycache__/app.cpython-312.pyc");
+    expect(view.currentCycle.validationSummary.mergeAllowed).toBe(false);
+  });
+
+  it("turns repeated fallback/no-delta fixture into a reconciliation task", async () => {
+    const base = await readJsonFixture<LegacyWorkflowFixture>("aw-trends-active-cycle-23-legacy.json");
+    const fixture = await readJsonFixture<{
+      cycles: Array<{ cycleNumber: number }>;
+      cycleContract: { targetedCheckIds: string[] };
+      recentAgentOutputs: string[];
+    }>("aw-trends-repeated-fallback-no-delta.json");
+    const workflow = buildWorkflowFromLegacyFixture(base);
+    deriveLegacyWorkflowDiagnostics(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      deriveChecklistDelta: false,
+      deriveValidationLedger: false,
+      deriveRepoHygiene: false
+    });
+    workflow.checklistDeltas = fixture.cycles.map((cycle) => ({
+      schemaVersion: 1,
+      cycleNumber: cycle.cycleNumber,
+      targetedTotal: fixture.cycleContract.targetedCheckIds.length,
+      targetedMetBefore: 0,
+      targetedMetAfter: 0,
+      targetedNewlyMet: [],
+      targetedStillUnknown: fixture.cycleContract.targetedCheckIds,
+      targetedNeedsAttention: [],
+      targetedNotApplicable: [],
+      nonTargetedChanges: [],
+      evidenceObservedCount: 1,
+      evidenceConsumedCount: 0,
+      evidenceNotConsumedCount: 1,
+      evidenceNotConsumedReasons: { missing_check_id: 1 },
+      summaryForHumans: "Validation passed but no targeted checklist item became met.",
+      didGoalProgressChange: false,
+      goalProgressBefore: 13,
+      goalProgressAfter: 13,
+      whyStillUnknownByCheckId: Object.fromEntries(fixture.cycleContract.targetedCheckIds.map((checkId) => [checkId, "evidence emitted but missing check ID"])),
+      createdAt: `2026-06-${String(cycle.cycleNumber).padStart(2, "0")}T00:00:00.000Z`
+    }));
+    workflow.evidenceObservations = [{
+      observationId: "obs-source-audit-missing-ids",
+      cycleNumber: 23,
+      checkId: "unknown",
+      status: "met",
+      evidenceText: "source-audit emitted targeted_check_satisfaction rows",
+      evidenceSourceType: "command_output",
+      sourceRef: { commandId: "source-audit", sourceKey: "targeted_check_satisfaction" },
+      relevantPaths: ["src/aw_trends/app.py"],
+      validationCommands: [],
+      confidence: 0.45,
+      observedAt: "2026-06-23T00:00:00.000Z",
+      consumedByChecklist: false,
+      notConsumedReason: "missing_check_id"
+    }];
+
+    const recommendation = buildNoProgressReconciliationRecommendation(workflow);
+
+    expect(recommendation?.title).toContain("Debug checklist evidence ingestion");
+    expect(recommendation?.title).not.toContain("Satisfy work package");
+    expect(recommendation?.summary).toContain("did not reconcile");
+  });
+
+  it("derives history task separation without swapping completed and next tasks", async () => {
+    const fixture = await readJsonFixture<{ cycles: Array<{ cycleNumber: number; triedToDo: string; nextRecommendedTasks: string[] }> }>("aw-trends-history-task-mixing.json");
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 23;
+    workflow.cycleRetrospectives = fixture.cycles.map((cycle) => ({
+      id: `retro-${cycle.cycleNumber}`,
+      cycleNumber: cycle.cycleNumber,
+      createdAt: `2026-06-${cycle.cycleNumber}T00:00:00.000Z`,
+      triedToDo: cycle.triedToDo,
+      whyChosen: "Fixture",
+      changedFiles: [],
+      commandsRun: [],
+      passed: [],
+      failed: [],
+      learned: [],
+      checklistItemsAdvanced: [],
+      goalChecklistChangeRecommendation: "Fixture",
+      nextRecommendedTasks: cycle.nextRecommendedTasks,
+      shouldContinue: true
+    }));
+
+    const cycle21 = workflowCycleTaskSeparation(workflow, 21);
+    const cycle22 = workflowCycleTaskSeparation(workflow, 22);
+
+    expect(cycle21.completedTask).toBe("Satisfy work package: source provenance and access policy");
+    expect(cycle21.nextRecommendedTask).toBe("Satisfy work package: core portfolio analytics");
+    expect(cycle22.completedTask).toBe("Satisfy work package: core portfolio analytics");
+    expect(cycle22.nextRecommendedTask).toBe("Satisfy work package: source provenance and access policy");
+  });
+
+  it("exports review logs with diagnostic objects and redaction", async () => {
+    const fixture = await readJsonFixture<LegacyWorkflowFixture>("aw-trends-active-cycle-23-legacy.json");
+    const workflow = buildWorkflowFromLegacyFixture(fixture);
+    workflow.evidenceObservations = [{
+      observationId: "obs-redaction",
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      checkId: "success_criterion:coxjd1",
+      status: "met",
+      evidenceText: "Evidence lives at /home/nicot/private/AW_Trends and token sk-abcdefghijklmnopqrstuvwxyz123456",
+      evidenceSourceType: "command_output",
+      sourceRef: { commandId: "source-audit", sourceKey: "targeted_check_satisfaction" },
+      relevantPaths: ["/home/nicot/private/AW_Trends/src/aw_trends/app.py"],
+      validationCommands: ["PYTHONPATH=src python3 -m aw_trends.app source-audit"],
+      confidence: 0.9,
+      observedAt: "2026-06-01T00:05:00.000Z",
+      consumedByChecklist: true
+    }];
+    const project = makeAppServiceLoadedProject("review-log-diagnostics-project");
+    project.record.identity.projectName = "AW_Trends";
+    project.record.workflow = workflow;
+    const storage = new WorkbenchStorage(await createTempDir("review-log-diagnostics-appdata"));
+    const outputDir = await createTempDir("review-log-diagnostics-output");
+    const outputPath = await storage.writeReviewLogBundleToFile(project.record, defaultSettings(), [], path.join(outputDir, "review-log.json"));
+    const raw = await readFile(outputPath, "utf8");
+    const parsed = projectReviewLogBundleSchema.parse(JSON.parse(raw));
+
+    expect(parsed.workflowDiagnostics?.activeCycle.cycleContract?.targetedChecklistItems).toHaveLength(4);
+    expect(parsed.workflowDiagnostics?.activeCycle.checklistDelta?.summaryForHumans).toContain("not recorded");
+    expect(parsed.workflowDiagnostics?.activeCycle.validationLedger?.finalValidationStatus).toBe("not_run");
+    expect(parsed.workflowDiagnostics?.activeCycle.repoHygieneReport?.status).toBe("unknown");
+    expect(parsed.workflowDiagnostics?.activeCycle.recommendationHealth.fallbackUsedForCurrentRecommendation).toBe(true);
+    expect(parsed.workflowDiagnostics?.activeCycle.cycleStartedWithTask).toContain("source provenance");
+    expect(parsed.workflowDiagnostics?.activeCycle.evidenceCommands).toEqual([]);
+    expect(raw).not.toContain("/home/nicot/private");
+    expect(raw).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456");
+    expect(raw).toContain("<local-path>");
+    expect(parsed.workflowDiagnostics?.redactionStatus.fullCommandOutputIncluded).toBe(false);
+  });
+
+  it("keeps generic projects generic while still deriving cycle contracts from work-package data", async () => {
+    const fixture = await readJsonFixture<LegacyWorkflowFixture>("generic-project-legacy.json");
+    const workflow = buildWorkflowFromLegacyFixture(fixture);
+    deriveLegacyWorkflowDiagnostics(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      deriveChecklistDelta: true,
+      deriveValidationLedger: true,
+      deriveRepoHygiene: true
+    });
+    const commands = discoverProjectEvidenceCommands({
+      files: [
+        { relativePath: "src/importer.ts" },
+        { relativePath: "tests/importer.test.ts" }
+      ],
+      checklist: workflow.goalChecklist,
+      workPackages: workflow.workPackages
+    });
+
+    expect(workflow.cycleContract?.plainEnglishObjective).toContain("import validation");
+    expect(workflow.cycleContract?.targetedChecklistItems.map((item) => item.checkId)).toEqual([
+      "success_criterion:import-validation",
+      "success_criterion:audit-summary"
+    ]);
+    expect(commands.some((command) => command.command.includes("aw_trends"))).toBe(false);
+  });
+
+  it("derives paused-after-checkpoint status for AW_Trends-like cycle 23", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.workflowStage = "goal_ready";
+    const codingAgent = {
+      ...createAgentSkeleton("coding", "Coding Pass 23", "Implement source provenance", "gpt-5.4"),
+      status: "completed" as const,
+      workflowCycleNumber: fixture.cycleNumber,
+      currentPhase: "Checkpointed worktree changes for merge",
+      completedAt: "2026-06-01T00:10:00.000Z"
+    };
+
+    const status = deriveUserFacingWorkflowStatus(workflow, { agents: [codingAgent] });
+
+    expect(status.label).toBe("Paused after coding checkpoint; awaiting integrity/merge");
+    expect(status.label).not.toBe("Preparing Coding");
+  });
+
+  it("derived status reports validation failure as merge-blocking", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const ledger = finalizeValidationLedger({
+      ...createValidationLedger({ cycleNumber: fixture.cycleNumber, testCommands: ["npm test"] }),
+      commandResults: [makeLedgerCommandResult({ command: "npm test", exitCode: 1, stdout: "AssertionError" })]
+    });
+    workflow.validationLedgers = [ledger];
+
+    const status = deriveUserFacingWorkflowStatus(workflow, { validationLedger: ledger });
+
+    expect(status.label).toBe("Merge blocked by validation failure");
+  });
+
+  it("derived status does not display success when validation has not run", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const ledger = finalizeValidationLedger(createValidationLedger({ cycleNumber: fixture.cycleNumber }));
+    workflow.validationLedgers = [ledger];
+
+    const status = deriveUserFacingWorkflowStatus(workflow, { validationLedger: ledger });
+
+    expect(status.label).toBe("Awaiting validation");
+    expect(status.label).not.toMatch(/success|passed/i);
+  });
+
+  it("builds an operator overview model for AW_Trends-like cycle 23", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.goalChecklist = [
+      ...workflow.goalChecklist,
+      ...Array.from({ length: 12 }, (_, index) => makeGoalCheck({
+        id: `extra-check-${index + 1}`,
+        title: `Extra required check ${index + 1}`,
+        status: index < 2 ? "met" : "unknown",
+        source: "success_criterion"
+      }))
+    ];
+    workflow.ultimateGoalProgress = {
+      percentComplete: 13,
+      rationale: "2 of 16 required checks are met.",
+      source: "deterministic",
+      updatedAt: "2026-06-01T00:12:00.000Z"
+    };
+    workflow.recommendationHealth = recordRecommendationFallbackUsed(
+      recordStructuredRecommendationFailure(workflow.recommendationHealth, {
+        category: "schema_mismatch",
+        message: "recommendations[0].priority expected enum value",
+        at: "2026-06-01T00:00:00.000Z"
+      }),
+      {
+        reason: "Planner fallback used because structured recommendation output failed schema validation.",
+        candidateCount: 3,
+        confidence: 0.91
+      }
+    );
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      selectedTaskSource: "deterministic_fallback"
+    });
+    const codingAgent = {
+      ...createAgentSkeleton("coding", "Coding Pass 23", "Implement source provenance", "gpt-5.4"),
+      status: "completed" as const,
+      workflowCycleNumber: fixture.cycleNumber,
+      currentPhase: "Checkpointed worktree changes for merge",
+      changedFiles: ["src/aw_trends/app.py", "src/aw_trends/ranking.py"],
+      completedAt: "2026-06-01T00:10:00.000Z"
+    };
+
+    const view = buildOperatorWorkflowViewModel({
+      workflow,
+      agents: [codingAgent],
+      projectName: "AW_Trends",
+      branch: "feature/source-provenance",
+      workflowPauseRequested: true,
+      approvalCount: 0
+    });
+
+    expect(view.currentStatus.primaryLabel).toBe("Paused after coding checkpoint; awaiting integrity/merge");
+    expect(view.currentStatus.primaryLabel).not.toBe("Preparing Coding");
+    expect(view.currentCycle.cycleNumber).toBe(23);
+    expect(view.goalProgress.percent).toBe(13);
+    expect(view.goalProgress.requiredMet).toBe(2);
+    expect(view.goalProgress.requiredTotal).toBe(16);
+    expect(view.currentCycle.cycleContract?.targetedChecklistItems).toHaveLength(4);
+    expect(view.planner.fallbackWarning).toContain("Planner fallback used");
+    expect(view.currentCycle.cycleContract?.concreteGoalForThisCycle).not.toContain("Use this coherent work package");
+  });
+
+  it("expands a generic work-package summary into a concrete cycle contract", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.recommendationHealth = recordRecommendationFallbackUsed(
+      recordStructuredRecommendationFailure(workflow.recommendationHealth, {
+        category: "schema_mismatch",
+        message: "recommendations[0].priority expected enum value",
+        at: "2026-06-01T00:00:00.000Z"
+      }),
+      {
+        reason: "Planner fallback used: structured recommendation JSON failed schema validation. Selected deterministic work package because it targeted 4 unknown required checks.",
+        candidateCount: 3,
+        confidence: 0.91
+      }
+    );
+
+    const contract = buildCycleContract(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      selectedTaskSource: "deterministic_fallback"
+    });
+
+    expect(contract.plainEnglishObjective).toContain("Prove the source provenance and access policy slice");
+    expect(contract.plainEnglishObjective).toContain("ranking factors");
+    expect(contract.plainEnglishObjective).toContain("validation flows");
+    expect(contract.plainEnglishObjective).not.toContain("Use this coherent work package");
+    expect(contract.targetedChecklistItems).toHaveLength(4);
+    expect(contract.targetedChecklistItems[0]?.fullDescription).toContain("provider freshness");
+    expect(contract.scoreBreakdown.repetition).toBe(-70);
+    expect(contract.repetitionPenalty).toBe(-70);
+    expect(contract.expectedFilesOrAreas).toEqual(expect.arrayContaining(["src/aw_trends/app.py", "src/aw_trends/ranking.py"]));
+    expect(contract.fallbackOrHealthWarnings.join(" ")).toContain("Planner fallback used");
+  });
+
+  it("operator cycle contract exposes targeted checks, done-when criteria, expected files, validation plan, and repetition penalty", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      selectedTaskSource: "deterministic_fallback"
+    });
+
+    const view = buildOperatorWorkflowViewModel({ workflow, workflowPauseRequested: true });
+    const contract = view.currentCycle.cycleContract;
+
+    expect(contract?.concreteGoalForThisCycle).toContain("Prove the source provenance and access policy slice");
+    expect(contract?.targetedChecklistItems.map((item) => item.fullDescription).join("\n")).toContain("provider freshness");
+    expect(contract?.doneWhen.length).toBeGreaterThan(0);
+    expect(contract?.expectedFilesOrAreas).toEqual(expect.arrayContaining(["src/aw_trends/app.py", "src/aw_trends/ranking.py"]));
+    expect([...contract?.expectedEvidenceCommands ?? [], ...contract?.expectedValidationCommands ?? []].length).toBeGreaterThan(0);
+    expect(view.planner.scoreBreakdown.find((score) => score.key === "repetition")?.value).toBe(-70);
+  });
+
+  it("operator repository hygiene flags suspicious changed paths and cleaned generated artifacts", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.repoHygieneReports = [{
+      status: "failed",
+      scannedAt: "2026-06-01T00:15:00.000Z",
+      scannedRef: "cycle:23",
+      forbiddenFiles: ["EADME.md", "ocs/source-policy.md"],
+      cleanedFiles: ["src/aw_trends/__pycache__/ranking.cpython-312.pyc"],
+      warnings: ["Suspicious typo paths were found."],
+      mergeBlockingFindings: ["EADME.md is not an expected repository path.", "ocs/source-policy.md looks like a docs typo."],
+      summaryForHumans: "Repository hygiene failed because suspicious typo paths were present."
+    }];
+    const codingAgent = {
+      ...createAgentSkeleton("coding", "Coding Pass 23", "Implement source provenance", "gpt-5.4"),
+      workflowCycleNumber: fixture.cycleNumber,
+      status: "completed" as const,
+      changedFiles: ["EADME.md", "ocs/source-policy.md", "src/aw_trends/__pycache__/ranking.cpython-312.pyc"]
+    };
+
+    const view = buildOperatorWorkflowViewModel({ workflow, agents: [codingAgent] });
+
+    expect(suspiciousPathReason("EADME.md")).toContain("README");
+    expect(suspiciousPathReason("ocs/source-policy.md")).toContain("docs");
+    expect(view.repositoryHealth.suspiciousPaths).toEqual(expect.arrayContaining(["EADME.md", "ocs/source-policy.md"]));
+    expect(view.repositoryHealth.cleanedGeneratedArtifacts).toContain("src/aw_trends/__pycache__/ranking.cpython-312.pyc");
+    expect(view.currentCycle.changedFilesSummary.find((group) => group.kind === "suspicious")?.files).toEqual(expect.arrayContaining(["EADME.md", "ocs/source-policy.md"]));
+    expect(view.currentStatus.nextOperatorAction).toBe("Remove or repair forbidden changed paths before merge.");
+  });
+
+  it("marks targeted checks met from explicit targeted_check_satisfaction JSON", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const evidence = await readJsonFixture<unknown>("aw-trends-source-audit-evidence.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const targetIds = fixture.selectedCandidate.targetedCheckIds;
+    const observations = extractChecklistEvidenceObservations(JSON.stringify(evidence), {
+      cycleNumber: fixture.cycleNumber,
+      targetedCheckIds: targetIds,
+      knownCheckIds: workflow.goalChecklist.map((check) => check.id),
+      evidenceSourceType: "command_output",
+      sourceRef: {
+        commandId: "cmd-source-audit",
+        agentRunId: "agent-source-audit"
+      },
+      observedAt: "2026-06-01T00:05:00.000Z"
+    });
+
+    const applied = applyChecklistEvidenceObservations(workflow.goalChecklist, observations, {
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+    const delta = computeChecklistDelta(workflow.goalChecklist, applied.checklist, applied.observations, {
+      cycleNumber: fixture.cycleNumber,
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+
+    expect(observations.filter((observation) => observation.consumedByChecklist)).toHaveLength(4);
+    expect(applied.checklist.filter((check) => targetIds.includes(check.id)).every((check) => check.status === "met")).toBe(true);
+    expect(delta.targetedNewlyMet).toHaveLength(4);
+    expect(delta.evidenceObservedCount).toBeGreaterThanOrEqual(4);
+    expect(delta.evidenceConsumedCount).toBe(4);
+    expect(delta.didGoalProgressChange).toBe(true);
+
+    workflow.checklistDeltas = [delta];
+    const view = buildOperatorWorkflowViewModel({ workflow });
+    expect(view.currentCycle.checklistDeltaSummary.newlyMet).toEqual(expect.arrayContaining(targetIds));
+    expect(view.currentCycle.checklistDeltaSummary.evidenceConsumed).toBe(4);
+  });
+
+  it("stores evidence without check IDs but does not consume it into checklist status", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const evidence = await readJsonFixture<unknown>("aw-trends-evidence-without-check-ids.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const targetIds = fixture.selectedCandidate.targetedCheckIds;
+    const observations = extractChecklistEvidenceObservations(JSON.stringify(evidence), {
+      cycleNumber: fixture.cycleNumber,
+      targetedCheckIds: targetIds,
+      knownCheckIds: workflow.goalChecklist.map((check) => check.id),
+      evidenceSourceType: "artifact",
+      sourceRef: {
+        artifactPath: "artifacts/source-audit.json"
+      },
+      observedAt: "2026-06-01T00:05:00.000Z"
+    });
+    const applied = applyChecklistEvidenceObservations(workflow.goalChecklist, observations, {
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+    const delta = computeChecklistDelta(workflow.goalChecklist, applied.checklist, applied.observations, {
+      cycleNumber: fixture.cycleNumber,
+      targetedCheckIds: targetIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+
+    expect(observations.length).toBeGreaterThan(0);
+    expect(applied.observations.every((observation) => !observation.consumedByChecklist)).toBe(true);
+    expect(applied.observations.some((observation) => observation.notConsumedReason === "missing_check_id")).toBe(true);
+    expect(applied.checklist.filter((check) => targetIds.includes(check.id)).every((check) => check.status === "unknown")).toBe(true);
+    expect(delta.didGoalProgressChange).toBe(false);
+    expect(delta.evidenceNotConsumedReasons.missing_check_id).toBeGreaterThan(0);
+    expect(delta.whyStillUnknownByCheckId[targetIds[0] ?? ""]).toBe("evidence emitted but missing check ID");
+
+    workflow.checklistDeltas = [delta];
+    workflow.evidenceObservations = applied.observations;
+    const view = buildOperatorWorkflowViewModel({ workflow });
+    expect(view.currentCycle.checklistDeltaSummary.evidenceNotConsumedReasons.join(" ")).toContain("missing check id");
+    expect(view.currentCycle.checklistDeltaSummary.whyStillUnknownByCheckId[targetIds[0] ?? ""]).toBe("evidence emitted but missing check ID");
+  });
+
+  it("distinguishes validation passing from checklist advancement", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const delta = computeChecklistDelta(workflow.goalChecklist, workflow.goalChecklist, [], {
+      cycleNumber: fixture.cycleNumber,
+      targetedCheckIds: fixture.selectedCandidate.targetedCheckIds,
+      timestamp: "2026-06-01T00:06:00.000Z"
+    });
+
+    expect(delta.targetedNewlyMet).toHaveLength(0);
+    expect(delta.didGoalProgressChange).toBe(false);
+    expect(delta.summaryForHumans).toContain("No checklist evidence was emitted");
+    expect(Object.values(delta.whyStillUnknownByCheckId)).toContain("no evidence emitted");
+
+    const view = buildOperatorWorkflowViewModel({ workflow });
+    expect(view.emptyStates.checklistDelta).toBe("No checklist delta recorded yet because integrity/reconciliation has not run.");
+    expect(view.currentCycle.checklistDeltaSummary.summary).toContain("integrity/reconciliation has not run");
+  });
+
+  it("turns repeated no-delta attempts into a reconciliation recommendation", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      selectedTaskSource: "deterministic_fallback"
+    });
+    workflow.checklistDeltas = [20, 21, 23].map((cycleNumber) => ({
+      schemaVersion: 1,
+      cycleNumber,
+      targetedTotal: 4,
+      targetedMetBefore: 0,
+      targetedMetAfter: 0,
+      targetedNewlyMet: [],
+      targetedStillUnknown: fixture.selectedCandidate.targetedCheckIds,
+      targetedNeedsAttention: [],
+      targetedNotApplicable: [],
+      nonTargetedChanges: [],
+      evidenceObservedCount: 1,
+      evidenceConsumedCount: 0,
+      evidenceNotConsumedCount: 1,
+      evidenceNotConsumedReasons: { missing_check_id: 1 },
+      summaryForHumans: "Validation passed but no targeted checklist item became met.",
+      didGoalProgressChange: false,
+      goalProgressBefore: 13,
+      goalProgressAfter: 13,
+      whyStillUnknownByCheckId: Object.fromEntries(fixture.selectedCandidate.targetedCheckIds.map((checkId) => [checkId, "evidence emitted but missing check ID"])),
+      createdAt: `2026-06-${String(cycleNumber).padStart(2, "0")}T00:00:00.000Z`
+    }));
+    workflow.evidenceObservations = [{
+      observationId: "obs-source-audit",
+      cycleNumber: 23,
+      checkId: "unknown",
+      status: "met",
+      evidenceText: "source-audit emitted targeted_check_satisfaction rows",
+      evidenceSourceType: "command_output",
+      sourceRef: { commandId: "source-audit", sourceKey: "targeted_check_satisfaction" },
+      relevantPaths: ["src/aw_trends/app.py"],
+      validationCommands: [],
+      confidence: 0.45,
+      observedAt: "2026-06-23T00:00:00.000Z",
+      consumedByChecklist: false,
+      notConsumedReason: "missing_check_id"
+    }];
+
+    const recommendation = buildNoProgressReconciliationRecommendation(workflow);
+
+    expect(recommendation?.title).toBe("Debug checklist evidence ingestion for source provenance and access policy");
+    expect(recommendation?.summary).toContain("source-audit emitted targeted_check_satisfaction rows");
+    expect(recommendation?.summary).toContain("did not reconcile");
+    expect(recommendation?.targetedCheckIds).toEqual(fixture.selectedCandidate.targetedCheckIds);
+  });
+
+  it("records structured recommendation failures and visible fallback warnings", () => {
+    let health = defaultProjectWorkflowState().recommendationHealth;
+    health = recordStructuredRecommendationFailure(health, {
+      category: "schema_mismatch",
+      message: "recommendations[0].riskLevel expected enum"
+    });
+    health = recordStructuredRecommendationFailure(health, {
+      category: "missing_required_field",
+      message: "ultimateGoalProgress is required"
+    });
+    health = recordRecommendationFallbackUsed(health, {
+      reason: "Planner fallback used: structured recommendation JSON failed schema validation. Selected deterministic work package because it targeted 4 unknown required checks.",
+      candidateCount: 3,
+      confidence: 0.91
+    });
+
+    expect(health.totalStructuredAttempts).toBe(2);
+    expect(health.totalStructuredFailures).toBe(2);
+    expect(health.consecutiveStructuredFailures).toBe(2);
+    expect(health.visibleWarningLevel).toBe("warning");
+    expect(health.fallbackUsedForCurrentRecommendation).toBe(true);
+    expect(health.fallbackReason).toContain("Planner fallback used");
+
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal.confirmedAt = "2026-06-01T00:00:00.000Z";
+    workflow.recommendationHealth = health;
+    const warningView = buildOperatorWorkflowViewModel({ workflow });
+    expect(warningView.planner.fallbackWarning).toContain("Planner fallback used");
+
+    const structuredWorkflow = defaultProjectWorkflowState();
+    structuredWorkflow.ultimateGoal.confirmedAt = "2026-06-01T00:00:00.000Z";
+    structuredWorkflow.recommendationHealth = {
+      ...structuredWorkflow.recommendationHealth,
+      totalStructuredAttempts: 1,
+      selectedTaskSource: "structured_recommendation",
+      modelRecommendationAccepted: true
+    };
+    const structuredView = buildOperatorWorkflowViewModel({ workflow: structuredWorkflow });
+    expect(structuredView.planner.fallbackWarning).toBeUndefined();
+  });
+
+  it("discovers safe AW_Trends-like evidence commands separately from tests", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const commands = discoverProjectEvidenceCommands({
+      files: [
+        { relativePath: "src/aw_trends/app.py" },
+        { relativePath: "src/aw_trends/ranking.py" },
+        { relativePath: "tests/test_source_audit.py" }
+      ],
+      checklist: workflow.goalChecklist,
+      previousSuccessfulCommands: ["python3 -m unittest discover -s tests -q"]
+    });
+
+    const sourceAudit = commands.find((command) => command.command.includes("source-audit"));
+    expect(sourceAudit?.safeDefault).toBe(true);
+    expect(sourceAudit?.expectedOutput).toBe("json");
+    expect(sourceAudit?.mapsToCheckIds).toEqual(expect.arrayContaining(fixture.selectedCandidate.targetedCheckIds));
+    expect(commands.some((command) => command.command === "python3 -m unittest discover -s tests -q")).toBe(true);
+  });
+
+  it("derives a cycle contract for legacy workflow state without one", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    const legacyWorkflow = projectWorkflowStateSchema.parse({
+      ...workflow,
+      cycleContract: undefined
+    });
+    const contract = buildCycleContract(legacyWorkflow, {
+      now: "2026-06-01T00:00:00.000Z",
+      selectedTaskSource: "derived_from_legacy_state"
+    });
+
+    expect(legacyWorkflow.cycleContract).toBeUndefined();
+    expect(contract.selectedTaskSource).toBe("derived_from_legacy_state");
+    expect(contract.targetedChecklistItems).toHaveLength(4);
+    expect(contract.plainEnglishObjective).toContain("machine-checkable evidence");
+  });
+});
+
 describe("project shell handoff", () => {
   const createProjectShellSpawnStub = (
     handler: (child: EventEmitter & { unref: () => void }) => void
@@ -7391,7 +8836,7 @@ describe("AppService workflow performance guards", () => {
     expect(cycleEightSummary?.strategySettingsUsed).toContain("Goal restrictiveness 80");
     expect(cycleEightSummary?.checklistChanges[0]).toContain("mark complete");
     expect(cycleEightSummary?.retrospective).toContain("Tried: Satisfy goal check");
-    expect(cycleEightSummary?.validationOutcome).toContain("no retained validation report");
+    expect(cycleEightSummary?.validationOutcome).toContain("no final validation ledger");
     expect(cycleEightDetail).not.toHaveProperty("agents");
     expect(cycleEightDetail.plannerDecision?.selectedRecommendationId).toBe("recommendation-cycle-8");
     expect(cycleEightDetail.retrospectiveRecord?.commandsRun).toContain("npm test -- cycle-eight");
@@ -7408,6 +8853,63 @@ describe("AppService workflow performance guards", () => {
     expect(fullOutput.output).toContain(longOutput);
     expect(fullOutput.output.length).toBeGreaterThan(50_000);
     expect(transcript.entries[0]?.text).toBe(longOutput);
+  });
+
+  it("keeps history selected/completed task separate from the next recommendation", async () => {
+    const appData = await createTempDir("history-task-separation");
+    const service = new AppService(appData) as unknown as {
+      projects: Map<string, ReturnType<typeof makeAppServiceLoadedProject>>;
+      listWorkflowCycles: AppService["listWorkflowCycles"];
+    };
+    const project = makeAppServiceLoadedProject("history-separation-project");
+    project.record.workflow.workflowCycle.cycleNumber = 23;
+    project.record.workflow.workflowCycle.status = "recommendation_approved";
+    project.record.workflow.cycleRetrospectives = [
+      {
+        id: "retro-21",
+        cycleNumber: 21,
+        createdAt: "2026-06-21T00:00:00.000Z",
+        triedToDo: "Satisfy work package: source provenance and access policy",
+        whyChosen: "Selected because source provenance checks were unknown.",
+        changedFiles: ["src/aw_trends/ranking.py"],
+        commandsRun: ["python3 -m unittest discover -s tests -q"],
+        passed: ["python3 -m unittest discover -s tests -q"],
+        failed: [],
+        learned: ["Source provenance evidence still needed reconciliation."],
+        checklistItemsAdvanced: [],
+        goalChecklistChangeRecommendation: "No targeted checklist delta.",
+        nextRecommendedTasks: ["Satisfy work package: core portfolio analytics"],
+        shouldContinue: true
+      },
+      {
+        id: "retro-22",
+        cycleNumber: 22,
+        createdAt: "2026-06-22T00:00:00.000Z",
+        triedToDo: "Satisfy work package: core portfolio analytics",
+        whyChosen: "Selected because portfolio analytics had a validation path.",
+        changedFiles: ["src/aw_trends/app.py"],
+        commandsRun: ["python3 -m unittest discover -s tests -q"],
+        passed: ["python3 -m unittest discover -s tests -q"],
+        failed: [],
+        learned: ["Portfolio analytics was implemented."],
+        checklistItemsAdvanced: ["met: Portfolio analytics"],
+        goalChecklistChangeRecommendation: "Portfolio analytics advanced.",
+        nextRecommendedTasks: ["Satisfy work package: source provenance and access policy"],
+        shouldContinue: true
+      }
+    ];
+    service.projects.set(project.record.id, project);
+
+    const history = service.listWorkflowCycles(project.record.id, { limit: 5 });
+    const cycle21 = history.cycles.find((cycle) => cycle.cycleNumber === 21);
+    const cycle22 = history.cycles.find((cycle) => cycle.cycleNumber === 22);
+
+    expect(cycle21?.selectedTask).toBe("Satisfy work package: source provenance and access policy");
+    expect(cycle21?.nextStepRecommendation).toBe("Satisfy work package: core portfolio analytics");
+    expect(cycle21?.selectedTask).not.toBe(cycle21?.nextStepRecommendation);
+    expect(cycle22?.selectedTask).toBe("Satisfy work package: core portfolio analytics");
+    expect(cycle22?.nextStepRecommendation).toBe("Satisfy work package: source provenance and access policy");
+    expect(cycle22?.selectedTask).not.toBe(cycle22?.nextStepRecommendation);
   });
 
   it("keeps history viewer controls explicit and raw details collapsed by default", async () => {
@@ -7439,7 +8941,7 @@ describe("AppService workflow performance guards", () => {
     expect(commandCenterSource).toContain("Why this matters");
     expect(commandCenterSource).toContain("What changed so far");
     expect(commandCenterSource).toContain("Needs your attention");
-    expect(commandCenterSource).toContain("No action needed");
+    expect(commandCenterSource).toContain("No validation, hygiene, checklist, or planner blocker is currently recorded.");
     expect(commandCenterSource).toContain("Last result");
     expect(commandCenterSource).toContain("Next step");
     expect(commandCenterSource).toContain("Project health");

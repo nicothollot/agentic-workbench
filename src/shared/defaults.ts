@@ -21,6 +21,7 @@ import type {
   WorkflowCycle,
   WorkflowAppealState,
   WorkflowMemory,
+  RecommendationHealth,
   WorkflowStepId,
   WorkflowStepProgress
 } from "./types";
@@ -96,6 +97,17 @@ export const defaultWorkflowAppealState = (): WorkflowAppealState => ({
   status: "not_started"
 });
 
+export const defaultRecommendationHealth = (): RecommendationHealth => ({
+  totalStructuredAttempts: 0,
+  totalStructuredFailures: 0,
+  consecutiveStructuredFailures: 0,
+  fallbackUsedForCurrentRecommendation: false,
+  selectedTaskSource: "derived_from_legacy_state",
+  modelRecommendationAccepted: false,
+  deterministicFallbackCandidateCount: 0,
+  visibleWarningLevel: "none"
+});
+
 const defaultAgentFreshnessMarker = (): AgentFreshnessMarker => ({
   restartCount: 0,
   freshnessToken: 0
@@ -166,6 +178,12 @@ export const defaultProjectWorkflowState = (): ProjectWorkflowState => ({
   plannerDecisions: [],
   checklistChanges: [],
   cycleRetrospectives: [],
+  evidenceObservations: [],
+  checklistDeltas: [],
+  recommendationHealth: defaultRecommendationHealth(),
+  evidenceCommands: [],
+  validationLedgers: [],
+  repoHygieneReports: [],
   workflowCycle: defaultWorkflowCycle(),
   workflowStage: "charter_needed",
   repairLoopCount: 0,

@@ -14,6 +14,7 @@ import type {
   ProjectKind,
   ProjectWorkflowState,
   ScopedGoal,
+  StrategicAutopilotMode,
   UltimateGoal,
   WorkPackage,
   WorkflowMode,
@@ -107,7 +108,7 @@ export const isPreviewRecommendation = (
 );
 
 export interface WorkflowModeConfig {
-  mode: WorkflowMode;
+  mode: WorkflowMode | StrategicAutopilotMode;
   maxChecksPerPackage: number;
   preferredMinChecksPerPackage: number;
   breadthLimit: number;
@@ -147,7 +148,7 @@ export const getWorkflowModeConfig = (mode?: string, policy?: AutopilotPolicy): 
       highConfidencePackageThreshold: 0.73
     }
     : {
-    mode: "normal",
+    mode: "autopilot_balanced",
     maxChecksPerPackage: 4,
     preferredMinChecksPerPackage: 2,
     breadthLimit: 2,

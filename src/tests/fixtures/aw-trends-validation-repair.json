@@ -1,0 +1,36 @@
+{
+  "cycleNumber": 23,
+  "commands": [
+    {
+      "commandId": "pytest-missing",
+      "command": "python3 -m pytest",
+      "phase": "integrity",
+      "exitCode": 1,
+      "stderr": "/usr/bin/python3: No module named pytest"
+    },
+    {
+      "commandId": "python-missing",
+      "command": "python -m pytest",
+      "phase": "integrity",
+      "exitCode": 127,
+      "stderr": "python: command not found"
+    },
+    {
+      "commandId": "unittest-pass",
+      "command": "python3 -m unittest discover -s tests -q",
+      "phase": "integrity",
+      "exitCode": 0,
+      "stdout": "Ran 42 tests in 0.8s\nOK"
+    }
+  ],
+  "repoHygiene": {
+    "status": "passed",
+    "scannedAt": "2026-06-01T00:10:00.000Z",
+    "scannedRef": "integrity:23",
+    "forbiddenFiles": [],
+    "cleanedFiles": [],
+    "warnings": [],
+    "mergeBlockingFindings": [],
+    "summaryForHumans": "Repository hygiene passed."
+  }
+}

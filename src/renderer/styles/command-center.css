@@ -118,6 +118,11 @@
   color: var(--textMuted);
 }
 
+.command-center-card__lead {
+  color: inherit;
+  line-height: 1.45;
+}
+
 .command-center-card__facts > div {
   min-width: min(220px, 100%);
   padding: 12px;
@@ -149,6 +154,23 @@
 .command-center-list__item--blocked {
   border-color: rgba(146, 53, 50, 0.28);
   background: rgba(248, 231, 228, 0.72);
+}
+
+.command-center-inline-details {
+  display: grid;
+  gap: 8px;
+}
+
+.command-center-inline-details summary {
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.command-center-inline-details p {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .command-center-empty {

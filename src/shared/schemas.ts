@@ -52,6 +52,7 @@ export const plannerApprovalStatusSchema = z.enum(["not_required", "pending", "a
 export const candidateTaskKindSchema = z.enum([
   "goal_check",
   "work_package",
+  "reconciliation_debug",
   "blocker",
   "validation",
   "stabilization",
@@ -733,6 +734,273 @@ export const plannerDecisionSchema = z.object({
   createdAt: isoDatetime()
 });
 
+export const cycleContractTaskSourceSchema = z.enum([
+  "structured_recommendation",
+  "deterministic_fallback",
+  "manual",
+  "derived_from_legacy_state"
+]);
+
+export const cycleContractTargetedChecklistItemSchema = z.object({
+  checkId: z.string().min(1),
+  title: z.string().default(""),
+  fullDescription: z.string().default(""),
+  required: z.boolean().default(true),
+  itemKind: goalCheckItemKindSchema.default("required"),
+  groupId: z.string().min(1).optional(),
+  previousStatus: goalCheckStatusSchema.default("unknown"),
+  currentStatus: goalCheckStatusSchema.default("unknown"),
+  currentEvidence: z.string().default(""),
+  evidenceHistoryCount: z.number().int().nonnegative().default(0),
+  whyTargeted: z.string().default(""),
+  acceptanceHint: z.string().default(""),
+  relatedPaths: z.array(z.string()).default([]),
+  observableSignalsExpected: z.array(z.string()).default([])
+});
+
+export const cycleContractPriorSimilarAttemptSchema = z.object({
+  cycleNumber: z.number().int().positive(),
+  attemptedTaskTitle: z.string().default(""),
+  completedTaskTitle: z.string().optional(),
+  nextRecommendedTaskTitle: z.string().optional(),
+  filesChanged: z.array(z.string()).default([]),
+  commandCount: z.number().int().nonnegative().default(0),
+  validationSummary: z.string().default(""),
+  checklistDeltaSummary: z.string().default(""),
+  structuredFallbackUsed: z.boolean().default(false),
+  outcome: z.enum(["checklist_moved", "no_delta", "failed", "unknown"]).default("unknown")
+});
+
+export const cycleContractSchema = z.object({
+  schemaVersion: z.number().int().positive().default(1),
+  cycleNumber: z.number().int().positive(),
+  createdAt: isoDatetime(),
+  updatedAt: isoDatetime(),
+  selectedTaskId: z.string().min(1).optional(),
+  selectedTaskTitle: z.string().default(""),
+  selectedTaskKind: candidateTaskKindSchema.default("custom"),
+  selectedTaskSource: cycleContractTaskSourceSchema.default("derived_from_legacy_state"),
+  plainEnglishObjective: z.string().default(""),
+  concreteGoalForThisCycle: z.string().default(""),
+  targetedChecklistItems: z.array(cycleContractTargetedChecklistItemSchema).default([]),
+  expectedFilesOrAreas: z.array(z.string()).default([]),
+  expectedValidationCommands: z.array(z.string()).default([]),
+  expectedEvidenceCommands: z.array(z.string()).default([]),
+  acceptanceCriteria: z.array(z.string()).default([]),
+  nonGoalsForThisCycle: z.array(z.string()).default([]),
+  constraintsForThisCycle: z.array(z.string()).default([]),
+  whySelectedNow: z.string().default(""),
+  plannerScore: z.number().optional(),
+  scoreBreakdown: z.record(z.number()).default({}),
+  repetitionPenalty: z.number().default(0),
+  priorSimilarAttempts: z.array(cycleContractPriorSimilarAttemptSchema).default([]),
+  currentKnownBlockers: z.array(z.string()).default([]),
+  fallbackOrHealthWarnings: z.array(z.string()).default([]),
+  doneWhen: z.array(z.string()).default([]),
+  failureModes: z.array(z.string()).default([]),
+  sourceDataRefs: z.record(z.union([z.string(), z.array(z.string()), z.number(), z.boolean(), z.undefined()])).default({})
+});
+
+export const checklistEvidenceStatusSchema = z.enum(["met", "needs_attention", "unknown", "not_applicable"]);
+export const checklistEvidenceSourceTypeSchema = z.enum([
+  "command_output",
+  "agent_message",
+  "structured_recommendation",
+  "deterministic_validator",
+  "artifact",
+  "manual",
+  "derived"
+]);
+export const checklistEvidenceNotConsumedReasonSchema = z.enum([
+  "missing_check_id",
+  "unknown_check_id",
+  "ambiguous_status",
+  "assertion_failed",
+  "validation_failed",
+  "artifact_missing",
+  "stale_or_superseded",
+  "not_targeted_this_cycle",
+  "low_confidence",
+  "parse_error"
+]);
+
+export const checklistEvidenceObservationSchema = z.object({
+  observationId: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  checkId: z.string().default(""),
+  status: checklistEvidenceStatusSchema.default("unknown"),
+  evidenceText: z.string().default(""),
+  evidenceSourceType: checklistEvidenceSourceTypeSchema,
+  sourceRef: z.object({
+    commandId: z.string().optional(),
+    eventId: z.string().optional(),
+    agentRunId: z.string().optional(),
+    artifactPath: z.string().optional(),
+    sourceKey: z.string().optional()
+  }).default({}),
+  relevantPaths: z.array(z.string()).default([]),
+  validationCommands: z.array(z.string()).default([]),
+  confidence: z.number().min(0).max(1).default(0.5),
+  observedAt: isoDatetime(),
+  consumedByChecklist: z.boolean().default(false),
+  notConsumedReason: checklistEvidenceNotConsumedReasonSchema.optional()
+});
+
+export const checklistDeltaSchema = z.object({
+  schemaVersion: z.number().int().positive().default(1),
+  cycleNumber: z.number().int().positive(),
+  targetedTotal: z.number().int().nonnegative().default(0),
+  targetedMetBefore: z.number().int().nonnegative().default(0),
+  targetedMetAfter: z.number().int().nonnegative().default(0),
+  targetedNewlyMet: z.array(z.string()).default([]),
+  targetedStillUnknown: z.array(z.string()).default([]),
+  targetedNeedsAttention: z.array(z.string()).default([]),
+  targetedNotApplicable: z.array(z.string()).default([]),
+  nonTargetedChanges: z.array(z.string()).default([]),
+  evidenceObservedCount: z.number().int().nonnegative().default(0),
+  evidenceConsumedCount: z.number().int().nonnegative().default(0),
+  evidenceNotConsumedCount: z.number().int().nonnegative().default(0),
+  evidenceNotConsumedReasons: z.record(checklistEvidenceNotConsumedReasonSchema, z.number().int().nonnegative()).default({}),
+  summaryForHumans: z.string().default(""),
+  didGoalProgressChange: z.boolean().default(false),
+  goalProgressBefore: z.number().int().min(0).max(100).default(0),
+  goalProgressAfter: z.number().int().min(0).max(100).default(0),
+  whyStillUnknownByCheckId: z.record(z.string()).default({}),
+  createdAt: isoDatetime()
+});
+
+export const recommendationHealthSchema = z.object({
+  totalStructuredAttempts: z.number().int().nonnegative().default(0),
+  totalStructuredFailures: z.number().int().nonnegative().default(0),
+  consecutiveStructuredFailures: z.number().int().nonnegative().default(0),
+  lastStructuredFailureAt: isoDatetime().optional(),
+  lastStructuredFailureCategory: z.enum([
+    "invalid_json",
+    "schema_mismatch",
+    "missing_required_field",
+    "wrong_type",
+    "unknown_enum",
+    "empty_recommendations",
+    "parse_timeout",
+    "other"
+  ]).optional(),
+  lastStructuredFailureMessage: z.string().optional(),
+  fallbackUsedForCurrentRecommendation: z.boolean().default(false),
+  fallbackReason: z.string().optional(),
+  selectedTaskSource: cycleContractTaskSourceSchema.default("derived_from_legacy_state"),
+  fallbackConfidence: z.number().min(0).max(1).optional(),
+  modelRecommendationAccepted: z.boolean().default(false),
+  deterministicFallbackCandidateCount: z.number().int().nonnegative().default(0),
+  visibleWarningLevel: z.enum(["none", "info", "warning", "critical"]).default("none")
+});
+
+export const projectEvidenceCommandSchema = z.object({
+  name: z.string().min(1),
+  command: z.string().min(1),
+  purpose: z.string().default(""),
+  expectedOutput: z.enum(["json", "text", "html", "file"]).default("text"),
+  mapsToChecklistGroups: z.array(z.string()).default([]),
+  mapsToCheckIds: z.array(z.string()).default([]),
+  safeDefault: z.boolean().default(true),
+  requiresNetwork: z.boolean().default(false),
+  requiresCredentials: z.boolean().default(false),
+  discoveredFrom: z.enum([
+    "README",
+    "package_json",
+    "pyproject",
+    "previous_successful_command",
+    "known_adapter",
+    "manual"
+  ]),
+  confidence: z.number().min(0).max(1).default(0.5)
+});
+
+export const validationCommandCwdKindSchema = z.enum(["project_root", "coding_worktree", "integration_worktree", "unknown"]);
+export const validationCommandPhaseSchema = z.enum(["planning", "coding", "evidence", "integrity", "merge", "hygiene", "manual"]);
+export const validationCommandStatusSchema = z.enum(["passed", "failed", "skipped", "timed_out", "cancelled"]);
+export const validationFinalStatusSchema = z.enum(["passed", "failed", "partial", "skipped", "not_run"]);
+export const validationFailureKindSchema = z.enum([
+  "environment_toolchain",
+  "environment_tooling_unavailable",
+  "command_construction",
+  "product_test",
+  "evidence_command",
+  "approval_required",
+  "timeout",
+  "hygiene",
+  "unknown"
+]);
+
+export const validationFailureClassificationSchema = z.object({
+  kind: validationFailureKindSchema,
+  summary: z.string().default(""),
+  mergeBlocking: z.boolean().default(true),
+  repairedByCommandId: z.string().min(1).optional()
+});
+
+export const validationCommandResultSchema = z.object({
+  commandId: z.string().min(1),
+  command: z.string().min(1),
+  normalizedCommand: z.string().default(""),
+  cwdKind: validationCommandCwdKindSchema.default("unknown"),
+  phase: validationCommandPhaseSchema.default("integrity"),
+  startedAt: isoDatetime(),
+  endedAt: isoDatetime(),
+  durationMs: z.number().nonnegative().default(0),
+  exitCode: z.number().int().nullable().optional(),
+  status: validationCommandStatusSchema,
+  stdoutSummary: z.string().default(""),
+  stderrSummary: z.string().default(""),
+  fullOutputRef: z.string().optional(),
+  parsedJsonRef: z.string().optional(),
+  redactionApplied: z.boolean().default(false),
+  classifiedFailure: validationFailureClassificationSchema.optional(),
+  relatedCheckIds: z.array(z.string()).default([]),
+  relatedFiles: z.array(z.string()).default([])
+});
+
+export const validationLedgerSchema = z.object({
+  schemaVersion: z.number().int().positive().default(1),
+  cycleNumber: z.number().int().positive(),
+  createdAt: isoDatetime(),
+  updatedAt: isoDatetime(),
+  plannedCommands: z.array(z.string()).default([]),
+  attemptedCommands: z.array(z.string()).default([]),
+  evidenceCommands: z.array(z.string()).default([]),
+  testCommands: z.array(z.string()).default([]),
+  commandResults: z.array(validationCommandResultSchema).default([]),
+  environmentFailures: z.array(z.string()).default([]),
+  commandConstructionFailures: z.array(z.string()).default([]),
+  productFailures: z.array(z.string()).default([]),
+  evidenceFailures: z.array(z.string()).default([]),
+  hygieneFailures: z.array(z.string()).default([]),
+  repairedFailures: z.array(z.string()).default([]),
+  warnings: z.array(z.string()).default([]),
+  finalValidationStatus: validationFinalStatusSchema.default("not_run"),
+  finalValidationBasis: z.string().default(""),
+  unresolvedValidationFailures: z.array(z.string()).default([]),
+  mergeAllowed: z.boolean().default(false),
+  mergeBlockedReasons: z.array(z.string()).default([]),
+  summaryForHumans: z.string().default("Validation has not run.")
+});
+
+export const repoHygieneReportSchema = z.object({
+  status: z.enum(["passed", "warnings", "failed", "unknown"]),
+  scannedAt: isoDatetime(),
+  scannedRef: z.string().default(""),
+  forbiddenFiles: z.array(z.string()).default([]),
+  cleanedFiles: z.array(z.string()).default([]),
+  warnings: z.array(z.string()).default([]),
+  mergeBlockingFindings: z.array(z.string()).default([]),
+  summaryForHumans: z.string().default("")
+});
+
+export const workflowDerivedStatusSchema = z.object({
+  label: z.string().min(1),
+  explanation: z.string().default(""),
+  tone: z.enum(["idle", "running", "success", "warning", "danger", "paused"])
+});
+
 export const cycleRetrospectiveSchema = z.object({
   id: z.string().min(1),
   cycleNumber: z.number().int().positive(),
@@ -748,7 +1016,9 @@ export const cycleRetrospectiveSchema = z.object({
   goalChecklistChangeRecommendation: z.string().default(""),
   nextRecommendedTasks: z.array(z.string()).default([]),
   shouldContinue: z.boolean().default(false),
-  pauseReason: z.string().optional()
+  pauseReason: z.string().optional(),
+  cycleContract: cycleContractSchema.optional(),
+  checklistDelta: checklistDeltaSchema.optional()
 });
 
 export const workflowTaskMapGroupSchema = z.object({
@@ -1111,6 +1381,13 @@ export const projectWorkflowStateSchema = z.object({
   plannerDecisions: z.array(plannerDecisionSchema).default([]),
   checklistChanges: z.array(checklistChangeSchema).default([]),
   cycleRetrospectives: z.array(cycleRetrospectiveSchema).default([]),
+  cycleContract: cycleContractSchema.optional(),
+  evidenceObservations: z.array(checklistEvidenceObservationSchema).default([]),
+  checklistDeltas: z.array(checklistDeltaSchema).default([]),
+  recommendationHealth: recommendationHealthSchema.default(defaultProjectWorkflowState().recommendationHealth),
+  evidenceCommands: z.array(projectEvidenceCommandSchema).default([]),
+  validationLedgers: z.array(validationLedgerSchema).default([]),
+  repoHygieneReports: z.array(repoHygieneReportSchema).default([]),
   workflowCycle: workflowCycleSchema.default(defaultProjectWorkflowState().workflowCycle),
   approvedRecommendation: approvedRecommendationSchema.optional(),
   scopedGoal: scopedGoalSchema.optional(),
@@ -1267,6 +1544,8 @@ export const agentStateSchema = z.object({
   recoveryHandledAt: isoDatetime().optional(),
   repositorySummaryTarget: repositoryPathSummaryTargetSchema.optional(),
   integrityReport: integrityReportSchema.optional(),
+  validationLedger: validationLedgerSchema.optional(),
+  repoHygieneReport: repoHygieneReportSchema.optional(),
   mergeReport: mergeReportSchema.optional(),
   recommendationReport: recommendationReportSchema.optional(),
   appliedStructuredOutputs: z.array(
@@ -1371,6 +1650,50 @@ export const reviewLogProjectSnapshotSchema = z.object({
   dependencies: z.array(dependencyRecordSchema)
 });
 
+export const reviewLogRedactionStatusSchema = z.object({
+  localPathsRedacted: z.boolean(),
+  secretsRedacted: z.boolean(),
+  fullCommandOutputIncluded: z.boolean(),
+  note: z.string().min(1)
+});
+
+export const reviewLogEvidenceObservationSummarySchema = z.object({
+  observationId: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  checkId: z.string().default(""),
+  status: checklistEvidenceStatusSchema,
+  evidenceText: z.string().default(""),
+  evidenceSourceType: checklistEvidenceSourceTypeSchema,
+  sourceKey: z.string().optional(),
+  relevantPaths: z.array(z.string()).default([]),
+  validationCommands: z.array(z.string()).default([]),
+  confidence: z.number().min(0).max(1),
+  consumedByChecklist: z.boolean(),
+  notConsumedReason: checklistEvidenceNotConsumedReasonSchema.optional()
+});
+
+export const reviewLogCycleDiagnosticsSchema = z.object({
+  cycleNumber: z.number().int().positive(),
+  cycleStartedWithTask: z.string().optional(),
+  completedTask: z.string().optional(),
+  nextRecommendedTask: z.string().optional(),
+  cycleContract: cycleContractSchema.optional(),
+  checklistDelta: checklistDeltaSchema.optional(),
+  evidenceObservations: z.array(reviewLogEvidenceObservationSummarySchema),
+  validationLedger: validationLedgerSchema.optional(),
+  recommendationHealth: recommendationHealthSchema,
+  repoHygieneReport: repoHygieneReportSchema.optional(),
+  derivedStatus: workflowDerivedStatusSchema.optional(),
+  evidenceCommands: z.array(projectEvidenceCommandSchema),
+  redactionStatus: reviewLogRedactionStatusSchema
+});
+
+export const reviewLogWorkflowDiagnosticsSchema = z.object({
+  activeCycle: reviewLogCycleDiagnosticsSchema,
+  cycles: z.array(reviewLogCycleDiagnosticsSchema),
+  redactionStatus: reviewLogRedactionStatusSchema
+});
+
 export const projectReviewLogBundleSchema = z.object({
   schemaVersion: z.number().default(REVIEW_LOG_BUNDLE_VERSION),
   appVersion: z.string().default(APP_VERSION),
@@ -1379,6 +1702,7 @@ export const projectReviewLogBundleSchema = z.object({
   summary: reviewLogSummarySchema,
   redactions: z.array(z.string().min(1)),
   warnings: z.array(z.string().min(1)),
+  workflowDiagnostics: reviewLogWorkflowDiagnosticsSchema.optional(),
   project: reviewLogProjectSnapshotSchema,
   agents: z.array(agentStateSchema),
   userInputRequests: z.array(userInputRequestSchema),

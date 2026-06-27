@@ -1,0 +1,82 @@
+{
+  "workflowStage": "goal_ready",
+  "cycleNumber": 23,
+  "workflowPauseRequested": true,
+  "currentRecommendationTitle": "Satisfy work package: source provenance and access policy",
+  "lastCompletedAction": "start_coding",
+  "ultimateGoalProgress": {
+    "percentComplete": 13,
+    "requiredMet": 2,
+    "requiredTotal": 16
+  },
+  "selectedCandidate": {
+    "id": "candidate:source-provenance-access-policy",
+    "kind": "work_package",
+    "title": "Satisfy work package: source provenance and access policy",
+    "summary": "Use this coherent work package to close 4 related required checks.",
+    "expectedFiles": [
+      "src/aw_trends/app.py",
+      "src/aw_trends/ranking.py"
+    ],
+    "targetedCheckIds": [
+      "success_criterion:coxjd1",
+      "success_criterion:w68u6d",
+      "success_criterion:1r9p2m5",
+      "success_criterion:1bg7iks"
+    ],
+    "scoreBreakdown": {
+      "checklistImpact": 190,
+      "repetition": -70
+    }
+  },
+  "workPackage": {
+    "id": "work-package:source-provenance-access-policy",
+    "title": "source provenance and access policy work package",
+    "summary": "Close 4 related required checks without changing checklist granularity.",
+    "primaryTopic": "source provenance and access policy",
+    "likelyPaths": [
+      "src/aw_trends/app.py",
+      "src/aw_trends/ranking.py"
+    ],
+    "acceptanceHints": [
+      "Emit targeted_check_satisfaction rows for every targeted check.",
+      "Review ranking factors, validation flows, dashboard warnings/comparisons, and databank refresh/change history."
+    ],
+    "checkIds": [
+      "success_criterion:coxjd1",
+      "success_criterion:w68u6d",
+      "success_criterion:1r9p2m5",
+      "success_criterion:1bg7iks"
+    ],
+    "score": 410
+  },
+  "goalChecklist": [
+    {
+      "id": "success_criterion:coxjd1",
+      "title": "Ranking factors expose source provenance and access-policy weighting",
+      "description": "The ranking engine must show which source-provenance and access-policy factors influenced each recommendation, including provider freshness, permitted access mode, and fallback behavior.",
+      "status": "unknown"
+    },
+    {
+      "id": "success_criterion:w68u6d",
+      "title": "Validation flows prove source access policy decisions",
+      "description": "Validation commands must emit machine-readable evidence that access policy decisions were checked for permitted providers, blocked live-only flows, and offline review behavior.",
+      "status": "unknown"
+    },
+    {
+      "id": "success_criterion:1r9p2m5",
+      "title": "Dashboard surfaces warnings and comparisons for sourced data",
+      "description": "The dashboard must expose user-visible source warnings, provider comparisons, stale data indicators, and unavailable-source limitations without hiding access-policy constraints.",
+      "status": "unknown"
+    },
+    {
+      "id": "success_criterion:1bg7iks",
+      "title": "Databank refresh records change history and source provenance",
+      "description": "The databank refresh path must preserve source provenance, refresh timestamps, change history, and failure records so reviewers can inspect what changed and why.",
+      "status": "unknown"
+    }
+  ],
+  "recentAgentOutputs": [
+    "Structured recommendation output was invalid, so the workflow used the deterministic fallback."
+  ]
+}

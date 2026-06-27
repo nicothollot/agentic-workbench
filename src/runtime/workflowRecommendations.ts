@@ -19,6 +19,7 @@ import type {
 } from "@shared/types";
 import { nowIso } from "@shared/utils";
 import { getWorkflowModeConfig, getWorkflowPreviewRequest, resolveEffectiveAutopilotPolicy } from "@shared/workflow";
+import { buildNoProgressReconciliationRecommendation } from "@shared/workflowEvidence";
 import type { RepoScanResult } from "./repoScanner";
 import {
   sanitizeChecklistEvidenceText,
@@ -2048,6 +2049,9 @@ export const buildAppealRecommendations = (context: WorkflowRecommendationContex
 
 export const buildWorkflowRecommendations = (context: WorkflowRecommendationContext): WorkflowRecommendationOption[] => {
   const modeConfig = getWorkflowModeConfig(context.workflow.workflowMode, resolveEffectiveAutopilotPolicy(context.workflow));
+  const noProgressRecommendation = context.customFocus?.trim()
+    ? undefined
+    : buildNoProgressReconciliationRecommendation(context.workflow);
   const recentChangedFiles = collectRecentChangedFiles(context.agents);
   const openIssues = context.workflow.memory.knownOpenIssues.filter((issue) => issue.status === "open");
   const pendingInterventions = context.workflow.humanInterventions.filter((intervention) => intervention.status === "pending");
@@ -2351,7 +2355,7 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     relatedPaths: relevantPaths.slice(0, 3)
   });
 
-  return drafts
+  const recommendations = drafts
     .sort((left, right) => right.score - left.score || right.confidence - left.confidence || left.title.localeCompare(right.title))
     .map((draft, index) => ({
       id: nanoid(),
@@ -2370,6 +2374,20 @@ export const buildWorkflowRecommendations = (context: WorkflowRecommendationCont
     }))
     .map((entry) => sanitizeRecommendationForCycle(entry, { breadthLimit: modeConfig.breadthLimit }))
     .filter((entry): entry is WorkflowRecommendationOption => Boolean(entry))
+    .slice(0, Math.max(1, Math.min(context.maxOptions, 5)))
+    .map((entry, index) => ({
+      ...entry,
+      rank: index + 1
+    }));
+
+  if (!noProgressRecommendation) {
+    return recommendations;
+  }
+
+  return [
+    noProgressRecommendation,
+    ...recommendations.filter((recommendation) => recommendation.title !== noProgressRecommendation.title)
+  ]
     .slice(0, Math.max(1, Math.min(context.maxOptions, 5)))
     .map((entry, index) => ({
       ...entry,

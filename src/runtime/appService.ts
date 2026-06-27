@@ -59,6 +59,7 @@ import type {
   FileSummary,
   GitHubStatus,
   ChecklistChange,
+  ChecklistEvidenceObservation,
   CycleRetrospective,
   GoalChangeRecord,
   GoalChangeProposal,
@@ -90,6 +91,7 @@ import type {
   ProjectLoadIntent,
   ProjectLoadResult,
   PlannerDecision,
+  RepoHygieneReport,
   RepositoryChildrenResponse,
   RepositorySearchResponse,
   RepositoryPathSummaryTarget,
@@ -104,6 +106,7 @@ import type {
   UltimateGoalImportPreview,
   UltimateGoalProgressEstimate,
   UltimateGoal,
+  ValidationLedger,
   ValidationStatus,
   WorkflowMode,
   WorkflowCycleDetail,
@@ -111,6 +114,7 @@ import type {
   WorkflowCycleStatus,
   WorkflowCycleSummaryView,
   WorkflowStepId,
+  StructuredRecommendationFailureCategory,
   WorkPackage,
   WorkbenchState
 } from "@shared/types";
@@ -137,6 +141,24 @@ import {
   validateAutopilotPolicy,
   workPackageRequiresModelScoping
 } from "@shared/workflow";
+import { deriveUserFacingWorkflowStatus } from "@shared/workflowView";
+import {
+  applyChecklistEvidenceObservations,
+  buildCycleContract,
+  computeChecklistDelta,
+  discoverProjectEvidenceCommands,
+  extractChecklistEvidenceObservations,
+  recordRecommendationFallbackUsed,
+  recordStructuredRecommendationFailure,
+  recordStructuredRecommendationSuccess
+} from "@shared/workflowEvidence";
+import {
+  buildValidationCommandResult,
+  createValidationLedger,
+  deriveMergeGateDecision,
+  finalizeValidationLedger
+} from "@shared/validationLedger";
+import { deriveLegacyWorkflowDiagnostics } from "@shared/workflowMigration";
 import { buildDeterministicDirectorySummary, buildDeterministicFileSummary, buildDeterministicOverview } from "./fileSummary";
 import {
   applyBranchToProjectCheckout,
@@ -195,6 +217,8 @@ import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec }
 import { sanitizeWorkflowState } from "./stateSanitizer";
 import { readUltimateGoalTextImport } from "./ultimateGoalImport";
 import { buildProjectShellHandoffPrompt, openProjectShellWindow } from "./projectShell";
+import { scanAndCleanRepoHygiene } from "./repoHygiene";
+import { resolveTargetProjectCommands, type TargetProjectResolvedCommand } from "./targetProjectCommands";
 import {
   createAgentContextDescriptor,
   createWorkflowContextDescriptor,
@@ -625,6 +649,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly repositoryScanFailures = new Map<string, { failedAt: string; message: string; recoverySteps: string[] }>();
   private readonly registeredProjectIds = new Set<string>();
   private readonly structuredOutputApplicationsInFlight = new Set<string>();
+  private lastRecommendationParseFailure?: {
+    category: StructuredRecommendationFailureCategory;
+    message: string;
+  };
   private readonly commandOutputBuffers = new Map<string, {
     command?: string;
     cwd?: string;
@@ -1702,6 +1730,32 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.plannerDecisions ??= defaults.plannerDecisions;
     workflow.checklistChanges ??= defaults.checklistChanges;
     workflow.cycleRetrospectives ??= defaults.cycleRetrospectives;
+    workflow.evidenceObservations ??= defaults.evidenceObservations;
+    workflow.checklistDeltas ??= defaults.checklistDeltas;
+    workflow.recommendationHealth = {
+      ...defaults.recommendationHealth,
+      ...workflow.recommendationHealth
+    };
+    workflow.evidenceCommands ??= defaults.evidenceCommands;
+    workflow.validationLedgers ??= defaults.validationLedgers;
+    workflow.repoHygieneReports ??= defaults.repoHygieneReports;
+    const currentCycleAgents = (record.agents ?? []).filter((agent) =>
+      agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
+    );
+    const shouldDeriveLegacyCycleDiagnostics = Boolean(
+      workflow.approvedRecommendation ||
+      workflow.scopedGoal ||
+      workflow.plannerDecisions.some((decision) => decision.cycleNumber === workflow.workflowCycle.cycleNumber) ||
+      workflow.recommendations.length > 0 ||
+      workflow.workPackages.length > 0 ||
+      currentCycleAgents.some((agent) => agent.commandLog.length > 0 || (agent.integrityReport?.checks.length ?? 0) > 0)
+    );
+    deriveLegacyWorkflowDiagnostics(workflow, {
+      agents: record.agents ?? [],
+      deriveChecklistDelta: shouldDeriveLegacyCycleDiagnostics,
+      deriveValidationLedger: shouldDeriveLegacyCycleDiagnostics,
+      deriveRepoHygiene: shouldDeriveLegacyCycleDiagnostics
+    });
     record.userInputRequests ??= [];
     record.credentials = {
       ...defaultProjectCredentialsState(),
@@ -2517,6 +2571,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.manualHandoff = undefined;
     workflow.recommendations = [];
     workflow.recommendationsGeneratedAt = undefined;
+    workflow.cycleContract = undefined;
+    workflow.recommendationHealth = {
+      ...workflow.recommendationHealth,
+      fallbackUsedForCurrentRecommendation: false,
+      fallbackReason: undefined,
+      selectedTaskSource: "derived_from_legacy_state",
+      fallbackConfidence: undefined,
+      modelRecommendationAccepted: false,
+      deterministicFallbackCandidateCount: 0,
+      visibleWarningLevel: workflow.recommendationHealth.consecutiveStructuredFailures >= 3
+        ? "critical"
+        : workflow.recommendationHealth.consecutiveStructuredFailures >= 2
+          ? "warning"
+          : "none"
+    };
     this.recordWorkflowActivity(workflow, {
       source: "workflow",
       status: "waiting",
@@ -2755,11 +2824,275 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
   }
 
+  private currentCycleTargetedCheckIds(workflow: ProjectWorkflowState): string[] {
+    return unique([
+      ...(workflow.cycleContract?.targetedChecklistItems.map((item) => item.checkId) ?? []),
+      ...(workflow.scopedGoal?.targetedCheckIds ?? []),
+      ...(workflow.approvedRecommendation?.targetedCheckIds ?? []),
+      ...(this.plannerDecisionForCycle(workflow)?.targetedChecklistIds ?? [])
+    ]);
+  }
+
+  private collectCycleChecklistEvidenceObservations(
+    project: LoadedProject,
+    timestamp: string
+  ): ChecklistEvidenceObservation[] {
+    const workflow = this.ensureWorkflowState(project.record);
+    const cycleNumber = workflow.workflowCycle.cycleNumber;
+    const targetedCheckIds = this.currentCycleTargetedCheckIds(workflow);
+    const deterministicTargetCheck = getWorkflowPreviewRequest(workflow).status === "active" && isPreviewRecommendation(workflow.approvedRecommendation)
+      ? undefined
+      : this.findCompletedCycleTargetGoalCheck(project, timestamp);
+    const deterministicTargetedCheckIds = deterministicTargetCheck ? [deterministicTargetCheck.id] : [];
+    const effectiveTargetedCheckIds = unique([...targetedCheckIds, ...deterministicTargetedCheckIds]);
+    if (effectiveTargetedCheckIds.length === 0) {
+      return [];
+    }
+    const knownCheckIds = workflow.goalChecklist.map((check) => check.id);
+    const cycleAgents = this.cycleAgents(project, cycleNumber);
+    const retainedCommandEvidence = workflow.evidenceObservations.filter((observation) =>
+      observation.cycleNumber === cycleNumber &&
+      observation.evidenceSourceType === "command_output" &&
+      observation.sourceRef.commandId
+    );
+    const observations = [
+      ...retainedCommandEvidence,
+      ...cycleAgents.flatMap((agent) => {
+        const commandObservations = agent.commandLog.flatMap((command) => {
+          const output = command.output.trim();
+          if (!output) {
+            return [];
+          }
+          return extractChecklistEvidenceObservations(output, {
+            cycleNumber,
+            targetedCheckIds: effectiveTargetedCheckIds,
+            knownCheckIds,
+            evidenceSourceType: "command_output",
+            sourceRef: {
+              commandId: command.itemId ?? command.command,
+              agentRunId: agent.id
+            },
+            observedAt: command.completedAt ?? timestamp
+          });
+        });
+        const integrityObservations = (agent.integrityReport?.checks ?? []).flatMap((check) =>
+          extractChecklistEvidenceObservations(check.outputSnippet, {
+            cycleNumber,
+            targetedCheckIds: effectiveTargetedCheckIds,
+            knownCheckIds,
+            evidenceSourceType: "deterministic_validator",
+            sourceRef: {
+              commandId: check.command || check.name,
+              agentRunId: agent.id
+            },
+            observedAt: agent.integrityReport?.generatedAt ?? timestamp
+          })
+        );
+        const messageObservations = agent.events
+          .filter((event) => (event.type === "message" || event.type === "raw" || event.type === "report") && event.detail?.trim())
+          .flatMap((event) =>
+            extractChecklistEvidenceObservations(event.detail ?? "", {
+              cycleNumber,
+              targetedCheckIds: effectiveTargetedCheckIds,
+              knownCheckIds,
+              evidenceSourceType: "agent_message",
+              sourceRef: {
+                eventId: event.id,
+                agentRunId: agent.id
+              },
+              observedAt: event.timestamp
+            })
+          );
+        return [...commandObservations, ...integrityObservations, ...messageObservations];
+      })
+    ];
+    if (deterministicTargetCheck) {
+      const validationCommands = unique(cycleAgents.flatMap((agent) => agent.commandLog.map((command) => command.command))).slice(0, 12);
+      const evidence = [
+        `Cycle ${workflow.workflowCycle.cycleNumber} completed after deterministic validation and integration.`,
+        workflow.scopedGoal?.summary ? `Scoped goal: ${workflow.scopedGoal.summary}.` : undefined
+      ].filter((entry): entry is string => Boolean(entry)).join(" ");
+      observations.push({
+        observationId: `evidence:${cycleNumber}:deterministic-validator:${deterministicTargetCheck.id}`,
+        cycleNumber,
+        checkId: deterministicTargetCheck.id,
+        status: "met",
+        evidenceText: evidence,
+        evidenceSourceType: "deterministic_validator",
+        sourceRef: {
+          commandId: validationCommands[0] ?? "workflow-cycle-validation",
+          agentRunId: cycleAgents[0]?.id,
+          sourceKey: "completed_cycle_target_check"
+        },
+        relevantPaths: workflow.approvedRecommendation?.relatedPaths ?? [],
+        validationCommands,
+        confidence: Math.max(deterministicTargetCheck.confidence ?? 0, 0.86),
+        observedAt: timestamp,
+        consumedByChecklist: true
+      });
+    }
+    const byObservationId = new Map(observations.map((observation) => [observation.observationId, observation]));
+    return [...byObservationId.values()];
+  }
+
+  private reconcileCycleChecklistEvidence(
+    project: LoadedProject,
+    timestamp: string,
+    checklistBefore: GoalAttainmentCheck[]
+  ): ChecklistEvidenceObservation[] {
+    const workflow = this.ensureWorkflowState(project.record);
+    const targetedCheckIds = this.currentCycleTargetedCheckIds(workflow);
+    const observations = this.collectCycleChecklistEvidenceObservations(project, timestamp);
+    const knownCheckIds = new Set(workflow.goalChecklist.map((check) => check.id));
+    const effectiveTargetedCheckIds = unique([
+      ...targetedCheckIds,
+      ...observations
+        .filter((observation) => observation.evidenceSourceType === "deterministic_validator" && knownCheckIds.has(observation.checkId))
+        .map((observation) => observation.checkId)
+    ]);
+    if (effectiveTargetedCheckIds.length === 0) {
+      return observations;
+    }
+    const applied = applyChecklistEvidenceObservations(workflow.goalChecklist, observations, {
+      targetedCheckIds: effectiveTargetedCheckIds,
+      timestamp
+    });
+    workflow.goalChecklist = applied.checklist;
+    workflow.evidenceObservations = [
+      ...applied.observations,
+      ...workflow.evidenceObservations.filter((observation) => observation.cycleNumber !== workflow.workflowCycle.cycleNumber)
+    ].slice(0, 500);
+    if (applied.observations.length > 0) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: applied.observations.some((observation) => observation.consumedByChecklist) ? "completed" : "waiting",
+        title: "Checklist evidence reconciled",
+        detail: `${applied.observations.filter((observation) => observation.consumedByChecklist).length}/${applied.observations.length} evidence observation(s) consumed for targeted checks.`,
+        stepId: "merge"
+      });
+    }
+    const delta = computeChecklistDelta(checklistBefore, workflow.goalChecklist, applied.observations, {
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      targetedCheckIds: effectiveTargetedCheckIds,
+      timestamp
+    });
+    workflow.checklistDeltas = [
+      delta,
+      ...workflow.checklistDeltas.filter((entry) => entry.cycleNumber !== delta.cycleNumber)
+    ].slice(0, 100);
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: timestamp,
+      selectedTaskSource: workflow.cycleContract?.selectedTaskSource ?? workflow.recommendationHealth.selectedTaskSource,
+      previousChecklist: checklistBefore
+    });
+    return applied.observations;
+  }
+
   private refreshWorkflowTaskMap(project: LoadedProject, timestamp = nowIso()): void {
     const workflow = this.ensureWorkflowState(project.record);
     const context = this.buildWorkflowRecommendationContext(project);
     workflow.taskMap = buildChecklistTaskMap(context, timestamp);
     workflow.workPackages = buildChecklistWorkPackages(context);
+    this.refreshEvidenceCommands(project);
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: timestamp,
+      selectedTaskSource: workflow.cycleContract?.selectedTaskSource ?? workflow.recommendationHealth.selectedTaskSource
+    });
+  }
+
+  private refreshEvidenceCommands(project: LoadedProject): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previousSuccessfulCommands = unique(project.record.agents.flatMap((agent) =>
+      agent.commandLog
+        .filter((command) => command.exitCode === 0)
+        .map((command) => command.command)
+    ));
+    const codingAgentCommands = unique(project.record.agents.flatMap((agent) =>
+      agent.category === "coding" ? agent.commandLog.map((command) => command.command) : []
+    ));
+    workflow.evidenceCommands = discoverProjectEvidenceCommands({
+      files: project.scan.files.map((file) => ({ relativePath: file.relativePath })),
+      previousSuccessfulCommands,
+      codingAgentCommands,
+      checklist: workflow.goalChecklist,
+      workPackages: workflow.workPackages
+    });
+  }
+
+  private upsertValidationLedger(workflow: ProjectWorkflowState, ledger: ValidationLedger): void {
+    workflow.validationLedgers = [
+      ledger,
+      ...workflow.validationLedgers.filter((entry) => entry.cycleNumber !== ledger.cycleNumber)
+    ].slice(0, 40);
+  }
+
+  private latestCycleValidationLedger(workflow: ProjectWorkflowState): ValidationLedger | undefined {
+    return workflow.validationLedgers
+      .filter((ledger) => ledger.cycleNumber === workflow.workflowCycle.cycleNumber)
+      .sort((left, right) => toTime(right.updatedAt) - toTime(left.updatedAt))[0];
+  }
+
+  private validationLedgerIsMissingEquivalent(ledger?: ValidationLedger): boolean {
+    return !ledger || (
+      ledger.finalValidationStatus === "not_run" &&
+      ledger.commandResults.length === 0 &&
+      ledger.attemptedCommands.length === 0
+    );
+  }
+
+  private mergeGateReasonIsOnlyMissingValidationLedger(reason?: string): boolean {
+    return Boolean(reason && /No validation ledger|Validation did not run|Validation status is not_run/i.test(reason));
+  }
+
+  private upsertRepoHygieneReport(workflow: ProjectWorkflowState, report: RepoHygieneReport): void {
+    workflow.repoHygieneReports = [
+      report,
+      ...workflow.repoHygieneReports.filter((entry) => entry.scannedRef !== report.scannedRef)
+    ].slice(0, 60);
+  }
+
+  private latestRepoHygieneReport(workflow: ProjectWorkflowState): RepoHygieneReport | undefined {
+    return workflow.repoHygieneReports
+      .slice()
+      .sort((left, right) => toTime(right.scannedAt) - toTime(left.scannedAt))[0];
+  }
+
+  private async scanWorkflowRepoHygiene(
+    project: LoadedProject,
+    scannedRef: string,
+    clean = true,
+    rootOverride?: string
+  ): Promise<RepoHygieneReport> {
+    const scanRoot = rootOverride ?? project.record.projectRoot;
+    const report = await scanAndCleanRepoHygiene({
+      projectRoot: scanRoot,
+      hostRoot: rootOverride ?? project.record.hostPath ?? project.record.projectRoot,
+      projectKind: project.scan.kind,
+      runtimeSettings: this.getRuntimeSettings(project.record.distroName),
+      scannedRef,
+      clean
+    });
+    const workflow = this.ensureWorkflowState(project.record);
+    this.upsertRepoHygieneReport(workflow, report);
+    if (report.cleanedFiles.length > 0 || report.mergeBlockingFindings.length > 0) {
+      this.recordWorkflowActivity(workflow, {
+        source: "validation",
+        status: report.mergeBlockingFindings.length > 0 ? "failed" : "completed",
+        title: report.mergeBlockingFindings.length > 0 ? "Repository hygiene blocked merge" : "Repository hygiene cleaned generated artifacts",
+        detail: report.summaryForHumans,
+        stepId: report.mergeBlockingFindings.length > 0 ? "merge" : "integrity"
+      });
+    }
+    return report;
+  }
+
+  private mergeGateBlockedReasons(workflow: ProjectWorkflowState, repoHygieneReport?: RepoHygieneReport): string[] {
+    const ledger = this.latestCycleValidationLedger(workflow);
+    const hygiene = repoHygieneReport ?? this.latestRepoHygieneReport(workflow);
+    const decision = deriveMergeGateDecision({ ledger, repoHygieneReport: hygiene });
+    return unique(decision.blockedReasons.map((reason) =>
+      reason === "No validation ledger has passed." ? "No validation ledger has passed for this cycle." : reason
+    ));
   }
 
   private refreshUltimateGoalAssessment(project: LoadedProject, timestamp = nowIso()): void {
@@ -3022,8 +3355,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       summary: workflow.scopedGoal?.summary ?? workflow.approvedRecommendation?.title ?? "",
       cycleNumber: workflow.workflowCycle.cycleNumber
     });
-    this.markCompletedCycleGoalCheckEvidence(project, completedAt);
+    const checklistBeforeEvidence = workflow.goalChecklist.map((check) => ({
+      ...check,
+      relatedPaths: [...(check.relatedPaths ?? [])],
+      evidenceHistory: [...(check.evidenceHistory ?? [])]
+    }));
+    this.reconcileCycleChecklistEvidence(project, completedAt, checklistBeforeEvidence);
     this.refreshUltimateGoalAssessment(project, completedAt);
+    const latestDelta = workflow.checklistDeltas.find((entry) => entry.cycleNumber === workflow.workflowCycle.cycleNumber);
+    if (latestDelta) {
+      workflow.checklistDeltas = [
+        computeChecklistDelta(checklistBeforeEvidence, workflow.goalChecklist, workflow.evidenceObservations.filter((entry) => entry.cycleNumber === workflow.workflowCycle.cycleNumber), {
+          cycleNumber: workflow.workflowCycle.cycleNumber,
+          targetedCheckIds: this.currentCycleTargetedCheckIds(workflow),
+          timestamp: completedAt
+        }),
+        ...workflow.checklistDeltas.filter((entry) => entry.cycleNumber !== workflow.workflowCycle.cycleNumber)
+      ].slice(0, 100);
+    }
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: completedAt,
+      selectedTaskSource: workflow.cycleContract?.selectedTaskSource ?? workflow.recommendationHealth.selectedTaskSource,
+      previousChecklist: checklistBeforeEvidence
+    });
     this.markWorkflowPreviewReady(project, completedAt);
     const retrospective = buildCycleRetrospective({
       workflow,
@@ -3034,6 +3388,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       shouldContinue: workflow.ultimateGoalCompletion?.state !== "goal_satisfied" && workflow.memory.knownOpenIssues.every((issue) => issue.status !== "open"),
       now: completedAt
     });
+    retrospective.cycleContract = workflow.cycleContract;
+    retrospective.checklistDelta = workflow.checklistDeltas.find((entry) => entry.cycleNumber === workflow.workflowCycle.cycleNumber);
     workflow.cycleRetrospectives = [
       retrospective,
       ...workflow.cycleRetrospectives.filter((entry) => entry.cycleNumber !== retrospective.cycleNumber)
@@ -5860,13 +6216,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       const counts = checks.length ? ` (${passed} passed, ${failed} failed, ${skipped} skipped)` : "";
       return compactText(`${integrityAgent.integrityReport.summary}${counts}`, 500);
     }
+    const commands = agents.flatMap((agent) => agent.commandLog);
+    const failedCommands = commands.filter((command) =>
+      (typeof command.exitCode === "number" && command.exitCode !== 0) ||
+      /fail|error|timed|cancel/i.test(command.status)
+    );
+    if (failedCommands.length > 0) {
+      return compactText(`${failedCommands.length} command attempt${failedCommands.length === 1 ? "" : "s"} failed, but no validation ledger was retained. Latest: ${failedCommands[0]?.command ?? "unknown command"}.`, 500);
+    }
+    if (commands.length > 0) {
+      return compactText(`${commands.length} command${commands.length === 1 ? "" : "s"} recorded, but no final validation ledger is attached.`, 500);
+    }
     if (status === "completed" || status === "merged") {
       return "Cycle completed; no retained validation report is attached.";
     }
     if (agents.some((agent) => agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected")) {
       return "Validation outcome needs review because at least one agent did not complete cleanly.";
     }
-    return "No validation result recorded yet.";
+    return "Validation has not run for this cycle.";
   }
 
   private cyclePlannerDecision(project: LoadedProject, cycleNumber: number): PlannerDecision | undefined {
@@ -5941,6 +6308,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         return compactText(workflow.ultimateGoalCompletion.rationale, 500);
       }
     }
+    const retrospective = workflow.cycleRetrospectives.find((entry) => entry.cycleNumber === cycleNumber);
+    if (retrospective?.nextRecommendedTasks[0]) {
+      return compactText(retrospective.nextRecommendedTasks[0], 500);
+    }
     const recommendation = [...agents]
       .filter((agent) => agent.recommendationReport?.nextSteps.length)
       .sort((left, right) => toTime(right.completedAt ?? right.lastActivityAt ?? right.createdAt) - toTime(left.completedAt ?? left.lastActivityAt ?? left.createdAt))[0]
@@ -5954,6 +6325,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private cycleSelectedTask(project: LoadedProject, cycleNumber: number, agents: AgentState[]): { selectedTask?: string; selectionReason?: string } {
     const workflow = project.record.workflow;
+    const retrospective = workflow.cycleRetrospectives.find((entry) => entry.cycleNumber === cycleNumber);
+    if (retrospective?.cycleContract?.selectedTaskTitle || retrospective?.triedToDo) {
+      return {
+        selectedTask: compactText(retrospective.cycleContract?.selectedTaskTitle ?? retrospective.triedToDo, 500),
+        selectionReason: compactText(retrospective.cycleContract?.whySelectedNow ?? retrospective.whyChosen, 900)
+      };
+    }
     const plannerDecision = this.cyclePlannerDecision(project, cycleNumber);
     if (plannerDecision?.selectedTaskTitle || plannerDecision?.whySelected) {
       return {
@@ -5998,7 +6376,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       .filter((value): value is string => Boolean(value))
       .sort((left, right) => toTime(right) - toTime(left))[0];
     const status = this.summarizeCycleStatus(project, cycleNumber, agents);
-    const commandsRun = unique(agents.flatMap((agent) => agent.commandLog.map((command) => command.command))).slice(0, 16);
+    const validationLedger = workflow.validationLedgers
+      .filter((ledger) => ledger.cycleNumber === cycleNumber)
+      .sort((left, right) => toTime(right.updatedAt) - toTime(left.updatedAt))[0];
+    const repoHygieneReport = workflow.repoHygieneReports
+      .filter((report) => report.scannedRef.includes(`:${cycleNumber}`))
+      .sort((left, right) => toTime(right.scannedAt) - toTime(left.scannedAt))[0];
+    const commandsRun = unique([
+      ...agents.flatMap((agent) => agent.commandLog.map((command) => command.command)),
+      ...(validationLedger?.commandResults.map((result) => result.command) ?? [])
+    ]).slice(0, 16);
     const filesChanged = unique(agents.flatMap((agent) => agent.changedFiles)).slice(0, 80);
     const approvals = agents.flatMap((agent) => agent.approvals);
     const userInputRequests = project.record.userInputRequests.filter((request) =>
@@ -6044,7 +6431,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         agent.status === "conflicted" ||
         agent.status === "disconnected" ||
         agent.events.some((event) => event.status === "failed")
-      ),
+      ) || Boolean(validationLedger?.unresolvedValidationFailures.length) || Boolean(repoHygieneReport?.mergeBlockingFindings.length),
       hasApprovals: approvals.length > 0,
       hasUserInputRequests: userInputRequests.length > 0,
       errorSummaries,
@@ -6062,7 +6449,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       goalChangeProposals: goalChangeProposalRecords.map((proposal) =>
         compactText(`${proposal.approvalStatus}: ${proposal.title}: ${proposal.summary || proposal.toGoalSummary || ""}`, 260)
       ),
-      validationOutcome: this.cycleValidationOutcome(agents, status),
+      validationOutcome: validationLedger?.summaryForHumans ?? this.cycleValidationOutcome(agents, status),
+      validationLedger,
+      repoHygieneReport,
+      derivedStatus: cycleNumber === workflow.workflowCycle.cycleNumber
+        ? deriveUserFacingWorkflowStatus(workflow, {
+          agents,
+          validationLedger,
+          repoHygieneReport,
+          workflowPauseRequested: project.record.localState.workflowPauseRequested
+        })
+        : undefined,
       retrospective: this.cycleRetrospective(project, cycleNumber, agents),
       nextStepRecommendation: this.cycleNextStepRecommendation(project, cycleNumber, agents)
     };
@@ -9221,6 +9618,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ? "Return 1 to 3 recommendations for the final appeal pass."
         : "Return 0 to 5 recommendations.",
       "Output terse JSON only. No greetings, markdown, filler, or restating unchanged logs/checklists.",
+      "Return exactly one JSON object with top-level fields summary, ultimateGoalProgress, ultimateGoalCompletion, recommendations, and goalCheckUpdates. ultimateGoalProgress has percentComplete and rationale. ultimateGoalCompletion has state and rationale. Each recommendation has title, summary, rationale, expectedImpact, priority, confidence, estimatedScope, riskLevel, and relatedPaths. Each goalCheckUpdate has action, id, title, description, required, itemKind, status, confidence, evidence, relatedPaths, and optional promotionReason; use null for nullable fields when absent. Do not include ids, ranks, or other properties on recommendations.",
       "Plan like a small SWE team. Checklist items are acceptance checks; a cycle is the next coherent task group based on shared paths, tests, evidence, user value, and blocking order.",
       "Recommendations must be concrete single-cycle tasks. Use medium scope for cohesive batches, small only for isolated checks, and split unrelated or umbrella work.",
       "If required checks are unmet/unknown, rank the next coherent required-check group ahead of generic stabilization unless a real blocker exists. Do not claim met without repository evidence or validation output.",
@@ -9383,6 +9781,35 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }).slice(0, 30);
   }
 
+  private classifyStructuredRecommendationFailure(message: string): StructuredRecommendationFailureCategory {
+    if (/invalid enum|received ['"]?[^'"]+['"]?/i.test(message)) {
+      return "unknown_enum";
+    }
+    if (/required|missing|required/i.test(message)) {
+      return "missing_required_field";
+    }
+    if (/expected|received|type/i.test(message)) {
+      return "wrong_type";
+    }
+    if (/recommendations.*empty|empty recommendations/i.test(message)) {
+      return "empty_recommendations";
+    }
+    if (/schema|parse/i.test(message)) {
+      return "schema_mismatch";
+    }
+    return "other";
+  }
+
+  private rememberRecommendationParseFailure(
+    category: StructuredRecommendationFailureCategory,
+    message: string
+  ): void {
+    this.lastRecommendationParseFailure = {
+      category,
+      message: compactText(message, 700)
+    };
+  }
+
   private parseRecommendationOutput(
     project: LoadedProject,
     rawText: string
@@ -9393,10 +9820,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     goalCheckUpdates: GoalCheckUpdateInput[];
     recommendations: ProjectWorkflowState["recommendations"];
   } | undefined {
+    this.lastRecommendationParseFailure = undefined;
     const workflow = this.ensureWorkflowState(project.record);
     const modeConfig = getWorkflowModeConfig(workflow.workflowMode, resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled));
-    for (const parsed of this.extractJsonObjects(rawText).reverse()) {
+    const parsedObjects = this.extractJsonObjects(rawText).reverse();
+    if (parsedObjects.length === 0) {
+      this.rememberRecommendationParseFailure("invalid_json", "No complete JSON object was found in the recommendation output.");
+      return undefined;
+    }
+    const failures: string[] = [];
+    for (const parsed of parsedObjects) {
       if (typeof parsed.summary !== "string" || !Array.isArray(parsed.recommendations)) {
+        failures.push("Missing or invalid top-level summary/recommendations fields.");
         continue;
       }
 
@@ -9407,6 +9842,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         );
         const goalCheckUpdatesPayload = (parsed as { goalCheckUpdates?: unknown }).goalCheckUpdates;
         if (!ultimateGoalProgress || !ultimateGoalCompletion) {
+          failures.push("Missing or invalid ultimateGoalProgress/ultimateGoalCompletion fields.");
           continue;
         }
         const recommendations = parsed.recommendations
@@ -9433,11 +9869,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           goalCheckUpdates,
           recommendations
         };
-      } catch {
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
         // Try the next complete object in the message.
       }
     }
 
+    const failureMessage = failures[0] ?? "Recommendation JSON did not match the expected schema.";
+    this.rememberRecommendationParseFailure(this.classifyStructuredRecommendationFailure(failureMessage), failureMessage);
     return undefined;
   }
 
@@ -9509,7 +9948,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return ["npm run typecheck", "npm run lint", "npm test", "npm run build"];
     }
     if (managers.includes("python") || project.scan.stats.manifestFiles.some((file) => /pyproject\.toml|requirements\.txt$/i.test(file))) {
-      return ["python -m pytest"];
+      const hasPytestManifest = project.scan.stats.manifestFiles.some((file) => /requirements.*\.txt|pyproject\.toml|setup\.cfg|tox\.ini/i.test(file)) &&
+        project.record.dependencies.some((dependency) => dependency.name.toLowerCase() === "pytest");
+      return hasPytestManifest
+        ? ["PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m pytest"]
+        : ["PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -q"];
     }
     return ["Run the project-supported deterministic verification commands"];
   }
@@ -9750,6 +10193,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ...checklistGoalCompletion,
       updatedAt: generatedAt
     };
+    workflow.cycleContract = plannedRecommendations.length > 0 || workflow.approvedRecommendation || workflow.scopedGoal
+      ? buildCycleContract(workflow, {
+        now: generatedAt,
+        selectedTaskSource: workflow.recommendationHealth.selectedTaskSource
+      })
+      : undefined;
     if (checklistGoalCompletion.state === "goal_satisfied" && project.record.localState.workflowObjective === "deliver") {
       if (appealPassQueued) {
         workflow.appeal = {
@@ -9873,9 +10322,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ...entry,
         rank: index + 1
       }));
+    const selectedFallback = recommendations[0];
+    const failureDetail = recommendationContext.workflow.recommendationHealth.lastStructuredFailureMessage
+      ? `structured recommendation JSON failed ${recommendationContext.workflow.recommendationHealth.lastStructuredFailureCategory ?? "validation"}: ${recommendationContext.workflow.recommendationHealth.lastStructuredFailureMessage}`
+      : "structured recommendation output was unavailable or invalid";
+    const targetedCount = selectedFallback?.targetedCheckIds?.length ?? 0;
+    const fallbackReason = selectedFallback
+      ? `Planner fallback used: ${failureDetail}. Selected deterministic ${selectedFallback.sourceWorkPackageId ? "work package" : "candidate"} because it targeted ${targetedCount} unknown required check${targetedCount === 1 ? "" : "s"}.`
+      : `Planner fallback used: ${failureDetail}. No deterministic follow-up was needed.`;
+    recommendationContext.workflow.recommendationHealth = recordRecommendationFallbackUsed(
+      recommendationContext.workflow.recommendationHealth,
+      {
+        reason: fallbackReason,
+        candidateCount: recommendations.length,
+        confidence: selectedFallback?.confidence
+      }
+    );
     if (agent) {
       agent.currentPhase = "Used fallback recommendations";
-      agent.lastMessageSnippet = "Structured recommendation output was invalid, so the workflow used the deterministic fallback.";
+      agent.lastMessageSnippet = fallbackReason;
     }
     await this.applyRecommendationSet(
       project,
@@ -9916,10 +10381,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const parsed = this.parseRecommendationOutput(project, rawText);
     if (!parsed) {
       this.abortStructuredOutputApplication(outputGuard);
+      const workflow = this.ensureWorkflowState(project.record);
+      const failure = this.lastRecommendationParseFailure ?? {
+        category: "schema_mismatch" as const,
+        message: "Structured recommendation output did not match the expected schema."
+      };
+      workflow.recommendationHealth = recordStructuredRecommendationFailure(workflow.recommendationHealth, {
+        category: failure.category,
+        message: failure.message
+      });
       reduceAgentRuntimeEvent(agent, {
         kind: "raw",
         title: "Recommendation output rejected",
-        detail: rawText.slice(0, 240),
+        detail: `${failure.category}: ${failure.message}`,
         raw: rawText
       });
       return false;
@@ -9955,10 +10429,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       : parsed.recommendations;
     if (objective === "optimize" && recommendations.length === 0) {
       this.abortStructuredOutputApplication(outputGuard);
+      const workflow = this.ensureWorkflowState(project.record);
+      workflow.recommendationHealth = recordStructuredRecommendationFailure(workflow.recommendationHealth, {
+        category: "empty_recommendations",
+        message: "Optimize mode requires at least one recommendation, but the structured response returned none."
+      });
       return false;
     }
 
     try {
+      const workflow = this.ensureWorkflowState(project.record);
+      workflow.recommendationHealth = recordStructuredRecommendationSuccess(workflow.recommendationHealth);
       await this.applyRecommendationSet(
         project,
         agent,
@@ -10158,6 +10639,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       acceptanceCriteria: boundedScopedGoal.acceptanceCriteria,
       status: "goal_ready"
     };
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: boundedScopedGoal.createdAt,
+      selectedTaskSource: workflow.cycleContract?.selectedTaskSource ?? workflow.recommendationHealth.selectedTaskSource
+    });
     if (agent) {
       agent.status = "completed";
       agent.completedAt = nowIso();
@@ -10482,6 +10967,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       title: decisionSource === "autopilot" ? "Autopilot selected a recommendation" : "Approved a recommendation",
       detail: recommendation.title,
       stepId: "recommendation"
+    });
+    workflow.cycleContract = buildCycleContract(workflow, {
+      now: nowIso(),
+      selectedTaskSource: workflow.recommendationHealth.selectedTaskSource === "derived_from_legacy_state"
+        ? decisionSource === "manual" ? "manual" : workflow.recommendationHealth.selectedTaskSource
+        : workflow.recommendationHealth.selectedTaskSource
     });
     this.syncWorkflowState(project);
     await this.persistProjectUpdate(project, {
@@ -12029,6 +12520,30 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const finalizedWorktreePath = agent.worktree.worktreePath;
 
     try {
+      const hygieneReport = await this.scanWorkflowRepoHygiene(project, `checkpoint:${agent.id}`, true, finalizedWorktreePath);
+      agent.repoHygieneReport = hygieneReport;
+      if (hygieneReport.status !== "passed") {
+        const detail = hygieneReport.summaryForHumans;
+        agent.status = "failed";
+        agent.completedAt = nowIso();
+        agent.currentPhase = "Repository hygiene blocked worktree checkpoint";
+        agent.lastMessageSnippet = detail.slice(0, 240);
+        this.recordWorkflowOpenIssue(
+          this.ensureWorkflowState(project.record),
+          "Repository hygiene blocked checkpoint",
+          detail,
+          agent.category === "coding" ? "coding" : "system"
+        );
+        reduceAgentRuntimeEvent(agent, {
+          kind: "raw",
+          title: "Repository hygiene blocked checkpoint",
+          detail
+        });
+        this.syncWorkflowStepProgressFromAgent(project, agent);
+        this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+        await this.persistProjectUpdate(project);
+        return;
+      }
       const checkpoint = await checkpointWorktreeChanges(
         finalizedWorktreePath,
         targetBranch,
@@ -12298,14 +12813,47 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "Integrity validation"
     );
 
-    const commands = await this.detectVerificationCommands(project.record.hostPath, project.scan.kind);
+    this.refreshEvidenceCommands(project);
+    const previousCommandResults = workflow.validationLedgers.flatMap((ledger) => ledger.commandResults);
+    const commandResolution = await resolveTargetProjectCommands({
+      projectRoot: project.record.hostPath ?? project.record.projectRoot,
+      projectKind: project.scan.kind,
+      evidenceCommands: workflow.evidenceCommands,
+      previousCommandResults
+    });
     const validationRuntimePathDirs = await this.resolveValidationRuntimePathDirs(project);
+    let ledger = createValidationLedger({
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      testCommands: commandResolution.testCommands.map((command) => command.command),
+      evidenceCommands: [
+        ...commandResolution.evidenceCommands.map((command) => command.command),
+        ...commandResolution.skippedEvidenceCommands.map((command) => command.command)
+      ]
+    });
+    ledger.warnings = [...ledger.warnings, ...commandResolution.warnings];
+    for (const command of commandResolution.skippedEvidenceCommands) {
+      const timestamp = nowIso();
+      ledger.commandResults.push(buildValidationCommandResult({
+        commandId: `${agent.id}:evidence:${ledger.commandResults.length + 1}`,
+        command: command.command,
+        phase: "evidence",
+        startedAt: timestamp,
+        endedAt: timestamp,
+        status: "skipped",
+        stdout: "",
+        stderr: command.skipReason ?? "Evidence command skipped.",
+        cwdKind: agent.worktree?.worktreePath === cwd ? "integration_worktree" : "project_root",
+        relatedCheckIds: command.mapsToCheckIds,
+        relatedFiles: command.relatedFiles
+      }));
+    }
     const checks: Array<{
       name: string;
       command: string;
       status: "passed" | "failed" | "skipped";
       outputSnippet: string;
     }> = [];
+    const commands: TargetProjectResolvedCommand[] = [...commandResolution.evidenceCommands, ...commandResolution.testCommands];
     for (const command of commands) {
       this.recordWorkflowActivity(workflow, {
         source: "validation",
@@ -12317,46 +12865,112 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         agentCategory: "integrity"
       });
       this.updateWorkflowStepProgress(workflow, "integrity", {
-        currentActivity: "Running deterministic validation",
+        currentActivity: command.kind === "evidence" ? "Running evidence command" : "Running deterministic validation",
         currentSubstep: command.name,
         latestProgressNote: command.command,
         message: `Running ${command.command}`
       }, { status: "running" });
       await this.persistProjectUpdate(project);
+      const startedAt = nowIso();
       const result = await runner.runShellCommand({
         command: command.command,
         cwd,
         runtimePathDirs: validationRuntimePathDirs
       });
+      const endedAt = nowIso();
+      let status: "passed" | "failed" = result.exitCode === 0 ? "passed" : "failed";
+      let stderr = result.stderr;
+      let parsedJsonRef: string | undefined;
+      if (command.kind === "evidence" && command.expectedOutput === "json" && result.exitCode === 0) {
+        const output = `${result.stdout}\n${result.stderr}`.trim();
+        const parsedObjects = this.extractJsonObjects(output);
+        let parsedEvidence: unknown;
+        try {
+          parsedEvidence = JSON.parse(output);
+        } catch {
+          parsedEvidence = parsedObjects[0];
+        }
+        if (parsedEvidence === undefined) {
+          status = "failed";
+          stderr = `${stderr}\nJSON parse failure: evidence command did not emit a parseable JSON object.`.trim();
+        } else {
+          parsedJsonRef = `validation-ledger:${workflow.workflowCycle.cycleNumber}:${agent.id}:${ledger.commandResults.length + 1}:json`;
+          const targetedCheckIds = this.currentCycleTargetedCheckIds(workflow);
+          const knownCheckIds = workflow.goalChecklist.map((check) => check.id);
+          const observations = extractChecklistEvidenceObservations(JSON.stringify(parsedEvidence), {
+            cycleNumber: workflow.workflowCycle.cycleNumber,
+            targetedCheckIds,
+            knownCheckIds,
+            evidenceSourceType: "command_output",
+            sourceRef: {
+              commandId: `${agent.id}:evidence:${ledger.commandResults.length + 1}`,
+              agentRunId: agent.id,
+              sourceKey: command.name
+            },
+            observedAt: endedAt
+          });
+          if (observations.length > 0) {
+            const byObservationId = new Map([
+              ...observations,
+              ...workflow.evidenceObservations
+            ].map((observation) => [observation.observationId, observation]));
+            workflow.evidenceObservations = [...byObservationId.values()].slice(0, 500);
+          }
+        }
+      }
+      const commandResult = buildValidationCommandResult({
+        commandId: `${agent.id}:${command.kind}:${ledger.commandResults.length + 1}`,
+        command: command.command,
+        phase: command.phase,
+        startedAt,
+        endedAt,
+        exitCode: result.exitCode,
+        status,
+        stdout: result.stdout,
+        stderr,
+        cwdKind: agent.worktree?.worktreePath === cwd ? "integration_worktree" : "project_root",
+        parsedJsonRef,
+        fullOutputRef: `agent:${agent.id}:command:${ledger.commandResults.length + 1}`,
+        relatedCheckIds: command.mapsToCheckIds,
+        relatedFiles: command.relatedFiles
+      });
+      ledger.commandResults.push(commandResult);
       this.recordWorkflowActivity(workflow, {
         source: "validation",
-        status: result.exitCode === 0 ? "completed" : "failed",
-        title: `${command.name} ${result.exitCode === 0 ? "passed" : "failed"}`,
+        status: commandResult.status === "passed" ? "completed" : "failed",
+        title: `${command.name} ${commandResult.status === "passed" ? "passed" : "failed"}`,
         detail: command.command,
         stepId: "integrity",
         agentId: agent.id,
         agentCategory: "integrity"
       });
-      checks.push({
-        name: command.name,
-        command: command.command,
-        status: result.exitCode === 0 ? "passed" : "failed",
-        outputSnippet: `${result.stdout}\n${result.stderr}`.trim().slice(0, 500)
-      });
+      if (command.kind === "test") {
+        checks.push({
+          name: command.name,
+          command: command.command,
+          status: commandResult.status === "passed" ? "passed" : "failed",
+          outputSnippet: `${commandResult.stdoutSummary}\n${commandResult.stderrSummary}`.trim().slice(0, 500)
+        });
+      }
     }
+    const hygieneReport = await this.scanWorkflowRepoHygiene(project, `integrity:${workflow.workflowCycle.cycleNumber}`, true, cwd);
+    ledger = finalizeValidationLedger(ledger, { repoHygieneReport: hygieneReport });
+    this.upsertValidationLedger(workflow, ledger);
+    agent.validationLedger = ledger;
+    agent.repoHygieneReport = hygieneReport;
 
     const contextualRisks = [
       !workflow.scopedGoal?.summary.trim() ? "No scoped goal was defined before integrity validation." : undefined,
       !workflow.ultimateGoal.confirmedAt ? "The ultimate goal is not confirmed, so integrity cannot validate final alignment confidently." : undefined
     ].filter((entry): entry is string => Boolean(entry));
-    const commandRisks = checks.filter((check) => check.status === "failed").map((check) => `Investigate failing command: ${check.command}`);
+    const commandRisks = ledger.unresolvedValidationFailures;
     const risks = [...contextualRisks, ...commandRisks];
-    const passed = checks.every((check) => check.status === "passed") && risks.length === 0;
+    const passed = ledger.finalValidationStatus === "passed" && risks.length === 0;
 
     agent.integrityReport = {
       summary: passed
-        ? "Deterministic integrity checks passed and the current scoped goal remains aligned with the project charter."
-        : "One or more deterministic integrity checks or workflow-alignment checks failed.",
+        ? ledger.summaryForHumans
+        : ledger.summaryForHumans,
       checks,
       risks,
       generatedAt: nowIso()
@@ -12542,7 +13156,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     mergeAgent: AgentState,
     workflow: ProjectWorkflowState,
     branch: string,
-    operation: string
+    operation: string,
+    manualValidationOverride = false
   ): Promise<boolean> {
     if (this.settings.mockMode) {
       return true;
@@ -12554,6 +13169,40 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       conflictCycleCount: 0,
       generatedAt: nowIso()
     };
+    const pushBlockedReasons = this.mergeGateBlockedReasons(workflow, mergeAgent.repoHygieneReport);
+    const onlyMissingLedger = this.validationLedgerIsMissingEquivalent(this.latestCycleValidationLedger(workflow)) &&
+      pushBlockedReasons.length === 1 &&
+      this.mergeGateReasonIsOnlyMissingValidationLedger(pushBlockedReasons[0]);
+    if (pushBlockedReasons.length > 0 && !(manualValidationOverride && onlyMissingLedger)) {
+      const detail = pushBlockedReasons.join(" ");
+      mergeAgent.mergeReport = {
+        ...baseReport,
+        summary: `${baseReport.summary} Push blocked by validation or repository hygiene gates. ${detail}`,
+        targetBranch: branch
+      };
+      mergeAgent.status = "failed";
+      mergeAgent.completedAt = nowIso();
+      mergeAgent.currentPhase = "GitHub push blocked";
+      mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+      this.recordWorkflowOpenIssue(workflow, "GitHub push blocked", detail, "merge");
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "failed",
+        title: "GitHub push blocked",
+        detail,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        currentActivity: "GitHub push blocked",
+        latestProgressNote: detail,
+        message: mergeAgent.mergeReport.summary,
+        warning: "Auto-approve push settings do not bypass validation or hygiene gates.",
+        agentCategory: "merge"
+      }, { status: "failed" });
+      return false;
+    }
 
     try {
       const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
@@ -12666,12 +13315,44 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return false;
     }
 
+    const workflow = this.ensureWorkflowState(project.record);
+    const hygieneReport = await this.scanWorkflowRepoHygiene(
+      project,
+      `merge:${workflow.workflowCycle.cycleNumber}:resolved-conflict`,
+      true,
+      mergeAgent.worktree.worktreePath
+    );
+    mergeAgent.repoHygieneReport = hygieneReport;
+    if (hygieneReport.status !== "passed") {
+      const detail = hygieneReport.mergeBlockingFindings.join(" ") || hygieneReport.summaryForHumans;
+      mergeAgent.mergeReport = {
+        summary: `Resolved merge-conflict worktree was not applied because repository hygiene failed. ${detail}`,
+        targetBranch,
+        mergedBranches: codingBranches,
+        conflicts: [],
+        conflictCycleCount: mergeAgent.mergeReport?.conflictCycleCount ?? 1,
+        generatedAt: nowIso()
+      };
+      mergeAgent.status = "failed";
+      mergeAgent.completedAt = nowIso();
+      mergeAgent.currentPhase = "Repository hygiene blocked resolved merge";
+      this.recordWorkflowOpenIssue(workflow, "Repository hygiene blocked resolved merge", detail, "merge");
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        currentActivity: "Merge blocked by repository hygiene",
+        latestProgressNote: detail,
+        message: mergeAgent.mergeReport.summary,
+        warning: "Forbidden files must be removed before merge can continue."
+      }, { status: "failed" });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, false);
+      return true;
+    }
+
     const appliedCheckoutBranch = await this.applyGitBranchToProjectCheckout(
       project,
       mergeAgent.worktree.branch,
       "Merge conflict retry"
     );
-    const workflow = this.ensureWorkflowState(project.record);
     mergeAgent.mergeReport = {
       summary: appliedCheckoutBranch
         ? `Resolved merge-conflict worktree was applied to the opened checkout on ${appliedCheckoutBranch}.`
@@ -12693,7 +13374,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       mergeAgent,
       workflow,
       appliedCheckoutBranch || targetBranch,
-      "Merge conflict retry"
+      "Merge conflict retry",
+      !this.latestCycleValidationLedger(workflow)
     );
     if (!published) {
       this.syncWorkflowState(project);
@@ -12805,6 +13487,59 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       mergeModel,
       { launchThread: false, persistOnCreate: false }
     );
+    const preMergeHygieneReport = await this.scanWorkflowRepoHygiene(project, `merge:${workflow.workflowCycle.cycleNumber}:pre`, true);
+    mergeAgent.repoHygieneReport = preMergeHygieneReport;
+    const mergeBlockedReasons = this.mergeGateBlockedReasons(workflow, preMergeHygieneReport);
+    const onlyMissingLedger = this.validationLedgerIsMissingEquivalent(this.latestCycleValidationLedger(workflow)) &&
+      mergeBlockedReasons.length === 1 &&
+      this.mergeGateReasonIsOnlyMissingValidationLedger(mergeBlockedReasons[0]);
+    const allowMissingLedgerOverride = onlyMissingLedger && (!automate || this.workflowMergeRetryInFlight.has(projectId));
+    if (mergeBlockedReasons.length > 0 && !allowMissingLedgerOverride) {
+      const detail = mergeBlockedReasons.join(" ");
+      mergeAgent.mergeReport = {
+        summary: `Merge blocked before integration. ${detail}`,
+        mergedBranches: [],
+        conflicts: [],
+        conflictCycleCount: 0,
+        generatedAt: nowIso()
+      };
+      mergeAgent.status = "failed";
+      mergeAgent.completedAt = nowIso();
+      mergeAgent.currentPhase = "Merge blocked by validation or repository hygiene";
+      mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+      this.recordWorkflowOpenIssue(workflow, "Merge blocked", detail, "merge");
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "failed",
+        title: preMergeHygieneReport.mergeBlockingFindings.length > 0 ? "Merge blocked by repository hygiene" : "Merge blocked by validation",
+        detail,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        currentActivity: "Merge blocked",
+        latestProgressNote: detail,
+        message: mergeAgent.mergeReport.summary,
+        warning: "Validation and repository hygiene gates must pass before merge or push."
+      }, { status: "failed" });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, false);
+      return;
+    }
+    if (allowMissingLedgerOverride) {
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "waiting",
+        title: "Manual merge proceeding without retained validation ledger",
+        detail: this.workflowMergeRetryInFlight.has(projectId)
+          ? "The operator retried a resolved merge-conflict workflow. Future automated merge paths still require a passing validation ledger."
+          : "The operator invoked merge directly. Future automated merge paths still require a passing validation ledger.",
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+    }
 
     if (project.scan.kind !== "git") {
       mergeAgent.mergeReport = {
@@ -12916,6 +13651,38 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     } else {
       mergeAgent.status = "running";
       mergeAgent.completedAt = undefined;
+      const integrationHygieneReport = await this.scanWorkflowRepoHygiene(
+        project,
+        `merge:${workflow.workflowCycle.cycleNumber}:integration`,
+        true,
+        integrationWorktree.worktreePath
+      );
+      mergeAgent.repoHygieneReport = integrationHygieneReport;
+      if (integrationHygieneReport.status !== "passed") {
+        const detail = integrationHygieneReport.mergeBlockingFindings.join(" ") || integrationHygieneReport.summaryForHumans;
+        mergeAgent.mergeReport.summary = `Merged cleanly in the integration worktree, but repository hygiene blocked finalization. ${detail}`;
+        mergeAgent.status = "failed";
+        mergeAgent.completedAt = nowIso();
+        this.recordWorkflowOpenIssue(workflow, "Repository hygiene blocked merge", detail, "merge");
+        this.recordWorkflowActivity(workflow, {
+          source: "workflow",
+          status: "failed",
+          title: "Merge blocked by repository hygiene",
+          detail,
+          stepId: "merge",
+          agentId: mergeAgent.id,
+          agentCategory: "merge"
+        });
+        this.updateWorkflowStepProgress(workflow, "merge", {
+          currentActivity: "Merge blocked by repository hygiene",
+          latestProgressNote: detail,
+          message: mergeAgent.mergeReport.summary,
+          warning: "Forbidden files must be removed before merge can continue."
+        }, { status: "failed" });
+        this.syncWorkflowState(project);
+        await this.persistProjectUpdate(project, false);
+        return;
+      }
       try {
         appliedCheckoutBranch = integrationBranch
           ? await this.applyGitBranchToProjectCheckout(project, integrationBranch, "Merge finalization")
@@ -12966,7 +13733,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         mergeAgent,
         workflow,
         appliedCheckoutBranch ?? targetBranch,
-        "Merge finalization"
+        "Merge finalization",
+        allowMissingLedgerOverride
       );
       if (!published) {
         this.syncWorkflowState(project);

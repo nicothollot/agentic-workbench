@@ -243,6 +243,7 @@ export type PlannerApprovalStatus = "not_required" | "pending" | "accepted" | "r
 export type CandidateTaskKind =
   | "goal_check"
   | "work_package"
+  | "reconciliation_debug"
   | "blocker"
   | "validation"
   | "stabilization"
@@ -358,6 +359,271 @@ export interface PlannerDecision {
   createdAt: string;
 }
 
+export type CycleContractTaskSource =
+  | "structured_recommendation"
+  | "deterministic_fallback"
+  | "manual"
+  | "derived_from_legacy_state";
+
+export interface CycleContractTargetedChecklistItem {
+  checkId: string;
+  title: string;
+  fullDescription: string;
+  required: boolean;
+  itemKind: GoalCheckItemKind;
+  groupId?: string;
+  previousStatus: GoalCheckStatus;
+  currentStatus: GoalCheckStatus;
+  currentEvidence: string;
+  evidenceHistoryCount: number;
+  whyTargeted: string;
+  acceptanceHint: string;
+  relatedPaths: string[];
+  observableSignalsExpected: string[];
+}
+
+export interface CycleContractPriorSimilarAttempt {
+  cycleNumber: number;
+  attemptedTaskTitle: string;
+  completedTaskTitle?: string;
+  nextRecommendedTaskTitle?: string;
+  filesChanged: string[];
+  commandCount: number;
+  validationSummary: string;
+  checklistDeltaSummary: string;
+  structuredFallbackUsed: boolean;
+  outcome: "checklist_moved" | "no_delta" | "failed" | "unknown";
+}
+
+export interface CycleContract {
+  schemaVersion: number;
+  cycleNumber: number;
+  createdAt: string;
+  updatedAt: string;
+  selectedTaskId?: string;
+  selectedTaskTitle: string;
+  selectedTaskKind: CandidateTaskKind;
+  selectedTaskSource: CycleContractTaskSource;
+  plainEnglishObjective: string;
+  concreteGoalForThisCycle: string;
+  targetedChecklistItems: CycleContractTargetedChecklistItem[];
+  expectedFilesOrAreas: string[];
+  expectedValidationCommands: string[];
+  expectedEvidenceCommands: string[];
+  acceptanceCriteria: string[];
+  nonGoalsForThisCycle: string[];
+  constraintsForThisCycle: string[];
+  whySelectedNow: string;
+  plannerScore?: number;
+  scoreBreakdown: Record<string, number>;
+  repetitionPenalty: number;
+  priorSimilarAttempts: CycleContractPriorSimilarAttempt[];
+  currentKnownBlockers: string[];
+  fallbackOrHealthWarnings: string[];
+  doneWhen: string[];
+  failureModes: string[];
+  sourceDataRefs: Record<string, string | string[] | number | boolean | undefined>;
+}
+
+export type ChecklistEvidenceStatus = "met" | "needs_attention" | "unknown" | "not_applicable";
+
+export type ChecklistEvidenceSourceType =
+  | "command_output"
+  | "agent_message"
+  | "structured_recommendation"
+  | "deterministic_validator"
+  | "artifact"
+  | "manual"
+  | "derived";
+
+export type ChecklistEvidenceNotConsumedReason =
+  | "missing_check_id"
+  | "unknown_check_id"
+  | "ambiguous_status"
+  | "assertion_failed"
+  | "validation_failed"
+  | "artifact_missing"
+  | "stale_or_superseded"
+  | "not_targeted_this_cycle"
+  | "low_confidence"
+  | "parse_error";
+
+export interface ChecklistEvidenceObservation {
+  observationId: string;
+  cycleNumber: number;
+  checkId: string;
+  status: ChecklistEvidenceStatus;
+  evidenceText: string;
+  evidenceSourceType: ChecklistEvidenceSourceType;
+  sourceRef: {
+    commandId?: string;
+    eventId?: string;
+    agentRunId?: string;
+    artifactPath?: string;
+    sourceKey?: string;
+  };
+  relevantPaths: string[];
+  validationCommands: string[];
+  confidence: number;
+  observedAt: string;
+  consumedByChecklist: boolean;
+  notConsumedReason?: ChecklistEvidenceNotConsumedReason;
+}
+
+export interface ChecklistDelta {
+  schemaVersion: number;
+  cycleNumber: number;
+  targetedTotal: number;
+  targetedMetBefore: number;
+  targetedMetAfter: number;
+  targetedNewlyMet: string[];
+  targetedStillUnknown: string[];
+  targetedNeedsAttention: string[];
+  targetedNotApplicable: string[];
+  nonTargetedChanges: string[];
+  evidenceObservedCount: number;
+  evidenceConsumedCount: number;
+  evidenceNotConsumedCount: number;
+  evidenceNotConsumedReasons: Partial<Record<ChecklistEvidenceNotConsumedReason, number>>;
+  summaryForHumans: string;
+  didGoalProgressChange: boolean;
+  goalProgressBefore: number;
+  goalProgressAfter: number;
+  whyStillUnknownByCheckId: Record<string, string>;
+  createdAt: string;
+}
+
+export type StructuredRecommendationFailureCategory =
+  | "invalid_json"
+  | "schema_mismatch"
+  | "missing_required_field"
+  | "wrong_type"
+  | "unknown_enum"
+  | "empty_recommendations"
+  | "parse_timeout"
+  | "other";
+
+export interface RecommendationHealth {
+  totalStructuredAttempts: number;
+  totalStructuredFailures: number;
+  consecutiveStructuredFailures: number;
+  lastStructuredFailureAt?: string;
+  lastStructuredFailureCategory?: StructuredRecommendationFailureCategory;
+  lastStructuredFailureMessage?: string;
+  fallbackUsedForCurrentRecommendation: boolean;
+  fallbackReason?: string;
+  selectedTaskSource: CycleContractTaskSource;
+  fallbackConfidence?: number;
+  modelRecommendationAccepted: boolean;
+  deterministicFallbackCandidateCount: number;
+  visibleWarningLevel: "none" | "info" | "warning" | "critical";
+}
+
+export interface ProjectEvidenceCommand {
+  name: string;
+  command: string;
+  purpose: string;
+  expectedOutput: "json" | "text" | "html" | "file";
+  mapsToChecklistGroups: string[];
+  mapsToCheckIds: string[];
+  safeDefault: boolean;
+  requiresNetwork: boolean;
+  requiresCredentials: boolean;
+  discoveredFrom:
+    | "README"
+    | "package_json"
+    | "pyproject"
+    | "previous_successful_command"
+    | "known_adapter"
+    | "manual";
+  confidence: number;
+}
+
+export type ValidationCommandCwdKind = "project_root" | "coding_worktree" | "integration_worktree" | "unknown";
+export type ValidationCommandPhase = "planning" | "coding" | "evidence" | "integrity" | "merge" | "hygiene" | "manual";
+export type ValidationCommandStatus = "passed" | "failed" | "skipped" | "timed_out" | "cancelled";
+export type ValidationFinalStatus = "passed" | "failed" | "partial" | "skipped" | "not_run";
+export type ValidationFailureKind =
+  | "environment_toolchain"
+  | "environment_tooling_unavailable"
+  | "command_construction"
+  | "product_test"
+  | "evidence_command"
+  | "approval_required"
+  | "timeout"
+  | "hygiene"
+  | "unknown";
+
+export interface ValidationFailureClassification {
+  kind: ValidationFailureKind;
+  summary: string;
+  mergeBlocking: boolean;
+  repairedByCommandId?: string;
+}
+
+export interface ValidationCommandResult {
+  commandId: string;
+  command: string;
+  normalizedCommand: string;
+  cwdKind: ValidationCommandCwdKind;
+  phase: ValidationCommandPhase;
+  startedAt: string;
+  endedAt: string;
+  durationMs: number;
+  exitCode?: number | null;
+  status: ValidationCommandStatus;
+  stdoutSummary: string;
+  stderrSummary: string;
+  fullOutputRef?: string;
+  parsedJsonRef?: string;
+  redactionApplied: boolean;
+  classifiedFailure?: ValidationFailureClassification;
+  relatedCheckIds: string[];
+  relatedFiles: string[];
+}
+
+export interface ValidationLedger {
+  schemaVersion: number;
+  cycleNumber: number;
+  createdAt: string;
+  updatedAt: string;
+  plannedCommands: string[];
+  attemptedCommands: string[];
+  evidenceCommands: string[];
+  testCommands: string[];
+  commandResults: ValidationCommandResult[];
+  environmentFailures: string[];
+  commandConstructionFailures: string[];
+  productFailures: string[];
+  evidenceFailures: string[];
+  hygieneFailures: string[];
+  repairedFailures: string[];
+  warnings: string[];
+  finalValidationStatus: ValidationFinalStatus;
+  finalValidationBasis: string;
+  unresolvedValidationFailures: string[];
+  mergeAllowed: boolean;
+  mergeBlockedReasons: string[];
+  summaryForHumans: string;
+}
+
+export interface RepoHygieneReport {
+  status: "passed" | "warnings" | "failed" | "unknown";
+  scannedAt: string;
+  scannedRef: string;
+  forbiddenFiles: string[];
+  cleanedFiles: string[];
+  warnings: string[];
+  mergeBlockingFindings: string[];
+  summaryForHumans: string;
+}
+
+export interface WorkflowDerivedStatus {
+  label: string;
+  explanation: string;
+  tone: "idle" | "running" | "success" | "warning" | "danger" | "paused";
+}
+
 export interface CycleRetrospective {
   id: string;
   cycleNumber: number;
@@ -374,6 +640,8 @@ export interface CycleRetrospective {
   nextRecommendedTasks: string[];
   shouldContinue: boolean;
   pauseReason?: string;
+  cycleContract?: CycleContract;
+  checklistDelta?: ChecklistDelta;
 }
 export type UltimateGoalCompletionState = "needs_more_work" | "goal_satisfied";
 export type WorkflowAppealStatus = "not_started" | "not_applicable" | "pending" | "running" | "completed";
@@ -1077,6 +1345,13 @@ export interface ProjectWorkflowState {
   plannerDecisions: PlannerDecision[];
   checklistChanges: ChecklistChange[];
   cycleRetrospectives: CycleRetrospective[];
+  cycleContract?: CycleContract;
+  evidenceObservations: ChecklistEvidenceObservation[];
+  checklistDeltas: ChecklistDelta[];
+  recommendationHealth: RecommendationHealth;
+  evidenceCommands: ProjectEvidenceCommand[];
+  validationLedgers: ValidationLedger[];
+  repoHygieneReports: RepoHygieneReport[];
   workflowCycle: WorkflowCycle;
   approvedRecommendation?: ApprovedRecommendation;
   scopedGoal?: ScopedGoal;
@@ -1436,6 +1711,8 @@ export interface AgentState {
   recoveryHandledAt?: string;
   repositorySummaryTarget?: RepositoryPathSummaryTarget;
   integrityReport?: IntegrityReport;
+  validationLedger?: ValidationLedger;
+  repoHygieneReport?: RepoHygieneReport;
   mergeReport?: MergeReport;
   recommendationReport?: RecommendationReport;
   appliedStructuredOutputs?: StructuredOutputApplication[];
@@ -1510,6 +1787,9 @@ export interface WorkflowCycleSummaryView {
   checklistChanges: string[];
   goalChangeProposals: string[];
   validationOutcome?: string;
+  validationLedger?: ValidationLedger;
+  repoHygieneReport?: RepoHygieneReport;
+  derivedStatus?: WorkflowDerivedStatus;
   retrospective?: string;
   nextStepRecommendation?: string;
 }
@@ -1686,6 +1966,50 @@ export interface ReviewLogProjectSnapshot {
   dependencies: DependencyRecord[];
 }
 
+export interface ReviewLogRedactionStatus {
+  localPathsRedacted: boolean;
+  secretsRedacted: boolean;
+  fullCommandOutputIncluded: boolean;
+  note: string;
+}
+
+export interface ReviewLogEvidenceObservationSummary {
+  observationId: string;
+  cycleNumber: number;
+  checkId: string;
+  status: ChecklistEvidenceStatus;
+  evidenceText: string;
+  evidenceSourceType: ChecklistEvidenceSourceType;
+  sourceKey?: string;
+  relevantPaths: string[];
+  validationCommands: string[];
+  confidence: number;
+  consumedByChecklist: boolean;
+  notConsumedReason?: ChecklistEvidenceNotConsumedReason;
+}
+
+export interface ReviewLogCycleDiagnostics {
+  cycleNumber: number;
+  cycleStartedWithTask?: string;
+  completedTask?: string;
+  nextRecommendedTask?: string;
+  cycleContract?: CycleContract;
+  checklistDelta?: ChecklistDelta;
+  evidenceObservations: ReviewLogEvidenceObservationSummary[];
+  validationLedger?: ValidationLedger;
+  recommendationHealth: RecommendationHealth;
+  repoHygieneReport?: RepoHygieneReport;
+  derivedStatus?: WorkflowDerivedStatus;
+  evidenceCommands: ProjectEvidenceCommand[];
+  redactionStatus: ReviewLogRedactionStatus;
+}
+
+export interface ReviewLogWorkflowDiagnostics {
+  activeCycle: ReviewLogCycleDiagnostics;
+  cycles: ReviewLogCycleDiagnostics[];
+  redactionStatus: ReviewLogRedactionStatus;
+}
+
 export interface ProjectReviewLogBundle {
   schemaVersion: number;
   appVersion: string;
@@ -1694,6 +2018,7 @@ export interface ProjectReviewLogBundle {
   summary: ReviewLogSummary;
   redactions: string[];
   warnings: string[];
+  workflowDiagnostics?: ReviewLogWorkflowDiagnostics;
   project: ReviewLogProjectSnapshot;
   agents: AgentState[];
   userInputRequests: UserInputRequestRecord[];

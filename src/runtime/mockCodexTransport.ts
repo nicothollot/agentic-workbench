@@ -527,6 +527,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         modelProvider: "openai",
         createdAt: Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
+        recencyAt: Math.floor(Date.now() / 1000),
         status: { type: "idle" },
         path: null,
         cwd: params.cwd ?? "/tmp",
@@ -555,7 +556,8 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         excludeSlashTmp: false
       },
       activePermissionProfile: null,
-      reasoningEffort: null
+      reasoningEffort: null,
+      multiAgentMode: "explicitRequestOnly"
     };
   }
 
@@ -575,6 +577,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         modelProvider: "openai",
         createdAt: Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
+        recencyAt: Math.floor(Date.now() / 1000),
         status: { type: "idle" },
         path: null,
         cwd: thread.cwd,
@@ -604,6 +607,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
       },
       activePermissionProfile: null,
       reasoningEffort: null,
+      multiAgentMode: "explicitRequestOnly",
       initialTurnsPage: null
     };
   }
@@ -626,6 +630,7 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
         modelProvider: "openai",
         createdAt: Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
+        recencyAt: Math.floor(Date.now() / 1000),
         status: { type: "idle" },
         path: null,
         cwd: thread.cwd,

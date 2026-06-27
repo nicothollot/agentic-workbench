@@ -18,14 +18,19 @@ export interface CommandCenterProps {
   projectName: string;
   projectContext: string;
   currentFocus: string;
+  focusSummary?: string;
+  focusChips?: CommandCenterHealthItem[];
+  phaseDetails?: CommandCenterItem[];
   currentPhase: string;
   activeAgent: string;
   statusLabel: string;
   statusTone: CommandCenterTone;
   whyThisMatters: string;
+  whyDetails?: CommandCenterItem[];
   progress: CommandCenterItem[];
   changes: CommandCenterItem[];
   attention: CommandCenterItem[];
+  attentionEmpty?: string;
   lastResult: string;
   nextStep: string;
   health: CommandCenterHealthItem[];
@@ -42,17 +47,26 @@ const ToneBadge = ({ label, tone }: { label: string; tone: CommandCenterTone }) 
 
 const CommandCenterList = ({
   items,
-  empty
+  empty,
+  expandable = false
 }: {
   items: CommandCenterItem[];
   empty: string;
+  expandable?: boolean;
 }) => (
   <div className="command-center-list">
     {items.length ? items.map((item) => (
       <div key={`${item.label}:${item.value}`} className={`command-center-list__item ${item.tone ? `command-center-list__item--${item.tone}` : ""}`}>
         <span>{item.label}</span>
         <strong>{item.value}</strong>
-        {item.detail ? <p>{item.detail}</p> : null}
+        {item.detail ? (
+          expandable ? (
+            <details className="command-center-inline-details">
+              <summary>Details</summary>
+              <p>{item.detail}</p>
+            </details>
+          ) : <p>{item.detail}</p>
+        ) : null}
       </div>
     )) : (
       <p className="command-center-empty">{empty}</p>
@@ -64,14 +78,19 @@ export const CommandCenter = ({
   projectName,
   projectContext,
   currentFocus,
+  focusSummary,
+  focusChips = [],
+  phaseDetails,
   currentPhase,
   activeAgent,
   statusLabel,
   statusTone,
   whyThisMatters,
+  whyDetails = [],
   progress,
   changes,
   attention,
+  attentionEmpty = "No validation, hygiene, checklist, or planner blocker is currently recorded.",
   lastResult,
   nextStep,
   health,
@@ -101,15 +120,23 @@ export const CommandCenter = ({
           <ToneBadge label={statusLabel} tone={statusTone} />
         </div>
         <h3>{currentFocus}</h3>
+        {focusSummary ? <p className="command-center-card__lead">{focusSummary}</p> : null}
+        {focusChips.length ? (
+          <div className="command-center-health">
+            {focusChips.map((item) => <ToneBadge key={`${item.label}:${item.tone}`} label={item.label} tone={item.tone} />)}
+          </div>
+        ) : null}
         <div className="command-center-card__facts">
-          <div>
-            <span>Current phase</span>
-            <strong>{currentPhase}</strong>
-          </div>
-          <div>
-            <span>Active agent</span>
-            <strong>{activeAgent}</strong>
-          </div>
+          {(phaseDetails ?? [
+            { label: "Current phase", value: currentPhase },
+            { label: "Active agent", value: activeAgent }
+          ]).map((item) => (
+            <div key={`${item.label}:${item.value}`}>
+              <span>{item.label}</span>
+              <strong>{item.value}</strong>
+              {item.detail ? <p>{item.detail}</p> : null}
+            </div>
+          ))}
         </div>
       </article>
 
@@ -118,6 +145,7 @@ export const CommandCenter = ({
           <span>Why this matters</span>
         </div>
         <p>{whyThisMatters}</p>
+        {whyDetails.length ? <CommandCenterList items={whyDetails} empty="" expandable /> : null}
       </article>
 
       <article className="command-center-card">
@@ -139,9 +167,9 @@ export const CommandCenter = ({
       <article className={`command-center-card ${attention.length ? "command-center-card--attention" : "command-center-card--clear"}`}>
         <div className="command-center-card__header">
           <span>Needs your attention</span>
-          <ToneBadge label={attention.length ? `${attention.length} item${attention.length === 1 ? "" : "s"}` : "No action needed"} tone={attention.length ? "warning" : "success"} />
+          <ToneBadge label={attention.length ? `${attention.length} item${attention.length === 1 ? "" : "s"}` : "Clear"} tone={attention.length ? "warning" : "success"} />
         </div>
-        <CommandCenterList items={attention} empty="No action needed." />
+        <CommandCenterList items={attention} empty={attentionEmpty} />
       </article>
 
       <article className="command-center-card">
