@@ -13,6 +13,7 @@ export interface RepoHygieneScanInput {
   runtimeSettings: RuntimeSettings;
   scannedRef: string;
   clean?: boolean;
+  diffBaseRef?: string;
 }
 
 const TYPO_ROOT_DOCS = new Set(["EADME.md", "RREADME.md", "READM.md", "READNE.md", "README.m"]);
@@ -72,21 +73,37 @@ const parseGitStatusPaths = (output: string): string[] =>
 const readChangedGitPaths = async (
   projectRoot: string,
   projectKind: ProjectKind,
-  runtimeSettings: RuntimeSettings
+  runtimeSettings: RuntimeSettings,
+  diffBaseRef?: string
 ): Promise<string[]> => {
   if (projectKind !== "git") {
     return [];
   }
+  const executor = new RuntimeCommandExecutor(runtimeSettings);
+  const paths: string[] = [];
   try {
-    const { stdout } = await new RuntimeCommandExecutor(runtimeSettings).execStructuredCommand({
+    const { stdout } = await executor.execStructuredCommand({
       command: "git",
       args: ["status", "--porcelain=1", "--untracked-files=all"],
       cwd: projectRoot
     });
-    return parseGitStatusPaths(stdout);
+    paths.push(...parseGitStatusPaths(stdout));
   } catch {
-    return [];
+    // Keep any diff-derived paths below.
   }
+  if (diffBaseRef?.trim()) {
+    try {
+      const { stdout } = await executor.execStructuredCommand({
+        command: "git",
+        args: ["diff", "--name-only", "--diff-filter=ACMRTUXB", `${diffBaseRef.trim()}...HEAD`],
+        cwd: projectRoot
+      });
+      paths.push(...stdout.split(/\r?\n/).map(normalizeRelativePath).filter(Boolean));
+    } catch {
+      // The base ref may not be available in unusual repos; status paths still provide coverage.
+    }
+  }
+  return unique(paths);
 };
 
 const cleanupPythonBytecode = async (root: string): Promise<string[]> => {
@@ -239,7 +256,7 @@ const contentFindings = async (hostRoot: string, changedPaths: string[]): Promis
 export const scanAndCleanRepoHygiene = async (input: RepoHygieneScanInput): Promise<RepoHygieneReport> => {
   const hostRoot = input.hostRoot ?? input.projectRoot;
   const cleanedFiles = input.clean === false ? [] : await cleanupPythonBytecode(hostRoot);
-  const changedPaths = await readChangedGitPaths(input.projectRoot, input.projectKind, input.runtimeSettings);
+  const changedPaths = await readChangedGitPaths(input.projectRoot, input.projectKind, input.runtimeSettings, input.diffBaseRef);
   const pathReport = await pathFindings(hostRoot, changedPaths);
   const contentReport = await contentFindings(hostRoot, changedPaths);
   const mergeBlockingFindings = unique([...pathReport.blocking, ...contentReport.blocking]);

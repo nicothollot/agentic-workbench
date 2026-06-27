@@ -7,6 +7,11 @@ import { AppService } from "@runtime/appService";
 import { MockCodexTransport } from "@runtime/mockCodexTransport";
 import { WorkbenchStorage } from "@runtime/storage";
 import {
+  buildValidationCommandResult,
+  createValidationLedger,
+  finalizeValidationLedger
+} from "@shared/validationLedger";
+import {
   applyGoalChecklistUpdates,
   buildGoalChecklistFromUltimateGoal
 } from "@runtime/workflowRecommendations";
@@ -1057,6 +1062,234 @@ describe("integration flows", () => {
       reason: "merge_conflicts",
       title: "Merge conflicts detected"
     });
+  });
+
+  it("queues automatic repair when autopilot merge is blocked by repository hygiene", async () => {
+    const root = await createSampleRepo("merge-hygiene-autorepair");
+    const appData = await createTempDir("appdata-merge-hygiene-autorepair");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Repair hygiene blockers automatically.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-hygiene-autorepair",
+      sourceRecommendationId: "rec-hygiene-autorepair",
+      summary: "Merge a branch and repair hygiene blockers if needed.",
+      executionBrief: "Fix blocked changed paths before integration can complete.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: ["npm test"],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.stepProgress.coding.status = "completed";
+    workflow.stepProgress.integrity.status = "completed";
+    workflow.autopilotPolicy = {
+      ...workflow.autopilotPolicy,
+      enabled: true
+    };
+    project.record.localState.autopilotEnabled = true;
+
+    const passedHygiene = {
+      status: "passed" as const,
+      scannedAt: "2026-04-12T00:00:00.000Z",
+      scannedRef: "integrity:1",
+      forbiddenFiles: [],
+      cleanedFiles: [],
+      warnings: [],
+      mergeBlockingFindings: [],
+      summaryForHumans: "Repository hygiene passed."
+    };
+    const ledger = createValidationLedger({
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      testCommands: ["npm test"]
+    });
+    ledger.commandResults = [
+      buildValidationCommandResult({
+        commandId: "npm-test-pass",
+        command: "npm test",
+        phase: "integrity",
+        startedAt: "2026-04-12T00:00:01.000Z",
+        endedAt: "2026-04-12T00:00:02.000Z",
+        status: "passed",
+        exitCode: 0,
+        stdout: "ok",
+        cwdKind: "project_root"
+      })
+    ];
+    workflow.validationLedgers = [finalizeValidationLedger(ledger, { repoHygieneReport: passedHygiene })];
+    workflow.repoHygieneReports = [passedHygiene];
+
+    await execFileAsync("git", ["checkout", "-b", "feature-hygiene"], { cwd: root });
+    await writeFile(path.join(root, "EADME.md"), "typo path\n");
+    await commitAll(root, "add typo hygiene path");
+    await execFileAsync("git", ["checkout", "main"], { cwd: root });
+
+    project.record.agents.push({
+      ...createAgentSkeleton("coding", "Agent Hygiene", "Task Hygiene", "gpt-5.4"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "completed",
+      completedAt: "2026-04-12T00:02:00.000Z",
+      worktree: { baseDir: appData, worktreePath: root, branch: "feature-hygiene", targetBranch: "main" }
+    });
+
+    await service.runMerge(selected.record.id, true);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const mergeAgent = record?.agents.find((entry) => entry.category === "merge");
+    expect(mergeAgent?.status).toBe("failed");
+    expect(mergeAgent?.mergeReport?.summary).toContain("repository hygiene blocked finalization");
+    expect(record?.workflow.repair.status).toBe("repairing");
+    expect(record?.workflow.repair.attemptCount).toBe(1);
+    expect(record?.workflow.stepProgress.coding.status).toBe("waiting");
+    expect(record?.workflow.stepProgress.coding.currentActivity).toBe("Queued for automatic repair");
+    expect(record?.localState.autopilotEnabled).toBe(true);
+    expect(record?.workflow.activityLog[0]?.title).toContain("Automatic repair attempt 1");
+  });
+
+  it("turns autopilot off when merge is blocked by an environment-only validation failure", async () => {
+    const root = await createSampleRepo("merge-environment-autopilot-stop");
+    const appData = await createTempDir("appdata-merge-environment-autopilot-stop");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Stop automatic repair for environment blockers.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-environment-stop",
+      sourceRecommendationId: "rec-environment-stop",
+      summary: "Validate and merge only if the local environment can run the required checks.",
+      executionBrief: "Do not loop a repair coding agent for missing host tooling.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: ["python -m pytest"],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.stepProgress.coding.status = "completed";
+    workflow.stepProgress.integrity.status = "completed";
+    workflow.autopilotPolicy = {
+      ...workflow.autopilotPolicy,
+      enabled: true
+    };
+    project.record.localState.autopilotEnabled = true;
+
+    const passedHygiene = {
+      status: "passed" as const,
+      scannedAt: "2026-04-12T00:00:00.000Z",
+      scannedRef: "integrity:1",
+      forbiddenFiles: [],
+      cleanedFiles: [],
+      warnings: [],
+      mergeBlockingFindings: [],
+      summaryForHumans: "Repository hygiene passed."
+    };
+    const ledger = createValidationLedger({
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      testCommands: ["python -m pytest"]
+    });
+    ledger.commandResults = [
+      buildValidationCommandResult({
+        commandId: "python-pytest-missing",
+        command: "python -m pytest",
+        phase: "integrity",
+        startedAt: "2026-04-12T00:00:01.000Z",
+        endedAt: "2026-04-12T00:00:02.000Z",
+        status: "failed",
+        exitCode: 127,
+        stderr: "python: command not found",
+        cwdKind: "project_root"
+      })
+    ];
+    workflow.validationLedgers = [finalizeValidationLedger(ledger, { repoHygieneReport: passedHygiene })];
+    workflow.repoHygieneReports = [passedHygiene];
+
+    await service.runMerge(selected.record.id, true);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const mergeAgent = record?.agents.find((entry) => entry.category === "merge");
+    expect(mergeAgent?.status).toBe("failed");
+    expect(record?.workflow.repair.status).toBe("exhausted");
+    expect(record?.workflow.manualHandoff?.reason).toBe("repair_stopped_early");
+    expect(record?.workflow.manualHandoff?.latestFailureReason).toContain("Python executable was unavailable");
+    expect(record?.localState.autopilotEnabled).toBe(false);
+    expect(record?.localState.workflowPauseRequested).toBe(true);
+    expect(record?.workflow.activityLog[0]?.title).toBe("Autopilot turned off for manual repair");
+    expect(record?.workflow.stepProgress.merge.requiresUserInput).toBe(true);
+  });
+
+  it("counts a failed repair coding checkpoint as the next automatic repair attempt", async () => {
+    const root = await createSampleRepo("repair-checkpoint-hygiene-retry");
+    const appData = await createTempDir("appdata-repair-checkpoint-hygiene-retry");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Retry failed repair checkpoints without looping forever.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-repair-checkpoint",
+      sourceRecommendationId: "rec-repair-checkpoint",
+      summary: "Repair repository hygiene blockers before merge.",
+      executionBrief: "A repair pass that creates forbidden paths should consume an attempt.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: ["npm test"],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.repair = {
+      ...workflow.repair,
+      status: "repairing",
+      attemptCount: 1,
+      maxAttempts: 2,
+      latestIssueSummary: "Repository hygiene blocked merge.",
+      latestFailureReason: "EADME.md is not an allowed root documentation path."
+    };
+    workflow.stepProgress.coding.status = "running";
+    workflow.stepProgress.integrity.status = "waiting";
+    workflow.autopilotPolicy = {
+      ...workflow.autopilotPolicy,
+      enabled: true
+    };
+    project.record.localState.autopilotEnabled = true;
+
+    await execFileAsync("git", ["checkout", "-b", "feature-bad-repair"], { cwd: root });
+    await writeFile(path.join(root, "EADME.md"), "typo path from repair\n");
+    await commitAll(root, "bad repair typo path");
+
+    const repairAgent = {
+      ...createAgentSkeleton("coding", "Repair Coding Pass 1", "Repair repository hygiene blockers.", "gpt-5.4"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "completed" as const,
+      completedAt: "2026-04-12T00:02:00.000Z",
+      worktree: { baseDir: appData, worktreePath: root, branch: "feature-bad-repair", targetBranch: "main" }
+    };
+    project.record.agents.unshift(repairAgent);
+
+    await (service as any).finalizeGitWriteAgent(project, repairAgent);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const updatedAgent = record?.agents.find((entry) => entry.id === repairAgent.id);
+    expect(updatedAgent?.status).toBe("failed");
+    expect(updatedAgent?.repoHygieneReport?.forbiddenFiles).toContain("EADME.md");
+    expect(record?.workflow.repair.status).toBe("repairing");
+    expect(record?.workflow.repair.attemptCount).toBe(2);
+    expect(record?.workflow.stepProgress.coding.currentSubstep).toContain("Repair attempt 2");
+    expect(record?.workflow.activityLog[0]?.title).toContain("Automatic repair attempt 2");
+    expect(record?.localState.autopilotEnabled).toBe(true);
   });
 
   it("retries merge after conflicts are resolved manually", async () => {

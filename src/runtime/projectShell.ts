@@ -45,6 +45,7 @@ export interface ProjectShellPromptContext {
 }
 
 export interface WorkflowRepairAgentPromptContext {
+  agentRoleIntro?: string;
   projectName: string;
   projectRoot: string;
   branchOrPath: string;
@@ -278,7 +279,7 @@ export const buildWorkflowRepairAgentPrompt = (context: WorkflowRepairAgentPromp
     }) ?? [];
 
   const lines = [
-    "You are a separate Codex CLI repair agent launched by Agentic Workbench.",
+    context.agentRoleIntro ?? "You are a separate Codex CLI repair agent launched by Agentic Workbench.",
     "Your job is to repair the current workflow blocker in this repository, not to re-plan the project.",
     `Project: ${context.projectName}`,
     `Working root: ${context.projectRoot}`,

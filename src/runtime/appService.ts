@@ -1987,6 +1987,151 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
   }
 
+  private isAutopilotEnabledForProject(project: LoadedProject): boolean {
+    return resolveEffectiveAutopilotPolicy(
+      this.ensureWorkflowState(project.record),
+      project.record.localState.autopilotEnabled
+    ).enabled && !project.record.localState.workflowPauseRequested;
+  }
+
+  private disableAutopilotForUnrepairableIssue(
+    project: LoadedProject,
+    detail: string,
+    stepId: WorkflowStepId,
+    reason: AutopilotPauseReason = "repair_budget_exhausted"
+  ): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    project.record.localState.autopilotEnabled = false;
+    project.record.localState.workflowPauseRequested = true;
+    workflow.autopilotPolicy = validateAutopilotPolicy({
+      ...resolveEffectiveAutopilotPolicy(workflow, true),
+      enabled: false
+    }, false);
+    this.updateAutopilotRuntimeStatus(project, {
+      pause: {
+        reason,
+        detail,
+        highRiskPackageRequiresApproval: false
+      }
+    });
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: "Autopilot turned off for manual repair",
+      detail,
+      stepId
+    });
+    this.updateWorkflowStepProgress(workflow, stepId, {
+      requiresUserInput: true,
+      currentActivity: "Manual repair required",
+      latestProgressNote: detail,
+      message: "Autopilot stopped because the blocker is not likely to be repairable by another coding agent.",
+      warning: detail
+    });
+  }
+
+  private queueAutomaticWorkflowRepair(
+    project: LoadedProject,
+    input: {
+      sourceStep: WorkflowStepId;
+      issueSummary: string;
+      latestFailureReason: string;
+      involvedPaths?: string[];
+      repairable?: boolean;
+      automate: boolean;
+    }
+  ): boolean {
+    if (!input.automate || !this.isAutopilotEnabledForProject(project)) {
+      return false;
+    }
+    const workflow = this.ensureWorkflowState(project.record);
+    if (!workflow.scopedGoal || workflow.repair.status === "merge_conflicts" || workflow.repair.status === "exhausted") {
+      return false;
+    }
+    if (input.repairable === false) {
+      workflow.manualHandoff = this.buildRepairManualHandoff(
+        project,
+        input.issueSummary,
+        input.latestFailureReason,
+        "repair_stopped_early",
+        input.involvedPaths
+      );
+      this.updateWorkflowRepairState(workflow, {
+        status: "exhausted",
+        latestIssueSummary: input.issueSummary,
+        latestFailureReason: input.latestFailureReason
+      });
+      this.disableAutopilotForUnrepairableIssue(project, input.latestFailureReason, input.sourceStep);
+      return false;
+    }
+
+    const failedCurrentRepairCodingPass =
+      workflow.repair.status === "repairing" &&
+      input.sourceStep === "coding" &&
+      workflow.stepProgress.coding.status === "failed";
+    const nextAttemptNumber = workflow.repair.status === "repairing" && !failedCurrentRepairCodingPass
+      ? Math.max(1, workflow.repair.attemptCount)
+      : workflow.repair.attemptCount + 1;
+    if (nextAttemptNumber > workflow.repair.maxAttempts) {
+      workflow.manualHandoff = this.buildRepairManualHandoff(
+        project,
+        input.issueSummary,
+        input.latestFailureReason,
+        "repair_exhausted",
+        input.involvedPaths
+      );
+      this.updateWorkflowRepairState(workflow, {
+        status: "exhausted",
+        latestIssueSummary: input.issueSummary,
+        latestFailureReason: input.latestFailureReason
+      });
+      this.disableAutopilotForUnrepairableIssue(
+        project,
+        `Automatic repair reached the configured limit. ${input.latestFailureReason}`,
+        input.sourceStep
+      );
+      return false;
+    }
+
+    this.updateWorkflowRepairState(workflow, {
+      attemptCount: nextAttemptNumber,
+      status: "repairing",
+      latestIssueSummary: input.issueSummary,
+      latestFailureReason: input.latestFailureReason
+    });
+    const issueSource: ProjectWorkflowState["memory"]["knownOpenIssues"][number]["source"] =
+      input.sourceStep === "recommendation" ? "recommendation"
+      : input.sourceStep === "goal_plan" ? "goal"
+      : input.sourceStep === "coding" ? "coding"
+      : input.sourceStep === "integrity" ? "integrity"
+      : input.sourceStep === "merge" ? "merge"
+      : "system";
+    this.recordWorkflowOpenIssue(workflow, "Automatic repair queued", input.latestFailureReason, issueSource);
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: `Automatic repair attempt ${nextAttemptNumber} of ${workflow.repair.maxAttempts} queued`,
+      detail: input.latestFailureReason,
+      stepId: "coding"
+    });
+    this.resetWorkflowStepProgress(workflow, "coding", {
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Queued for automatic repair",
+      currentSubstep: `Repair attempt ${nextAttemptNumber} of ${workflow.repair.maxAttempts}`,
+      latestProgressNote: input.latestFailureReason,
+      message: "Autopilot will start a tracked repair coding agent, then rerun validation, hygiene, and merge gates.",
+      warning: undefined
+    });
+    this.resetWorkflowStepProgress(workflow, "integrity", {
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Waiting for repair output",
+      message: "Validation will run after the repair agent finishes."
+    });
+    return true;
+  }
+
   private mirrorLatestAgentEventToWorkflow(workflow: ProjectWorkflowState, agent: AgentState): void {
     const latestEvent = agent.events[0];
     if (!latestEvent) {
@@ -3062,7 +3207,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     project: LoadedProject,
     scannedRef: string,
     clean = true,
-    rootOverride?: string
+    rootOverride?: string,
+    diffBaseRef?: string
   ): Promise<RepoHygieneReport> {
     const scanRoot = rootOverride ?? project.record.projectRoot;
     const report = await scanAndCleanRepoHygiene({
@@ -3071,7 +3217,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       projectKind: project.scan.kind,
       runtimeSettings: this.getRuntimeSettings(project.record.distroName),
       scannedRef,
-      clean
+      clean,
+      diffBaseRef
     });
     const workflow = this.ensureWorkflowState(project.record);
     this.upsertRepoHygieneReport(workflow, report);
@@ -8381,7 +8528,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return result;
   }
 
-  private buildWorkflowRepairAgentPrompt(project: LoadedProject): string {
+  private buildWorkflowRepairAgentPrompt(project: LoadedProject, agentRoleIntro?: string): string {
     const workflow = this.ensureWorkflowState(project.record);
     const cycleAgents = this.cycleAgents(project, workflow.workflowCycle.cycleNumber);
     const sortedCycleAgents = this.sortAgentsForHistory(cycleAgents);
@@ -8519,6 +8666,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     ]);
 
     return buildWorkflowRepairAgentPrompt({
+      agentRoleIntro,
       projectName: project.record.identity.projectName,
       projectRoot: project.record.projectRoot,
       branchOrPath: project.record.validation.branch ?? project.record.displayPath,
@@ -12603,6 +12751,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private buildWorkflowCodingPrompt(project: LoadedProject, repair = false): string {
     const workflow = this.ensureWorkflowState(project.record);
     const repairStrategy = repair ? buildRepairStrategyContext(workflow, project.record.agents) : undefined;
+    const repairDiagnosticPrompt = repair
+      ? this.buildWorkflowRepairAgentPrompt(
+        project,
+        "You are the tracked Agentic Workbench repair coding agent for this workflow cycle."
+      )
+      : "";
     const previewRequest = getWorkflowPreviewRequest(workflow);
     const previewMode = previewRequest.status === "active" && isPreviewRecommendation(workflow.approvedRecommendation);
     const outcomeStrategyBrief = buildOutcomeStrategyBrief(this.buildWorkflowRecommendationContext(project), {
@@ -12630,6 +12784,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             : "",
           repairStrategy && repairStrategy.recurringFailureCount >= 2
             ? "Form a new root-cause hypothesis before editing. Do not just retry the same patch shape."
+            : "",
+          repairDiagnosticPrompt
+            ? `Current Workbench repair diagnostics:\n${repairDiagnosticPrompt}`
             : ""
         ]
       : [];
@@ -12723,7 +12880,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const finalizedWorktreePath = agent.worktree.worktreePath;
 
     try {
-      const hygieneReport = await this.scanWorkflowRepoHygiene(project, `checkpoint:${agent.id}`, true, finalizedWorktreePath);
+      const hygieneReport = await this.scanWorkflowRepoHygiene(
+        project,
+        `checkpoint:${agent.id}`,
+        true,
+        finalizedWorktreePath,
+        targetBranch
+      );
       agent.repoHygieneReport = hygieneReport;
       if (hygieneReport.status !== "passed") {
         const detail = hygieneReport.summaryForHumans;
@@ -12744,7 +12907,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         });
         this.syncWorkflowStepProgressFromAgent(project, agent);
         this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-        await this.persistProjectUpdate(project);
+        const queuedAutomaticRepair = agent.category === "coding" && this.queueAutomaticWorkflowRepair(project, {
+          sourceStep: "coding",
+          issueSummary: "Repository hygiene blocked the coding worktree checkpoint.",
+          latestFailureReason: detail,
+          involvedPaths: [
+            ...hygieneReport.forbiddenFiles,
+            ...hygieneReport.cleanedFiles
+          ],
+          automate: true
+        });
+        await this.persistProjectUpdate(project, queuedAutomaticRepair
+          ? {
+            save: "immediate",
+            emit: "coalesced",
+            automate: true,
+            reason: "checkpoint hygiene blocked; automatic repair queued"
+          }
+          : undefined);
         return;
       }
       const checkpoint = await checkpointWorktreeChanges(
@@ -13248,6 +13428,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           failureAssessment.latestFailureReason,
           stoppedEarly ? "repair_stopped_early" : "repair_exhausted"
         );
+        if (stoppedEarly) {
+          this.disableAutopilotForUnrepairableIssue(
+            project,
+            failureAssessment.latestFailureReason,
+            "integrity"
+          );
+        }
         this.recordWorkflowActivity(workflow, {
           source: "workflow",
           status: "failed",
@@ -13523,7 +13710,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       project,
       `merge:${workflow.workflowCycle.cycleNumber}:resolved-conflict`,
       true,
-      mergeAgent.worktree.worktreePath
+      mergeAgent.worktree.worktreePath,
+      targetBranch
     );
     mergeAgent.repoHygieneReport = hygieneReport;
     if (hygieneReport.status !== "passed") {
@@ -13699,6 +13887,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const allowMissingLedgerOverride = onlyMissingLedger && (!automate || this.workflowMergeRetryInFlight.has(projectId));
     if (mergeBlockedReasons.length > 0 && !allowMissingLedgerOverride) {
       const detail = mergeBlockedReasons.join(" ");
+      const latestLedger = this.latestCycleValidationLedger(workflow);
       mergeAgent.mergeReport = {
         summary: `Merge blocked before integration. ${detail}`,
         mergedBranches: [],
@@ -13726,8 +13915,62 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         message: mergeAgent.mergeReport.summary,
         warning: "Validation and repository hygiene gates must pass before merge or push."
       }, { status: "failed" });
+      if (automate && onlyMissingLedger) {
+        this.updateWorkflowRepairState(workflow, {
+          status: "retrying_validation",
+          latestIssueSummary: "Merge needs a current validation ledger before integration.",
+          latestFailureReason: detail
+        });
+        this.resetWorkflowStepProgress(workflow, "integrity", {
+          status: "waiting",
+          requiresUserInput: false,
+          currentActivity: "Queued to rebuild validation ledger",
+          latestProgressNote: detail,
+          message: "Autopilot will rerun validation before trying merge again."
+        });
+        this.recordWorkflowActivity(workflow, {
+          source: "workflow",
+          status: "waiting",
+          title: "Validation rerun queued before merge",
+          detail,
+          stepId: "integrity"
+        });
+        this.syncWorkflowState(project);
+        await this.persistProjectUpdate(project, {
+          save: "immediate",
+          emit: "coalesced",
+          automate: true,
+          reason: "merge blocked by missing validation ledger"
+        });
+        return;
+      }
+      const environmentOnlyValidationBlocker = latestLedger
+        ? latestLedger.finalValidationStatus !== "passed" &&
+          latestLedger.environmentFailures.length > 0 &&
+          latestLedger.productFailures.length === 0 &&
+          latestLedger.evidenceFailures.length === 0 &&
+          latestLedger.hygieneFailures.length === 0
+        : false;
+      const queuedAutomaticRepair = this.queueAutomaticWorkflowRepair(project, {
+        sourceStep: "merge",
+        issueSummary: mergeAgent.mergeReport.summary,
+        latestFailureReason: detail,
+        involvedPaths: [
+          ...preMergeHygieneReport.forbiddenFiles,
+          ...preMergeHygieneReport.cleanedFiles
+        ],
+        repairable: !environmentOnlyValidationBlocker,
+        automate
+      });
       this.syncWorkflowState(project);
-      await this.persistProjectUpdate(project, false);
+      await this.persistProjectUpdate(project, queuedAutomaticRepair
+        ? {
+          save: "immediate",
+          emit: "coalesced",
+          automate: true,
+          reason: "merge blocked; automatic repair queued"
+        }
+        : false);
       return;
     }
     if (allowMissingLedgerOverride) {
@@ -13858,7 +14101,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         project,
         `merge:${workflow.workflowCycle.cycleNumber}:integration`,
         true,
-        integrationWorktree.worktreePath
+        integrationWorktree.worktreePath,
+        targetBranch
       );
       mergeAgent.repoHygieneReport = integrationHygieneReport;
       if (integrationHygieneReport.status !== "passed") {
@@ -13882,8 +14126,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           message: mergeAgent.mergeReport.summary,
           warning: "Forbidden files must be removed before merge can continue."
         }, { status: "failed" });
+        const queuedAutomaticRepair = this.queueAutomaticWorkflowRepair(project, {
+          sourceStep: "merge",
+          issueSummary: mergeAgent.mergeReport.summary,
+          latestFailureReason: detail,
+          involvedPaths: [
+            ...integrationHygieneReport.forbiddenFiles,
+            ...integrationHygieneReport.cleanedFiles
+          ],
+          automate
+        });
         this.syncWorkflowState(project);
-        await this.persistProjectUpdate(project, false);
+        await this.persistProjectUpdate(project, queuedAutomaticRepair
+          ? {
+            save: "immediate",
+            emit: "coalesced",
+            automate: true,
+            reason: "integration hygiene blocked; automatic repair queued"
+          }
+          : false);
         return;
       }
       try {
