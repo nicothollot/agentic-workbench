@@ -4858,6 +4858,10 @@ select.input {
   padding-top: 2px;
 }
 
+.workflow-now-card__actions {
+  padding-top: 4px;
+}
+
 .workflow-agent-messages-card__summary,
 .workflow-agent-messages-card__recovery {
   display: grid;

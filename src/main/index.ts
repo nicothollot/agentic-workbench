@@ -48,6 +48,7 @@ import {
   repositoryPathWindowRequestSchema,
   repositoryRescanRequestSchema,
   repositoryScanSettingsRequestSchema,
+  openWorkflowRepairAgentRequestSchema,
   projectSelectionDecisionSchema,
   polishGoalCharterFieldRequestSchema,
   refreshOverviewRequestSchema,
@@ -689,6 +690,10 @@ const registerIpc = (): void => {
   ipcMain.handle("project:openProjectShell", async (_event, payload) => {
     const parsed = openProjectShellRequestSchema.parse(payload);
     return await appService?.openProjectShell(parsed.projectId);
+  });
+  ipcMain.handle("workflow:openRepairAgent", async (_event, payload) => {
+    const parsed = openWorkflowRepairAgentRequestSchema.parse(payload);
+    return await appService?.openWorkflowRepairAgent(parsed.projectId);
   });
   ipcMain.handle("credentials:saveEntry", async (_event, payload) => {
     const parsed = credentialEntrySaveRequestSchema.parse(payload);

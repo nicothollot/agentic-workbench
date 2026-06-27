@@ -141,6 +141,7 @@ import {
   validateAutopilotPolicy,
   workPackageRequiresModelScoping
 } from "@shared/workflow";
+import { buildOperatorWorkflowViewModel } from "@shared/operatorWorkflowView";
 import { deriveUserFacingWorkflowStatus } from "@shared/workflowView";
 import {
   applyChecklistEvidenceObservations,
@@ -216,7 +217,7 @@ import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEve
 import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
 import { sanitizeWorkflowState } from "./stateSanitizer";
 import { readUltimateGoalTextImport } from "./ultimateGoalImport";
-import { buildProjectShellHandoffPrompt, openProjectShellWindow } from "./projectShell";
+import { buildProjectShellHandoffPrompt, buildWorkflowRepairAgentPrompt, openProjectShellWindow } from "./projectShell";
 import { scanAndCleanRepoHygiene } from "./repoHygiene";
 import { resolveTargetProjectCommands, type TargetProjectResolvedCommand } from "./targetProjectCommands";
 import {
@@ -8338,6 +8339,208 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       reason: "autopilot policy changed"
     });
     return project.record.workflow;
+  }
+
+  async openWorkflowRepairAgent(projectId: string): Promise<OpenProjectShellResult> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const prompt = this.buildWorkflowRepairAgentPrompt(project);
+    const result = await openProjectShellWindow(
+      {
+        projectName: `${project.record.identity.projectName} Repair`,
+        projectRoot: project.record.projectRoot,
+        projectHostPath: project.record.hostPath,
+        prompt,
+        settings: {
+          executionMode: this.settings.executionMode,
+          distroName: project.record.distroName ?? this.settings.distroName,
+          codexBinaryPath: this.settings.codexBinaryPath,
+          codexHome: this.settings.codexHome
+        }
+      },
+      process.platform
+    );
+    const activeStepId = getWorkflowActiveStepId(workflow);
+    this.recordWorkflowActivity(workflow, {
+      source: "system",
+      status: result.launched ? "completed" : "failed",
+      title: result.launched ? "Opened Codex repair agent" : "Codex repair agent launch failed",
+      detail: result.message,
+      stepId: activeStepId
+    });
+    this.updateWorkflowStepProgress(workflow, activeStepId, {
+      latestProgressNote: result.launched
+        ? "Opened an external Codex repair agent with current validation, hygiene, checklist, and cycle-contract context."
+        : result.message,
+      message: result.launched
+        ? "A separate Codex CLI repair session is working from the current diagnostic context."
+        : "The external Codex repair session could not be opened.",
+      warning: result.launched ? undefined : result.message
+    });
+    await this.persistProjectUpdate(project);
+    return result;
+  }
+
+  private buildWorkflowRepairAgentPrompt(project: LoadedProject): string {
+    const workflow = this.ensureWorkflowState(project.record);
+    const cycleAgents = this.cycleAgents(project, workflow.workflowCycle.cycleNumber);
+    const sortedCycleAgents = this.sortAgentsForHistory(cycleAgents);
+    const latestAgent = sortedCycleAgents[0];
+    const ledger = this.latestCycleValidationLedger(workflow);
+    const hygiene = this.latestRepoHygieneReport(workflow);
+    const activeStepId = getWorkflowActiveStepId(workflow);
+    const activeStep = workflow.stepProgress[activeStepId];
+    const operatorView = buildOperatorWorkflowViewModel({
+      workflow,
+      agents: cycleAgents,
+      validationLedger: ledger,
+      repoHygieneReport: hygiene,
+      workflowPauseRequested: project.record.localState.workflowPauseRequested,
+      projectName: project.record.identity.projectName,
+      branch: project.record.validation.branch ?? project.record.displayPath,
+      approvalCount: project.record.agents.flatMap((agent) => agent.approvals).filter((approval) => approval.status === "pending").length
+    });
+    const sanitize = (value?: string, maxLength = 900): string | undefined => {
+      if (!value?.trim()) {
+        return undefined;
+      }
+      return compactText(this.sanitizeTextToProjectBoundary(project, value, project.record.projectRoot) ?? value, maxLength);
+    };
+    const sanitizeList = (values: string[] | undefined, maxItems = 24, maxLength = 240): string[] =>
+      unique((values ?? []).flatMap((value) => sanitize(value, maxLength) ?? [])).slice(0, maxItems);
+    const contract = operatorView.currentCycle.cycleContract;
+    const sanitizedContract = contract
+      ? {
+        ...contract,
+        selectedTaskTitle: sanitize(contract.selectedTaskTitle, 500) ?? contract.selectedTaskTitle,
+        plainEnglishObjective: sanitize(contract.plainEnglishObjective, 800) ?? contract.plainEnglishObjective,
+        concreteGoalForThisCycle: sanitize(contract.concreteGoalForThisCycle, 800) ?? contract.concreteGoalForThisCycle,
+        targetedChecklistItems: contract.targetedChecklistItems.map((item) => ({
+          ...item,
+          title: sanitize(item.title, 240) ?? item.title,
+          fullDescription: sanitize(item.fullDescription, 700) ?? item.fullDescription,
+          currentEvidence: sanitize(item.currentEvidence, 500) ?? item.currentEvidence,
+          whyTargeted: sanitize(item.whyTargeted, 500) ?? item.whyTargeted,
+          acceptanceHint: sanitize(item.acceptanceHint, 500) ?? item.acceptanceHint,
+          relatedPaths: sanitizeList(item.relatedPaths, 8),
+          observableSignalsExpected: sanitizeList(item.observableSignalsExpected, 8, 320)
+        })),
+        expectedFilesOrAreas: sanitizeList(contract.expectedFilesOrAreas, 18),
+        expectedValidationCommands: sanitizeList(contract.expectedValidationCommands, 10, 500),
+        expectedEvidenceCommands: sanitizeList(contract.expectedEvidenceCommands, 10, 500),
+        acceptanceCriteria: sanitizeList(contract.acceptanceCriteria, 12, 500),
+        nonGoalsForThisCycle: sanitizeList(contract.nonGoalsForThisCycle, 10, 500),
+        constraintsForThisCycle: sanitizeList(contract.constraintsForThisCycle, 10, 500),
+        whySelectedNow: sanitize(contract.whySelectedNow, 700) ?? contract.whySelectedNow,
+        currentKnownBlockers: sanitizeList(contract.currentKnownBlockers, 10, 500),
+        fallbackOrHealthWarnings: sanitizeList(contract.fallbackOrHealthWarnings, 10, 500),
+        doneWhen: sanitizeList(contract.doneWhen, 12, 500),
+        failureModes: sanitizeList(contract.failureModes, 12, 500),
+        priorSimilarAttempts: contract.priorSimilarAttempts.slice(0, 6).map((attempt) => ({
+          ...attempt,
+          attemptedTaskTitle: sanitize(attempt.attemptedTaskTitle, 300) ?? attempt.attemptedTaskTitle,
+          completedTaskTitle: sanitize(attempt.completedTaskTitle, 300),
+          nextRecommendedTaskTitle: sanitize(attempt.nextRecommendedTaskTitle, 300),
+          filesChanged: sanitizeList(attempt.filesChanged, 10),
+          validationSummary: sanitize(attempt.validationSummary, 400) ?? attempt.validationSummary,
+          checklistDeltaSummary: sanitize(attempt.checklistDeltaSummary, 400) ?? attempt.checklistDeltaSummary
+        })),
+        sourceDataRefs: {}
+      }
+      : undefined;
+    const sanitizedLedger = ledger
+      ? {
+        ...ledger,
+        plannedCommands: sanitizeList(ledger.plannedCommands, 14, 500),
+        attemptedCommands: sanitizeList(ledger.attemptedCommands, 14, 500),
+        evidenceCommands: sanitizeList(ledger.evidenceCommands, 10, 500),
+        testCommands: sanitizeList(ledger.testCommands, 10, 500),
+        commandResults: ledger.commandResults.slice(0, 16).map((result) => ({
+          ...result,
+          command: sanitize(result.command, 500) ?? result.command,
+          normalizedCommand: sanitize(result.normalizedCommand, 500) ?? result.normalizedCommand,
+          stdoutSummary: sanitize(result.stdoutSummary, 500) ?? result.stdoutSummary,
+          stderrSummary: sanitize(result.stderrSummary, 500) ?? result.stderrSummary,
+          fullOutputRef: undefined,
+          parsedJsonRef: undefined,
+          classifiedFailure: result.classifiedFailure
+            ? {
+              ...result.classifiedFailure,
+              summary: sanitize(result.classifiedFailure.summary, 500) ?? result.classifiedFailure.summary
+            }
+            : undefined,
+          relatedFiles: sanitizeList(result.relatedFiles, 10)
+        })),
+        environmentFailures: sanitizeList(ledger.environmentFailures, 10, 500),
+        commandConstructionFailures: sanitizeList(ledger.commandConstructionFailures, 10, 500),
+        productFailures: sanitizeList(ledger.productFailures, 10, 500),
+        evidenceFailures: sanitizeList(ledger.evidenceFailures, 10, 500),
+        hygieneFailures: sanitizeList(ledger.hygieneFailures, 10, 500),
+        repairedFailures: sanitizeList(ledger.repairedFailures, 10, 500),
+        warnings: sanitizeList(ledger.warnings, 10, 500),
+        finalValidationBasis: sanitize(ledger.finalValidationBasis, 600) ?? ledger.finalValidationBasis,
+        unresolvedValidationFailures: sanitizeList(ledger.unresolvedValidationFailures, 12, 500),
+        mergeBlockedReasons: sanitizeList(ledger.mergeBlockedReasons, 12, 500),
+        summaryForHumans: sanitize(ledger.summaryForHumans, 600) ?? ledger.summaryForHumans
+      }
+      : undefined;
+    const sanitizedHygiene = hygiene
+      ? {
+        ...hygiene,
+        scannedRef: sanitize(hygiene.scannedRef, 240) ?? hygiene.scannedRef,
+        forbiddenFiles: sanitizeList(hygiene.forbiddenFiles, 18),
+        cleanedFiles: sanitizeList(hygiene.cleanedFiles, 18),
+        warnings: sanitizeList(hygiene.warnings, 12, 500),
+        mergeBlockingFindings: sanitizeList(hygiene.mergeBlockingFindings, 18, 500),
+        summaryForHumans: sanitize(hygiene.summaryForHumans, 600) ?? hygiene.summaryForHumans
+      }
+      : undefined;
+    const delta = operatorView.currentCycle.checklistDelta;
+    const sanitizedDelta = delta
+      ? {
+        ...delta,
+        targetedNewlyMet: sanitizeList(delta.targetedNewlyMet, 16),
+        targetedStillUnknown: sanitizeList(delta.targetedStillUnknown, 16),
+        targetedNeedsAttention: sanitizeList(delta.targetedNeedsAttention, 16),
+        targetedNotApplicable: sanitizeList(delta.targetedNotApplicable, 16),
+        nonTargetedChanges: sanitizeList(delta.nonTargetedChanges, 16, 500),
+        summaryForHumans: sanitize(delta.summaryForHumans, 600) ?? delta.summaryForHumans,
+        whyStillUnknownByCheckId: Object.fromEntries(
+          Object.entries(delta.whyStillUnknownByCheckId).map(([checkId, reason]) => [
+            sanitize(checkId, 160) ?? checkId,
+            sanitize(reason, 500) ?? reason
+          ])
+        )
+      }
+      : undefined;
+    const recentAgentMessages = sortedCycleAgents.flatMap((agent) => [
+      `${agent.name}: ${agent.currentPhase ?? agent.lastMessageSnippet ?? agent.status}`,
+      ...agent.events.slice(-2).map((event) => `${agent.name}: ${event.title}${event.detail ? ` - ${event.detail}` : ""}`)
+    ]);
+
+    return buildWorkflowRepairAgentPrompt({
+      projectName: project.record.identity.projectName,
+      projectRoot: project.record.projectRoot,
+      branchOrPath: project.record.validation.branch ?? project.record.displayPath,
+      statusLabel: operatorView.currentStatus.primaryLabel,
+      technicalStage: operatorView.currentStatus.technicalStage,
+      activeAgent: operatorView.currentStatus.activeAgent,
+      currentPhase: sanitize(latestAgent?.currentPhase ?? activeStep.currentActivity ?? activeStep.message, 240) ?? "No active phase recorded",
+      currentFocus: operatorView.currentStatus.secondaryExplanation,
+      nextOperatorAction: operatorView.currentStatus.nextOperatorAction,
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      cycleContract: sanitizedContract,
+      checklistDelta: sanitizedDelta,
+      validationLedger: sanitizedLedger,
+      repoHygieneReport: sanitizedHygiene,
+      changedFiles: sanitizeList([
+        ...operatorView.currentCycle.changedFiles,
+        ...(hygiene?.forbiddenFiles ?? []),
+        ...(hygiene?.cleanedFiles ?? [])
+      ], 32),
+      recentAgentMessages: sanitizeList(recentAgentMessages, 10, 500),
+      pendingApprovals: project.record.agents.flatMap((agent) => agent.approvals).filter((approval) => approval.status === "pending").length
+    });
   }
 
   async openProjectShell(projectId: string): Promise<OpenProjectShellResult> {

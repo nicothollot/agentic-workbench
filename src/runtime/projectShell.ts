@@ -9,9 +9,13 @@ import {
 } from "@shared/constants";
 import type {
   AppSettings,
+  ChecklistDelta,
+  CycleContract,
   HumanInterventionRecord,
   OpenProjectShellResult,
+  RepoHygieneReport,
   UserInputRequestRecord,
+  ValidationLedger,
   WorkflowManualHandoff
 } from "@shared/types";
 import { RuntimeCommandExecutor } from "./execution";
@@ -38,6 +42,26 @@ export interface ProjectShellPromptContext {
     }
   >;
   pendingHumanInterventions: Array<Pick<HumanInterventionRecord, "title" | "description" | "severity">>;
+}
+
+export interface WorkflowRepairAgentPromptContext {
+  projectName: string;
+  projectRoot: string;
+  branchOrPath: string;
+  statusLabel: string;
+  technicalStage: string;
+  activeAgent: string;
+  currentPhase: string;
+  currentFocus: string;
+  nextOperatorAction: string;
+  cycleNumber: number;
+  cycleContract?: CycleContract;
+  checklistDelta?: ChecklistDelta;
+  validationLedger?: ValidationLedger;
+  repoHygieneReport?: RepoHygieneReport;
+  changedFiles: string[];
+  recentAgentMessages: string[];
+  pendingApprovals: number;
 }
 
 export interface OpenProjectShellWindowRequest {
@@ -224,6 +248,126 @@ export const buildProjectShellHandoffPrompt = (context: ProjectShellPromptContex
     "- If you can continue by inspecting the repo or running commands, do that from this project root.",
     "- Treat files under .agent-workbench/input-requests as user-provided context unless the user asks to copy them into project files.",
     "- Stay focused on getting the paused workflow unstuck."
+  );
+
+  return `${lines.join("\n").trim()}\n`;
+};
+
+const pushSection = (lines: string[], title: string, values: string[]): void => {
+  const cleaned = values.map((entry) => entry.trim()).filter(Boolean);
+  if (cleaned.length === 0) {
+    return;
+  }
+  lines.push(title, ...cleaned, "");
+};
+
+const bulletList = (values: string[], maxItems = 12): string[] =>
+  values.slice(0, maxItems).map((entry) => `- ${entry}`);
+
+export const buildWorkflowRepairAgentPrompt = (context: WorkflowRepairAgentPromptContext): string => {
+  const contract = context.cycleContract;
+  const ledger = context.validationLedger;
+  const hygiene = context.repoHygieneReport;
+  const delta = context.checklistDelta;
+  const failedCommands = ledger?.commandResults
+    .filter((result) => result.status !== "passed" && result.status !== "skipped")
+    .slice(0, 8)
+    .map((result) => {
+      const failure = result.classifiedFailure?.summary ?? (result.stderrSummary || result.stdoutSummary || "failed");
+      return `${result.command} -> ${result.status}: ${failure}`;
+    }) ?? [];
+
+  const lines = [
+    "You are a separate Codex CLI repair agent launched by Agentic Workbench.",
+    "Your job is to repair the current workflow blocker in this repository, not to re-plan the project.",
+    `Project: ${context.projectName}`,
+    `Working root: ${context.projectRoot}`,
+    `Branch/path: ${context.branchOrPath}`,
+    "",
+    "Current Workbench diagnosis:",
+    `- Status: ${context.statusLabel}`,
+    `- Stage: ${context.technicalStage}`,
+    `- Active agent: ${context.activeAgent}`,
+    `- Phase: ${context.currentPhase}`,
+    `- Current focus: ${context.currentFocus}`,
+    `- Next operator action: ${context.nextOperatorAction}`,
+    `- Pending approvals: ${context.pendingApprovals}`,
+    ""
+  ];
+
+  if (contract) {
+    lines.push(
+      "Cycle contract:",
+      `- Cycle: ${context.cycleNumber}`,
+      `- Objective: ${contract.concreteGoalForThisCycle || contract.plainEnglishObjective}`,
+      `- Selected task: ${contract.selectedTaskTitle}`,
+      `- Why selected: ${contract.whySelectedNow}`,
+      ""
+    );
+    pushSection(lines, "Targeted checklist items:", contract.targetedChecklistItems.map((item) =>
+      `- ${item.checkId}: ${item.title} [${item.currentStatus}] ${item.fullDescription}${item.acceptanceHint ? ` Acceptance hint: ${item.acceptanceHint}` : ""}`
+    ));
+    pushSection(lines, "Expected files or areas:", bulletList(contract.expectedFilesOrAreas, 16));
+    pushSection(lines, "Expected evidence commands:", bulletList(contract.expectedEvidenceCommands, 10));
+    pushSection(lines, "Expected validation commands:", bulletList(contract.expectedValidationCommands, 10));
+    pushSection(lines, "Known cycle blockers:", bulletList(contract.currentKnownBlockers, 10));
+    pushSection(lines, "Cycle failure modes to avoid:", bulletList(contract.failureModes, 10));
+  }
+
+  if (hygiene) {
+    lines.push(
+      "Repository hygiene:",
+      `- Status: ${hygiene.status}`,
+      `- Summary: ${hygiene.summaryForHumans}`
+    );
+    lines.push(...bulletList([
+      ...hygiene.mergeBlockingFindings,
+      ...hygiene.forbiddenFiles.map((entry) => `Forbidden changed path: ${entry}`),
+      ...hygiene.warnings.map((entry) => `Warning: ${entry}`),
+      ...hygiene.cleanedFiles.map((entry) => `Cleaned generated artifact: ${entry}`)
+    ], 24));
+    lines.push("");
+  }
+
+  if (ledger) {
+    lines.push(
+      "Validation ledger:",
+      `- Final status: ${ledger.finalValidationStatus}`,
+      `- Basis: ${ledger.finalValidationBasis}`,
+      `- Merge allowed: ${ledger.mergeAllowed ? "yes" : "no"}`,
+      `- Summary: ${ledger.summaryForHumans}`
+    );
+    pushSection(lines, "Merge-blocking validation reasons:", bulletList(ledger.mergeBlockedReasons, 14));
+    pushSection(lines, "Unresolved validation failures:", bulletList(ledger.unresolvedValidationFailures, 14));
+    pushSection(lines, "Failed command attempts:", bulletList(failedCommands, 8));
+    pushSection(lines, "Repaired validation attempts:", bulletList(ledger.repairedFailures, 8));
+  }
+
+  if (delta) {
+    lines.push(
+      "Checklist delta:",
+      `- ${delta.summaryForHumans}`,
+      `- Evidence observed: ${delta.evidenceObservedCount}; consumed: ${delta.evidenceConsumedCount}; not consumed: ${delta.evidenceNotConsumedCount}`
+    );
+    pushSection(lines, "Targeted checks still unknown:", bulletList(delta.targetedStillUnknown, 14));
+    pushSection(lines, "Why targeted checks remain unknown:", bulletList(
+      Object.entries(delta.whyStillUnknownByCheckId).map(([checkId, reason]) => `${checkId}: ${reason}`),
+      14
+    ));
+  }
+
+  pushSection(lines, "Changed files seen by Workbench:", bulletList(context.changedFiles, 24));
+  pushSection(lines, "Recent agent messages:", bulletList(context.recentAgentMessages, 8));
+
+  lines.push(
+    "Repair instructions:",
+    "- Inspect the exact blocker paths and validation failures before editing.",
+    "- If repository hygiene is blocking, remove generated junk or typo paths, or move useful content into the intended repository path.",
+    "- If validation is blocking, fix the product/test/evidence issue that the ledger names; do not claim success until the relevant command passes.",
+    "- Keep the work generic to this project. Do not invent AW_Trends-only commands unless the repository already contains them.",
+    "- Do not add secrets, machine-local paths, raw credentials, or bulky generated output.",
+    "- Run the most relevant validation and evidence commands you can from this project root.",
+    "- When done, summarize changed files, commands run, remaining blockers, and tell the operator whether to return to Workbench and press Revalidate or Retry merge."
   );
 
   return `${lines.join("\n").trim()}\n`;

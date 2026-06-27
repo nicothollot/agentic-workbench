@@ -280,6 +280,10 @@ export const openProjectShellRequestSchema = z.object({
   projectId: z.string().min(1)
 });
 
+export const openWorkflowRepairAgentRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
 export const updateUltimateGoalRequestSchema = z.object({
   projectId: z.string().min(1),
   goal: ultimateGoalSchema.omit({
@@ -545,6 +549,7 @@ export type IpcChannel =
   | "project:updateLayout"
   | "project:updateUiState"
   | "project:openProjectShell"
+  | "workflow:openRepairAgent"
   | "credentials:saveEntry"
   | "credentials:deleteEntry"
   | "credentials:updateRequest"

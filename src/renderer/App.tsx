@@ -5011,7 +5011,8 @@ const WorkflowCurrentActionCard = ({
   checksStatus,
   approvalsPending,
   nextAction,
-  phase
+  phase,
+  repairAction
 }: {
   stageLabel: string;
   agentName: string;
@@ -5023,6 +5024,12 @@ const WorkflowCurrentActionCard = ({
   approvalsPending: number;
   nextAction: string;
   phase: string;
+  repairAction?: {
+    label: string;
+    disabled?: boolean;
+    busy?: boolean;
+    onClick: () => void;
+  };
 }) => (
   <article className="workflow-now-card">
     <SectionTitle
@@ -5064,6 +5071,13 @@ const WorkflowCurrentActionCard = ({
     <div className="workflow-now-card__next">
       <span className="workflow-option__label">Next recommended action</span>
       <p>{nextAction}</p>
+      {repairAction ? (
+        <div className="actions-row workflow-now-card__actions">
+          <button className="primary-button" disabled={repairAction.disabled || repairAction.busy} onClick={repairAction.onClick} type="button">
+            {repairAction.busy ? "Opening repair agent..." : repairAction.label}
+          </button>
+        </div>
+      ) : null}
     </div>
   </article>
 );
@@ -8204,6 +8218,7 @@ const WorkbenchApp = () => {
   const [userInputDrafts, setUserInputDrafts] = useState<Record<string, Record<string, string>>>({});
   const [clockNow, setClockNow] = useState(() => Date.now());
   const [shellLaunchBusy, setShellLaunchBusy] = useState(false);
+  const [repairAgentLaunchBusy, setRepairAgentLaunchBusy] = useState(false);
   const [workflowCommandBusyKey, setWorkflowCommandBusyKey] = useState<string>();
   const [runtimeCheckBusy, setRuntimeCheckBusy] = useState(false);
   const [codexUpdateBusy, setCodexUpdateBusy] = useState(false);
@@ -11009,6 +11024,23 @@ const WorkbenchApp = () => {
     }
   };
 
+  const openWorkflowRepairAgent = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    try {
+      setRepairAgentLaunchBusy(true);
+      setNotice(undefined);
+      const result = await window.workbench.openWorkflowRepairAgent(activeProject.record.id);
+      setNotice({ message: result.message, tone: result.launched ? "info" : "error" });
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setRepairAgentLaunchBusy(false);
+    }
+  };
+
   const saveSettings = async () => {
     try {
       setNotice(undefined);
@@ -11667,6 +11699,21 @@ const WorkbenchApp = () => {
     120
   );
   const workflowChecksStatus = operatorWorkflowView.currentCycle.validationSummary.finalStatusLabel;
+  const workflowValidationBlocking = latestValidationLedger
+    ? latestValidationLedger.finalValidationStatus !== "passed" || latestValidationLedger.unresolvedValidationFailures.length > 0
+    : false;
+  const workflowHygieneBlocking = latestRepoHygieneReport
+    ? latestRepoHygieneReport.status !== "passed"
+    : false;
+  const workflowRepairAgentAvailable = Boolean(
+    workflow &&
+    !ultimateGoalMissing &&
+    (
+      workflowValidationBlocking ||
+      workflowHygieneBlocking ||
+      operatorWorkflowView.currentStatus.severity === "danger"
+    )
+  );
   const commandCenterFocusChips: CommandCenterHealthItem[] = [
     operatorWorkflowView.currentCycle.cycleNumber ? { label: `Cycle ${operatorWorkflowView.currentCycle.cycleNumber}`, tone: "pending" } : undefined,
     operatorWorkflowView.currentStatus.lastCompletedAction !== "None" ? { label: operatorWorkflowView.currentStatus.lastCompletedAction, tone: "success" } : undefined,
@@ -12250,6 +12297,12 @@ const WorkbenchApp = () => {
                 approvalsPending={workflowPendingApprovals.length}
                 nextAction={summarizeText(operatorWorkflowView.currentStatus.nextOperatorAction, "No validation, hygiene, checklist, or planner blocker is currently recorded.", 160)}
                 phase={workflowCurrentPhase}
+                repairAction={workflowRepairAgentAvailable ? {
+                  label: "Repair in Codex",
+                  busy: repairAgentLaunchBusy,
+                  disabled: shellLaunchBusy,
+                  onClick: () => void openWorkflowRepairAgent()
+                } : undefined}
               />
               <WorkflowCurrentAgentMessages
                 agent={currentWorkflowAgent}

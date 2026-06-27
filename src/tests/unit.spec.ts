@@ -135,7 +135,7 @@ import {
   parseWslCommandResolutionOutput
 } from "@runtime/execution";
 import { assessCodexProtocolCompatibility, buildCodexUpdateCommand, checkCodexCliUpdate, compareCodexVersions, parseCodexCliVersion, parseNpmPackageVersion, updateCodexCliIfAvailable } from "@runtime/codexUpdate";
-import { buildProjectShellHandoffPrompt, buildWindowsProjectShellLaunchPlan, openProjectShellWindow } from "@runtime/projectShell";
+import { buildProjectShellHandoffPrompt, buildWindowsProjectShellLaunchPlan, buildWorkflowRepairAgentPrompt, openProjectShellWindow } from "@runtime/projectShell";
 import { createTempDir, initGitRepo, commitAll } from "./helpers";
 import { executionPathToHostPath, resolveProjectPath, windowsPathToWslPath } from "@shared/pathUtils";
 import {
@@ -7885,6 +7885,101 @@ describe("project shell handoff", () => {
     expect(prompt).toContain("API key [secret]: Create the account and paste the key.");
     expect(prompt).toContain("Other pending human blockers:");
     expect(prompt).toContain("Accept the vendor invite");
+  });
+
+  it("builds a Codex repair-agent prompt with hygiene, validation, and cycle context", () => {
+    const hygiene = {
+      status: "failed" as const,
+      scannedAt: "2026-06-27T12:00:00.000Z",
+      scannedRef: "merge:23:pre",
+      forbiddenFiles: ["EADME.md"],
+      cleanedFiles: ["src/aw_trends/__pycache__/app.cpython-312.pyc"],
+      warnings: [],
+      mergeBlockingFindings: ["EADME.md looks like a typo path and blocks merge."],
+      summaryForHumans: "Repository hygiene blocked merge: EADME.md looks like a typo path."
+    };
+    const ledger = createValidationLedger({
+      cycleNumber: 23,
+      testCommands: ["python3 -m unittest discover -s tests -q"]
+    });
+    ledger.commandResults = [
+      {
+        ...makeLedgerCommandResult({
+          command: "python3 -m pytest",
+          exitCode: 1,
+          stderr: "/usr/bin/python3: No module named pytest"
+        }),
+        fullOutputRef: "private-full-output-ref"
+      }
+    ];
+    const finalized = finalizeValidationLedger(ledger, { repoHygieneReport: hygiene });
+    const prompt = buildWorkflowRepairAgentPrompt({
+      projectName: "AW_Trends",
+      projectRoot: "/home/nicot/dev/AW_Trends",
+      branchOrPath: "main",
+      statusLabel: "Merge blocked by repository hygiene",
+      technicalStage: "Repair Loop",
+      activeAgent: "Repair Coding Pass 1",
+      currentPhase: "Merge blocked by repository hygiene",
+      currentFocus: "Prove source provenance and access policy with machine-checkable evidence.",
+      nextOperatorAction: "Remove or repair forbidden changed paths before merge.",
+      cycleNumber: 23,
+      cycleContract: {
+        schemaVersion: 1,
+        cycleNumber: 23,
+        createdAt: "2026-06-27T12:00:00.000Z",
+        updatedAt: "2026-06-27T12:00:00.000Z",
+        selectedTaskTitle: "Satisfy source provenance and access policy",
+        selectedTaskKind: "work_package",
+        selectedTaskSource: "deterministic_fallback",
+        plainEnglishObjective: "Produce evidence for source provenance and access policy.",
+        concreteGoalForThisCycle: "Prove source provenance and access policy with machine-checkable evidence.",
+        targetedChecklistItems: [{
+          checkId: "source-access-policy",
+          title: "Source access policy is documented",
+          fullDescription: "Document allowed source access, provider freshness, and dashboard warning behavior.",
+          required: true,
+          itemKind: "required",
+          previousStatus: "unknown",
+          currentStatus: "unknown",
+          currentEvidence: "",
+          evidenceHistoryCount: 0,
+          whyTargeted: "The current work package selected this check.",
+          acceptanceHint: "Evidence must reference the check ID.",
+          relatedPaths: ["docs/source-provenance-access-policy-evidence.md"],
+          observableSignalsExpected: ["targeted_check_satisfaction includes source-access-policy"]
+        }],
+        expectedFilesOrAreas: ["docs/source-provenance-access-policy-evidence.md"],
+        expectedValidationCommands: ["python3 -m unittest discover -s tests -q"],
+        expectedEvidenceCommands: ["python3 scripts/source-audit.py --json"],
+        acceptanceCriteria: [],
+        nonGoalsForThisCycle: [],
+        constraintsForThisCycle: [],
+        whySelectedNow: "Required checks remain unknown.",
+        scoreBreakdown: { repetition: -70 },
+        repetitionPenalty: -70,
+        priorSimilarAttempts: [],
+        currentKnownBlockers: ["Repository hygiene is blocking merge."],
+        fallbackOrHealthWarnings: [],
+        doneWhen: ["Hygiene passes and validation is reportable."],
+        failureModes: ["Creating typo paths such as EADME.md."],
+        sourceDataRefs: {}
+      },
+      checklistDelta: undefined,
+      validationLedger: finalized,
+      repoHygieneReport: hygiene,
+      changedFiles: ["EADME.md", "docs/source-provenance-access-policy-evidence.md"],
+      recentAgentMessages: ["Repair Coding Pass 1: wrote EADME.md by mistake."],
+      pendingApprovals: 0
+    });
+
+    expect(prompt).toContain("separate Codex CLI repair agent");
+    expect(prompt).toContain("Merge blocked by repository hygiene");
+    expect(prompt).toContain("source-access-policy");
+    expect(prompt).toContain("EADME.md looks like a typo path");
+    expect(prompt).toContain("Final status: failed");
+    expect(prompt).toContain("Remove or repair forbidden changed paths before merge.");
+    expect(prompt).not.toContain("private-full-output-ref");
   });
 
   it("adds merge-conflict recovery steps to Codex handoff prompts", () => {

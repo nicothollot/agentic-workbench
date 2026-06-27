@@ -133,6 +133,7 @@ export interface WorkbenchApi {
   updateLayout(projectId: string, payload: Record<string, unknown>): Promise<void>;
   updateUiState(projectId: string, payload: Partial<LocalProjectState>): Promise<void>;
   openProjectShell(projectId: string): Promise<OpenProjectShellResult>;
+  openWorkflowRepairAgent(projectId: string): Promise<OpenProjectShellResult>;
   saveCredentialEntry(
     projectId: string,
     payload: {
@@ -310,6 +311,7 @@ const api: WorkbenchApi = {
   updateLayout: async (projectId, payload) => await invoke<void>("project:updateLayout", { projectId, ...payload }),
   updateUiState: async (projectId, payload) => await invoke<void>("project:updateUiState", { projectId, ...payload }),
   openProjectShell: async (projectId) => await invoke<OpenProjectShellResult>("project:openProjectShell", { projectId }),
+  openWorkflowRepairAgent: async (projectId) => await invoke<OpenProjectShellResult>("workflow:openRepairAgent", { projectId }),
   saveCredentialEntry: async (projectId, payload) =>
     await invoke<CredentialEntryMetadata>("credentials:saveEntry", { projectId, ...payload }),
   deleteCredentialEntry: async (projectId, entryId) =>
