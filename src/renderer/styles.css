@@ -7376,6 +7376,16 @@ select.input {
   background: var(--successBg);
 }
 
+.codex-update-progress {
+  align-items: center;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+}
+
+.codex-update-progress > span {
+  color: var(--textMuted);
+  font-size: 0.9rem;
+}
+
 .loading-indicator {
   color: var(--accent-strong);
 }

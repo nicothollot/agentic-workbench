@@ -1710,6 +1710,21 @@ const LoadingIndicator = ({
   </div>
 );
 
+const CodexUpdateProgressNotice = ({ label }: { label?: string }) => {
+  if (!label) {
+    return null;
+  }
+  const detail = label === "Updating Codex CLI"
+    ? "Keep Workbench open and wait for this to finish."
+    : "This should only take a moment.";
+  return (
+    <div className="notice notice--status notice--running codex-update-progress">
+      <LoadingIndicator label={label} compact />
+      <span>{detail}</span>
+    </div>
+  );
+};
+
 const SectionTitle = ({
   eyebrow,
   title,
@@ -6342,12 +6357,14 @@ const RuntimeReadinessPanel = ({
 const CodexReadinessPanel = ({
   state,
   busy,
+  busyLabel,
   onRefreshReadiness,
   onCheckUpdate,
   onRunUpdate
 }: {
   state: WorkbenchState;
   busy: boolean;
+  busyLabel?: string;
   onRefreshReadiness: () => void;
   onCheckUpdate: () => void;
   onRunUpdate: (approvedCommand: string) => void;
@@ -6359,6 +6376,9 @@ const CodexReadinessPanel = ({
   const updateAvailable = update?.updateAvailable ?? report.updateAvailable;
   const warnings = report.warnings ?? [];
   const errors = report.errors ?? [];
+  const checkingUpdate = busyLabel === "Checking Codex CLI updates";
+  const refreshingReadiness = busyLabel === "Refreshing Codex readiness" || report.status === "checking";
+  const updatingCodex = busyLabel === "Updating Codex CLI";
   const approveUpdate = () => {
     if (!updateCommand) {
       return;
@@ -6423,15 +6443,16 @@ const CodexReadinessPanel = ({
           <span><code>{updateCommand}</code></span>
         </div>
       ) : null}
+      <CodexUpdateProgressNotice label={busyLabel} />
       <div className="actions-row">
         <button className="secondary-button" type="button" disabled={busy || report.status === "checking"} onClick={onRefreshReadiness}>
-          {report.status === "checking" ? "Refreshing..." : "Refresh Codex Readiness"}
+          {refreshingReadiness ? "Refreshing..." : "Refresh Codex Readiness"}
         </button>
         <button className="secondary-button" type="button" disabled={busy || report.status === "checking"} onClick={onCheckUpdate}>
-          {busy ? "Checking..." : "Check Codex Update"}
+          {checkingUpdate ? "Checking..." : "Check Codex Update"}
         </button>
         <button className="primary-button" type="button" disabled={busy || !updateAvailable || !updateCommand} onClick={approveUpdate}>
-          {busy ? "Updating..." : "Update Codex CLI"}
+          {updatingCodex ? <LoadingIndicator label="Updating Codex CLI" compact /> : "Update Codex CLI"}
         </button>
       </div>
     </section>
@@ -7146,6 +7167,7 @@ const SettingsDialog = ({
   onRunCodexUpdate,
   runtimeCheckBusy = false,
   codexUpdateBusy = false,
+  codexUpdateBusyLabel,
   mode = "modal"
 }: {
   state: WorkbenchState;
@@ -7180,6 +7202,7 @@ const SettingsDialog = ({
   onRunCodexUpdate: (approvedCommand: string) => void;
   runtimeCheckBusy?: boolean;
   codexUpdateBusy?: boolean;
+  codexUpdateBusyLabel?: string;
   mode?: "modal" | "page";
 }) => {
   const selectedModel = state.availableModels.find((model) => model.model === settingsDraft.interfaceCreationModel);
@@ -7233,6 +7256,7 @@ const SettingsDialog = ({
         <CodexReadinessPanel
           state={state}
           busy={codexUpdateBusy}
+          busyLabel={codexUpdateBusyLabel}
           onRefreshReadiness={onRefreshCodexReadiness}
           onCheckUpdate={onCheckCodexUpdate}
           onRunUpdate={onRunCodexUpdate}
@@ -8222,6 +8246,7 @@ const WorkbenchApp = () => {
   const [workflowCommandBusyKey, setWorkflowCommandBusyKey] = useState<string>();
   const [runtimeCheckBusy, setRuntimeCheckBusy] = useState(false);
   const [codexUpdateBusy, setCodexUpdateBusy] = useState(false);
+  const [codexUpdateBusyLabel, setCodexUpdateBusyLabel] = useState<string>();
   const [overviewRefreshBusy, setOverviewRefreshBusy] = useState(false);
   const [visualExtractBusy, setVisualExtractBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
@@ -9705,6 +9730,7 @@ const WorkbenchApp = () => {
   const checkCodexUpdate = async () => {
     try {
       setCodexUpdateBusy(true);
+      setCodexUpdateBusyLabel("Checking Codex CLI updates");
       setNotice(undefined);
       const result = await window.workbench.checkCodexUpdate();
       setNotice({
@@ -9715,12 +9741,14 @@ const WorkbenchApp = () => {
       handleError(error);
     } finally {
       setCodexUpdateBusy(false);
+      setCodexUpdateBusyLabel(undefined);
     }
   };
 
   const refreshCodexReadiness = async () => {
     try {
       setCodexUpdateBusy(true);
+      setCodexUpdateBusyLabel("Refreshing Codex readiness");
       setNotice(undefined);
       const result = await window.workbench.refreshCodexReadiness();
       setNotice({
@@ -9731,12 +9759,14 @@ const WorkbenchApp = () => {
       handleError(error);
     } finally {
       setCodexUpdateBusy(false);
+      setCodexUpdateBusyLabel(undefined);
     }
   };
 
   const runCodexUpdate = async (approvedCommand?: string) => {
     try {
       setCodexUpdateBusy(true);
+      setCodexUpdateBusyLabel("Updating Codex CLI");
       setNotice(undefined);
       const result = await window.workbench.runCodexUpdate(approvedCommand);
       setNotice({
@@ -9747,6 +9777,7 @@ const WorkbenchApp = () => {
       handleError(error);
     } finally {
       setCodexUpdateBusy(false);
+      setCodexUpdateBusyLabel(undefined);
     }
   };
 
@@ -11189,6 +11220,7 @@ const WorkbenchApp = () => {
       onRunCodexUpdate={(approvedCommand) => void runCodexUpdate(approvedCommand)}
       runtimeCheckBusy={runtimeCheckBusy}
       codexUpdateBusy={codexUpdateBusy}
+      codexUpdateBusyLabel={codexUpdateBusyLabel}
     />
   ) : null;
 
@@ -11250,6 +11282,7 @@ const WorkbenchApp = () => {
             </div>
           </section>
           {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
+          <CodexUpdateProgressNotice label={codexUpdateBusyLabel} />
           {state.runtimeReadiness.blockAgentActions ? (
             <RuntimeReadinessPanel
               report={state.runtimeReadiness}
@@ -11398,6 +11431,7 @@ const WorkbenchApp = () => {
             </div>
           </section>
           {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
+          <CodexUpdateProgressNotice label={codexUpdateBusyLabel} />
           {projectLoadBusy ? (
             <div className="notice notice--status notice--running">
               <LoadingIndicator
@@ -11924,6 +11958,7 @@ const WorkbenchApp = () => {
       <ProjectStatusStrip items={projectStatusItems} />
 
       {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
+      <CodexUpdateProgressNotice label={codexUpdateBusyLabel} />
       {state.runtimeReadiness.blockAgentActions ? (
         <RuntimeReadinessPanel
           report={state.runtimeReadiness}
@@ -13375,6 +13410,7 @@ const WorkbenchApp = () => {
               onRunCodexUpdate={(approvedCommand) => void runCodexUpdate(approvedCommand)}
               runtimeCheckBusy={runtimeCheckBusy}
               codexUpdateBusy={codexUpdateBusy}
+              codexUpdateBusyLabel={codexUpdateBusyLabel}
             />
             <CredentialsPanel project={activeProject} onSaved={showInfoNotice} onError={handleError} />
           </div>
