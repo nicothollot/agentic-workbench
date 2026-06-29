@@ -825,9 +825,7 @@ const manualHandoffBadgeLabel = (workflow: ProjectWorkflowState): string =>
 const manualHandoffRetryLabel = (workflow: ProjectWorkflowState): string =>
   isMergeConflictHandoff(workflow)
     ? "Retry merge"
-    : isEnvironmentRepairHandoff(workflow)
-      ? "Retry validation"
-      : "Retry current goal";
+    : "Revalidate repair";
 
 const goalSourceLabel = (goal: Pick<UltimateGoal, "source" | "confirmedAt">): string =>
   goal.confirmedAt ? "User confirmed" : goal.source === "detected" ? "Agent detected draft" : "User draft";
@@ -5043,6 +5041,7 @@ const WorkflowCurrentActionCard = ({
     label: string;
     disabled?: boolean;
     busy?: boolean;
+    busyLabel?: string;
     onClick: () => void;
   };
 }) => (
@@ -5089,7 +5088,7 @@ const WorkflowCurrentActionCard = ({
       {repairAction ? (
         <div className="actions-row workflow-now-card__actions">
           <button className="primary-button" disabled={repairAction.disabled || repairAction.busy} onClick={repairAction.onClick} type="button">
-            {repairAction.busy ? "Opening repair agent..." : repairAction.label}
+            {repairAction.busy ? repairAction.busyLabel ?? "Working..." : repairAction.label}
           </button>
         </div>
       ) : null}
@@ -5270,7 +5269,7 @@ const WorkflowNeedsAttentionPanel = ({
                     ) : null}
                     <div className="actions-row">
                       <button className="primary-button" onClick={onRetryManualHandoff} type="button">
-                        {manualHandoff.reason === "merge_conflicts" ? "Retry merge" : "Retry current goal"}
+                        {manualHandoff.reason === "merge_conflicts" ? "Retry merge" : "Revalidate repair"}
                       </button>
                       <button
                         className="secondary-button"
@@ -10480,6 +10479,11 @@ const WorkbenchApp = () => {
 
     await runWorkflowCommand("continue", async () => {
       setNotice(undefined);
+      if (workflow?.manualHandoff && workflow.repair.status === "exhausted") {
+        await window.workbench.revalidateWorkflowRepair(activeProject.record.id);
+        showInfoNotice("Repair revalidation started. Workbench will validate, check hygiene, and continue integration if it passes.");
+        return;
+      }
       if (previewStatus === "ready") {
         await window.workbench.completeWorkflowPreview(activeProject.record.id);
         showInfoNotice("Preview checkpoint completed. Workflow resumed.");
@@ -10932,6 +10936,18 @@ const WorkbenchApp = () => {
     await runWorkflowCommand("run-integrity", async () => {
       setNotice(undefined);
       await window.workbench.runIntegrity(activeProject.record.id);
+    });
+  };
+
+  const revalidateWorkflowRepair = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    await runWorkflowCommand("revalidate-repair", async () => {
+      setNotice(undefined);
+      await window.workbench.revalidateWorkflowRepair(activeProject.record.id);
+      showInfoNotice("Repair revalidation started. Workbench will validate, check hygiene, and continue integration if it passes.");
     });
   };
 
@@ -11553,9 +11569,15 @@ const WorkbenchApp = () => {
       }
       : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
         ? {
-          label: workflowAction.actionLabel,
-          disabled: shellLaunchBusy || !workflow?.manualHandoff?.shellSupported,
-          onClick: () => void openProjectShell()
+          label: workflow?.manualHandoff && !isMergeConflictHandoff(workflow) ? "Revalidate repair" : workflowAction.actionLabel,
+          disabled: workflowCommandBusy || (isMergeConflictHandoff(workflow) && (shellLaunchBusy || !workflow?.manualHandoff?.shellSupported)),
+          onClick: () => {
+            if (workflow?.manualHandoff && !isMergeConflictHandoff(workflow)) {
+              void revalidateWorkflowRepair();
+              return;
+            }
+            void openProjectShell();
+          }
         }
         : workflowAction?.kind === "confirm_goal"
           ? {
@@ -11589,7 +11611,7 @@ const WorkbenchApp = () => {
     { label: "Download Logs", onClick: () => void downloadLogs() },
     { label: visualExtractBusy ? "Extracting..." : "Extract Visuals", disabled: visualExtractBusy, onClick: () => void extractVisuals() },
     { label: overviewRefreshRunning ? "Refreshing..." : "Refresh Overview", disabled: overviewRefreshRunning, onClick: () => void refreshOverview() },
-    { label: "Revalidate", onClick: () => void window.workbench.revalidate(activeProject.record.id).catch(handleError) },
+    { label: "Rescan project", onClick: () => void window.workbench.revalidate(activeProject.record.id).catch(handleError) },
     { label: "Exit App", onClick: () => void quitApp() }
   ];
   const projectStatusItems: Array<string | JSX.Element> = [
@@ -11739,6 +11761,11 @@ const WorkbenchApp = () => {
   const workflowHygieneBlocking = latestRepoHygieneReport
     ? latestRepoHygieneReport.status !== "passed"
     : false;
+  const externalRepairReadyForRevalidation = Boolean(
+    workflow?.manualHandoff &&
+    !isMergeConflictHandoff(workflow) &&
+    workflow.manualHandoff.lastOpenedAt
+  );
   const workflowRepairAgentAvailable = Boolean(
     workflow &&
     !ultimateGoalMissing &&
@@ -12333,10 +12360,13 @@ const WorkbenchApp = () => {
                 nextAction={summarizeText(operatorWorkflowView.currentStatus.nextOperatorAction, "No validation, hygiene, checklist, or planner blocker is currently recorded.", 160)}
                 phase={workflowCurrentPhase}
                 repairAction={workflowRepairAgentAvailable ? {
-                  label: "Repair in Codex",
-                  busy: repairAgentLaunchBusy,
-                  disabled: shellLaunchBusy,
-                  onClick: () => void openWorkflowRepairAgent()
+                  label: externalRepairReadyForRevalidation ? "Revalidate repair" : "Repair in Codex",
+                  busy: externalRepairReadyForRevalidation ? workflowCommandBusy : repairAgentLaunchBusy,
+                  busyLabel: externalRepairReadyForRevalidation ? "Revalidating repair..." : "Opening repair agent...",
+                  disabled: externalRepairReadyForRevalidation ? workflowCommandBusy : shellLaunchBusy,
+                  onClick: externalRepairReadyForRevalidation
+                    ? () => void revalidateWorkflowRepair()
+                    : () => void openWorkflowRepairAgent()
                 } : undefined}
               />
               <WorkflowCurrentAgentMessages
@@ -12368,7 +12398,13 @@ const WorkbenchApp = () => {
                   }
                   openWorkflowDetailsAndScroll("workflow-attention-details");
                 }}
-                onRetryManualHandoff={() => void retryWorkflowGoal()}
+                onRetryManualHandoff={() => {
+                  if (workflow && isMergeConflictHandoff(workflow)) {
+                    void retryWorkflowGoal();
+                    return;
+                  }
+                  void revalidateWorkflowRepair();
+                }}
                 onOpenProjectShell={() => void openProjectShell()}
                 onDownloadRepairReport={downloadRepairReport}
                 shellLaunchBusy={shellLaunchBusy}
@@ -12674,7 +12710,14 @@ const WorkbenchApp = () => {
                     <div className="actions-row">
                       <button
                         className="primary-button"
-                        onClick={() => void retryWorkflowGoal()}
+                        disabled={workflowCommandBusy}
+                        onClick={() => {
+                          if (isMergeConflictHandoff(workflow)) {
+                            void retryWorkflowGoal();
+                            return;
+                          }
+                          void revalidateWorkflowRepair();
+                        }}
                       >
                         {manualHandoffRetryLabel(workflow)}
                       </button>
@@ -13244,6 +13287,9 @@ const WorkbenchApp = () => {
                     </button>
                     <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void runWorkflowIntegrity()}>
                       Run integrity
+                    </button>
+                    <button className="secondary-button" disabled={workflowCommandBusy || !workflow?.manualHandoff} onClick={() => void revalidateWorkflowRepair()}>
+                      Revalidate repair
                     </button>
                     <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void runWorkflowMerge()}>
                       Run merge

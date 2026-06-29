@@ -314,6 +314,7 @@ const writeEnabledAgentCategories = new Set<AgentCategory>(["coding", "manual"])
 const isWriteEnabledAgentCategory = (category: AgentCategory): boolean => writeEnabledAgentCategories.has(category);
 const activeAgentStatuses = new Set<AgentState["status"]>(["starting", "running", "waiting_approval"]);
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
+const EXTERNAL_REPAIR_REVALIDATION_REASON = "External repair completed in the opened checkout; revalidate the current checkout before merge.";
 const MAX_WORKFLOW_ACTIVITY_DETAIL_LENGTH = 1_200;
 const MAX_PROMPT_DETAIL_LENGTH = 280;
 const MAX_RECOMMENDATION_PROMPT_DETAIL_LENGTH = 180;
@@ -2306,6 +2307,10 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private isEnvironmentRepairFailureReason(reason?: string): boolean {
     return (reason?.trim() ?? "").startsWith("Integrity hit an environment or dependency blocker");
+  }
+
+  private isExternalRepairRevalidationReason(reason?: string): boolean {
+    return (reason?.trim() ?? "").startsWith(EXTERNAL_REPAIR_REVALIDATION_REASON);
   }
 
   private isScopeMismatchRepairFailureReason(reason?: string): boolean {
@@ -11671,6 +11676,274 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.persistProjectUpdate(project, true);
   }
 
+  async revalidateWorkflowRepair(projectId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+
+    if (this.hasActiveWorkflowAgent(project)) {
+      throw new Error("Wait for the active workflow agent to finish before revalidating the repair.");
+    }
+
+    if (this.isWaitingForMergeConflictResolution(workflow)) {
+      await this.retryWorkflowGoal(projectId);
+      return;
+    }
+
+    if (!workflow.scopedGoal) {
+      throw new Error("A scoped goal is required before a repair can be revalidated.");
+    }
+
+    const priorFailure =
+      workflow.manualHandoff?.latestFailureReason ??
+      workflow.repair.latestFailureReason ??
+      "External repair is ready for validation.";
+    const priorIssue =
+      workflow.manualHandoff?.validationIssue ??
+      workflow.repair.latestIssueSummary ??
+      "External repair is ready for validation.";
+
+    this.cancelScheduledWorkflowAutomation(projectId);
+    project.record.localState.workflowPauseRequested = false;
+    workflow.workflowStopReason = "none";
+    workflow.manualHandoff = undefined;
+    this.updateWorkflowRepairState(workflow, {
+      status: "retrying_validation",
+      latestIssueSummary: priorIssue,
+      latestFailureReason: EXTERNAL_REPAIR_REVALIDATION_REASON
+    });
+    this.updateWorkflowStepProgress(workflow, "coding", {
+      requiresUserInput: false,
+      currentActivity: "External repair completed",
+      latestProgressNote: priorFailure,
+      message: "Workbench will validate the repaired checkout before integration.",
+      warning: undefined
+    }, { status: "completed" });
+    this.resetWorkflowStepProgress(workflow, "integrity", {
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Queued to revalidate external repair",
+      currentSubstep: workflow.repair.attemptCount > 0
+        ? `Validation retry ${workflow.repair.attemptCount} of ${workflow.repair.maxAttempts}`
+        : undefined,
+      latestProgressNote: priorFailure,
+      message: "Validation will run against the currently opened checkout."
+    });
+    this.resetWorkflowStepProgress(workflow, "merge", {
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Waiting for repair validation",
+      message: "Merge will run only after validation and repository hygiene pass."
+    });
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: "External repair revalidation requested",
+      detail: priorFailure,
+      stepId: "integrity"
+    });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      reason: "external repair revalidation requested"
+    });
+
+    await this.runIntegrity(projectId, false, { continueAfterPass: false });
+
+    const refreshed = this.findProject(projectId);
+    const refreshedWorkflow = this.ensureWorkflowState(refreshed.record);
+    const latestLedger = this.latestCycleValidationLedger(refreshedWorkflow);
+    if (
+      refreshedWorkflow.repair.status === "fixed" &&
+      latestLedger?.finalValidationStatus === "passed" &&
+      refreshedWorkflow.stepProgress.integrity.status === "completed"
+    ) {
+      await this.finalizeExternalRepairCheckout(projectId);
+    }
+  }
+
+  private async finalizeExternalRepairCheckout(projectId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const mergeModel = this.getDefaultAgentModel();
+    const mergeAgent = await this.createAgent(
+      projectId,
+      "merge",
+      "External Repair Merge",
+      "Finalize a repair that was completed in the opened checkout.",
+      mergeModel,
+      { launchThread: false, persistOnCreate: false }
+    );
+    mergeAgent.currentPhase = "Finalizing externally repaired checkout";
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "running",
+      title: "External repair finalization started",
+      detail: "Validation passed. Checking repository hygiene before finalizing the repaired checkout.",
+      stepId: "merge",
+      agentId: mergeAgent.id,
+      agentCategory: "merge"
+    });
+    this.updateWorkflowStepProgress(workflow, "merge", {
+      requiresUserInput: false,
+      currentActivity: "Finalizing external repair",
+      latestProgressNote: "Validation passed after repair.",
+      message: "Repository hygiene will be checked before the repaired checkout is checkpointed.",
+      agentCategory: "merge"
+    }, { status: "running", incrementRunCount: true, incrementAttemptCount: true });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: false,
+      emit: "coalesced",
+      reason: "external repair finalization started"
+    });
+
+    const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
+    const targetBranch = project.scan.kind === "git"
+      ? await determineDefaultBranch(project.record.projectRoot, runtimeSettings)
+      : project.record.validation.branch ?? project.record.displayPath;
+    const hygieneReport = await this.scanWorkflowRepoHygiene(
+      project,
+      `merge:${workflow.workflowCycle.cycleNumber}:external-repair`,
+      true,
+      project.record.projectRoot
+    );
+    mergeAgent.repoHygieneReport = hygieneReport;
+
+    const blockedReasons = this.mergeGateBlockedReasons(workflow, hygieneReport);
+    if (blockedReasons.length > 0) {
+      const detail = blockedReasons.join(" ");
+      mergeAgent.mergeReport = {
+        summary: `External repair was validated, but finalization is blocked. ${detail}`,
+        targetBranch,
+        mergedBranches: [],
+        conflicts: [],
+        conflictCycleCount: 0,
+        generatedAt: nowIso()
+      };
+      mergeAgent.status = "failed";
+      mergeAgent.completedAt = nowIso();
+      mergeAgent.currentPhase = "External repair finalization blocked";
+      mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+      this.updateWorkflowRepairState(workflow, {
+        status: "exhausted",
+        latestIssueSummary: mergeAgent.mergeReport.summary,
+        latestFailureReason: detail
+      });
+      workflow.manualHandoff = this.buildRepairManualHandoff(
+        project,
+        mergeAgent.mergeReport.summary,
+        detail,
+        "repair_exhausted",
+        [
+          ...hygieneReport.forbiddenFiles,
+          ...hygieneReport.cleanedFiles
+        ]
+      );
+      this.recordWorkflowOpenIssue(workflow, "External repair finalization blocked", detail, "merge");
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: "failed",
+        title: "External repair finalization blocked",
+        detail,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        requiresUserInput: true,
+        currentActivity: "Finalization blocked",
+        latestProgressNote: detail,
+        message: mergeAgent.mergeReport.summary,
+        warning: "Validation and repository hygiene gates must pass before merge or push."
+      }, { status: "failed" });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, false);
+      return;
+    }
+
+    let changedFiles: string[] = [];
+    let checkpointCreated = false;
+    if (project.scan.kind === "git") {
+      const checkpoint = await checkpointWorktreeChanges(
+        project.record.projectRoot,
+        targetBranch,
+        targetBranch,
+        "AWB checkpoint: external repair",
+        runtimeSettings
+      );
+      changedFiles = checkpoint.changedFiles;
+      checkpointCreated = checkpoint.createdCommit;
+      mergeAgent.changedFiles = changedFiles;
+      try {
+        const refreshedProject = await this.scanCurrentProject(project);
+        this.applyScannedProjectState(project, refreshedProject);
+        await this.saveRepositoryIndex(project);
+      } catch (error) {
+        this.diagnostics.unshift(
+          `External repair finalization checkpointed ${targetBranch}, but the project overview refresh failed. ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    mergeAgent.mergeReport = {
+      summary: project.scan.kind === "git"
+        ? checkpointCreated
+          ? `Externally repaired checkout was validated, hygiene checked, and checkpointed on ${targetBranch}.`
+          : `Externally repaired checkout was validated and hygiene checked on ${targetBranch}; no pending checkout changes needed a new checkpoint.`
+        : "Externally repaired project folder was validated and hygiene checked in place.",
+      targetBranch,
+      mergedBranches: [],
+      conflicts: [],
+      conflictCycleCount: 0,
+      generatedAt: nowIso()
+    };
+
+    const published = project.scan.kind === "git"
+      ? await this.publishMergedCheckoutToOrigin(project, mergeAgent, workflow, targetBranch, "External repair finalization")
+      : true;
+    if (!published) {
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, false);
+      return;
+    }
+
+    this.resetWorkflowRepairState(workflow);
+    workflow.manualHandoff = undefined;
+    this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "integrity" || issue.source === "merge" || issue.source === "coding");
+    workflow.workflowCycle.status = "merged";
+    mergeAgent.status = "completed";
+    mergeAgent.completedAt = nowIso();
+    mergeAgent.currentPhase = "External repair finalized";
+    mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "completed",
+      title: "External repair integrated",
+      detail: mergeAgent.mergeReport.summary,
+      stepId: "merge",
+      agentId: mergeAgent.id,
+      agentCategory: "merge"
+    });
+    this.updateWorkflowStepProgress(workflow, "merge", {
+      requiresUserInput: false,
+      currentActivity: "Integration complete",
+      latestProgressNote: changedFiles.length
+        ? `Finalized ${changedFiles.length} repaired file${changedFiles.length === 1 ? "" : "s"}.`
+        : "No pending repaired files needed checkpointing.",
+      message: mergeAgent.mergeReport.summary,
+      warning: undefined,
+      agentCategory: "merge"
+    }, { status: "completed" });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: "deferred",
+      emit: "coalesced",
+      automate: true,
+      reason: "external repair finalized"
+    });
+  }
+
   private async createHumanInterventionRecord(
     project: LoadedProject,
     request: Omit<HumanInterventionRecord, "id" | "status" | "createdAt" | "resolvedAt" | "resolutionNotes">,
@@ -13070,9 +13343,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const workflow = this.ensureWorkflowState(project.record);
     if (
       workflow.repair.status !== "retrying_validation" ||
-      !this.isEnvironmentRepairFailureReason(workflow.repair.latestFailureReason)
+      (
+        !this.isEnvironmentRepairFailureReason(workflow.repair.latestFailureReason) &&
+        !this.isExternalRepairRevalidationReason(workflow.repair.latestFailureReason)
+      )
     ) {
       return false;
+    }
+
+    if (this.isExternalRepairRevalidationReason(workflow.repair.latestFailureReason)) {
+      return true;
     }
 
     const executor = new RuntimeCommandExecutor(this.getRuntimeSettings(project.record.distroName));
@@ -13137,7 +13417,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
-  async runIntegrity(projectId: string, automate = false): Promise<void> {
+  async runIntegrity(
+    projectId: string,
+    automate = false,
+    options: { continueAfterPass?: boolean } = {}
+  ): Promise<void> {
     const project = this.findProject(projectId);
     await this.ensureAgentBackedRuntimeReady(project, "integrity runtime check");
     this.assertResolvedPathCompatible(project.record.distroName);
@@ -13474,10 +13758,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
     }
     this.syncWorkflowState(project);
+    const shouldContinueAutomation =
+      workflow.repair.status === "repairing" ||
+      (
+        options.continueAfterPass !== false &&
+        (automate || (passed && !retryingExternalEnvironmentValidation))
+      );
     await this.persistProjectUpdate(project, {
       save: "immediate",
       emit: "coalesced",
-      automate: automate || (passed && !retryingExternalEnvironmentValidation) || workflow.repair.status === "repairing",
+      automate: shouldContinueAutomation,
       reason: "integrity completed"
     });
   }

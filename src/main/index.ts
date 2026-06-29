@@ -57,6 +57,7 @@ import {
   plannerCycleRecordRequestSchema,
   manageUserInputRequestAttachmentsSchema,
   requestWorkflowPreviewRequestSchema,
+  revalidateWorkflowRepairRequestSchema,
   retryWorkflowGoalRequestSchema,
   runRecommendationRequestSchema,
   setAutopilotPolicyRequestSchema,
@@ -815,6 +816,10 @@ const registerIpc = (): void => {
   ipcMain.handle("workflow:retryGoal", async (_event, payload) => {
     const parsed = retryWorkflowGoalRequestSchema.parse(payload);
     return await appService?.retryWorkflowGoal(parsed.projectId);
+  });
+  ipcMain.handle("workflow:revalidateRepair", async (_event, payload) => {
+    const parsed = revalidateWorkflowRepairRequestSchema.parse(payload);
+    return await appService?.revalidateWorkflowRepair(parsed.projectId);
   });
   ipcMain.handle("workflow:setMode", async (_event, payload) => {
     const parsed = setWorkflowModeRequestSchema.parse(payload);

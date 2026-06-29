@@ -262,6 +262,7 @@ export const checkpointWorktreeChanges = async (
   message: string,
   settings: RuntimeSettings
 ): Promise<{ changedFiles: string[]; createdCommit: boolean; commitSha?: string }> => {
+  await ensureManagedWorktreeGitExclude(worktreePath, settings);
   const pendingFiles = await listPendingWorktreeFiles(worktreePath, settings);
   let createdCommit = false;
   let commitSha: string | undefined;

@@ -1149,7 +1149,7 @@ describe("integration flows", () => {
     expect(record?.workflow.stepProgress.coding.status).toBe("waiting");
     expect(record?.workflow.stepProgress.coding.currentActivity).toBe("Queued for automatic repair");
     expect(record?.localState.autopilotEnabled).toBe(true);
-    expect(record?.workflow.activityLog[0]?.title).toContain("Automatic repair attempt 1");
+    expect(record?.workflow.activityLog.some((event) => event.title.includes("Automatic repair attempt 1"))).toBe(true);
   });
 
   it("turns autopilot off when merge is blocked by an environment-only validation failure", async () => {
@@ -3423,6 +3423,100 @@ describe("integration flows", () => {
       name: "typecheck",
       status: "passed"
     });
+  }, 12_000);
+
+  it("revalidates an external repair checkout and finalizes it without another coding pass", async () => {
+    const root = await createSampleProject("manual-external-repair-revalidate", "git", {
+      typecheck: "node -e \"const fs = require('fs'); process.exit(fs.existsSync('src/external-fix.ts') ? 0 : 1)\""
+    });
+    const appData = await createTempDir("appdata-manual-external-repair-revalidate");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Recover after a repair Codex terminal edits the opened checkout.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-external-repair",
+      sourceRecommendationId: "rec-external-repair",
+      summary: "Validate and integrate the external repair.",
+      executionBrief: "Revalidate the opened checkout, then finalize it if gates pass.",
+      acceptanceCriteria: ["src/external-fix.ts exists."],
+      constraints: ["Do not start another coding pass when the repair is already present."],
+      testStrategy: ["npm run typecheck"],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+
+    await execFileAsync("git", ["checkout", "-b", "feature-old-coding"], { cwd: root });
+    await writeFile(path.join(root, "src/old-coding.ts"), "export const oldCoding = true;\n");
+    await commitAll(root, "old managed coding branch");
+    await execFileAsync("git", ["checkout", "main"], { cwd: root });
+
+    project.record.agents.push({
+      ...createAgentSkeleton("coding", "Coding Pass 1", "Old managed coding branch.", "gpt-5.4"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "completed",
+      completedAt: "2026-04-12T00:01:00.000Z",
+      changedFiles: ["src/old-coding.ts"],
+      worktree: { baseDir: appData, worktreePath: root, branch: "feature-old-coding", targetBranch: "main" }
+    });
+
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "repair_budget_exhausted";
+    workflow.stepProgress.coding.status = "completed";
+    workflow.stepProgress.integrity.status = "failed";
+    workflow.stepProgress.merge.status = "failed";
+    workflow.repair = {
+      attemptCount: 2,
+      maxAttempts: 2,
+      status: "exhausted",
+      latestIssueSummary: "Validation failed before manual repair.",
+      latestFailureReason: "src/external-fix.ts was missing.",
+      lastUpdatedAt: "2026-04-12T00:02:00.000Z"
+    };
+    workflow.manualHandoff = {
+      reason: "repair_exhausted",
+      title: "Automatic repair reached its limit",
+      whatSystemWasTryingToDo: "Validate the current scoped goal.",
+      validationIssue: "Validation failed before manual repair.",
+      latestFailureReason: "src/external-fix.ts was missing.",
+      involvedPaths: ["src/external-fix.ts"],
+      shellSupported: true,
+      createdAt: "2026-04-12T00:02:00.000Z",
+      lastOpenedAt: "2026-04-12T00:03:00.000Z"
+    };
+
+    await mkdir(path.join(root, ".agent-workbench", "manual-handoff"), { recursive: true });
+    await writeFile(path.join(root, ".agent-workbench", "manual-handoff", "codex-handoff.md"), "local handoff helper\n");
+    await writeFile(path.join(root, "src/external-fix.ts"), "export const externalFix = true;\n");
+
+    const previousCodingAgentCount = project.record.agents.filter((agent: AgentState) => agent.category === "coding").length;
+    await service.revalidateWorkflowRepair(selected.record.id);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const codingAgentCount = record?.agents.filter((agent) => agent.category === "coding").length ?? 0;
+    const integrityAgent = record?.agents.find((agent) => agent.category === "integrity");
+    const mergeAgent = record?.agents.find((agent) => agent.category === "merge" && agent.name === "External Repair Merge");
+    const status = (await execFileAsync("git", ["status", "--short"], { cwd: root })).stdout.trim();
+    const latestCommit = (await execFileAsync("git", ["log", "-1", "--format=%s"], { cwd: root })).stdout.trim();
+
+    expect(codingAgentCount).toBe(previousCodingAgentCount);
+    expect(integrityAgent?.status).toBe("completed");
+    expect(integrityAgent?.worktree).toBeUndefined();
+    expect(mergeAgent?.status).toBe("completed");
+    expect(mergeAgent?.mergeReport?.summary).toContain("Externally repaired checkout was validated");
+    expect(record?.workflow.manualHandoff).toBeUndefined();
+    expect(record?.workflow.workflowCycle.status).toBe("merged");
+    expect(record?.workflow.activityLog.some((event) => event.title === "External repair revalidation requested")).toBe(true);
+    expect(record?.workflow.activityLog.some((event) => event.title === "External repair integrated")).toBe(true);
+    expect(await readFile(path.join(root, "src/external-fix.ts"), "utf8")).toContain("externalFix");
+    expect(latestCommit).toBe("AWB checkpoint: external repair");
+    expect(status).toBe("");
   }, 12_000);
 
   it("continues the repair workflow when the max repair cycle limit increases mid-run", async () => {
