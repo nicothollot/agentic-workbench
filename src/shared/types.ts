@@ -1041,6 +1041,7 @@ export interface WorkflowCycle {
   acceptanceCriteria: string[];
   status: WorkflowCycleStatus;
   startedAt?: string;
+  startGitRef?: string;
   completedAt?: string;
 }
 

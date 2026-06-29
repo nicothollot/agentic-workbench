@@ -3518,6 +3518,94 @@ describe("integration flows", () => {
     expect(status).toBe("");
   }, 12_000);
 
+  it("resets the current workflow cycle back to its start checkpoint", async () => {
+    const root = await createSampleRepo("workflow-cycle-reset");
+    const appData = await createTempDir("appdata-workflow-cycle-reset");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    const startGitRef = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
+
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Reset a broken workflow cycle.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.approvedRecommendation = {
+      id: "approved-reset-cycle",
+      recommendationId: "rec-reset-cycle",
+      rank: 1,
+      title: "Implement a resettable change.",
+      summary: "A current-cycle change can be discarded safely.",
+      rationale: "Operators need a reliable reset escape hatch.",
+      expectedImpact: "The cycle can restart from the approved recommendation.",
+      priority: "high",
+      confidence: 0.9,
+      estimatedScope: "small",
+      riskLevel: "low",
+      relatedPaths: ["src/index.ts", "src/new-cycle.ts"],
+      approvedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-reset-cycle",
+      sourceRecommendationId: "rec-reset-cycle",
+      summary: "Implement resettable current-cycle files.",
+      executionBrief: "Edit one tracked file and create one new file.",
+      acceptanceCriteria: ["src/index.ts changed", "src/new-cycle.ts created"],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-12T00:01:00.000Z"
+    };
+    workflow.workflowCycle = {
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      approvedRecommendationId: "rec-reset-cycle",
+      approvedRecommendationTitle: "Implement a resettable change.",
+      scopedGoalSummary: workflow.scopedGoal.summary,
+      acceptanceCriteria: workflow.scopedGoal.acceptanceCriteria,
+      status: "repair_loop",
+      startedAt: "2026-04-12T00:00:00.000Z",
+      startGitRef
+    };
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "repair_budget_exhausted";
+    workflow.repair = {
+      attemptCount: 2,
+      maxAttempts: 2,
+      status: "exhausted",
+      latestIssueSummary: "The current cycle broke validation.",
+      latestFailureReason: "Reset should discard current-cycle changes.",
+      lastUpdatedAt: "2026-04-12T00:02:00.000Z"
+    };
+    project.record.agents.push({
+      ...createAgentSkeleton("coding", "Coding Pass 1", "Broken current-cycle change.", "gpt-5.4"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "completed",
+      completedAt: "2026-04-12T00:02:00.000Z",
+      changedFiles: ["src/index.ts", "src/new-cycle.ts"]
+    });
+    await writeFile(path.join(root, "src/index.ts"), "export const value = 99;\n");
+    await writeFile(path.join(root, "src/new-cycle.ts"), "export const newCycle = true;\n");
+
+    await service.resetWorkflowCycle(selected.record.id);
+
+    const record = getProjectRecord(service, selected.record.id);
+    expect(await readFile(path.join(root, "src/index.ts"), "utf8")).toBe("export const value = 1;\n");
+    await expect(access(path.join(root, "src/new-cycle.ts"))).rejects.toThrow();
+    expect(record?.workflow.scopedGoal).toBeUndefined();
+    expect(record?.workflow.repair.status).toBe("idle");
+    expect(record?.workflow.workflowCycle).toMatchObject({
+      cycleNumber: workflow.workflowCycle.cycleNumber,
+      approvedRecommendationTitle: "Implement a resettable change.",
+      status: "recommendation_approved",
+      startGitRef
+    });
+    expect(record?.localState.workflowPauseRequested).toBe(true);
+    expect(record?.agents.some((agent) => agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)).toBe(false);
+    expect(record?.workflow.activityLog[0]?.title).toBe("Current workflow cycle reset");
+  }, 12_000);
+
   it("continues the repair workflow when the max repair cycle limit increases mid-run", async () => {
     const root = await createSampleFolder("repair-limit-live-update", {
       lint: "node -e \"process.exit(1)\""

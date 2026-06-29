@@ -194,6 +194,7 @@ export interface WorkbenchApi {
   createScopedGoal(projectId: string): Promise<unknown>;
   retryWorkflowGoal(projectId: string): Promise<unknown>;
   revalidateWorkflowRepair(projectId: string): Promise<unknown>;
+  resetWorkflowCycle(projectId: string): Promise<ProjectWorkflowState>;
   setWorkflowMode(projectId: string, workflowMode: ProjectWorkflowState["workflowMode"]): Promise<ProjectWorkflowState>;
   requestWorkflowPreview(projectId: string, reason?: string, remainingCycles?: number): Promise<ProjectWorkflowState>;
   cancelWorkflowPreview(projectId: string): Promise<ProjectWorkflowState>;
@@ -359,6 +360,7 @@ const api: WorkbenchApi = {
   createScopedGoal: async (projectId) => await invoke("workflow:createScopedGoal", { projectId }),
   retryWorkflowGoal: async (projectId) => await invoke("workflow:retryGoal", { projectId }),
   revalidateWorkflowRepair: async (projectId) => await invoke("workflow:revalidateRepair", { projectId }),
+  resetWorkflowCycle: async (projectId) => await invoke<ProjectWorkflowState>("workflow:resetCycle", { projectId }),
   setWorkflowMode: async (projectId, workflowMode) => await invoke<ProjectWorkflowState>("workflow:setMode", { projectId, workflowMode }),
   requestWorkflowPreview: async (projectId, reason, remainingCycles = 1) =>
     await invoke<ProjectWorkflowState>("workflow:requestPreview", { projectId, reason, remainingCycles }),

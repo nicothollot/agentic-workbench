@@ -1865,6 +1865,120 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     workflow.manualHandoff = undefined;
   }
 
+  private async readProjectHeadRef(project: LoadedProject): Promise<string | undefined> {
+    if (project.scan.kind !== "git") {
+      return undefined;
+    }
+    try {
+      const executor = new RuntimeCommandExecutor(this.getRuntimeSettings(project.record.distroName));
+      const result = await executor.execStructuredCommand({
+        command: "git",
+        args: ["rev-parse", "--verify", "HEAD"],
+        cwd: project.record.projectRoot
+      });
+      return result.stdout.trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async ensureWorkflowCycleStartGitRef(project: LoadedProject, workflow: ProjectWorkflowState): Promise<string | undefined> {
+    if (workflow.workflowCycle.startGitRef) {
+      return workflow.workflowCycle.startGitRef;
+    }
+    const startGitRef = await this.readProjectHeadRef(project);
+    if (startGitRef) {
+      workflow.workflowCycle.startGitRef = startGitRef;
+    }
+    return startGitRef;
+  }
+
+  private safeCycleResetCleanPaths(project: LoadedProject, cycleNumber: number): string[] {
+    const normalize = (value: string): string | undefined => {
+      const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "").trim();
+      if (
+        !normalized ||
+        normalized === "." ||
+        normalized.startsWith("/") ||
+        /^[A-Za-z]:\//.test(normalized) ||
+        normalized.startsWith("../") ||
+        normalized.includes("/../") ||
+        normalized === ".git" ||
+        normalized.startsWith(".git/")
+      ) {
+        return undefined;
+      }
+      return normalized;
+    };
+    const workflow = this.ensureWorkflowState(project.record);
+    const cycleAgents = project.record.agents.filter((agent) => agent.workflowCycleNumber === cycleNumber);
+    const currentCycleHygienePaths = workflow.repoHygieneReports
+      .filter((report) => report.scannedRef.includes(`:${cycleNumber}`))
+      .flatMap((report) => [...report.forbiddenFiles, ...report.cleanedFiles]);
+    return unique([
+      ...cycleAgents.flatMap((agent) => agent.changedFiles),
+      ...currentCycleHygienePaths
+    ].flatMap((entry) => normalize(entry) ?? []));
+  }
+
+  private async resetProjectCheckoutToCycleStart(project: LoadedProject, workflow: ProjectWorkflowState): Promise<string> {
+    if (project.scan.kind !== "git") {
+      return "Project is not a Git checkout; workflow state was reset but project files were not changed.";
+    }
+
+    const executor = new RuntimeCommandExecutor(this.getRuntimeSettings(project.record.distroName));
+    const startGitRef = workflow.workflowCycle.startGitRef;
+    if (startGitRef) {
+      try {
+        await executor.execStructuredCommand({
+          command: "git",
+          args: ["rev-parse", "--verify", `${startGitRef}^{commit}`],
+          cwd: project.record.projectRoot
+        });
+      } catch {
+        throw new Error(`The cycle start commit ${startGitRef.slice(0, 12)} is no longer available, so Workbench cannot safely reset project files.`);
+      }
+      await executor.execStructuredCommand({
+        command: "git",
+        args: ["reset", "--hard", startGitRef],
+        cwd: project.record.projectRoot
+      });
+      const cleanPaths = this.safeCycleResetCleanPaths(project, workflow.workflowCycle.cycleNumber);
+      for (let index = 0; index < cleanPaths.length; index += 50) {
+        await executor.execStructuredCommand({
+          command: "git",
+          args: ["clean", "-fd", "--", ...cleanPaths.slice(index, index + 50)],
+          cwd: project.record.projectRoot
+        });
+      }
+      return `Project checkout reset to cycle start commit ${startGitRef.slice(0, 12)}.`;
+    }
+
+    const cleanPaths = this.safeCycleResetCleanPaths(project, workflow.workflowCycle.cycleNumber);
+    const trackedPaths = cleanPaths.length > 0
+      ? unique((await executor.execStructuredCommand({
+        command: "git",
+        args: ["ls-files", "--", ...cleanPaths],
+        cwd: project.record.projectRoot
+      })).stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean))
+      : [];
+    for (let index = 0; index < trackedPaths.length; index += 50) {
+      await executor.execStructuredCommand({
+        command: "git",
+        args: ["restore", "--source", "HEAD", "--", ...trackedPaths.slice(index, index + 50)],
+        cwd: project.record.projectRoot
+      });
+    }
+    for (let index = 0; index < cleanPaths.length; index += 50) {
+      await executor.execStructuredCommand({
+        command: "git",
+        args: ["clean", "-fd", "--", ...cleanPaths.slice(index, index + 50)],
+        cwd: project.record.projectRoot
+      });
+    }
+    return "This saved cycle did not record a start commit. Recorded current-cycle paths were restored from HEAD; committed changes and unrelated files were left in place.";
+  }
+
   private updateWorkflowRepairState(
     workflow: ProjectWorkflowState,
     patch: Partial<ProjectWorkflowState["repair"]>
@@ -10988,6 +11102,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   ): Promise<void> {
     const workflow = this.ensureWorkflowState(project.record);
     const boundedScopedGoal = sanitizeScopedGoalForSingleAgent(scopedGoal);
+    await this.ensureWorkflowCycleStartGitRef(project, workflow);
     workflow.scopedGoal = boundedScopedGoal;
     workflow.workflowCycle = {
       ...workflow.workflowCycle,
@@ -11282,6 +11397,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         stepId: "recommendation"
       });
     }
+    const startGitRef = await this.ensureWorkflowCycleStartGitRef(project, workflow);
     workflow.workflowCycle = {
       ...workflow.workflowCycle,
       approvedRecommendationId: recommendation.id,
@@ -11289,6 +11405,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       scopedGoalSummary: undefined,
       acceptanceCriteria: [],
       startedAt: workflow.workflowCycle.startedAt ?? nowIso(),
+      startGitRef,
       completedAt: undefined,
       status: "recommendation_approved"
     };
@@ -11760,6 +11877,108 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     ) {
       await this.finalizeExternalRepairCheckout(projectId);
     }
+  }
+
+  async resetWorkflowCycle(projectId: string): Promise<ProjectWorkflowState> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+
+    if (this.hasActiveWorkflowAgent(project)) {
+      throw new Error("Wait for the active workflow agent to finish before resetting the cycle.");
+    }
+
+    this.cancelScheduledWorkflowAutomation(projectId);
+    const cycleNumber = workflow.workflowCycle.cycleNumber;
+    const checkoutResetSummary = await this.resetProjectCheckoutToCycleStart(project, workflow);
+    const approvedRecommendation = workflow.approvedRecommendation;
+    const startGitRef = workflow.workflowCycle.startGitRef;
+    const startedAt = workflow.workflowCycle.startedAt ?? nowIso();
+
+    project.record.agents = project.record.agents.filter((agent) => agent.workflowCycleNumber !== cycleNumber);
+    project.record.localState.workflowPauseRequested = true;
+
+    workflow.scopedGoal = undefined;
+    workflow.previewRequest = defaultProjectWorkflowState().previewRequest;
+    this.resetWorkflowRepairState(workflow);
+    workflow.workflowCycle = {
+      cycleNumber,
+      approvedRecommendationId: approvedRecommendation?.recommendationId,
+      approvedRecommendationTitle: approvedRecommendation?.title,
+      acceptanceCriteria: [],
+      status: approvedRecommendation ? "recommendation_approved" : "idle",
+      startedAt,
+      startGitRef
+    };
+    workflow.workflowStopReason = approvedRecommendation
+      ? "goal_not_scoped"
+      : workflow.recommendations.length > 0
+        ? "awaiting_recommendation_approval"
+        : "recommendation_missing";
+    workflow.evidenceObservations = workflow.evidenceObservations.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.checklistDeltas = workflow.checklistDeltas.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.validationLedgers = workflow.validationLedgers.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.repoHygieneReports = workflow.repoHygieneReports.filter((entry) => !entry.scannedRef.includes(`:${cycleNumber}`));
+    workflow.cycleRetrospectives = workflow.cycleRetrospectives.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.memory.perCycleSummaries = workflow.memory.perCycleSummaries.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.memory.contextDescriptors = workflow.memory.contextDescriptors.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.memory.lastRelevantContext = workflow.memory.lastRelevantContext.filter((entry) => entry.cycleNumber !== cycleNumber);
+    workflow.memory.lastAcceptedDecisions = workflow.memory.lastAcceptedDecisions.filter((entry) =>
+      entry.cycleNumber !== cycleNumber || entry.kind === "recommendation"
+    );
+    workflow.memory.knownOpenIssues = workflow.memory.knownOpenIssues.map((issue) =>
+      issue.status === "open" && (issue.source === "coding" || issue.source === "integrity" || issue.source === "merge")
+        ? { ...issue, status: "resolved" as const, resolvedAt: nowIso() }
+        : issue
+    );
+    workflow.cycleContract = approvedRecommendation
+      ? buildCycleContract(workflow, {
+        now: nowIso(),
+        selectedTaskSource: workflow.cycleContract?.selectedTaskSource ?? workflow.recommendationHealth.selectedTaskSource
+      })
+      : undefined;
+
+    if (approvedRecommendation) {
+      this.updateWorkflowStepProgress(workflow, "recommendation", {
+        requiresUserInput: false,
+        currentActivity: "Recommendation approved",
+        latestProgressNote: approvedRecommendation.title,
+        message: "Cycle was reset. The approved recommendation is preserved and ready to be scoped again.",
+        warning: undefined
+      }, { status: "completed" });
+      this.resetWorkflowStepProgress(workflow, "goal_plan", {
+        status: "waiting",
+        requiresUserInput: false,
+        currentActivity: "Queued for scoping",
+        message: "Reset returned this cycle to the start. Continue workflow to rebuild the scoped plan."
+      });
+    } else {
+      this.resetWorkflowStepProgress(workflow, "recommendation", {
+        status: workflow.recommendations.length > 0 ? "waiting" : "not_started",
+        requiresUserInput: workflow.recommendations.length > 0,
+        currentActivity: workflow.recommendations.length > 0 ? "Waiting for a recommendation choice" : "Queued for recommendation generation",
+        message: workflow.recommendations.length > 0
+          ? "Cycle was reset before a recommendation was approved."
+          : "Cycle was reset and recommendations can be generated again."
+      });
+      this.resetWorkflowStepProgress(workflow, "goal_plan");
+    }
+    this.resetWorkflowStepProgress(workflow, "coding");
+    this.resetWorkflowStepProgress(workflow, "integrity");
+    this.resetWorkflowStepProgress(workflow, "merge");
+    this.recordWorkflowActivity(workflow, {
+      source: "system",
+      status: "waiting",
+      title: "Current workflow cycle reset",
+      detail: `${checkoutResetSummary} Workflow is paused at the start of cycle ${cycleNumber}.`,
+      stepId: approvedRecommendation ? "goal_plan" : "recommendation"
+    });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, {
+      save: "immediate",
+      emit: "coalesced",
+      reason: "workflow cycle reset"
+    });
+    return project.record.workflow;
   }
 
   private async finalizeExternalRepairCheckout(projectId: string): Promise<void> {
@@ -13292,6 +13511,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "starting",
       repair ? "Starting the repair coding agent and preparing its worktree." : "Starting the coding agent and preparing its worktree."
     );
+    await this.ensureWorkflowCycleStartGitRef(project, workflow);
     this.scheduleProjectSave(project);
     this.emitState();
 

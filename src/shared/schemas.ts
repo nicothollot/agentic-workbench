@@ -1049,6 +1049,7 @@ export const workflowCycleSchema = z.object({
   acceptanceCriteria: z.array(z.string()).default([]),
   status: workflowCycleStatusSchema.default("idle"),
   startedAt: isoDatetime().optional(),
+  startGitRef: z.string().optional(),
   completedAt: isoDatetime().optional()
 });
 

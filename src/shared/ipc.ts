@@ -373,6 +373,10 @@ export const revalidateWorkflowRepairRequestSchema = z.object({
   projectId: z.string().min(1)
 });
 
+export const resetWorkflowCycleRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
 export const setWorkflowModeRequestSchema = z.object({
   projectId: z.string().min(1),
   workflowMode: workflowModeSchema
@@ -580,6 +584,7 @@ export type IpcChannel =
   | "workflow:createScopedGoal"
   | "workflow:retryGoal"
   | "workflow:revalidateRepair"
+  | "workflow:resetCycle"
   | "workflow:setMode"
   | "workflow:requestPreview"
   | "workflow:cancelPreview"

@@ -7186,9 +7186,14 @@ const SettingsDialog = ({
   onRefreshCodexReadiness,
   onCheckCodexUpdate,
   onRunCodexUpdate,
+  onRevalidateWorkflowRepair,
+  onResetWorkflowCycle,
   runtimeCheckBusy = false,
   codexUpdateBusy = false,
   codexUpdateBusyLabel,
+  workflowRepairRevalidationAvailable = false,
+  workflowRepairRevalidationBusy = false,
+  workflowCycleResetBusy = false,
   mode = "modal"
 }: {
   state: WorkbenchState;
@@ -7221,9 +7226,14 @@ const SettingsDialog = ({
   onRefreshCodexReadiness: () => void;
   onCheckCodexUpdate: () => void;
   onRunCodexUpdate: (approvedCommand: string) => void;
+  onRevalidateWorkflowRepair: () => void;
+  onResetWorkflowCycle: () => void;
   runtimeCheckBusy?: boolean;
   codexUpdateBusy?: boolean;
   codexUpdateBusyLabel?: string;
+  workflowRepairRevalidationAvailable?: boolean;
+  workflowRepairRevalidationBusy?: boolean;
+  workflowCycleResetBusy?: boolean;
   mode?: "modal" | "page";
 }) => {
   const selectedModel = state.availableModels.find((model) => model.model === settingsDraft.interfaceCreationModel);
@@ -7557,6 +7567,38 @@ const SettingsDialog = ({
                 onChange={(event) => onChange({ maxRepairCycles: Math.max(1, Math.min(10, Number(event.target.value) || 1)) })}
               />
             </label>
+          </div>
+          <div className="settings-card">
+            <div className="settings-section__heading">
+              <strong>Workflow recovery controls</strong>
+              <span className="badge">Manual fallback</span>
+            </div>
+            <p className="settings-card__copy">
+              Use these when the Workflow screen does not surface the right recovery action. Revalidation checks a repaired checkout before integration; reset returns the workflow to this cycle's starting point.
+            </p>
+            <div className="tag-row">
+              <span className="tag">Project: {activeProject?.record.identity.projectName ?? "No active project"}</span>
+              <span className="tag">Repair: {workflowRepairRevalidationAvailable ? "can be revalidated" : "Workbench will verify eligibility"}</span>
+              <span className="tag">Cycle: {activeProject?.record.workflow.workflowCycle.cycleNumber ?? "none"}</span>
+            </div>
+            <div className="actions-row">
+              <button
+                className="primary-button"
+                disabled={!activeProject || workflowRepairRevalidationBusy || workflowCycleResetBusy}
+                onClick={onRevalidateWorkflowRepair}
+                type="button"
+              >
+                {workflowRepairRevalidationBusy ? "Revalidating repair..." : "Revalidate repair"}
+              </button>
+              <button
+                className="secondary-button"
+                disabled={!activeProject || workflowRepairRevalidationBusy || workflowCycleResetBusy}
+                onClick={onResetWorkflowCycle}
+                type="button"
+              >
+                {workflowCycleResetBusy ? "Resetting cycle..." : "Reset current cycle"}
+              </button>
+            </div>
           </div>
         </div>
         <div className="settings-section">
@@ -8412,6 +8454,8 @@ const WorkbenchApp = () => {
   const createWorkspaceUsesGitHub = projectCreationMode === "initialize_github";
   const createWorkspaceLocked = createWorkspaceUsesGitHub && !githubSshReady;
   const activeProjectId = activeProject?.record.id;
+  const workflow = activeProject?.record.workflow;
+  const workflowCanRevalidateRepair = canRevalidateExternalRepair(workflow);
   const runtimeReadiness = state?.runtimeReadiness;
   const agentActionsBlocked = Boolean(runtimeReadiness?.blockAgentActions);
   const activeWorkflowCommandBusy = Boolean(activeProjectId && workflowCommandBusyKey?.startsWith(`${activeProjectId}:`));
@@ -8447,7 +8491,6 @@ const WorkbenchApp = () => {
     }
   }, [goalCharterAiModel, goalCharterAiReasoningEffort, modelOptionsByName]);
   const deferredTreeFilter = useDeferredValue(treeFilterDraft);
-  const workflow = activeProject?.record.workflow;
   const ultimateGoalMissing = !workflow?.ultimateGoal.confirmedAt;
   const autopilotPolicy = workflow?.autopilotPolicy;
   const autopilotStatus = workflow?.autopilotStatus;
@@ -10973,6 +11016,25 @@ const WorkbenchApp = () => {
     });
   };
 
+  const resetWorkflowCycle = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Reset the current workflow cycle? Workbench will discard recorded progress for this cycle and reset the project checkout to the cycle start when a safe Git checkpoint exists."
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    await runWorkflowCommand("reset-cycle", async () => {
+      setNotice(undefined);
+      await window.workbench.resetWorkflowCycle(activeProject.record.id);
+      showInfoNotice("Current workflow cycle reset. The workflow is paused at the start of the cycle.");
+    });
+  };
+
   const runWorkflowMerge = async () => {
     if (!activeProject) {
       return;
@@ -11256,9 +11318,14 @@ const WorkbenchApp = () => {
       onRefreshCodexReadiness={() => void refreshCodexReadiness()}
       onCheckCodexUpdate={() => void checkCodexUpdate()}
       onRunCodexUpdate={(approvedCommand) => void runCodexUpdate(approvedCommand)}
+      onRevalidateWorkflowRepair={() => void revalidateWorkflowRepair()}
+      onResetWorkflowCycle={() => void resetWorkflowCycle()}
       runtimeCheckBusy={runtimeCheckBusy}
       codexUpdateBusy={codexUpdateBusy}
       codexUpdateBusyLabel={codexUpdateBusyLabel}
+      workflowRepairRevalidationAvailable={workflowCanRevalidateRepair}
+      workflowRepairRevalidationBusy={workflowCommandBusyKey === `${activeProjectId}:revalidate-repair`}
+      workflowCycleResetBusy={workflowCommandBusyKey === `${activeProjectId}:reset-cycle`}
     />
   ) : null;
 
@@ -11569,7 +11636,6 @@ const WorkbenchApp = () => {
     activeProject.record.localState.lastOpenedAt;
   const projectBranchOrPath = activeProject.record.validation.branch ?? activeProject.record.displayPath;
   const workflowRecoveryAvailable = Boolean(workflowRuntimeStatus?.status === "stale-running" && workflowPendingApprovals.length === 0);
-  const workflowCanRevalidateRepair = canRevalidateExternalRepair(workflow);
   const workflowContinueActionLabel = workflowCanRevalidateRepair
     ? "Revalidate repair"
     : autopilotStatus?.pausedReason === "high_risk_package_requires_approval"
@@ -13508,9 +13574,14 @@ const WorkbenchApp = () => {
               onRefreshCodexReadiness={() => void refreshCodexReadiness()}
               onCheckCodexUpdate={() => void checkCodexUpdate()}
               onRunCodexUpdate={(approvedCommand) => void runCodexUpdate(approvedCommand)}
+              onRevalidateWorkflowRepair={() => void revalidateWorkflowRepair()}
+              onResetWorkflowCycle={() => void resetWorkflowCycle()}
               runtimeCheckBusy={runtimeCheckBusy}
               codexUpdateBusy={codexUpdateBusy}
               codexUpdateBusyLabel={codexUpdateBusyLabel}
+              workflowRepairRevalidationAvailable={workflowCanRevalidateRepair}
+              workflowRepairRevalidationBusy={workflowCommandBusyKey === `${activeProjectId}:revalidate-repair`}
+              workflowCycleResetBusy={workflowCommandBusyKey === `${activeProjectId}:reset-cycle`}
             />
             <CredentialsPanel project={activeProject} onSaved={showInfoNotice} onError={handleError} />
           </div>

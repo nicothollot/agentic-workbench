@@ -58,6 +58,7 @@ import {
   manageUserInputRequestAttachmentsSchema,
   requestWorkflowPreviewRequestSchema,
   revalidateWorkflowRepairRequestSchema,
+  resetWorkflowCycleRequestSchema,
   retryWorkflowGoalRequestSchema,
   runRecommendationRequestSchema,
   setAutopilotPolicyRequestSchema,
@@ -820,6 +821,10 @@ const registerIpc = (): void => {
   ipcMain.handle("workflow:revalidateRepair", async (_event, payload) => {
     const parsed = revalidateWorkflowRepairRequestSchema.parse(payload);
     return await appService?.revalidateWorkflowRepair(parsed.projectId);
+  });
+  ipcMain.handle("workflow:resetCycle", async (_event, payload) => {
+    const parsed = resetWorkflowCycleRequestSchema.parse(payload);
+    return await appService?.resetWorkflowCycle(parsed.projectId);
   });
   ipcMain.handle("workflow:setMode", async (_event, payload) => {
     const parsed = setWorkflowModeRequestSchema.parse(payload);
