@@ -6,6 +6,7 @@ import type {
   ProjectWorkflowState,
   UserInputRequestRecord
 } from "@shared/types";
+import { canRevalidateExternalRepair } from "@shared/workflowView";
 
 type WorkflowTimelineWarning = {
   id: string;
@@ -147,6 +148,19 @@ export const buildWorkflowAttentionItems = ({
       createdAt: workflow.manualHandoff.createdAt,
       manualHandoff: workflow.manualHandoff,
       target: "manual-handoff"
+    });
+  } else if (canRevalidateExternalRepair(workflow)) {
+    items.push({
+      id: "repair:revalidate",
+      kind: "integrity",
+      title: "Repair needs revalidation",
+      detail: summarizeAttentionText(
+        workflow?.repair.latestFailureReason ?? workflow?.repair.latestIssueSummary,
+        "Run repair revalidation before merge can continue.",
+        150
+      ),
+      tone: "danger",
+      createdAt: workflow?.repair.lastUpdatedAt
     });
   } else if (workflow?.workflowStage === "blocked_human" && humanInterventions.length === 0 && userInputRequests.length === 0) {
     items.push({

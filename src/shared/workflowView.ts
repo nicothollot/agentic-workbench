@@ -731,14 +731,34 @@ export const workflowStatusSummary = (
   return "The workflow is progressing automatically";
 };
 
+export const canRevalidateExternalRepair = (workflow?: ProjectWorkflowState | null): boolean => {
+  if (!workflow) {
+    return false;
+  }
+  if (
+    workflow.repair.status === "merge_conflicts" ||
+    workflow.workflowStopReason === "merge_conflicts" ||
+    workflow.manualHandoff?.reason === "merge_conflicts"
+  ) {
+    return false;
+  }
+
+  return Boolean(
+    workflow.manualHandoff ||
+    workflow.repair.status === "exhausted" ||
+    workflow.workflowStopReason === "repair_budget_exhausted" ||
+    workflow.workflowStopReason === "repair_stopped_early"
+  );
+};
+
 const hasVisibleManualHandoff = (workflow: ProjectWorkflowState): boolean =>
   Boolean(
     workflow.manualHandoff &&
     (
-      workflow.repair.status === "exhausted" ||
       workflow.repair.status === "merge_conflicts" ||
       workflow.workflowStopReason === "merge_conflicts" ||
-      workflow.manualHandoff.reason === "merge_conflicts"
+      workflow.manualHandoff.reason === "merge_conflicts" ||
+      canRevalidateExternalRepair(workflow)
     )
   );
 
@@ -775,7 +795,20 @@ export const workflowActionGuide = (
       kind: "manual_takeover",
       title: workflow.manualHandoff.title,
       description: workflow.manualHandoff.latestFailureReason,
-      actionLabel: workflow.manualHandoff.shellSupported ? "Open Codex terminal" : undefined
+      actionLabel: canRevalidateExternalRepair(workflow)
+        ? "Revalidate repair"
+        : workflow.manualHandoff.shellSupported
+          ? "Open Codex terminal"
+          : undefined
+    };
+  }
+
+  if (canRevalidateExternalRepair(workflow)) {
+    return {
+      kind: "manual_takeover",
+      title: "Revalidate repair before merge",
+      description: workflow.repair.latestFailureReason ?? workflow.repair.latestIssueSummary ?? "A repair was completed outside the workflow and needs validation before integration can continue.",
+      actionLabel: "Revalidate repair"
     };
   }
 

@@ -85,6 +85,7 @@ import {
 import {
   buildWorkflowGoalView,
   buildWorkflowTimelineSteps,
+  canRevalidateExternalRepair,
   deriveWorkflowRuntimeStatus,
   deriveUserFacingWorkflowStatus,
   getWorkflowRecoveryCandidate,
@@ -4363,9 +4364,51 @@ describe("workflow view helpers", () => {
     });
     expect(workflowActionGuide(workflow)).toMatchObject({
       kind: "manual_takeover",
-      actionLabel: "Open Codex terminal"
+      actionLabel: "Revalidate repair"
     });
+    expect(canRevalidateExternalRepair(workflow)).toBe(true);
     expect(workflowRunStateLabel(workflow, "git")).toBe("Waiting on you");
+  });
+
+  it("offers repair revalidation for legacy exhausted repair state without a manual handoff", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Recover a saved repair loop.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "integrity_failed";
+    workflow.repair = {
+      attemptCount: 2,
+      maxAttempts: 2,
+      status: "exhausted",
+      latestIssueSummary: "Validation and hygiene still block merge.",
+      latestFailureReason: "Repository hygiene blocked merge after external repair.",
+      lastUpdatedAt: "2026-04-07T00:04:00.000Z"
+    };
+
+    expect(canRevalidateExternalRepair(workflow)).toBe(true);
+    expect(workflowActionGuide(workflow)).toMatchObject({
+      kind: "manual_takeover",
+      title: "Revalidate repair before merge",
+      actionLabel: "Revalidate repair"
+    });
+
+    const attentionItems = buildWorkflowAttentionItems({
+      workflow,
+      approvals: [],
+      userInputRequests: [],
+      humanInterventions: [],
+      credentialRequests: [],
+      timeline: buildWorkflowTimelineSteps(workflow),
+      agents: []
+    });
+
+    expect(attentionItems).toContainEqual(expect.objectContaining({
+      id: "repair:revalidate",
+      title: "Repair needs revalidation"
+    }));
   });
 
   it("distinguishes early repair stops from configured repair-budget exhaustion", () => {

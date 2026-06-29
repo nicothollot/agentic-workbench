@@ -3487,8 +3487,7 @@ describe("integration flows", () => {
       latestFailureReason: "src/external-fix.ts was missing.",
       involvedPaths: ["src/external-fix.ts"],
       shellSupported: true,
-      createdAt: "2026-04-12T00:02:00.000Z",
-      lastOpenedAt: "2026-04-12T00:03:00.000Z"
+      createdAt: "2026-04-12T00:02:00.000Z"
     };
 
     await mkdir(path.join(root, ".agent-workbench", "manual-handoff"), { recursive: true });

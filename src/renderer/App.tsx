@@ -11,6 +11,7 @@ import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/
 import {
   buildWorkflowGoalView,
   buildWorkflowTimelineSteps,
+  canRevalidateExternalRepair,
   deriveUserFacingWorkflowStatus,
   deriveWorkflowRuntimeStatus,
   getWorkflowRecoveryCandidate,
@@ -305,6 +306,14 @@ type ShellAction = {
   label: string;
   onClick: () => void;
   disabled?: boolean;
+};
+
+type WorkflowButtonAction = {
+  label: string;
+  disabled?: boolean;
+  busy?: boolean;
+  busyLabel?: string;
+  onClick: () => void;
 };
 
 const interfaceIconUrl = new URL("../../assets/branding/interface_icon.png", import.meta.url).href;
@@ -5025,7 +5034,8 @@ const WorkflowCurrentActionCard = ({
   approvalsPending,
   nextAction,
   phase,
-  repairAction
+  repairAction,
+  secondaryRepairAction
 }: {
   stageLabel: string;
   agentName: string;
@@ -5037,13 +5047,8 @@ const WorkflowCurrentActionCard = ({
   approvalsPending: number;
   nextAction: string;
   phase: string;
-  repairAction?: {
-    label: string;
-    disabled?: boolean;
-    busy?: boolean;
-    busyLabel?: string;
-    onClick: () => void;
-  };
+  repairAction?: WorkflowButtonAction;
+  secondaryRepairAction?: WorkflowButtonAction;
 }) => (
   <article className="workflow-now-card">
     <SectionTitle
@@ -5085,11 +5090,18 @@ const WorkflowCurrentActionCard = ({
     <div className="workflow-now-card__next">
       <span className="workflow-option__label">Next recommended action</span>
       <p>{nextAction}</p>
-      {repairAction ? (
+      {repairAction || secondaryRepairAction ? (
         <div className="actions-row workflow-now-card__actions">
-          <button className="primary-button" disabled={repairAction.disabled || repairAction.busy} onClick={repairAction.onClick} type="button">
-            {repairAction.busy ? repairAction.busyLabel ?? "Working..." : repairAction.label}
-          </button>
+          {repairAction ? (
+            <button className="primary-button" disabled={repairAction.disabled || repairAction.busy} onClick={repairAction.onClick} type="button">
+              {repairAction.busy ? repairAction.busyLabel ?? "Working..." : repairAction.label}
+            </button>
+          ) : null}
+          {secondaryRepairAction ? (
+            <button className="secondary-button" disabled={secondaryRepairAction.disabled || secondaryRepairAction.busy} onClick={secondaryRepairAction.onClick} type="button">
+              {secondaryRepairAction.busy ? secondaryRepairAction.busyLabel ?? "Working..." : secondaryRepairAction.label}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -5185,8 +5197,10 @@ const WorkflowNeedsAttentionPanel = ({
   onViewDetails,
   onRetryManualHandoff,
   onOpenProjectShell,
+  onOpenRepairAgent,
   onDownloadRepairReport,
   shellLaunchBusy,
+  repairAgentLaunchBusy,
   repairReportAvailable
 }: {
   items: WorkflowAttentionItem[];
@@ -5196,8 +5210,10 @@ const WorkflowNeedsAttentionPanel = ({
   onViewDetails: (target?: WorkflowAttentionItem["target"]) => void;
   onRetryManualHandoff: () => void;
   onOpenProjectShell: () => void;
+  onOpenRepairAgent: () => void;
   onDownloadRepairReport: () => void;
   shellLaunchBusy: boolean;
+  repairAgentLaunchBusy: boolean;
   repairReportAvailable: boolean;
 }) => {
   const [expandedItemId, setExpandedItemId] = useState<string>();
@@ -5273,11 +5289,17 @@ const WorkflowNeedsAttentionPanel = ({
                       </button>
                       <button
                         className="secondary-button"
-                        disabled={shellLaunchBusy || !manualHandoff.shellSupported}
-                        onClick={onOpenProjectShell}
+                        disabled={
+                          manualHandoff.reason === "merge_conflicts"
+                            ? shellLaunchBusy || !manualHandoff.shellSupported
+                            : repairAgentLaunchBusy || !manualHandoff.shellSupported
+                        }
+                        onClick={manualHandoff.reason === "merge_conflicts" ? onOpenProjectShell : onOpenRepairAgent}
                         type="button"
                       >
-                        {shellLaunchBusy ? "Opening terminal..." : "Open Codex terminal"}
+                        {manualHandoff.reason === "merge_conflicts"
+                          ? shellLaunchBusy ? "Opening terminal..." : "Open Codex terminal"
+                          : repairAgentLaunchBusy ? "Opening repair agent..." : "Repair in Codex"}
                       </button>
                       <button
                         className="secondary-button"
@@ -10479,7 +10501,7 @@ const WorkbenchApp = () => {
 
     await runWorkflowCommand("continue", async () => {
       setNotice(undefined);
-      if (workflow?.manualHandoff && workflow.repair.status === "exhausted") {
+      if (canRevalidateExternalRepair(workflow)) {
         await window.workbench.revalidateWorkflowRepair(activeProject.record.id);
         showInfoNotice("Repair revalidation started. Workbench will validate, check hygiene, and continue integration if it passes.");
         return;
@@ -11547,7 +11569,10 @@ const WorkbenchApp = () => {
     activeProject.record.localState.lastOpenedAt;
   const projectBranchOrPath = activeProject.record.validation.branch ?? activeProject.record.displayPath;
   const workflowRecoveryAvailable = Boolean(workflowRuntimeStatus?.status === "stale-running" && workflowPendingApprovals.length === 0);
-  const workflowContinueActionLabel = autopilotStatus?.pausedReason === "high_risk_package_requires_approval"
+  const workflowCanRevalidateRepair = canRevalidateExternalRepair(workflow);
+  const workflowContinueActionLabel = workflowCanRevalidateRepair
+    ? "Revalidate repair"
+    : autopilotStatus?.pausedReason === "high_risk_package_requires_approval"
     ? "Approve package"
     : "Continue workflow";
   const workflowShellStatus: { label: string; tone: ShellStatusTone } = activeProject.record.interfaceCreation?.status === "running"
@@ -11569,10 +11594,10 @@ const WorkbenchApp = () => {
       }
       : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
         ? {
-          label: workflow?.manualHandoff && !isMergeConflictHandoff(workflow) ? "Revalidate repair" : workflowAction.actionLabel,
+          label: workflowCanRevalidateRepair ? "Revalidate repair" : workflowAction.actionLabel,
           disabled: workflowCommandBusy || (isMergeConflictHandoff(workflow) && (shellLaunchBusy || !workflow?.manualHandoff?.shellSupported)),
           onClick: () => {
-            if (workflow?.manualHandoff && !isMergeConflictHandoff(workflow)) {
+            if (workflowCanRevalidateRepair) {
               void revalidateWorkflowRepair();
               return;
             }
@@ -11691,9 +11716,13 @@ const WorkbenchApp = () => {
               }
             : workflowAction?.kind === "manual_takeover" && workflowAction.actionLabel
               ? {
-                label: workflowAction.actionLabel,
-                disabled: shellLaunchBusy || !workflow?.manualHandoff?.shellSupported,
-                onClick: () => void openProjectShell()
+                label: workflowCanRevalidateRepair ? "Revalidate repair" : workflowAction.actionLabel,
+                disabled: workflowCanRevalidateRepair
+                  ? workflowCommandBusy
+                  : shellLaunchBusy || !workflow?.manualHandoff?.shellSupported,
+                onClick: workflowCanRevalidateRepair
+                  ? () => void revalidateWorkflowRepair()
+                  : () => void openProjectShell()
               }
               : workflowShellStatus.tone === "running" && !workflowPauseRequested
                 ? {
@@ -11761,15 +11790,11 @@ const WorkbenchApp = () => {
   const workflowHygieneBlocking = latestRepoHygieneReport
     ? latestRepoHygieneReport.status !== "passed"
     : false;
-  const externalRepairReadyForRevalidation = Boolean(
-    workflow?.manualHandoff &&
-    !isMergeConflictHandoff(workflow) &&
-    workflow.manualHandoff.lastOpenedAt
-  );
   const workflowRepairAgentAvailable = Boolean(
     workflow &&
     !ultimateGoalMissing &&
     (
+      workflowCanRevalidateRepair ||
       workflowValidationBlocking ||
       workflowHygieneBlocking ||
       operatorWorkflowView.currentStatus.severity === "danger"
@@ -12360,13 +12385,20 @@ const WorkbenchApp = () => {
                 nextAction={summarizeText(operatorWorkflowView.currentStatus.nextOperatorAction, "No validation, hygiene, checklist, or planner blocker is currently recorded.", 160)}
                 phase={workflowCurrentPhase}
                 repairAction={workflowRepairAgentAvailable ? {
-                  label: externalRepairReadyForRevalidation ? "Revalidate repair" : "Repair in Codex",
-                  busy: externalRepairReadyForRevalidation ? workflowCommandBusy : repairAgentLaunchBusy,
-                  busyLabel: externalRepairReadyForRevalidation ? "Revalidating repair..." : "Opening repair agent...",
-                  disabled: externalRepairReadyForRevalidation ? workflowCommandBusy : shellLaunchBusy,
-                  onClick: externalRepairReadyForRevalidation
+                  label: workflowCanRevalidateRepair ? "Revalidate repair" : "Repair in Codex",
+                  busy: workflowCanRevalidateRepair ? workflowCommandBusy : repairAgentLaunchBusy,
+                  busyLabel: workflowCanRevalidateRepair ? "Revalidating repair..." : "Opening repair agent...",
+                  disabled: workflowCanRevalidateRepair ? workflowCommandBusy : repairAgentLaunchBusy,
+                  onClick: workflowCanRevalidateRepair
                     ? () => void revalidateWorkflowRepair()
                     : () => void openWorkflowRepairAgent()
+                } : undefined}
+                secondaryRepairAction={workflowCanRevalidateRepair && workflowRepairAgentAvailable ? {
+                  label: "Repair in Codex",
+                  busy: repairAgentLaunchBusy,
+                  busyLabel: "Opening repair agent...",
+                  disabled: repairAgentLaunchBusy,
+                  onClick: () => void openWorkflowRepairAgent()
                 } : undefined}
               />
               <WorkflowCurrentAgentMessages
@@ -12406,8 +12438,10 @@ const WorkbenchApp = () => {
                   void revalidateWorkflowRepair();
                 }}
                 onOpenProjectShell={() => void openProjectShell()}
+                onOpenRepairAgent={() => void openWorkflowRepairAgent()}
                 onDownloadRepairReport={downloadRepairReport}
                 shellLaunchBusy={shellLaunchBusy}
+                repairAgentLaunchBusy={repairAgentLaunchBusy}
                 repairReportAvailable={repairAttemptReports.length > 0}
               />
             </section>
@@ -12460,7 +12494,7 @@ const WorkbenchApp = () => {
               onCompletePreview={() => void completeWorkflowPreview()}
               onContinueWorkflow={() => void continueWorkflow()}
               continueActionLabel={workflowContinueActionLabel}
-              canContinueWorkflow={!workflowCommandBusy && (workflowRuntimeStatus?.canContinue ?? false)}
+              canContinueWorkflow={!workflowCommandBusy && (workflowCanRevalidateRepair || (workflowRuntimeStatus?.canContinue ?? false))}
               continueDisabledReason={workflowCommandBusyReason ?? workflowRuntimeStatus?.continueDisabledReason}
             />
 
@@ -12532,10 +12566,18 @@ const WorkbenchApp = () => {
                   ) : workflowAction?.kind === "manual_takeover" ? (
                     <button
                       className="primary-button"
-                      disabled={shellLaunchBusy || !workflow?.manualHandoff?.shellSupported}
-                      onClick={() => void openProjectShell()}
+                      disabled={workflowCanRevalidateRepair ? workflowCommandBusy : shellLaunchBusy || !workflow?.manualHandoff?.shellSupported}
+                      onClick={() => {
+                        if (workflowCanRevalidateRepair) {
+                          void revalidateWorkflowRepair();
+                          return;
+                        }
+                        void openProjectShell();
+                      }}
                     >
-                      {shellLaunchBusy ? "Opening terminal..." : workflowAction.actionLabel ?? "Open Codex terminal"}
+                      {workflowCanRevalidateRepair
+                        ? workflowCommandBusy ? "Revalidating repair..." : "Revalidate repair"
+                        : shellLaunchBusy ? "Opening terminal..." : workflowAction.actionLabel ?? "Open Codex terminal"}
                     </button>
                   ) : null}
                 </article>
@@ -12723,10 +12765,22 @@ const WorkbenchApp = () => {
                       </button>
                       <button
                         className="secondary-button"
-                        disabled={shellLaunchBusy || !workflow.manualHandoff.shellSupported}
-                        onClick={() => void openProjectShell()}
+                        disabled={
+                          isMergeConflictHandoff(workflow)
+                            ? shellLaunchBusy || !workflow.manualHandoff.shellSupported
+                            : repairAgentLaunchBusy || !workflow.manualHandoff.shellSupported
+                        }
+                        onClick={() => {
+                          if (isMergeConflictHandoff(workflow)) {
+                            void openProjectShell();
+                            return;
+                          }
+                          void openWorkflowRepairAgent();
+                        }}
                       >
-                        {shellLaunchBusy ? "Opening terminal..." : "Open Codex terminal"}
+                        {isMergeConflictHandoff(workflow)
+                          ? shellLaunchBusy ? "Opening terminal..." : "Open Codex terminal"
+                          : repairAgentLaunchBusy ? "Opening repair agent..." : "Repair in Codex"}
                       </button>
                       <button
                         className="secondary-button"
@@ -13288,7 +13342,7 @@ const WorkbenchApp = () => {
                     <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void runWorkflowIntegrity()}>
                       Run integrity
                     </button>
-                    <button className="secondary-button" disabled={workflowCommandBusy || !workflow?.manualHandoff} onClick={() => void revalidateWorkflowRepair()}>
+                    <button className="secondary-button" disabled={workflowCommandBusy || !workflowCanRevalidateRepair} onClick={() => void revalidateWorkflowRepair()}>
                       Revalidate repair
                     </button>
                     <button className="secondary-button" disabled={workflowCommandBusy} onClick={() => void runWorkflowMerge()}>
