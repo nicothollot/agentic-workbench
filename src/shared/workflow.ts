@@ -518,17 +518,6 @@ export const deriveWorkflowProjection = (
     };
   }
 
-  if (
-    workflow.stepProgress.merge.status === "completed" ||
-    (mergeHasCurrentProgress && latestMergeAgent?.status === "completed" && latestMergeAgent.mergeReport?.conflicts.length === 0)
-  ) {
-    return {
-      stage: "merged",
-      stopReason: "none",
-      cycleStatus: "merged"
-    };
-  }
-
   if (repairStatus === "exhausted") {
     return {
       stage: "repair_loop",
@@ -544,6 +533,17 @@ export const deriveWorkflowProjection = (
       stage: "repair_loop",
       stopReason: "integrity_failed",
       cycleStatus: "repair_loop"
+    };
+  }
+
+  if (
+    workflow.stepProgress.merge.status === "completed" ||
+    (mergeHasCurrentProgress && latestMergeAgent?.status === "completed" && latestMergeAgent.mergeReport?.conflicts.length === 0)
+  ) {
+    return {
+      stage: "merged",
+      stopReason: "none",
+      cycleStatus: "merged"
     };
   }
 

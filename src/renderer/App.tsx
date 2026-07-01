@@ -5549,6 +5549,193 @@ const WorkflowValidationLedgerCard = ({
   );
 };
 
+const isWorkflowBlockerDetailsAvailable = (
+  workflow: ProjectWorkflowState | undefined,
+  view: OperatorWorkflowViewModel
+): boolean => {
+  const ledger = view.currentCycle.validationLedger;
+  const validation = view.currentCycle.validationSummary;
+  const hygiene = view.currentCycle.repoHygiene;
+  const repairBlocked = Boolean(
+    workflow?.manualHandoff ||
+    workflow?.repair.status === "exhausted" ||
+    workflow?.repair.status === "merge_conflicts" ||
+    workflow?.workflowStopReason === "repair_budget_exhausted" ||
+    workflow?.workflowStopReason === "repair_stopped_early" ||
+    workflow?.workflowStopReason === "merge_conflicts"
+  );
+  const validationBlocked = Boolean(
+    ledger &&
+    (
+      validation.finalStatus === "failed" ||
+      validation.finalStatus === "partial" ||
+      validation.failedCommands.length > 0 ||
+      ledger.unresolvedValidationFailures.length > 0
+    )
+  );
+  const hygieneBlocked = Boolean(
+    hygiene &&
+    (
+      hygiene.status === "failed" ||
+      hygiene.mergeBlockingFindings.length > 0 ||
+      hygiene.forbiddenFiles.length > 0
+    )
+  );
+  return repairBlocked || validationBlocked || hygieneBlocked;
+};
+
+const latestCycleIntegrityAgent = (
+  workflow: ProjectWorkflowState | undefined,
+  agents: AgentState[]
+): AgentState | undefined => {
+  const cycleNumber = workflow?.workflowCycle.cycleNumber;
+  return [...agents]
+    .filter((agent) =>
+      agent.category === "integrity" &&
+      (cycleNumber === undefined || agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === cycleNumber)
+    )
+    .sort((left, right) =>
+      toTime(right.completedAt ?? right.lastActivityAt ?? right.startedAt ?? right.createdAt) -
+      toTime(left.completedAt ?? left.lastActivityAt ?? left.startedAt ?? left.createdAt)
+    )[0];
+};
+
+const WorkflowBlockerDetailsCard = ({
+  workflow,
+  view,
+  agents,
+  onOpenIntegrityTranscript
+}: {
+  workflow?: ProjectWorkflowState;
+  view: OperatorWorkflowViewModel;
+  agents: AgentState[];
+  onOpenIntegrityTranscript?: (agent: AgentState) => void;
+}) => {
+  if (!isWorkflowBlockerDetailsAvailable(workflow, view)) {
+    return null;
+  }
+
+  const ledger = view.currentCycle.validationLedger;
+  const validation = view.currentCycle.validationSummary;
+  const hygiene = view.currentCycle.repoHygiene;
+  const failedResults = ledger?.commandResults.filter((result) => result.status !== "passed" && result.status !== "skipped") ?? [];
+  const integrityAgent = latestCycleIntegrityAgent(workflow, agents);
+  const blockerSummary = workflow?.manualHandoff?.latestFailureReason ??
+    workflow?.repair.latestFailureReason ??
+    ledger?.summaryForHumans ??
+    hygiene?.summaryForHumans ??
+    view.currentStatus.nextOperatorAction;
+
+  return (
+    <article id="workflow-blocker-details" className="workflow-checklist-card operator-validation-card workflow-blocker-details">
+      <SectionTitle
+        eyebrow="Blocker details"
+        title="What is blocking this cycle"
+        meta={<StatusChip label={validation.finalStatusLabel} tone={operatorStatusTone(validation.finalStatus)} />}
+      />
+      <p>{blockerSummary}</p>
+      <div className="workflow-checklist-card__stats">
+        <div>
+          <span>Repair</span>
+          <strong>{workflow?.repair.status ?? "None"}</strong>
+        </div>
+        <div>
+          <span>Attempts</span>
+          <strong>{workflow ? `${workflow.repair.attemptCount}/${workflow.repair.maxAttempts}` : "0/0"}</strong>
+        </div>
+        <div>
+          <span>Validation</span>
+          <strong>{validation.finalStatusLabel}</strong>
+        </div>
+        <div>
+          <span>Failed commands</span>
+          <strong>{failedResults.length}</strong>
+        </div>
+        <div>
+          <span>Merge</span>
+          <strong>{validation.mergeAllowed ? "Allowed" : "Blocked"}</strong>
+        </div>
+        <div>
+          <span>Hygiene</span>
+          <strong>{hygiene?.status ?? "Not scanned"}</strong>
+        </div>
+      </div>
+      {workflow?.manualHandoff ? (
+        <div className="workflow-manual-handoff__grid">
+          <div className="workflow-manual-handoff__section">
+            <span className="workflow-option__label">What failed</span>
+            <p>{workflow.manualHandoff.validationIssue}</p>
+          </div>
+          <div className="workflow-manual-handoff__section">
+            <span className="workflow-option__label">Manual handoff reason</span>
+            <p>{workflow.manualHandoff.reason.replace(/_/g, " ")}</p>
+          </div>
+        </div>
+      ) : null}
+      <OperatorMiniList
+        label="Unresolved validation failures"
+        items={ledger?.unresolvedValidationFailures ?? []}
+        empty="No unresolved validation failures are recorded."
+        tone={ledger?.unresolvedValidationFailures.length ? "danger" : undefined}
+        limit={12}
+      />
+      <OperatorMiniList
+        label="Merge blocked reasons"
+        items={validation.mergeBlockedReasons}
+        empty="No merge-blocking reasons are recorded."
+        tone={validation.mergeBlockedReasons.length ? "danger" : undefined}
+        limit={12}
+      />
+      <OperatorMiniList
+        label="Environment failures"
+        items={ledger?.environmentFailures ?? []}
+        empty="No environment failures are recorded."
+        tone={ledger?.environmentFailures.length ? "warning" : undefined}
+        limit={12}
+      />
+      <OperatorMiniList
+        label="Evidence failures"
+        items={ledger?.evidenceFailures ?? []}
+        empty="No evidence parse or evidence command failures are recorded."
+        tone={ledger?.evidenceFailures.length ? "danger" : undefined}
+        limit={12}
+      />
+      <OperatorMiniList
+        label="Repository hygiene blockers"
+        items={hygiene?.mergeBlockingFindings ?? []}
+        empty="No repository hygiene blockers are recorded."
+        tone={hygiene?.mergeBlockingFindings.length ? "danger" : undefined}
+        limit={12}
+      />
+      <div className="operator-command-list">
+        {failedResults.length ? failedResults.map((result) => (
+          <OperatorCommandDisclosure key={result.commandId} command={result.command} result={result} label={`Failed ${result.phase}`} />
+        )) : (
+          <p>No failed command result is recorded for this blocker.</p>
+        )}
+      </div>
+      <div className="actions-row">
+        {integrityAgent && onOpenIntegrityTranscript ? (
+          <button className="secondary-button" type="button" onClick={() => onOpenIntegrityTranscript(integrityAgent)}>
+            Open integrity transcript
+          </button>
+        ) : null}
+      </div>
+      <OperatorRawDetails
+        title="Raw blocker state"
+        value={{
+          manualHandoff: workflow?.manualHandoff,
+          repair: workflow?.repair,
+          workflowStopReason: workflow?.workflowStopReason,
+          autopilotStatus: workflow?.autopilotStatus,
+          validationLedger: ledger,
+          repoHygieneReport: hygiene
+        }}
+      />
+    </article>
+  );
+};
+
 const WorkflowChecklistProgressCard = ({
   view
 }: {
@@ -12509,6 +12696,12 @@ const WorkbenchApp = () => {
                 shellLaunchBusy={shellLaunchBusy}
                 repairAgentLaunchBusy={repairAgentLaunchBusy}
                 repairReportAvailable={repairAttemptReports.length > 0}
+              />
+              <WorkflowBlockerDetailsCard
+                workflow={workflow}
+                view={operatorWorkflowView}
+                agents={workflowAgents}
+                onOpenIntegrityTranscript={(agent) => openAgentOutputById(agent, { loadTranscript: true })}
               />
             </section>
 

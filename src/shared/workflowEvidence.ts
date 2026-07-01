@@ -1027,8 +1027,19 @@ const commandRequiresNetwork = (command: string): boolean =>
 const commandRequiresCredentials = (command: string): boolean =>
   /\b(?:api[_-]?key|token|secret|credential|oauth|login|broker|account)\b/i.test(command);
 
-const commandExpectedOutput = (command: string): ProjectEvidenceCommand["expectedOutput"] =>
-  /\b(?:json|audit|status|refresh)\b/i.test(command) ? "json" : "text";
+const commandExpectedOutput = (command: string): ProjectEvidenceCommand["expectedOutput"] => {
+  const normalized = command.trim();
+  if (/\b(?:--json|--format(?:=|\s+)json|--output(?:=|\s+)json|json-output|jsonl?)\b/i.test(normalized)) {
+    return "json";
+  }
+  if (/\bsource-audit\b/i.test(normalized)) {
+    return "json";
+  }
+  if (/\bpython3?\s+-m\s+[A-Za-z_][\w.]*\.app\s+(?:status|refresh|portfolio-analytics)\b/i.test(normalized)) {
+    return "json";
+  }
+  return "text";
+};
 
 const buildCommand = (
   command: string,

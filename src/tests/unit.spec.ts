@@ -4370,6 +4370,43 @@ describe("workflow view helpers", () => {
     expect(workflowRunStateLabel(workflow, "git")).toBe("Waiting on you");
   });
 
+  it("projects exhausted repair ahead of stale completed merge progress", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Keep blocker state authoritative.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "goal-1",
+      sourceRecommendationId: "rec-1",
+      summary: "Revalidate external repair",
+      executionBrief: "Validate the repaired checkout before merge.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-07T00:01:00.000Z"
+    };
+    workflow.workflowCycle.status = "merged";
+    workflow.workflowStage = "merged";
+    workflow.stepProgress.merge.status = "completed";
+    workflow.stepProgress.integrity.status = "failed";
+    workflow.repair = {
+      attemptCount: 3,
+      maxAttempts: 3,
+      status: "exhausted",
+      latestIssueSummary: "Validation failed.",
+      latestFailureReason: "pytest is unavailable in this environment.",
+      lastUpdatedAt: "2026-04-07T00:04:00.000Z"
+    };
+
+    expect(deriveWorkflowProjection(workflow, [])).toMatchObject({
+      stage: "repair_loop",
+      stopReason: "repair_budget_exhausted",
+      cycleStatus: "repair_loop"
+    });
+  });
+
   it("offers repair revalidation for legacy exhausted repair state without a manual handoff", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {
@@ -7837,14 +7874,35 @@ describe("workflow planning evidence layer", () => {
         { relativePath: "tests/test_source_audit.py" }
       ],
       checklist: workflow.goalChecklist,
-      previousSuccessfulCommands: ["python3 -m unittest discover -s tests -q"]
+      previousSuccessfulCommands: [
+        "python3 -m unittest discover -s tests -q",
+        "/bin/bash -lc 'git status --short --untracked-files=all'"
+      ]
     });
 
     const sourceAudit = commands.find((command) => command.command.includes("source-audit"));
+    const gitStatus = commands.find((command) => command.command.includes("git status --short"));
     expect(sourceAudit?.safeDefault).toBe(true);
     expect(sourceAudit?.expectedOutput).toBe("json");
+    expect(gitStatus?.expectedOutput).toBe("text");
     expect(sourceAudit?.mapsToCheckIds).toEqual(expect.arrayContaining(fixture.selectedCandidate.targetedCheckIds));
     expect(commands.some((command) => command.command === "python3 -m unittest discover -s tests -q")).toBe(true);
+  });
+
+  it("does not infer JSON output from generic status or audit command names", () => {
+    const commands = discoverProjectEvidenceCommands({
+      previousSuccessfulCommands: [
+        "python3 tools/audit_sources.py",
+        "/bin/bash -lc 'git diff --check && git status --short --untracked-files=all'",
+        "python3 tools/source-audit.py --limit 3",
+        "python3 -m sample.app status"
+      ]
+    });
+
+    expect(commands.find((command) => command.command.includes("audit_sources.py"))?.expectedOutput).toBe("text");
+    expect(commands.find((command) => command.command.includes("git diff --check"))?.expectedOutput).toBe("text");
+    expect(commands.find((command) => command.command.includes("source-audit.py"))?.expectedOutput).toBe("json");
+    expect(commands.find((command) => command.command.includes("sample.app status"))?.expectedOutput).toBe("json");
   });
 
   it("derives a cycle contract for legacy workflow state without one", async () => {

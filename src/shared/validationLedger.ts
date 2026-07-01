@@ -10,6 +10,7 @@ import type {
 import { nowIso, unique } from "./utils";
 
 export const VALIDATION_LEDGER_SCHEMA_VERSION = 1;
+const VALIDATION_OUTPUT_SUMMARY_LIMIT = 2_000;
 
 const SECRET_PATTERN =
   /\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b|\b(?:ghp|github_pat)_[A-Za-z0-9_]{16,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{12,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g;
@@ -205,8 +206,8 @@ export const buildValidationCommandResult = (input: BuildValidationCommandResult
     durationMs: Number.isFinite(durationMs) ? durationMs : 0,
     exitCode: input.exitCode,
     status,
-    stdoutSummary: truncate(redactedStdout.text, 700),
-    stderrSummary: truncate(redactedStderr.text, 700),
+    stdoutSummary: truncate(redactedStdout.text, VALIDATION_OUTPUT_SUMMARY_LIMIT),
+    stderrSummary: truncate(redactedStderr.text, VALIDATION_OUTPUT_SUMMARY_LIMIT),
     fullOutputRef: input.fullOutputRef,
     parsedJsonRef: input.parsedJsonRef,
     redactionApplied: redactedStdout.redactionApplied || redactedStderr.redactionApplied,
