@@ -7437,20 +7437,20 @@ const GoalCharterSettingsPanel = ({
           </div>
           <div className="strategy-budget-grid">
             <label className="form-field">
-              <span>Max cycles before pause</span>
-              <input className="input" type="number" min={1} max={24} value={strategy.autonomyBudget.maxCyclesBeforePause} onChange={(event) => updateBudget({ maxCyclesBeforePause: Number(event.target.value) })} />
+              <span>Max cycles before pause (0 = unlimited)</span>
+              <input className="input" type="number" min={0} max={24} value={strategy.autonomyBudget.maxCyclesBeforePause} onChange={(event) => updateBudget({ maxCyclesBeforePause: Number(event.target.value) })} />
             </label>
             <label className="form-field">
-              <span>Max minutes before pause</span>
-              <input className="input" type="number" min={1} max={480} value={strategy.autonomyBudget.maxMinutesBeforePause} onChange={(event) => updateBudget({ maxMinutesBeforePause: Number(event.target.value) })} />
+              <span>Max minutes before pause (0 = unlimited)</span>
+              <input className="input" type="number" min={0} max={480} value={strategy.autonomyBudget.maxMinutesBeforePause} onChange={(event) => updateBudget({ maxMinutesBeforePause: Number(event.target.value) })} />
             </label>
             <label className="form-field">
-              <span>Max failed repair attempts</span>
+              <span>Max failed repair attempts (0 = repair until exhausted)</span>
               <input className="input" type="number" min={0} max={10} value={strategy.autonomyBudget.maxFailedRepairAttempts} onChange={(event) => updateBudget({ maxFailedRepairAttempts: Number(event.target.value) })} />
             </label>
             <label className="form-field">
-              <span>Max tasks without review</span>
-              <input className="input" type="number" min={1} max={24} value={strategy.autonomyBudget.maxConsecutiveTasksWithoutUserReview} onChange={(event) => updateBudget({ maxConsecutiveTasksWithoutUserReview: Number(event.target.value) })} />
+              <span>Max tasks without review (0 = unlimited)</span>
+              <input className="input" type="number" min={0} max={24} value={strategy.autonomyBudget.maxConsecutiveTasksWithoutUserReview} onChange={(event) => updateBudget({ maxConsecutiveTasksWithoutUserReview: Number(event.target.value) })} />
             </label>
           </div>
           <div className="strategy-stop-grid">
@@ -7472,7 +7472,7 @@ const GoalCharterSettingsPanel = ({
           </div>
           <div className="lane-note">
             <strong>Always explicit</strong>
-            <span>Destructive actions, secrets, credentials, data loss, major dependency changes, and unclear intent still require a pause unless explicitly allowed later.</span>
+            <span>Set a max value to 0 to disable that strategy pause. Destructive actions, secrets, credentials, data loss, major dependency changes, unclear intent, and internal no-progress protection still require a pause unless explicitly allowed later.</span>
           </div>
         </div>
       </div>

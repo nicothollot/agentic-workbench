@@ -349,6 +349,13 @@ const WORKFLOW_AUTOMATION_NO_PROGRESS_LIMIT = 2;
 const WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT = 20;
 const STRUCTURED_OUTPUT_HISTORY_LIMIT = 24;
 const WSL_WINDOWS_MOUNT_PATH = /^\/mnt\/[a-z](?:\/|$)/i;
+
+const positiveAutonomyLimit = (value: number | undefined): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+
+const minPositiveLimit = (...values: Array<number | undefined>): number =>
+  Math.min(...values.filter((value): value is number => positiveAutonomyLimit(value) !== undefined));
+
 const throttledTransportDeltaMethods = new Set<string>([
   "turn/diff/updated",
   "item/agentMessage/delta",
@@ -3767,15 +3774,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.workflowAutomationQueued.delete(projectId);
   }
 
+  private resolveRuntimeAutopilotPolicy(project: LoadedProject, workflow = this.ensureWorkflowState(project.record)): AutopilotPolicy {
+    const budget = workflow.goalCharter.autopilotStrategy.autonomyBudget;
+    return {
+      ...resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled),
+      stopWhenGoalSatisfied: budget.stopWhenGoalComplete,
+      stopWhenNoSafeRecommendation: budget.stopWhenNoSafeNextTaskExists
+    };
+  }
+
   private getNextAutomationActionForProject(project: LoadedProject): ReturnType<typeof getNextWorkflowAutomationAction> {
     const workflow = this.ensureWorkflowState(project.record);
+    const autopilotPolicy = this.resolveRuntimeAutopilotPolicy(project, workflow);
     return getNextWorkflowAutomationAction(
       workflow,
       project.record.agents,
       project.scan.kind,
-      resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled),
+      autopilotPolicy,
       project.record.localState.workflowPauseRequested,
-      project.record.localState.workflowObjective
+      autopilotPolicy.stopWhenGoalSatisfied ? project.record.localState.workflowObjective : "optimize"
     );
   }
 
@@ -4028,11 +4045,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           });
         }
         const workflow = this.ensureWorkflowState(project.record);
-        const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+        const autopilotPolicy = this.resolveRuntimeAutopilotPolicy(project, workflow);
         const autonomyBudget = workflow.goalCharter.autopilotStrategy.autonomyBudget;
-        const maxActionsThisPass = Math.min(
+        const maxActionsThisPass = minPositiveLimit(
           autopilotPolicy.maxAutomaticActionsPerPass,
-          autonomyBudget.maxConsecutiveTasksWithoutUserReview,
+          positiveAutonomyLimit(autonomyBudget.maxConsecutiveTasksWithoutUserReview),
           WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT
         );
         if (automaticActionsThisPass >= maxActionsThisPass) {
@@ -4042,13 +4059,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             emit: "coalesced",
             reason: "workflow automation action limit"
           });
+          this.workflowAutomationQueued.add(projectId);
           break;
         }
-        if (performance.now() - automationPassStartedAt >= autonomyBudget.maxMinutesBeforePause * 60_000) {
+        const maxMinutesBeforePause = positiveAutonomyLimit(autonomyBudget.maxMinutesBeforePause);
+        if (maxMinutesBeforePause !== undefined && performance.now() - automationPassStartedAt >= maxMinutesBeforePause * 60_000) {
           project.record.localState.workflowPauseRequested = true;
           const pause = {
             reason: "max_consecutive_cycles" as const,
-            detail: `Autopilot reached the ${autonomyBudget.maxMinutesBeforePause} minute strategy budget checkpoint.`,
+            detail: `Autopilot reached the ${maxMinutesBeforePause} minute strategy budget checkpoint.`,
             highRiskPackageRequiresApproval: false
           };
           this.updateAutopilotRuntimeStatus(project, { pause });
@@ -4060,16 +4079,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           });
           break;
         }
+        const maxCyclesBeforePause = positiveAutonomyLimit(autonomyBudget.maxCyclesBeforePause);
         if (
-          completedCyclesThisPass >= autonomyBudget.maxCyclesBeforePause ||
+          (maxCyclesBeforePause !== undefined && completedCyclesThisPass >= maxCyclesBeforePause) ||
           (
             autopilotPolicy.maxConsecutiveCycles !== undefined &&
             completedCyclesThisPass >= autopilotPolicy.maxConsecutiveCycles
           )
         ) {
           project.record.localState.workflowPauseRequested = true;
-          const maxCycleCheckpoint = Math.min(
-            autonomyBudget.maxCyclesBeforePause,
+          const maxCycleCheckpoint = minPositiveLimit(
+            maxCyclesBeforePause,
             autopilotPolicy.maxConsecutiveCycles ?? autonomyBudget.maxCyclesBeforePause
           );
           const pause = {
@@ -4086,14 +4106,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           });
           break;
         }
+        const maxFailedRepairAttempts = positiveAutonomyLimit(autonomyBudget.maxFailedRepairAttempts);
         if (
           autonomyBudget.stopWhenValidationFailsRepeatedly &&
-          workflow.repair.attemptCount > autonomyBudget.maxFailedRepairAttempts
+          maxFailedRepairAttempts !== undefined &&
+          workflow.repair.attemptCount > maxFailedRepairAttempts
         ) {
           project.record.localState.workflowPauseRequested = true;
           const pause = {
             reason: "repeated_failure" as const,
-            detail: `Autopilot reached the ${autonomyBudget.maxFailedRepairAttempts} failed repair attempt strategy budget.`,
+            detail: `Autopilot reached the ${maxFailedRepairAttempts} failed repair attempt strategy budget.`,
             highRiskPackageRequiresApproval: false
           };
           this.updateAutopilotRuntimeStatus(project, { pause });
@@ -4111,7 +4133,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           project.scan.kind,
           autopilotPolicy,
           project.record.localState.workflowPauseRequested,
-          project.record.localState.workflowObjective
+          autopilotPolicy.stopWhenGoalSatisfied ? project.record.localState.workflowObjective : "optimize"
         );
         const recommendation = action === "approve_recommendation"
           ? this.selectAutopilotRecommendation(project)

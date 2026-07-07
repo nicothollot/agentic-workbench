@@ -452,10 +452,10 @@ export const visualPreferenceProfileSchema = z.object({
 });
 
 export const autonomyBudgetSchema = z.object({
-  maxCyclesBeforePause: z.number().int().min(1).max(24).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxCyclesBeforePause),
-  maxMinutesBeforePause: z.number().int().min(1).max(480).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxMinutesBeforePause),
+  maxCyclesBeforePause: z.number().int().min(0).max(24).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxCyclesBeforePause),
+  maxMinutesBeforePause: z.number().int().min(0).max(480).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxMinutesBeforePause),
   maxFailedRepairAttempts: z.number().int().min(0).max(10).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxFailedRepairAttempts),
-  maxConsecutiveTasksWithoutUserReview: z.number().int().min(1).max(24).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxConsecutiveTasksWithoutUserReview),
+  maxConsecutiveTasksWithoutUserReview: z.number().int().min(0).max(24).default(defaultProjectWorkflowState().goalCharter.autopilotStrategy.autonomyBudget.maxConsecutiveTasksWithoutUserReview),
   stopWhenGoalComplete: z.boolean().default(true),
   stopWhenNoSafeNextTaskExists: z.boolean().default(true),
   stopWhenPlannerWantsToChangeUltimateGoal: z.boolean().default(true),

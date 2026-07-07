@@ -13,7 +13,7 @@ import {
 import { SummaryCache } from "@shared/summaryCache";
 import { buildRepairReportMarkdown, collectRepairAttemptReports } from "@shared/workflowRepairReport";
 import { buildCycleRetrospective, buildStrategicPlan, selectNextWorkPackage } from "@shared/strategicPlanner";
-import { humanInterventionRecordSchema, portableInterfaceSchema, projectCredentialsStateSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
+import { autonomyBudgetSchema, humanInterventionRecordSchema, portableInterfaceSchema, projectCredentialsStateSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
 import { getPreloadEntryPath, getRendererBase, getRendererEntryPath } from "@shared/electronAppPaths";
 import { calculateValidationStatus } from "@shared/validation";
 import { createDefaultGoalCharter, listAutopilotPresets } from "@shared/goalCharter";
@@ -3457,6 +3457,28 @@ describe("workflow state", () => {
       projectId: "project-1",
       policy: { profile: "aggressive" }
     }).policy.profile).toBe("aggressive");
+  });
+
+  it("allows zero autonomy budget values to mean no strategy pause", () => {
+    const budget = autonomyBudgetSchema.parse({
+      maxCyclesBeforePause: 0,
+      maxMinutesBeforePause: 0,
+      maxFailedRepairAttempts: 0,
+      maxConsecutiveTasksWithoutUserReview: 0,
+      stopWhenGoalComplete: false,
+      stopWhenNoSafeNextTaskExists: false,
+      stopWhenPlannerWantsToChangeUltimateGoal: false,
+      stopWhenValidationFailsRepeatedly: false
+    });
+
+    expect(budget).toMatchObject({
+      maxCyclesBeforePause: 0,
+      maxMinutesBeforePause: 0,
+      maxFailedRepairAttempts: 0,
+      maxConsecutiveTasksWithoutUserReview: 0,
+      stopWhenGoalComplete: false,
+      stopWhenNoSafeNextTaskExists: false
+    });
   });
 
   it("pauses autopilot at background-safe checkpoints", () => {
