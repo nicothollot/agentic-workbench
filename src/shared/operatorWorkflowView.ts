@@ -212,6 +212,11 @@ const validationStatusLabel = (status: OperatorValidationSummary["finalStatus"])
   }
 };
 
+const validationLedgerIsMissingEquivalent = (ledger: ValidationLedger): boolean =>
+  ledger.finalValidationStatus === "not_run" &&
+  ledger.commandResults.length === 0 &&
+  ledger.attemptedCommands.length === 0;
+
 const buildValidationSummary = (ledger?: ValidationLedger): OperatorValidationSummary => {
   if (!ledger) {
     return {
@@ -222,12 +227,15 @@ const buildValidationSummary = (ledger?: ValidationLedger): OperatorValidationSu
       finalStatus: "unknown",
       finalStatusLabel: "Validation unknown",
       mergeAllowed: false,
-      mergeBlockedReasons: ["No validation ledger is recorded for this cycle."],
+      mergeBlockedReasons: [],
       warnings: [],
       failedCommands: []
     };
   }
   const failedResults = ledger.commandResults.filter((result) => result.status !== "passed" && result.status !== "skipped");
+  const mergeBlockedReasons = validationLedgerIsMissingEquivalent(ledger)
+    ? []
+    : ledger.mergeBlockedReasons;
   return {
     planned: ledger.plannedCommands,
     attempted: ledger.attemptedCommands,
@@ -236,7 +244,7 @@ const buildValidationSummary = (ledger?: ValidationLedger): OperatorValidationSu
     finalStatus: ledger.finalValidationStatus,
     finalStatusLabel: validationStatusLabel(ledger.finalValidationStatus),
     mergeAllowed: ledger.mergeAllowed,
-    mergeBlockedReasons: ledger.mergeBlockedReasons,
+    mergeBlockedReasons,
     warnings: ledger.warnings,
     failedCommands: failedResults.map((result) => ({
       command: result.command,
@@ -538,6 +546,9 @@ const buildNextOperatorAction = (
     return "Review partial validation and unresolved evidence before merge.";
   }
   if (!ledger || ledger.finalValidationStatus === "not_run") {
+    if (status.tone === "running" && !/validation|merge|checkpoint|repair/i.test(status.label)) {
+      return status.explanation;
+    }
     return workflowPauseRequested
       ? "Continue workflow to run integrity validation and checklist reconciliation."
       : "Run integrity validation and checklist reconciliation before merge.";

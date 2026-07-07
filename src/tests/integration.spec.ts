@@ -1689,6 +1689,52 @@ describe("integration flows", () => {
     expect(integrityAgent?.status).toBe("completed");
   });
 
+  it("runs generic Git sanity validation for fresh repositories without project commands", async () => {
+    const root = await createTempDir("generic-git-integrity");
+    await writeFile(path.join(root, "README.md"), "# Generic repo\n");
+    await initGitRepo(root);
+    await commitAll(root, "initial");
+
+    const appData = await createTempDir("appdata-generic-git-integrity");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Validate a fresh repository without project-specific test commands.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-generic-git",
+      sourceRecommendationId: "rec-generic-git",
+      summary: "Run baseline repository validation.",
+      executionBrief: "Validate the fresh repository without app-specific scripts.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.workflowStage = "goal_ready";
+
+    await service.runIntegrity(selected.record.id);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const integrityAgent = record?.agents.find((agent) => agent.category === "integrity");
+    const ledger = record?.workflow.validationLedgers.find((entry) => entry.cycleNumber === workflow.workflowCycle.cycleNumber);
+
+    expect(integrityAgent?.status).toBe("completed");
+    expect(integrityAgent?.integrityReport?.checks[0]).toMatchObject({
+      name: "repository sanity",
+      command: "git diff --check && git status --short --untracked-files=all",
+      status: "passed"
+    });
+    expect(ledger?.finalValidationStatus).toBe("passed");
+    expect(ledger?.mergeAllowed).toBe(true);
+  });
+
   it("bases repair coding passes on the latest completed coding branch in the active workflow cycle", async () => {
     const root = await createSampleRepo("repair-pass-branch-base");
     const appData = await createTempDir("appdata-repair-pass-branch-base");

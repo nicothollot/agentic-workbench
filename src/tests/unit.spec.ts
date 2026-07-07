@@ -848,6 +848,7 @@ describe("validation ledger", () => {
     workflow.validationLedgers = [finalized];
     const view = buildOperatorWorkflowViewModel({ workflow, validationLedger: finalized });
     expect(view.currentCycle.validationSummary.finalStatusLabel).toBe("Validation not run");
+    expect(view.currentCycle.validationSummary.mergeBlockedReasons).toEqual([]);
     expect(view.currentCycle.validationSummary.finalStatusLabel).not.toMatch(/success|passed/i);
   });
 
@@ -915,6 +916,30 @@ describe("target project command resolver", () => {
     const resolution = await resolveTargetProjectCommands({ projectRoot: root, projectKind: "folder" });
 
     expect(resolution.testCommands.map((command) => command.command)).toContain("PYTHONDONTWRITEBYTECODE=1 python3 -m pytest");
+  });
+
+  it("uses a generic Git sanity check when no project validation command exists", async () => {
+    const root = await createTempDir("resolver-git-fallback");
+    await writeFile(path.join(root, "README.md"), "# Empty project\n");
+    await initGitRepo(root);
+    await commitAll(root, "initial");
+
+    const resolution = await resolveTargetProjectCommands({ projectRoot: root, projectKind: "git" });
+
+    expect(resolution.testCommands.map((command) => command.command)).toEqual([
+      "git diff --check && git status --short --untracked-files=all"
+    ]);
+  });
+
+  it("does not add the generic Git sanity check when project validation commands exist", async () => {
+    const root = await createTempDir("resolver-git-with-package");
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { test: "echo ok" } }, null, 2));
+    await initGitRepo(root);
+    await commitAll(root, "initial");
+
+    const resolution = await resolveTargetProjectCommands({ projectRoot: root, projectKind: "git" });
+
+    expect(resolution.testCommands.map((command) => command.command)).toEqual(["npm test"]);
   });
 
   it("marks live HTTP evidence commands approval-required", async () => {
@@ -7536,7 +7561,7 @@ describe("workflow planning evidence layer", () => {
     expect(status.label).toBe("Merge blocked by validation failure");
   });
 
-  it("derived status does not display success when validation has not run", async () => {
+  it("derived status does not display success or a validation blocker before coding has run", async () => {
     const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
     const workflow = buildAwTrendsWorkflow(fixture);
     const ledger = finalizeValidationLedger(createValidationLedger({ cycleNumber: fixture.cycleNumber }));
@@ -7544,8 +7569,38 @@ describe("workflow planning evidence layer", () => {
 
     const status = deriveUserFacingWorkflowStatus(workflow, { validationLedger: ledger });
 
-    expect(status.label).toBe("Awaiting validation");
+    expect(status.label).toBe("Preparing Coding");
+    expect(status.label).not.toMatch(/blocked/i);
     expect(status.label).not.toMatch(/success|passed/i);
+  });
+
+  it("derived status reports awaiting validation after coding reached a checkpoint", async () => {
+    const fixture = await readJsonFixture<AwTrendsCycleFixture>("aw-trends-cycle-23-active.json");
+    const workflow = buildAwTrendsWorkflow(fixture);
+    workflow.stepProgress.coding.status = "completed";
+    const ledger = finalizeValidationLedger(createValidationLedger({ cycleNumber: fixture.cycleNumber }));
+    workflow.validationLedgers = [ledger];
+
+    const status = deriveUserFacingWorkflowStatus(workflow, { validationLedger: ledger });
+
+    expect(status.label).toBe("Awaiting validation");
+  });
+
+  it("operator view keeps fresh Cycle 1 setup out of merge-blocked validation state", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Ship the first project increment.",
+      confirmedAt: "2026-06-01T00:00:00.000Z"
+    };
+    workflow.workflowStage = "goal_ready";
+
+    const view = buildOperatorWorkflowViewModel({ workflow });
+
+    expect(view.currentStatus.primaryLabel).toBe("Preparing Coding");
+    expect(view.currentStatus.nextOperatorAction).toBe("The system is preparing a scoped goal");
+    expect(view.currentCycle.validationSummary.finalStatusLabel).toBe("Validation unknown");
+    expect(view.currentCycle.validationSummary.mergeBlockedReasons).toEqual([]);
   });
 
   it("builds an operator overview model for AW_Trends-like cycle 23", async () => {

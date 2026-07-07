@@ -5501,6 +5501,16 @@ const operatorStatusTone = (status: string): StatusChipTone => {
   return "pending";
 };
 
+const operatorMergeGateLabel = (summary: OperatorWorkflowViewModel["currentCycle"]["validationSummary"]): string => {
+  if (summary.mergeAllowed) {
+    return "Allowed";
+  }
+  if (summary.finalStatus === "failed" || summary.finalStatus === "partial" || summary.mergeBlockedReasons.length > 0) {
+    return "Blocked";
+  }
+  return "Not ready";
+};
+
 const operatorGroupTone = (group: OperatorChangedFileGroup): "warning" | "danger" | undefined =>
   group.kind === "suspicious" ? "danger" : group.kind === "generated" ? "warning" : undefined;
 
@@ -5659,7 +5669,7 @@ const WorkflowValidationLedgerCard = ({
         </div>
         <div>
           <span>Merge</span>
-          <strong>{summary.mergeAllowed ? "Allowed" : "Blocked"}</strong>
+          <strong>{operatorMergeGateLabel(summary)}</strong>
         </div>
       </div>
       {view.emptyStates.validationLedger ? <p>{view.emptyStates.validationLedger}</p> : <p>{ledger?.summaryForHumans}</p>}
@@ -5782,7 +5792,7 @@ const WorkflowBlockerDetailsCard = ({
         </div>
         <div>
           <span>Merge</span>
-          <strong>{validation.mergeAllowed ? "Allowed" : "Blocked"}</strong>
+          <strong>{operatorMergeGateLabel(validation)}</strong>
         </div>
         <div>
           <span>Hygiene</span>

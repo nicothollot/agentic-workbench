@@ -246,7 +246,7 @@ export const createValidationLedger = (input: {
     finalValidationBasis: "",
     unresolvedValidationFailures: [],
     mergeAllowed: false,
-    mergeBlockedReasons: ["Validation has not run."],
+    mergeBlockedReasons: [],
     summaryForHumans: "Validation has not run."
   };
 };

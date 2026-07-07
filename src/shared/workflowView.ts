@@ -472,6 +472,23 @@ export const deriveUserFacingWorkflowStatus = (
     workflow.autopilotStatus?.pausedReason &&
     /start_coding|coding|checkpoint/i.test(workflow.autopilotStatus.lastCompletedAction ?? "")
   );
+  const cycleMatches = (agent: AgentState): boolean =>
+    agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber;
+  const validationReachedByProgress = (
+    workflow.stepProgress.coding.status === "completed" ||
+    workflow.stepProgress.coding.runCount > 0 ||
+    workflow.stepProgress.integrity.status !== "not_started" ||
+    workflow.stepProgress.integrity.runCount > 0 ||
+    workflow.stepProgress.merge.status !== "not_started" ||
+    workflow.stepProgress.merge.runCount > 0 ||
+    workflow.workflowStage === "ready_to_merge" ||
+    workflow.workflowStage === "repair_loop"
+  );
+  const validationReachedByAgent = agents.some((agent) =>
+    cycleMatches(agent) &&
+    (agent.category === "integrity" || agent.category === "merge") &&
+    (agent.status !== "idle" || Boolean(agent.integrityReport) || Boolean(agent.mergeReport))
+  );
 
   if (hygiene?.mergeBlockingFindings.length) {
     return {
@@ -518,14 +535,14 @@ export const deriveUserFacingWorkflowStatus = (
       tone: "paused"
     };
   }
-  if (!ledger || ledger.finalValidationStatus === "not_run") {
+  if ((!ledger || ledger.finalValidationStatus === "not_run") && (codingCheckpointed || legacyCodingCheckpointed || validationReachedByProgress || validationReachedByAgent)) {
     return {
       label: "Awaiting validation",
       explanation: ledger?.summaryForHumans ?? "No validation ledger has been recorded for this cycle.",
       tone: "warning"
     };
   }
-  if (workflow.workflowStage === "ready_to_merge") {
+  if (workflow.workflowStage === "ready_to_merge" && ledger) {
     return {
       label: "Ready to merge",
       explanation: ledger.summaryForHumans,

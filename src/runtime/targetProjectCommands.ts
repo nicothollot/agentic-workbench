@@ -232,6 +232,18 @@ export const resolveTargetProjectCommands = async (
     }
   }
 
+  if (input.projectKind === "git" && testCommands.length === 0) {
+    testCommands.push({
+      name: "repository sanity",
+      command: "git diff --check && git status --short --untracked-files=all",
+      phase: "integrity",
+      kind: "test",
+      approvalRequired: false,
+      mapsToCheckIds: [],
+      relatedFiles: []
+    });
+  }
+
   const evidence = await resolveEvidenceCommandsForExecution(input.projectRoot, input.evidenceCommands);
   const dedupedTests = unique(testCommands.map((command) => command.command))
     .map((command) => testCommands.find((entry) => entry.command === command)!)
