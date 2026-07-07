@@ -8919,7 +8919,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       nonNegotiableRequirements: "Non-negotiable requirements",
       flexibleRequirements: "Flexible requirements",
       niceToHaveIdeas: "Nice-to-have ideas",
-      explicitNonGoals: "Explicit non-goals",
+      explicitNonGoals: "Charter non-goals",
       userConstraints: "User constraints",
       aestheticPreferences: "Aesthetic preferences",
       technicalPreferences: "Technical preferences",

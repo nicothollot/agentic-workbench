@@ -3740,9 +3740,17 @@ describe("integration flows", () => {
       "Detailed Intent:\nCoordinate repo analysis, planning, coding, and validation in one explicit loop.",
       "Success Criteria:\n- Recommendations are persisted.\n- Repair loops are visible.",
       "Constraints:\n- Keep typed IPC.\n- Keep the renderer sandboxed.",
-      "Non-goals:\n- No raw filesystem access from the renderer.",
+      "Explicit non-goals:\n- No raw filesystem access from the renderer.",
+      "Definition of done:\n- Import tests cover every format section.",
       "Quality Bar: Stable, test-backed behavior.",
-      "Target Audience: Developers operating the desktop app."
+      "Target Audience: Developers operating the desktop app.",
+      "Non-negotiable requirements:\n- Keep approvals visible.",
+      "Charter non-goals:\n- Do not replace stdio transport.",
+      "Flexible requirements:\n- Import button placement can change.",
+      "Nice-to-have ideas:\n- Add richer import previews.",
+      "User constraints:\n- Keep the uploaded file plain text.",
+      "Technical preferences:\n- Use shared workflow types.",
+      "Aesthetic preferences:\n- Keep settings controls compact."
     ].join("\n\n"));
 
     const preview = await service.importUltimateGoalText(selected.record.id, importPath);
@@ -3750,6 +3758,8 @@ describe("integration flows", () => {
     expect(preview.completeness).toBe("complete");
     expect(preview.goal.summary).toBe("Build a durable workflow dashboard.");
     expect(preview.goal.constraints).toContain("Keep typed IPC.");
+    expect(preview.charter.explicitNonGoals).toContain("Do not replace stdio transport.");
+    expect(preview.charter.flexibleRequirements).toContain("Import button placement can change.");
     expect(preview.missingFields).toEqual([]);
   });
 

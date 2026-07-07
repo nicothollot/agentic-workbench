@@ -473,17 +473,17 @@ const normalizeWorkspaceTab = (tab?: string): WorkspaceVisualTabId => {
 const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "Ultimate Goal authoring format for Codex Agent Workbench",
   "",
-  "Use this prompt with ChatGPT or another LLM when you want it to draft an Ultimate Goal that this workbench can turn into a reliable checklist and workflow cycle.",
+  "Use this prompt with ChatGPT or another LLM when you want it to draft an Ultimate Goal and Goal Charter that this workbench can turn into a reliable checklist and workflow cycle.",
   "",
   "Prompt to give the LLM:",
   "",
   `You are drafting an Ultimate Goal for the project named "${projectName}". The result will be imported into Codex Agent Workbench, which will infer a goal checklist and then run repeated recommendation, scoped planning, coding, integrity validation, and merge cycles against the repository.`,
   "",
-  "Write the goal so each success criterion can become an observable checklist item. Keep criteria outcome-focused and merge near-duplicates instead of splitting tiny implementation details apart. Be concrete about user-visible behavior, acceptance conditions, quality expectations, constraints, and what is out of scope. Avoid secrets, credentials, machine-specific paths, or private environment details.",
+  "Write the goal so each success criterion and definition-of-done item can become an observable checklist item. Keep criteria outcome-focused and merge near-duplicates instead of splitting tiny implementation details apart. Be concrete about user-visible behavior, acceptance conditions, quality expectations, constraints, non-goals, and which requirements are flexible. Avoid secrets, credentials, machine-specific paths, or private environment details.",
   "",
-  "Return plain text only. Do not wrap the result in Markdown fences. Use exactly these section headings:",
+  "Return plain text only. Do not wrap the result in Markdown fences. Use exactly these section headings. The importer reads each heading and assigns all following text to that section until the next heading.",
   "",
-  "Project Charter: [one sentence describing the durable end state]",
+  "Current Effective Goal: [one sentence describing the durable end state]",
   "",
   "Detailed Intent:",
   "[2-5 sentences explaining the best finished outcome, why it matters, who it should impress, and how the agent should prioritize tradeoffs]",
@@ -497,9 +497,13 @@ const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "- [technical, security, platform, compatibility, or process rule the agents must preserve]",
   "- [technical, security, platform, compatibility, or process rule the agents must preserve]",
   "",
-  "Non-goals:",
-  "- [explicitly out-of-scope work so the workflow does not chase it]",
-  "- [explicitly out-of-scope work so the workflow does not chase it]",
+  "Explicit non-goals:",
+  "- [out-of-scope work for the current effective goal]",
+  "- [out-of-scope work for the current effective goal]",
+  "",
+  "Definition of done:",
+  "- [observable final acceptance condition]",
+  "- [validation, review, or inspection requirement that proves the result is done]",
   "",
   "Quality Bar:",
   "[the standard for an excellent outcome: tests, UX polish, performance, reliability, accessibility, packaging expectations, or review expectations]",
@@ -507,12 +511,41 @@ const buildUltimateGoalFormatGuide = (projectName: string): string => [
   "Target Audience:",
   "[who will use or evaluate the finished project]",
   "",
+  "Non-negotiable requirements:",
+  "- [hard requirement the workflow must preserve]",
+  "- [hard requirement the workflow must preserve]",
+  "",
+  "Charter non-goals:",
+  "- [charter-level excluded work so the workflow does not chase it]",
+  "- [charter-level excluded work so the workflow does not chase it]",
+  "",
+  "Flexible requirements:",
+  "- [requirement the workflow may adapt if a better goal-supporting approach exists]",
+  "- [requirement the workflow may adapt if a better goal-supporting approach exists]",
+  "",
+  "Nice-to-have ideas:",
+  "- [optional improvement that should not block the main goal]",
+  "- [optional improvement that should not block the main goal]",
+  "",
+  "User constraints:",
+  "- [operator preference, workflow boundary, or practical constraint]",
+  "- [operator preference, workflow boundary, or practical constraint]",
+  "",
+  "Technical preferences:",
+  "- [preferred technology, architecture, command, or implementation style]",
+  "- [preferred technology, architecture, command, or implementation style]",
+  "",
+  "Aesthetic preferences:",
+  "- [visual, interaction, tone, density, layout, or motion preference]",
+  "- [visual, interaction, tone, density, layout, or motion preference]",
+  "",
   "Checklist inference guidance:",
   "- Describe outcomes, not just implementation chores; the workflow will choose bounded implementation slices from those outcomes.",
   "- Make every success criterion testable or inspectable.",
   "- Include enough detail for a scoped coding agent to choose the next bounded task without asking for basic intent.",
   "- Put hard rules in Constraints, not in Success Criteria.",
-  "- Put excluded work in Non-goals, especially packaging, deployment, account setup, or optional polish that should not happen automatically.",
+  "- Put excluded work in Explicit non-goals or Charter non-goals, especially packaging, deployment, account setup, or optional polish that should not happen automatically.",
+  "- Put adaptable scope in Flexible requirements and optional scope in Nice-to-have ideas.",
   "- Mention required validation commands or manual review expectations in Quality Bar when they matter.",
   ""
 ].join("\n");
@@ -535,13 +568,21 @@ const sourceLabel = (source: SummarySource): string =>
 
 const ultimateGoalFieldLabel = (field: UltimateGoalImportPreview["missingFields"][number]): string =>
   ({
-    summary: "Project charter",
+    summary: "Current Effective Goal",
     detailedIntent: "Detailed intent",
     successCriteria: "Success criteria",
     constraints: "Constraints",
     nonGoals: "Non-goals",
     qualityBar: "Quality bar",
-    targetAudience: "Target audience"
+    targetAudience: "Target audience",
+    nonNegotiableRequirements: "Non-negotiable requirements",
+    flexibleRequirements: "Flexible requirements",
+    niceToHaveIdeas: "Nice-to-have ideas",
+    explicitNonGoals: "Charter non-goals",
+    userConstraints: "User constraints",
+    aestheticPreferences: "Aesthetic preferences",
+    technicalPreferences: "Technical preferences",
+    definitionOfDone: "Definition of done"
   })[field];
 
 const availabilityMessage = (state: WorkbenchState): string => {
@@ -1550,6 +1591,94 @@ const goalCharterDraftUpdateFromAi = (draft: GoalCharterAiDraft): GoalCharterDra
   technicalPreferences: fromLineList(draft.technicalPreferences),
   definitionOfDone: fromLineList(draft.definitionOfDone)
 });
+
+const hasImportedGoalField = (preview: UltimateGoalImportPreview, field: UltimateGoalImportPreview["populatedFields"][number]): boolean =>
+  preview.populatedFields.includes(field);
+
+const goalCharterDraftUpdateFromImport = (preview: UltimateGoalImportPreview): GoalCharterDraftUpdate => {
+  const update: GoalCharterDraftUpdate = {};
+  if (hasImportedGoalField(preview, "summary")) {
+    update.currentSummary = preview.goal.summary;
+  }
+  if (hasImportedGoalField(preview, "detailedIntent")) {
+    update.currentDetailedIntent = preview.goal.detailedIntent;
+  }
+  if (hasImportedGoalField(preview, "successCriteria")) {
+    update.currentSuccessCriteria = fromLineList(preview.goal.successCriteria);
+  }
+  if (hasImportedGoalField(preview, "constraints")) {
+    update.currentConstraints = fromLineList(preview.goal.constraints);
+  }
+  if (hasImportedGoalField(preview, "nonGoals")) {
+    update.currentNonGoals = fromLineList(preview.goal.nonGoals);
+  }
+  if (hasImportedGoalField(preview, "targetAudience")) {
+    update.currentTargetAudience = preview.goal.targetAudience;
+  }
+  if (hasImportedGoalField(preview, "qualityBar")) {
+    update.currentQualityBar = preview.goal.qualityBar;
+  }
+  if (hasImportedGoalField(preview, "nonNegotiableRequirements")) {
+    update.nonNegotiableRequirements = fromLineList(preview.charter.nonNegotiableRequirements);
+  }
+  if (hasImportedGoalField(preview, "flexibleRequirements")) {
+    update.flexibleRequirements = fromLineList(preview.charter.flexibleRequirements);
+  }
+  if (hasImportedGoalField(preview, "niceToHaveIdeas")) {
+    update.niceToHaveIdeas = fromLineList(preview.charter.niceToHaveIdeas);
+  }
+  if (hasImportedGoalField(preview, "explicitNonGoals")) {
+    update.explicitNonGoals = fromLineList(preview.charter.explicitNonGoals);
+  }
+  if (hasImportedGoalField(preview, "userConstraints")) {
+    update.userConstraints = fromLineList(preview.charter.userConstraints);
+  }
+  if (hasImportedGoalField(preview, "aestheticPreferences")) {
+    update.aestheticPreferences = fromLineList(preview.charter.aestheticPreferences);
+  }
+  if (hasImportedGoalField(preview, "technicalPreferences")) {
+    update.technicalPreferences = fromLineList(preview.charter.technicalPreferences);
+  }
+  if (hasImportedGoalField(preview, "definitionOfDone")) {
+    update.definitionOfDone = fromLineList(preview.charter.definitionOfDone);
+  }
+  return update;
+};
+
+const importedGoalCharterPatch = (
+  preview: UltimateGoalImportPreview | null,
+  draft: GoalCharterDraftState
+): Partial<UltimateGoalImportPreview["charter"]> => {
+  if (!preview) {
+    return {};
+  }
+  const patch: Partial<UltimateGoalImportPreview["charter"]> = {};
+  if (hasImportedGoalField(preview, "nonNegotiableRequirements")) {
+    patch.nonNegotiableRequirements = toLineList(draft.nonNegotiableRequirements);
+  }
+  if (hasImportedGoalField(preview, "flexibleRequirements")) {
+    patch.flexibleRequirements = toLineList(draft.flexibleRequirements);
+  }
+  if (hasImportedGoalField(preview, "niceToHaveIdeas")) {
+    patch.niceToHaveIdeas = toLineList(draft.niceToHaveIdeas);
+  }
+  if (hasImportedGoalField(preview, "explicitNonGoals")) {
+    patch.explicitNonGoals = toLineList(draft.explicitNonGoals);
+  }
+  if (hasImportedGoalField(preview, "userConstraints")) {
+    patch.userConstraints = toLineList(draft.userConstraints);
+  }
+  if (hasImportedGoalField(preview, "aestheticPreferences")) {
+    patch.aestheticPreferences = toLineList(draft.aestheticPreferences);
+  }
+  if (hasImportedGoalField(preview, "technicalPreferences")) {
+    patch.technicalPreferences = toLineList(draft.technicalPreferences);
+  }
+  if (hasImportedGoalField(preview, "definitionOfDone")) {
+    patch.definitionOfDone = toLineList(draft.definitionOfDone);
+  }
+  return patch;
+};
 
 const cloneStrategy = (strategy?: AutopilotStrategy): AutopilotStrategy => {
   const base = strategy ?? createDefaultAutopilotStrategy();
@@ -6787,7 +6916,14 @@ const GoalCharterDraftField = ({
   multiline?: boolean;
 }) => {
   const polishBusy = busy?.kind === "polish" && busy.field === field;
-  const polishDisabled = disabled || Boolean(busy) || !value.trim();
+  const polishDisabled = Boolean(busy) || !value.trim();
+  const polishTitle = !value.trim()
+    ? `Enter text before polishing ${label}`
+    : busy
+      ? "Wait for the current AI draft action to finish"
+      : disabled
+        ? `Polish ${label}. Model availability will be checked when clicked.`
+        : `Polish ${label}`;
   return (
     <label className="form-field goal-charter-draft-field">
       <span className="goal-charter-draft-field__header">
@@ -6795,7 +6931,7 @@ const GoalCharterDraftField = ({
         <button
           className="secondary-button secondary-button--compact goal-charter-draft-field__polish"
           type="button"
-          title={`Pollish ${label}`}
+          title={polishTitle}
           onClick={(event) => {
             event.preventDefault();
             onPolish(field);
@@ -6803,7 +6939,7 @@ const GoalCharterDraftField = ({
           disabled={polishDisabled}
         >
           <WandIcon />
-          {polishBusy ? "Pollishing..." : "Pollish"}
+          {polishBusy ? "Polishing..." : "Polish"}
         </button>
       </span>
       {multiline ? (
@@ -6834,6 +6970,7 @@ const GoalCharterSettingsPanel = ({
   onAiModelChange,
   onAiReasoningEffortChange,
   onGenerateDraft,
+  onImportFormat,
   onDownloadFormat
 }: {
   project?: LoadedProjectView;
@@ -6854,6 +6991,7 @@ const GoalCharterSettingsPanel = ({
   onAiModelChange: (model: string) => void;
   onAiReasoningEffortChange: (effort: InterfaceReasoningEffort) => void;
   onGenerateDraft: () => void;
+  onImportFormat: () => void;
   onDownloadFormat: () => void;
 }) => {
   if (!project) {
@@ -6975,6 +7113,9 @@ const GoalCharterSettingsPanel = ({
               </button>
               <button className="secondary-button" type="button" onClick={onDownloadFormat}>
                 Download Ultimate Goal format
+              </button>
+              <button className="secondary-button" type="button" onClick={onImportFormat}>
+                Import Goal from .txt
               </button>
             </div>
           </div>
@@ -7365,6 +7506,7 @@ const SettingsDialog = ({
   onApplyAutopilotPreset,
   onDetectGoal,
   onRejectDetectedGoal,
+  onImportUltimateGoalText,
   onDownloadUltimateGoalFormat,
   onClose,
   onOpenDevTools,
@@ -7405,6 +7547,7 @@ const SettingsDialog = ({
   onApplyAutopilotPreset: (preset: AutopilotPreset) => void;
   onDetectGoal: () => void;
   onRejectDetectedGoal: () => void;
+  onImportUltimateGoalText: () => void;
   onDownloadUltimateGoalFormat: () => void;
   onClose: () => void;
   onOpenDevTools: () => void;
@@ -7463,6 +7606,7 @@ const SettingsDialog = ({
           onAiModelChange={onGoalCharterAiModelChange}
           onAiReasoningEffortChange={onGoalCharterAiReasoningEffortChange}
           onGenerateDraft={onGenerateGoalCharterDraft}
+          onImportFormat={onImportUltimateGoalText}
           onDownloadFormat={onDownloadUltimateGoalFormat}
         />
         <RuntimeReadinessPanel
@@ -10864,6 +11008,10 @@ const WorkbenchApp = () => {
         },
         true
       );
+      const importedCharterPatch = importedGoalCharterPatch(ultimateGoalImportPreview, goalCharterDraft);
+      if (Object.keys(importedCharterPatch).length > 0) {
+        await window.workbench.updateGoalCharter(activeProject.record.id, importedCharterPatch);
+      }
       setUltimateGoalImportPreview(null);
       showInfoNotice("Ultimate Goal confirmed.");
     } catch (error) {
@@ -10893,7 +11041,7 @@ const WorkbenchApp = () => {
       return;
     }
     if (!goalCharterAiModel) {
-      setNotice({ message: "Choose an available model before using Pollish.", tone: "error" });
+      setNotice({ message: "Choose an available model before using Polish.", tone: "error" });
       setWorkspaceTab("settings");
       return;
     }
@@ -10912,7 +11060,7 @@ const WorkbenchApp = () => {
         ...current,
         [result.field]: result.value
       }));
-      showInfoNotice("Pollished the Goal Charter field. Review before saving.");
+      showInfoNotice("Polished the Goal Charter field. Review before saving.");
     } catch (error) {
       handleError(error);
     } finally {
@@ -11118,6 +11266,10 @@ const WorkbenchApp = () => {
         targetAudience: imported.goal.targetAudience,
         qualityBar: imported.goal.qualityBar
       });
+      setGoalCharterDraft((current) => ({
+        ...current,
+        ...goalCharterDraftUpdateFromImport(imported)
+      }));
       setUltimateGoalImportPreview(imported);
       showInfoNotice(
         imported.completeness === "complete"
@@ -11497,6 +11649,7 @@ const WorkbenchApp = () => {
       onApplyAutopilotPreset={applyAutopilotPreset}
       onDetectGoal={() => void detectUltimateGoal()}
       onRejectDetectedGoal={() => void rejectDetectedGoal()}
+      onImportUltimateGoalText={() => void importUltimateGoalText()}
       onDownloadUltimateGoalFormat={downloadUltimateGoalFormat}
       onClose={() => setShowSettings(false)}
       onOpenDevTools={() => void openDevTools()}
@@ -13759,6 +13912,7 @@ const WorkbenchApp = () => {
               onApplyAutopilotPreset={applyAutopilotPreset}
               onDetectGoal={() => void detectUltimateGoal()}
               onRejectDetectedGoal={() => void rejectDetectedGoal()}
+              onImportUltimateGoalText={() => void importUltimateGoalText()}
               onDownloadUltimateGoalFormat={downloadUltimateGoalFormat}
               onClose={() => void setWorkspaceTab("overview")}
               onOpenDevTools={() => void openDevTools()}

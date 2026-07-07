@@ -8499,15 +8499,61 @@ describe("ultimate goal text import", () => {
       "Detailed Intent:\nCoordinate repo analysis, planning, coding, and validation in one explicit loop.",
       "Success Criteria:\n- Recommendations are persisted.\n- Repair loops are visible.",
       "Constraints:\n- Keep typed IPC.\n- Keep the renderer sandboxed.",
-      "Non-goals:\n- No hidden filesystem access.",
+      "Explicit non-goals:\n- No hidden filesystem access.",
+      "Definition of done:\n- Tests cover the import path.",
       "Quality Bar: Stable, test-backed behavior.",
-      "Target Audience: Developers operating the desktop app."
+      "Target Audience: Developers operating the desktop app.",
+      "Non-negotiable requirements:\n- Preserve renderer sandboxing.",
+      "Charter non-goals:\n- Do not add TUI scraping.",
+      "Flexible requirements:\n- Button copy may change if clearer.",
+      "Nice-to-have ideas:\n- Add import previews.",
+      "User constraints:\n- Keep imports local.",
+      "Technical preferences:\n- Use typed IPC.",
+      "Aesthetic preferences:\n- Keep settings dense."
     ].join("\n\n"), "goal.txt");
 
     expect(preview.completeness).toBe("complete");
     expect(preview.goal.summary).toBe("Build a durable workflow dashboard.");
     expect(preview.goal.successCriteria).toEqual(["Recommendations are persisted.", "Repair loops are visible."]);
     expect(preview.goal.constraints).toEqual(["Keep typed IPC.", "Keep the renderer sandboxed."]);
+    expect(preview.charter.explicitNonGoals).toEqual(["Do not add TUI scraping."]);
+    expect(preview.charter.flexibleRequirements).toEqual(["Button copy may change if clearer."]);
+    expect(preview.missingFields).toEqual([]);
+  });
+
+  it("assigns text to the region named by each section title", () => {
+    const preview = parseUltimateGoalText([
+      "Current Effective Goal: Build a focused import flow.",
+      "Detailed Intent: Keep goal setup explicit and reviewable.",
+      "Success Criteria:\n- Uploaded files populate the matching fields.",
+      "Constraints:\n- Preserve typed IPC.",
+      "Explicit non-goals:\n- Do not auto-confirm uploaded files.",
+      "Definition of done:\n- Parser tests cover adjacent headings.",
+      "Quality Bar: Reliable and easy to inspect.",
+      "Target Audience: Workbench operators.",
+      "Non-negotiable requirements:\n- Do not expose Node APIs.",
+      "Charter non-goals",
+      "- Do not add websocket transport.",
+      "- Do not scrape a TUI.",
+      "",
+      "Flexible requirements",
+      "- The import button can live in Settings or Workflow.",
+      "- The title matching can accept old aliases.",
+      "",
+      "Nice-to-have ideas:\n- Show richer previews.",
+      "User constraints:\n- Keep the file plain text.",
+      "Technical preferences:\n- Use the shared type model.",
+      "Aesthetic preferences:\n- Keep controls compact."
+    ].join("\n"), "regions.txt");
+
+    expect(preview.charter.explicitNonGoals).toEqual([
+      "Do not add websocket transport.",
+      "Do not scrape a TUI."
+    ]);
+    expect(preview.charter.flexibleRequirements).toEqual([
+      "The import button can live in Settings or Workflow.",
+      "The title matching can accept old aliases."
+    ]);
     expect(preview.missingFields).toEqual([]);
   });
 

@@ -2196,11 +2196,31 @@ export type UltimateGoalImportField =
   | "constraints"
   | "nonGoals"
   | "qualityBar"
-  | "targetAudience";
+  | "targetAudience"
+  | "nonNegotiableRequirements"
+  | "flexibleRequirements"
+  | "niceToHaveIdeas"
+  | "explicitNonGoals"
+  | "userConstraints"
+  | "aestheticPreferences"
+  | "technicalPreferences"
+  | "definitionOfDone";
+
+export interface UltimateGoalImportCharterSections {
+  nonNegotiableRequirements: string[];
+  flexibleRequirements: string[];
+  niceToHaveIdeas: string[];
+  explicitNonGoals: string[];
+  userConstraints: string[];
+  aestheticPreferences: string[];
+  technicalPreferences: string[];
+  definitionOfDone: string[];
+}
 
 export interface UltimateGoalImportPreview {
   sourceFileName: string;
   goal: Omit<UltimateGoal, "confirmedAt" | "lastUpdatedAt">;
+  charter: UltimateGoalImportCharterSections;
   populatedFields: UltimateGoalImportField[];
   missingFields: UltimateGoalImportField[];
   warnings: string[];
