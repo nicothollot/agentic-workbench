@@ -4667,6 +4667,132 @@ describe("workflow view helpers", () => {
     });
   });
 
+  it("keeps opened-checkout update blockers attached to merge instead of coding", async () => {
+    const service = new AppService(await createTempDir("checkout-update-blocker")) as unknown as {
+      syncWorkflowState: (project: ReturnType<typeof makeAppServiceLoadedProject>) => void;
+    };
+    const project = makeAppServiceLoadedProject("checkout-update-blocker-project");
+    const workflow = project.record.workflow;
+    workflow.approvedRecommendation = approveRecommendation(makeRecommendation({
+      id: "rec-checkout-update",
+      title: "Integrate validated work",
+      summary: "Merge the completed branch.",
+      rationale: "The work passed validation."
+    }));
+    workflow.scopedGoal = {
+      id: "goal-checkout-update",
+      sourceRecommendationId: "rec-checkout-update",
+      summary: "Integrate validated work",
+      executionBrief: "Merge the completed branch.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-04-07T00:01:00.000Z"
+    };
+    workflow.stepProgress.coding.status = "completed";
+    workflow.stepProgress.integrity.status = "completed";
+    workflow.stepProgress.merge.status = "failed";
+    workflow.humanInterventions = [
+      {
+        id: "intervention-checkout-update",
+        kind: "other",
+        title: "Opened checkout update blocked",
+        description: "Validated changes merged cleanly in the integration worktree, but Git could not apply them to the opened project checkout.",
+        reason: "Merge finalization could not update the opened project checkout.",
+        requestedByAgentCategory: "merge",
+        severity: "high",
+        blocking: true,
+        status: "pending",
+        createdAt: "2026-04-07T00:04:00.000Z"
+      }
+    ];
+
+    service.syncWorkflowState(project);
+
+    expect(workflow.workflowStage).toBe("blocked_human");
+    expect(workflow.stepProgress.coding.status).toBe("completed");
+    expect(workflow.stepProgress.merge).toMatchObject({
+      status: "blocked",
+      requiresUserInput: true,
+      blockedReason: "Validated changes merged cleanly in the integration worktree, but Git could not apply them to the opened project checkout."
+    });
+  });
+
+  it("resolves stale merge human interventions after successful merge cleanup", async () => {
+    const service = new AppService(await createTempDir("merge-intervention-cleanup")) as unknown as {
+      resolveWorkflowHumanInterventions: (
+        workflow: ProjectWorkflowState,
+        predicate: (intervention: ProjectWorkflowState["humanInterventions"][number]) => boolean,
+        resolutionNotes: string
+      ) => void;
+    };
+    const workflow = defaultProjectWorkflowState();
+    workflow.humanInterventions = [
+      {
+        id: "merge-blocker",
+        kind: "other",
+        title: "Opened checkout update blocked",
+        description: "Validated changes were not applied.",
+        reason: "Fast-forward failed.",
+        requestedByAgentCategory: "merge",
+        severity: "high",
+        blocking: true,
+        status: "pending",
+        createdAt: "2026-04-07T00:04:00.000Z"
+      },
+      {
+        id: "credential-blocker",
+        kind: "credentials",
+        title: "Provide API key",
+        description: "Credentials are required.",
+        reason: "Missing API key.",
+        requestedByAgentCategory: "coding",
+        severity: "high",
+        blocking: true,
+        status: "pending",
+        createdAt: "2026-04-07T00:05:00.000Z"
+      }
+    ];
+    workflow.memory.knownOpenIssues = [
+      {
+        id: "issue-merge-blocker",
+        title: "Opened checkout update blocked",
+        detail: "Validated changes were not applied.",
+        source: "human",
+        status: "open",
+        recordedAt: "2026-04-07T00:04:00.000Z"
+      },
+      {
+        id: "issue-credential-blocker",
+        title: "Provide API key",
+        detail: "Credentials are required.",
+        source: "human",
+        status: "open",
+        recordedAt: "2026-04-07T00:05:00.000Z"
+      }
+    ];
+
+    service.resolveWorkflowHumanInterventions(
+      workflow,
+      (intervention) => intervention.requestedByAgentCategory === "merge",
+      "Resolved automatically after merge finalization completed."
+    );
+
+    expect(workflow.humanInterventions.find((entry) => entry.id === "merge-blocker")).toMatchObject({
+      status: "resolved",
+      resolutionNotes: "Resolved automatically after merge finalization completed."
+    });
+    expect(workflow.humanInterventions.find((entry) => entry.id === "credential-blocker")).toMatchObject({
+      status: "pending"
+    });
+    expect(workflow.memory.knownOpenIssues.find((entry) => entry.id === "issue-merge-blocker")).toMatchObject({
+      status: "resolved"
+    });
+    expect(workflow.memory.knownOpenIssues.find((entry) => entry.id === "issue-credential-blocker")).toMatchObject({
+      status: "open"
+    });
+  });
+
   it("marks repairing and retrying validation in the timeline instead of leaving a stale failed state", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {

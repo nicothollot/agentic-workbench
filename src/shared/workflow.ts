@@ -732,13 +732,13 @@ export const getWorkflowActiveStepId = (
     case "appeal_pending":
       return "recommendation";
     case "blocked_human": {
-      if (workflow.stepProgress.merge.status === "running" || workflow.stepProgress.merge.status === "failed") {
+      if (workflow.stepProgress.merge.status === "running" || workflow.stepProgress.merge.status === "failed" || workflow.stepProgress.merge.status === "blocked") {
         return "merge";
       }
-      if (workflow.stepProgress.integrity.status === "running" || workflow.stepProgress.integrity.status === "failed") {
+      if (workflow.stepProgress.integrity.status === "running" || workflow.stepProgress.integrity.status === "failed" || workflow.stepProgress.integrity.status === "blocked") {
         return "integrity";
       }
-      if (workflow.stepProgress.coding.status === "running" || workflow.stepProgress.coding.status === "failed" || workflow.scopedGoal) {
+      if (workflow.stepProgress.coding.status === "running" || workflow.stepProgress.coding.status === "failed" || workflow.stepProgress.coding.status === "blocked" || workflow.scopedGoal) {
         return "coding";
       }
       if (workflow.approvedRecommendation) {

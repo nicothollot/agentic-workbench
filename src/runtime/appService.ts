@@ -2704,6 +2704,26 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.refreshWorkflowMemory(workflow);
   }
 
+  private resolveWorkflowHumanInterventions(
+    workflow: ProjectWorkflowState,
+    predicate: (intervention: ProjectWorkflowState["humanInterventions"][number]) => boolean,
+    resolutionNotes: string
+  ): void {
+    const resolvedAt = nowIso();
+    const resolvedTitles = new Set<string>();
+    for (const intervention of workflow.humanInterventions) {
+      if (intervention.status === "pending" && predicate(intervention)) {
+        intervention.status = "resolved";
+        intervention.resolvedAt = resolvedAt;
+        intervention.resolutionNotes = resolutionNotes;
+        resolvedTitles.add(intervention.title);
+      }
+    }
+    if (resolvedTitles.size > 0) {
+      this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "human" && resolvedTitles.has(issue.title));
+    }
+  }
+
   private syncWorkflowState(project: LoadedProject): void {
     const startedAt = performance.now();
     const workflow = this.ensureWorkflowState(project.record);
@@ -2758,15 +2778,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     if (workflow.workflowStage === "blocked_human") {
       const intervention = workflow.humanInterventions.find((entry) => entry.status === "pending");
-      const stepId = workflow.scopedGoal
-        ? workflow.stepProgress.integrity.status === "running" || workflow.stepProgress.integrity.status === "failed"
-          ? "integrity"
-          : "coding"
-        : workflow.approvedRecommendation
-          ? "goal_plan"
-          : hasConfirmedUltimateGoal(workflow.ultimateGoal)
-            ? "recommendation"
-            : "ultimate_goal";
+      const stepId = getWorkflowActiveStepId(workflow);
       this.updateWorkflowStepProgress(workflow, stepId, {
         requiresUserInput: true,
         blockedReason: intervention?.description ?? intervention?.reason,
@@ -12152,6 +12164,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.resetWorkflowRepairState(workflow);
     workflow.manualHandoff = undefined;
     this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "integrity" || issue.source === "merge" || issue.source === "coding");
+    this.resolveWorkflowHumanInterventions(
+      workflow,
+      (intervention) => intervention.requestedByAgentCategory === "merge",
+      "Resolved automatically after external repair finalization completed."
+    );
     workflow.workflowCycle.status = "merged";
     mergeAgent.status = "completed";
     mergeAgent.completedAt = nowIso();
@@ -14308,6 +14325,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     this.resetWorkflowRepairState(workflow);
     this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
+    this.resolveWorkflowHumanInterventions(
+      workflow,
+      (intervention) => intervention.requestedByAgentCategory === "merge",
+      "Resolved automatically after merge completed."
+    );
     workflow.workflowCycle.status = "merged";
     this.recordWorkflowActivity(workflow, {
       source: "workflow",
@@ -14540,6 +14562,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         });
       }
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
+      this.resolveWorkflowHumanInterventions(
+        workflow,
+        (intervention) => intervention.requestedByAgentCategory === "merge",
+        "Resolved automatically after in-place integration completed."
+      );
       this.updateWorkflowStepProgress(workflow, "merge", {
         currentActivity: "In-place integration complete",
         latestProgressNote: "No Git merge step was required.",
@@ -14738,6 +14765,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         return;
       }
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
+      this.resolveWorkflowHumanInterventions(
+        workflow,
+        (intervention) => intervention.requestedByAgentCategory === "merge",
+        "Resolved automatically after merge finalization completed."
+      );
       workflow.workflowCycle.status = "merged";
       await this.cleanupCompletedManagedWorktrees(project, this.getRetiredMergeWorktreePaths(project, mergeAgent.id));
       mergeAgent.status = "completed";
