@@ -4793,6 +4793,51 @@ describe("workflow view helpers", () => {
     });
   });
 
+  it("selects merge-ready coding branches from the active workflow cycle", async () => {
+    const service = new AppService(await createTempDir("merge-candidate-branches")) as unknown as {
+      getMergeCandidateCodingBranches: (project: ReturnType<typeof makeAppServiceLoadedProject>) => string[];
+    };
+    const project = makeAppServiceLoadedProject("merge-candidate-project");
+    const workflow = project.record.workflow;
+    workflow.workflowCycle.cycleNumber = 3;
+    project.record.agents = [
+      {
+        ...createAgentSkeleton("coding", "Previous Cycle Coding", "Old cycle.", "gpt-5.4"),
+        workflowCycleNumber: 2,
+        status: "completed",
+        completedAt: "2026-04-07T00:05:00.000Z",
+        changedFiles: ["src/old-cycle.ts"],
+        worktree: { baseDir: "/repo/.agent-workbench", worktreePath: "/repo/.agent-workbench/old", branch: "awb/repo/old-cycle", targetBranch: "main" }
+      },
+      {
+        ...createAgentSkeleton("coding", "Failed Coding", "Failed current cycle.", "gpt-5.4"),
+        workflowCycleNumber: 3,
+        status: "failed",
+        completedAt: "2026-04-07T00:06:00.000Z",
+        changedFiles: ["src/failed.ts"],
+        worktree: { baseDir: "/repo/.agent-workbench", worktreePath: "/repo/.agent-workbench/failed", branch: "awb/repo/failed", targetBranch: "main" }
+      },
+      {
+        ...createAgentSkeleton("coding", "Coding Pass 1", "Current cycle.", "gpt-5.4"),
+        workflowCycleNumber: 3,
+        status: "completed",
+        completedAt: "2026-04-07T00:04:00.000Z",
+        changedFiles: ["src/current.ts"],
+        worktree: { baseDir: "/repo/.agent-workbench", worktreePath: "/repo/.agent-workbench/current", branch: "awb/repo/current", targetBranch: "main" }
+      },
+      {
+        ...createAgentSkeleton("coding", "Repair Coding Pass 2", "Latest current cycle.", "gpt-5.4"),
+        workflowCycleNumber: 3,
+        status: "completed",
+        completedAt: "2026-04-07T00:07:00.000Z",
+        changedFiles: ["src/current.ts", "src/repair.ts"],
+        worktree: { baseDir: "/repo/.agent-workbench", worktreePath: "/repo/.agent-workbench/repair", branch: "awb/repo/repair", targetBranch: "awb/repo/current" }
+      }
+    ];
+
+    expect(service.getMergeCandidateCodingBranches(project)).toEqual(["awb/repo/current", "awb/repo/repair"]);
+  });
+
   it("marks repairing and retrying validation in the timeline instead of leaving a stale failed state", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {

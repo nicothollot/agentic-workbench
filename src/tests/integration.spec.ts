@@ -3624,6 +3624,30 @@ describe("integration flows", () => {
       latestFailureReason: "Reset should discard current-cycle changes.",
       lastUpdatedAt: "2026-04-12T00:02:00.000Z"
     };
+    workflow.humanInterventions = [
+      {
+        id: "reset-merge-blocker",
+        kind: "other",
+        title: "Opened checkout update blocked",
+        description: "Validated changes merged cleanly in the integration worktree, but Git could not apply them to the opened project checkout.",
+        reason: "The opened checkout had an untracked file that would be overwritten.",
+        requestedByAgentCategory: "merge",
+        severity: "high",
+        blocking: true,
+        status: "pending",
+        createdAt: "2026-04-12T00:03:00.000Z"
+      }
+    ];
+    workflow.memory.knownOpenIssues = [
+      {
+        id: "reset-human-issue",
+        title: "Opened checkout update blocked",
+        detail: "Validated changes merged cleanly in the integration worktree, but Git could not apply them to the opened project checkout.",
+        source: "human",
+        status: "open",
+        recordedAt: "2026-04-12T00:03:00.000Z"
+      }
+    ];
     project.record.agents.push({
       ...createAgentSkeleton("coding", "Coding Pass 1", "Broken current-cycle change.", "gpt-5.4"),
       workflowCycleNumber: workflow.workflowCycle.cycleNumber,
@@ -3649,6 +3673,14 @@ describe("integration flows", () => {
     });
     expect(record?.localState.workflowPauseRequested).toBe(true);
     expect(record?.agents.some((agent) => agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)).toBe(false);
+    expect(record?.workflow.workflowStage).not.toBe("blocked_human");
+    expect(record?.workflow.humanInterventions.find((entry) => entry.id === "reset-merge-blocker")).toMatchObject({
+      status: "resolved",
+      resolutionNotes: `Resolved by resetting workflow cycle ${workflow.workflowCycle.cycleNumber}.`
+    });
+    expect(record?.workflow.memory.knownOpenIssues.find((entry) => entry.id === "reset-human-issue")).toMatchObject({
+      status: "resolved"
+    });
     expect(record?.workflow.activityLog[0]?.title).toBe("Current workflow cycle reset");
   }, 12_000);
 

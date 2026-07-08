@@ -2371,10 +2371,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private getMergeCandidateCodingBranches(project: LoadedProject): string[] {
+    const workflow = this.ensureWorkflowState(project.record);
     return [...new Set(
-      project.record.agents.flatMap((agent) =>
-        agent.category === "coding" && agent.worktree?.branch ? [agent.worktree.branch] : []
-      )
+      project.record.agents.flatMap((agent) => {
+        if (agent.category !== "coding" || !agent.worktree?.branch) {
+          return [];
+        }
+        const currentCycle = agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber;
+        const mergeReady =
+          agent.status === "completed" ||
+          (agent.workflowCycleNumber === undefined && agent.status === "idle");
+        return currentCycle && mergeReady ? [agent.worktree.branch] : [];
+      })
     )];
   }
 
@@ -11960,10 +11968,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       entry.cycleNumber !== cycleNumber || entry.kind === "recommendation"
     );
     workflow.memory.knownOpenIssues = workflow.memory.knownOpenIssues.map((issue) =>
-      issue.status === "open" && (issue.source === "coding" || issue.source === "integrity" || issue.source === "merge")
+      issue.status === "open" && (issue.source === "coding" || issue.source === "integrity" || issue.source === "merge" || issue.source === "human")
         ? { ...issue, status: "resolved" as const, resolvedAt: nowIso() }
         : issue
     );
+    this.resolveWorkflowHumanInterventions(
+      workflow,
+      (intervention) => intervention.blocking && intervention.status === "pending",
+      `Resolved by resetting workflow cycle ${cycleNumber}.`
+    );
+    workflow.manualHandoff = undefined;
     workflow.cycleContract = approvedRecommendation
       ? buildCycleContract(workflow, {
         now: nowIso(),

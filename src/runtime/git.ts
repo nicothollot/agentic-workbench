@@ -315,20 +315,25 @@ export const listBranchesMissingFromHead = async (
 
 export const determineDefaultBranch = async (projectRoot: string, settings: RuntimeSettings): Promise<string> => {
   try {
+    const remoteHead = await execGit(settings, projectRoot, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
+    const normalized = remoteHead.replace("refs/remotes/origin/", "").trim();
+    if (normalized) {
+      return normalized;
+    }
+  } catch {
+    // Fall through to the checked-out branch or a conventional fallback.
+  }
+
+  try {
     const current = await execGit(settings, projectRoot, ["branch", "--show-current"]);
     if (current) {
       return current;
     }
   } catch {
-    // Fall through to the remote default branch or a conventional fallback.
+    // Fall through to a conventional fallback.
   }
 
-  try {
-    const remoteHead = await execGit(settings, projectRoot, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
-    return remoteHead.replace("refs/remotes/origin/", "");
-  } catch {
-    return "main";
-  }
+  return "main";
 };
 
 export const applyBranchToProjectCheckout = async (
