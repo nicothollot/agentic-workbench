@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { APP_VERSION, PORTABLE_INTERFACE_VERSION, PROJECT_FINGERPRINT_VERSION, REVIEW_LOG_BUNDLE_VERSION } from "./constants";
 import { defaultProjectWorkflowState } from "./defaults";
+import { WORKFLOW_SCHEMA_VERSION } from "./types";
 
 const isoDatetime = () => z.string().datetime({ offset: true });
 
@@ -11,6 +12,9 @@ export const summarySourceSchema = z.enum(["deterministic", "codex", "hybrid", "
 export const agentCategorySchema = z.enum(["bootstrap", "goal", "coding", "integrity", "merge", "recommendation", "manual"]);
 export const interfaceReasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh"]);
 export const executionModeSchema = z.enum(["local", "wsl"]);
+export const appAppearanceThemeSchema = z.enum(["catc-dark", "catc-light", "space"]);
+export const appAppearanceDensitySchema = z.enum(["compact", "comfortable"]);
+export const appMotionModeSchema = z.enum(["system", "full", "reduced"]);
 export const gitHubLinkStateSchema = z.enum(["linked", "not_linked", "needs_ssh", "cli_missing", "error"]);
 export const ultimateGoalSourceSchema = z.enum(["user", "detected"]);
 export const recommendationRiskLevelSchema = z.enum(["low", "medium", "high"]);
@@ -225,7 +229,10 @@ export const appSettingsSchema = z.object({
   autoApproveCommands: z.boolean().default(false),
   autoApproveGitCommits: z.boolean().default(false),
   autoApproveGitPushes: z.boolean().default(false),
-  considerPaidServices: z.boolean().default(false)
+  considerPaidServices: z.boolean().default(false),
+  appearanceTheme: appAppearanceThemeSchema.default("catc-dark"),
+  appearanceDensity: appAppearanceDensitySchema.default("comfortable"),
+  motionMode: appMotionModeSchema.default("system")
 });
 
 export const reviewLogRuntimeContextSchema = z.object({
@@ -258,7 +265,7 @@ export const projectIdentitySchema = z.object({
 });
 
 export const validationSnapshotSchema = z.object({
-  interfaceSchemaVersion: z.number().default(PORTABLE_INTERFACE_VERSION),
+  interfaceSchemaVersion: z.union([z.literal(1), z.literal(PORTABLE_INTERFACE_VERSION)]).default(PORTABLE_INTERFACE_VERSION),
   appMinVersion: z.string().default(APP_VERSION),
   lastValidatedAt: isoDatetime().optional(),
   gitHead: z.string().optional(),
@@ -1300,6 +1307,108 @@ export const workflowActivityEventSchema = z.object({
   agentCategory: agentCategorySchema.optional()
 });
 
+export const workflowExecutionTagSchema = z.enum([
+  "needs_goal",
+  "recommending",
+  "awaiting_recommendation",
+  "planning",
+  "coding",
+  "validating",
+  "repairing",
+  "merging",
+  "awaiting_approval",
+  "awaiting_human",
+  "paused",
+  "cycle_complete",
+  "goal_complete"
+]);
+
+const workflowResumeTagSchema = z.enum([
+  "needs_goal",
+  "recommending",
+  "awaiting_recommendation",
+  "planning",
+  "coding",
+  "validating",
+  "repairing",
+  "merging",
+  "cycle_complete",
+  "goal_complete"
+]);
+
+export const workflowExecutionStateSchema = z.object({
+  schemaVersion: z.literal(WORKFLOW_SCHEMA_VERSION).default(WORKFLOW_SCHEMA_VERSION),
+  revision: z.number().int().positive().default(1),
+  cycleNumber: z.number().int().positive(),
+  tag: workflowExecutionTagSchema,
+  stepId: workflowStepIdSchema,
+  activeAgentId: z.string().min(1).optional(),
+  activeRunId: z.string().min(1).optional(),
+  repairAttempt: z.number().int().nonnegative().optional(),
+  maxRepairAttempts: z.number().int().positive().optional(),
+  validationKind: z.enum(["initial", "repair", "external_repair", "merge_conflict"]).optional(),
+  resumeTag: workflowResumeTagSchema.optional(),
+  incidentId: z.string().min(1).optional(),
+  effectKey: z.string().min(1).optional(),
+  enteredAt: isoDatetime(),
+  updatedAt: isoDatetime()
+});
+
+export const workflowIncidentActionSchema = z.object({
+  kind: z.enum(["approve", "provide_input", "retry", "revalidate", "open_shell", "open_credentials", "reset_cycle", "view_details"]),
+  label: z.string().min(1),
+  targetId: z.string().min(1).optional(),
+  disabledReason: z.string().optional()
+});
+
+export const workflowIncidentSchema = z.object({
+  id: z.string().min(1),
+  fingerprint: z.string().min(1),
+  cycleNumber: z.number().int().positive(),
+  kind: z.enum(["approval", "credential", "user_input", "validation", "environment", "hygiene", "merge_conflict", "checkout", "runtime", "recovery", "policy"]),
+  severity: z.enum(["info", "warning", "high", "critical"]),
+  status: z.enum(["open", "resolving", "resolved", "superseded"]),
+  sourceStep: workflowStepIdSchema,
+  title: z.string().min(1),
+  summary: z.string().default(""),
+  rootCause: z.string().default(""),
+  evidenceRefs: z.array(z.string()).default([]),
+  involvedPaths: z.array(z.string()).default([]),
+  automaticActions: z.array(z.string()).default([]),
+  nextSystemAction: z.string().optional(),
+  userActionRequired: z.string().optional(),
+  primaryAction: workflowIncidentActionSchema.optional(),
+  secondaryActions: z.array(workflowIncidentActionSchema).default([]),
+  occurrenceCount: z.number().int().positive().default(1),
+  openedAt: isoDatetime(),
+  updatedAt: isoDatetime(),
+  resolvedAt: isoDatetime().optional()
+});
+
+export const workflowJournalEventSchema = z.object({
+  id: z.string().min(1),
+  sequence: z.number().int().positive(),
+  cycleNumber: z.number().int().positive(),
+  kind: z.enum(["transition", "agent", "validation", "repair", "merge", "approval", "incident", "system", "migration"]),
+  status: workflowEventStatusSchema,
+  stepId: workflowStepIdSchema,
+  title: z.string().min(1),
+  summary: z.string().optional(),
+  agentId: z.string().min(1).optional(),
+  incidentId: z.string().min(1).optional(),
+  evidenceRefs: z.array(z.string()).default([]),
+  occurredAt: isoDatetime()
+});
+
+export const workflowMetricsStateSchema = z.object({
+  totalInputTokens: z.number().int().nonnegative().default(0),
+  totalCachedInputTokens: z.number().int().nonnegative().default(0),
+  totalOutputTokens: z.number().int().nonnegative().default(0),
+  totalReasoningTokens: z.number().int().nonnegative().default(0),
+  totalTokens: z.number().int().nonnegative().default(0),
+  updatedAt: isoDatetime().optional()
+});
+
 export const autopilotRuntimeStatusSchema = z.object({
   enabled: z.boolean(),
   profile: autopilotProfileSchema,
@@ -1366,6 +1475,11 @@ export const workflowAppealStateSchema = z.object({
 });
 
 export const projectWorkflowStateSchema = z.object({
+  schemaVersion: z.union([z.literal(1), z.literal(WORKFLOW_SCHEMA_VERSION)]).default(WORKFLOW_SCHEMA_VERSION),
+  execution: workflowExecutionStateSchema.default(defaultProjectWorkflowState().execution),
+  incidents: z.array(workflowIncidentSchema).default([]),
+  journal: z.array(workflowJournalEventSchema).default([]),
+  metrics: workflowMetricsStateSchema.default(defaultProjectWorkflowState().metrics),
   ultimateGoal: ultimateGoalSchema.default(defaultProjectWorkflowState().ultimateGoal),
   ultimateGoalDraft: ultimateGoalSchema.optional(),
   goalCharter: goalCharterSchema.default(defaultProjectWorkflowState().goalCharter),
@@ -1563,11 +1677,20 @@ export const agentStateSchema = z.object({
     transcriptAvailable: z.boolean(),
     fullOutputAvailable: z.boolean(),
     updatedAt: isoDatetime()
+  }).optional(),
+  tokenUsage: z.object({
+    totalTokens: z.number().int().nonnegative(),
+    inputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    reasoningOutputTokens: z.number().int().nonnegative(),
+    modelContextWindow: z.number().int().positive().nullable().optional(),
+    updatedAt: isoDatetime()
   }).optional()
 });
 
 export const portableInterfaceSchema = z.object({
-  schemaVersion: z.number().default(PORTABLE_INTERFACE_VERSION),
+  schemaVersion: z.union([z.literal(1), z.literal(PORTABLE_INTERFACE_VERSION)]).default(PORTABLE_INTERFACE_VERSION),
   appMinVersion: z.string().default(APP_VERSION),
   exportedAt: isoDatetime(),
   checksum: z.string().min(1),

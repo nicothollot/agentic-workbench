@@ -161,13 +161,12 @@ export interface BuildOperatorWorkflowViewModelOptions {
 const toTime = (value?: string): number => value ? Date.parse(value) || 0 : 0;
 
 const latestValidationLedger = (workflow: ProjectWorkflowState, explicit?: ValidationLedger): ValidationLedger | undefined =>
-  explicit ?? workflow.validationLedgers
+  [...workflow.validationLedgers, ...(explicit ? [explicit] : [])]
     .filter((ledger) => ledger.cycleNumber === workflow.workflowCycle.cycleNumber)
     .sort((left, right) => toTime(right.updatedAt) - toTime(left.updatedAt))[0];
 
 const latestRepoHygieneReport = (workflow: ProjectWorkflowState, explicit?: RepoHygieneReport): RepoHygieneReport | undefined =>
-  explicit ?? workflow.repoHygieneReports
-    .slice()
+  [...workflow.repoHygieneReports, ...(explicit ? [explicit] : [])]
     .sort((left, right) => toTime(right.scannedAt) - toTime(left.scannedAt))[0];
 
 const latestChecklistDelta = (workflow: ProjectWorkflowState): ChecklistDelta | undefined =>
@@ -536,6 +535,15 @@ const buildNextOperatorAction = (
   contract: CycleContract | undefined,
   workflowPauseRequested?: boolean
 ): string => {
+  if (status.label === "Repair in progress") {
+    return "The system is repairing the current failure; validation will run automatically next.";
+  }
+  if (status.label === "Repair validation running") {
+    return "The system is revalidating the repair; merge will continue automatically if validation passes.";
+  }
+  if (status.label === "Repair validated") {
+    return "The repair passed validation; the system is preparing integration.";
+  }
   if (hygiene?.mergeBlockingFindings.length || hygiene?.forbiddenFiles.length) {
     return "Remove or repair forbidden changed paths before merge.";
   }

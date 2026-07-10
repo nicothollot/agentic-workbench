@@ -27,6 +27,9 @@ export type AgentReasoningEfforts = Partial<Record<AgentCategory, InterfaceReaso
 export type InterfaceCreationStatus = "idle" | "queued" | "running" | "completed" | "failed";
 export type ModelCatalogSource = "live" | "mock" | "unavailable";
 export type ExecutionMode = "local" | "wsl";
+export type AppAppearanceTheme = "catc-dark" | "catc-light" | "space";
+export type AppAppearanceDensity = "compact" | "comfortable";
+export type AppMotionMode = "system" | "full" | "reduced";
 export type GitHubLinkState = "linked" | "not_linked" | "needs_ssh" | "cli_missing" | "error";
 export type UltimateGoalSource = "user" | "detected";
 export type RecommendationRiskLevel = "low" | "medium" | "high";
@@ -760,6 +763,9 @@ export interface AppSettings {
   autoApproveGitCommits: boolean;
   autoApproveGitPushes: boolean;
   considerPaidServices: boolean;
+  appearanceTheme?: AppAppearanceTheme;
+  appearanceDensity?: AppAppearanceDensity;
+  motionMode?: AppMotionMode;
 }
 
 export interface ReviewLogRuntimeContext {
@@ -1250,6 +1256,138 @@ export interface WorkflowActivityEvent {
   agentCategory?: AgentCategory;
 }
 
+export const WORKFLOW_SCHEMA_VERSION = 2;
+
+export type WorkflowExecutionTag =
+  | "needs_goal"
+  | "recommending"
+  | "awaiting_recommendation"
+  | "planning"
+  | "coding"
+  | "validating"
+  | "repairing"
+  | "merging"
+  | "awaiting_approval"
+  | "awaiting_human"
+  | "paused"
+  | "cycle_complete"
+  | "goal_complete";
+
+export type WorkflowValidationKind = "initial" | "repair" | "external_repair" | "merge_conflict";
+
+/**
+ * Canonical execution projection for the active cycle. Legacy workflow fields are
+ * retained for v1 import/export compatibility, but runtime/UI decisions should use
+ * this revisioned projection whenever it is present.
+ */
+export interface WorkflowExecutionState {
+  schemaVersion: typeof WORKFLOW_SCHEMA_VERSION;
+  revision: number;
+  cycleNumber: number;
+  tag: WorkflowExecutionTag;
+  stepId: WorkflowStepId;
+  activeAgentId?: string;
+  activeRunId?: string;
+  repairAttempt?: number;
+  maxRepairAttempts?: number;
+  validationKind?: WorkflowValidationKind;
+  resumeTag?: Exclude<WorkflowExecutionTag, "paused" | "awaiting_approval" | "awaiting_human">;
+  incidentId?: string;
+  effectKey?: string;
+  enteredAt: string;
+  updatedAt: string;
+}
+
+export type WorkflowIncidentKind =
+  | "approval"
+  | "credential"
+  | "user_input"
+  | "validation"
+  | "environment"
+  | "hygiene"
+  | "merge_conflict"
+  | "checkout"
+  | "runtime"
+  | "recovery"
+  | "policy";
+export type WorkflowIncidentSeverity = "info" | "warning" | "high" | "critical";
+export type WorkflowIncidentStatus = "open" | "resolving" | "resolved" | "superseded";
+export type WorkflowIncidentActionKind =
+  | "approve"
+  | "provide_input"
+  | "retry"
+  | "revalidate"
+  | "open_shell"
+  | "open_credentials"
+  | "reset_cycle"
+  | "view_details";
+
+export interface WorkflowIncidentAction {
+  kind: WorkflowIncidentActionKind;
+  label: string;
+  targetId?: string;
+  disabledReason?: string;
+}
+
+export interface WorkflowIncident {
+  id: string;
+  fingerprint: string;
+  cycleNumber: number;
+  kind: WorkflowIncidentKind;
+  severity: WorkflowIncidentSeverity;
+  status: WorkflowIncidentStatus;
+  sourceStep: WorkflowStepId;
+  title: string;
+  summary: string;
+  rootCause: string;
+  evidenceRefs: string[];
+  involvedPaths: string[];
+  automaticActions: string[];
+  nextSystemAction?: string;
+  userActionRequired?: string;
+  primaryAction?: WorkflowIncidentAction;
+  secondaryActions: WorkflowIncidentAction[];
+  occurrenceCount: number;
+  openedAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+export type WorkflowJournalEventKind =
+  | "transition"
+  | "agent"
+  | "validation"
+  | "repair"
+  | "merge"
+  | "approval"
+  | "incident"
+  | "system"
+  | "migration";
+
+export interface WorkflowJournalEvent {
+  id: string;
+  sequence: number;
+  cycleNumber: number;
+  kind: WorkflowJournalEventKind;
+  status: WorkflowEventStatus;
+  stepId: WorkflowStepId;
+  title: string;
+  summary?: string;
+  agentId?: string;
+  incidentId?: string;
+  evidenceRefs: string[];
+  occurredAt: string;
+}
+
+export interface WorkflowMetricsState {
+  totalInputTokens: number;
+  totalCachedInputTokens: number;
+  totalOutputTokens: number;
+  totalReasoningTokens: number;
+  totalTokens: number;
+  updatedAt?: string;
+}
+
 export interface AutopilotRuntimeStatus {
   enabled: boolean;
   profile: AutopilotProfile;
@@ -1330,6 +1468,11 @@ export interface UltimateGoalCompletionAssessment {
 }
 
 export interface ProjectWorkflowState {
+  schemaVersion: number;
+  execution: WorkflowExecutionState;
+  incidents: WorkflowIncident[];
+  journal: WorkflowJournalEvent[];
+  metrics: WorkflowMetricsState;
   ultimateGoal: UltimateGoal;
   ultimateGoalDraft?: UltimateGoal;
   goalCharter: GoalCharter;
@@ -1718,6 +1861,15 @@ export interface AgentState {
   recommendationReport?: RecommendationReport;
   appliedStructuredOutputs?: StructuredOutputApplication[];
   outputReference?: AgentOutputReference;
+  tokenUsage?: {
+    totalTokens: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    modelContextWindow?: number | null;
+    updatedAt: string;
+  };
 }
 
 export type AgentHistoryScope = "all" | "workflow" | "manual";

@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ClientRequest, InitializeParams, InitializeResponse, ServerNotification, ServerRequest } from "@generated/app-server";
 import type { ModelListResponse, ThreadReadResponse, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, TurnStartParams, TurnStartResponse } from "@generated/app-server/v2";
+import { APP_VERSION } from "@shared/constants";
 import type { AppSettings } from "@shared/types";
 import {
   RuntimeCommandExecutor,
@@ -223,7 +224,7 @@ export class CodexAppServerTransport extends EventEmitter<TransportEventMap> imp
       clientInfo: {
         name: "codex-agent-workbench",
         title: "Codex Agent Workbench",
-        version: "0.1.0"
+        version: APP_VERSION
       },
       capabilities: {
         experimentalApi: true,

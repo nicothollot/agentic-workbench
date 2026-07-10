@@ -73,6 +73,7 @@ import {
   uiStateUpdateRequestSchema,
   workflowCycleDetailRequestSchema,
   workflowCycleListRequestSchema,
+  workflowDashboardRequestSchema,
   workflowPreviewCheckpointRequestSchema,
   visualExportCaptureRequestSchema,
   visualExportSessionRequestSchema,
@@ -664,6 +665,10 @@ const registerIpc = (): void => {
   ipcMain.handle("project:getWorkflowCycle", (_event, payload) => {
     const parsed = workflowCycleDetailRequestSchema.parse(payload);
     return appService?.getWorkflowCycle(parsed.projectId, parsed.cycleId);
+  });
+  ipcMain.handle("workflow:getDashboard", (_event, payload) => {
+    const parsed = workflowDashboardRequestSchema.parse(payload);
+    return appService?.getWorkflowDashboard(parsed.projectId, parsed.timeline);
   });
   ipcMain.handle("project:listCycleAgents", (_event, payload) => {
     const parsed = cycleAgentListRequestSchema.parse(payload);

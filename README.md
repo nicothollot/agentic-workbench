@@ -11,7 +11,8 @@ The desktop UI is intended to run on Windows. Codex, Git, worktrees, and determi
 - Shows a saved-interface decision flow with validation badges and synthetic preview cards.
 - Bootstraps repository tree, project stats, dependency discovery, overview text, and cached file summaries.
 - Creates bootstrap, coding, integrity, merge, and recommendation agents.
-- Opens to a Command Center view that summarizes the current task, why it matters, progress, attention items, last result, next step, and project health.
+- Opens to Mission Control: a live goal-to-merge pipeline, causal timeline, current/next handoff, deduplicated attention queue, and evidence drawer.
+- Records canonical workflow execution revisions, structured incidents, a durable workflow journal, token usage, and validation/repair analytics.
 - Keeps full workflow, history, repository, logs, credentials, and settings details available in advanced tabs.
 - Uses the official `codex app-server` stdio JSON-RPC path for live Codex integration.
 - Stores machine-local registry/state in app data and portable interface data in the repo.
@@ -78,6 +79,8 @@ npm run build:app
 npm start
 ```
 
+This is also the primary local Windows workflow. From PowerShell in the repository, run `npm run build` and then `npm start`; the Electron app runs on Windows while Git, Codex, and managed worktrees continue to use WSL as execution truth.
+
 ## Build And Test
 
 ```bash
@@ -100,12 +103,12 @@ npm run package:mac
 
 Use the packaging commands only when you deliberately need a shareable desktop artifact:
 
-- WSL/Linux and native Windows packaging emits a Windows portable `.exe`.
+- WSL/Linux and native Windows packaging emits an unpacked Windows app folder by default; use `npm run package:win:portable` only when a one-file portable `.exe` is required.
 - macOS packaging emits a `.dmg`.
 
-Windows executable packaging is available for local use. `npm run package:win` and `npm run dist:win` produce the local portable `.exe` without requesting extra files or secrets.
+Windows packaging is available for local use. `npm run package:win` and `npm run dist:win` produce an unpacked app folder without requesting extra files or secrets; `npm run package:win:portable` and `npm run dist:win:portable` produce the optional one-file `.exe`.
 
-When a packaging command is used, the final `.exe` or `.dmg` is copied into the detected Downloads folder. Under WSL, the script prefers the Windows profile Downloads folder, so this machine resolves to `/mnt/c/Users/nicot/Downloads`.
+When a packaging command is used, the final unpacked folder, optional portable `.exe`, or `.dmg` is copied into the detected Downloads folder. Under WSL, the script prefers the Windows profile Downloads folder, so this machine resolves to `/mnt/c/Users/nicot/Downloads`.
 Use `AWB_PACKAGE_OUTPUT_DIR=/path/to/output npm run package:win` to override the destination.
 
 Detailed packaging and test instructions:
@@ -129,7 +132,7 @@ Portable interfaces are stored in:
 <target-project>/.agent-workbench/interface.json
 ```
 
-The portable file is versioned, schema-validated, checksumed, and excludes secrets, auth state, and raw credentials.
+The portable file is versioned and schema-validated. Version 2 checksums are verified on import; legacy version 1 files remain importable and are migrated. Exports exclude secrets, auth state, live approvals, raw command output, and machine-local execution handles.
 
 ## Import And Export
 
@@ -142,17 +145,15 @@ The portable file is versioned, schema-validated, checksumed, and excludes secre
 - Machine-specific paths and settings stay local.
 - The runtime blocks target-project artifacts from being written into the Agentic Workbench source repository.
 
-## Command Center And Advanced Views
+## Mission Control And Advanced Views
 
-The Overview tab starts with Command Center, a high-level Simple Mode for non-technical review:
+The Overview tab starts with Mission Control, a high-level operator view:
 
-- Current focus: task, phase, active agent, and status.
-- Why this matters: planner rationale or goal/checklist impact.
-- Progress: stage, cycle, and goal completion.
-- What changed so far: changed files, commands, and validation status.
-- Needs your attention: approvals, blockers, credential requests, user input, or "No action needed".
-- Last result and next step: links into History and Workflow details.
-- Project health: workflow, validation, repository scan, Codex readiness, runtime readiness, and state-repair signals.
+- Live execution map: goal, recommendation, plan, coding, integrity, and merge stages with repair-loop routing.
+- Causal timeline: selectable events with attached status, source, and evidence.
+- Now / Next / Needs you: the active agent, planned handoff, and one deduplicated operator queue.
+- Evidence drawer: progress, changed files, planner rationale, and project health without overwhelming the main view.
+- Analytics: cycle throughput, validation pass rate, repair success, commands, files, models, and token totals.
 
 Advanced tabs remain available for detailed operation:
 
@@ -181,7 +182,7 @@ If a generated artifact with private project history, absolute local paths, tran
 
 ## Limitations / Non-goals
 
-- The current renderer focuses on core flows, not full IDE parity.
-- Integrity/recommendation reports currently lean more on deterministic data than on rich structured Codex responses.
+- The renderer focuses on harness operation and repository evidence, not full IDE parity.
+- Deterministic validation remains the merge authority even when agents provide richer narrative summaries.
 - Packaging from WSL depends on network access to Electron artifacts and, in some setups, a Windows-native packaging pass.
 - The app does not ship telemetry, analytics, or a remote backend.

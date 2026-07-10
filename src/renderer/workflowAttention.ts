@@ -53,6 +53,23 @@ const attentionTime = (value?: string): number => {
   return Number.isNaN(parsed) ? 0 : parsed;
 };
 
+const attentionFingerprint = (item: WorkflowAttentionItem): string =>
+  `${item.title}\n${item.detail}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+const agentAttentionTime = (agent: AgentState): number =>
+  attentionTime(
+    agent.integrityReport?.generatedAt ??
+    agent.completedAt ??
+    agent.lastActivityAt ??
+    agent.startedAt ??
+    agent.createdAt
+  );
+
+const activeAgentStatuses = new Set<AgentState["status"]>(["starting", "running", "waiting_approval"]);
+
 const workflowStopReasonAttentionLabel = (reason?: string): string =>
   ({
     none: "No blocker",
@@ -89,8 +106,62 @@ export const buildWorkflowAttentionItems = ({
   agents: AgentState[];
 }): WorkflowAttentionItem[] => {
   const items: WorkflowAttentionItem[] = [];
+  const credentialLinkedUserInputIds = new Set(
+    credentialRequests.map((request) => request.userInputRequestId).filter((id): id is string => Boolean(id))
+  );
+  const linkedHumanInterventionIds = new Set([
+    ...userInputRequests.map((request) => request.humanInterventionId).filter((id): id is string => Boolean(id)),
+    ...credentialRequests.map((request) => request.humanInterventionId).filter((id): id is string => Boolean(id))
+  ]);
+  const currentCycleIncidents = (workflow?.incidents ?? []).filter((incident) =>
+    incident.cycleNumber === workflow?.workflowCycle.cycleNumber &&
+    (incident.status === "open" || (incident.status === "resolving" && Boolean(incident.userActionRequired)))
+  );
+  const incidentEvidenceRefs = new Set(currentCycleIncidents.flatMap((incident) => incident.evidenceRefs));
+  const incidentKinds = new Set(currentCycleIncidents.map((incident) => incident.kind));
+
+  for (const incident of currentCycleIncidents) {
+    const approvalId = incident.evidenceRefs.find((reference) => reference.startsWith("approval:"))?.slice("approval:".length);
+    const approval = approvalId ? approvals.find((entry) => entry.id === approvalId) : undefined;
+    items.push({
+      id: `incident:${incident.id}`,
+      kind: incident.kind === "approval"
+        ? "approval"
+        : incident.kind === "credential"
+          ? "credential"
+          : incident.kind === "validation" || incident.kind === "environment" || incident.kind === "hygiene"
+            ? "integrity"
+            : "blocker",
+      title: incident.title,
+      detail: summarizeAttentionText(
+        incident.userActionRequired ?? incident.nextSystemAction ?? incident.rootCause ?? incident.summary,
+        "Review the incident evidence before continuing.",
+        160
+      ),
+      tone: incident.severity === "critical" || incident.severity === "high"
+        ? "danger"
+        : incident.severity === "warning"
+          ? "warning"
+          : "neutral",
+      createdAt: incident.openedAt,
+      approval,
+      manualHandoff: incident.kind === "merge_conflict" || incident.kind === "validation" || incident.kind === "environment"
+        ? workflow?.manualHandoff
+        : undefined,
+      target: incident.kind === "credential"
+        ? "credentials"
+        : incident.kind === "user_input"
+          ? "user-input"
+          : incident.kind === "merge_conflict" || incident.kind === "validation" || incident.kind === "environment"
+            ? workflow?.manualHandoff ? "manual-handoff" : "blocker"
+            : "blocker"
+    });
+  }
 
   for (const approval of approvals) {
+    if (incidentEvidenceRefs.has(`approval:${approval.id}`)) {
+      continue;
+    }
     items.push({
       id: `approval:${approval.id}`,
       kind: "approval",
@@ -103,6 +174,9 @@ export const buildWorkflowAttentionItems = ({
   }
 
   for (const intervention of humanInterventions) {
+    if (linkedHumanInterventionIds.has(intervention.id) || incidentEvidenceRefs.has(`intervention:${intervention.id}`)) {
+      continue;
+    }
     items.push({
       id: `intervention:${intervention.id}`,
       kind: "blocker",
@@ -115,6 +189,12 @@ export const buildWorkflowAttentionItems = ({
   }
 
   for (const request of userInputRequests) {
+    if (
+      credentialLinkedUserInputIds.has(request.id) ||
+      Boolean(request.humanInterventionId && incidentEvidenceRefs.has(`intervention:${request.humanInterventionId}`))
+    ) {
+      continue;
+    }
     items.push({
       id: `user-input:${request.id}`,
       kind: "blocker",
@@ -127,6 +207,9 @@ export const buildWorkflowAttentionItems = ({
   }
 
   for (const request of credentialRequests) {
+    if (request.humanInterventionId && incidentEvidenceRefs.has(`intervention:${request.humanInterventionId}`)) {
+      continue;
+    }
     items.push({
       id: `credential:${request.id}`,
       kind: "credential",
@@ -138,7 +221,8 @@ export const buildWorkflowAttentionItems = ({
     });
   }
 
-  if (workflow?.manualHandoff) {
+  const repairNeedsRevalidation = !workflow?.manualHandoff && canRevalidateExternalRepair(workflow);
+  if (workflow?.manualHandoff && !incidentKinds.has("merge_conflict") && !incidentKinds.has("validation") && !incidentKinds.has("environment") && !incidentKinds.has("hygiene")) {
     items.push({
       id: `manual-handoff:${workflow.manualHandoff.reason}`,
       kind: "blocker",
@@ -149,7 +233,7 @@ export const buildWorkflowAttentionItems = ({
       manualHandoff: workflow.manualHandoff,
       target: "manual-handoff"
     });
-  } else if (canRevalidateExternalRepair(workflow)) {
+  } else if (repairNeedsRevalidation) {
     items.push({
       id: "repair:revalidate",
       kind: "integrity",
@@ -172,8 +256,45 @@ export const buildWorkflowAttentionItems = ({
     });
   }
 
-  const failedIntegrityAgent = agents.find((agent) => agent.integrityReport?.checks.some((check) => check.status === "failed"));
-  if (failedIntegrityAgent?.integrityReport) {
+  const currentCycleIntegrityAgents = agents
+    .filter((agent) =>
+      agent.category === "integrity" &&
+      Boolean(agent.integrityReport) &&
+      (!workflow || agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+    )
+    .sort((left, right) => agentAttentionTime(right) - agentAttentionTime(left));
+  const latestIntegrityAgent = currentCycleIntegrityAgents[0];
+  const failedIntegrityAgent = latestIntegrityAgent?.integrityReport?.checks.some((check) => check.status === "failed")
+    ? latestIntegrityAgent
+    : undefined;
+  const latestValidationLedger = workflow?.validationLedgers
+    .filter((ledger) => ledger.cycleNumber === workflow.workflowCycle.cycleNumber)
+    .sort((left, right) => attentionTime(right.updatedAt) - attentionTime(left.updatedAt))[0];
+  const repairOrValidationInFlight = Boolean(
+    workflow && (
+      workflow.repair.status === "repairing" ||
+      workflow.repair.status === "retrying_validation" ||
+      workflow.workflowStage === "integrity_running" ||
+      agents.some((agent) =>
+        activeAgentStatuses.has(agent.status) &&
+        (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber) &&
+        (agent.category === "integrity" || (workflow.workflowStage === "repair_loop" && agent.category === "coding"))
+      )
+    )
+  );
+  const integrityFailureResolved = Boolean(
+    workflow && (
+      workflow.repair.status === "fixed" ||
+      workflow.workflowStage === "ready_to_merge" ||
+      workflow.workflowStage === "merged" ||
+      workflow.workflowStage === "cycle_complete" ||
+      (latestIntegrityAgent?.status === "completed" && latestIntegrityAgent.integrityReport && !latestIntegrityAgent.integrityReport.checks.some((check) => check.status === "failed")) ||
+      latestValidationLedger?.finalValidationStatus === "passed"
+    )
+  );
+  const hasPrimaryRepairBlocker = Boolean(workflow?.manualHandoff || repairNeedsRevalidation);
+
+  if (!repairOrValidationInFlight && !integrityFailureResolved && !hasPrimaryRepairBlocker && failedIntegrityAgent?.integrityReport) {
     const failedCount = failedIntegrityAgent.integrityReport.checks.filter((check) => check.status === "failed").length;
     items.push({
       id: `integrity-agent:${failedIntegrityAgent.id}`,
@@ -183,7 +304,12 @@ export const buildWorkflowAttentionItems = ({
       tone: "danger",
       createdAt: failedIntegrityAgent.completedAt ?? failedIntegrityAgent.lastActivityAt
     });
-  } else if (workflow?.stepProgress.integrity.status === "failed" || workflow?.workflowStopReason === "integrity_failed") {
+  } else if (
+    !repairOrValidationInFlight &&
+    !integrityFailureResolved &&
+    !hasPrimaryRepairBlocker &&
+    (workflow?.stepProgress.integrity.status === "failed" || workflow?.workflowStopReason === "integrity_failed")
+  ) {
     items.push({
       id: "integrity:failed",
       kind: "integrity",
@@ -194,7 +320,22 @@ export const buildWorkflowAttentionItems = ({
     });
   }
 
-  for (const step of timeline.filter((step) => step.warning).slice(0, 3)) {
+  const representedWarningSteps = new Set<string>();
+  if (workflow?.manualHandoff?.reason === "merge_conflicts") {
+    representedWarningSteps.add("merge");
+  }
+  if (hasPrimaryRepairBlocker || items.some((item) => item.kind === "integrity")) {
+    representedWarningSteps.add("integrity");
+  }
+  if (repairOrValidationInFlight) {
+    representedWarningSteps.add("coding");
+    representedWarningSteps.add("integrity");
+  }
+  if (integrityFailureResolved) {
+    representedWarningSteps.add("integrity");
+  }
+
+  for (const step of timeline.filter((step) => step.warning && !representedWarningSteps.has(step.id)).slice(0, 3)) {
     items.push({
       id: `warning:${step.id}`,
       kind: "warning",
@@ -205,7 +346,15 @@ export const buildWorkflowAttentionItems = ({
     });
   }
 
-  return items.sort((left, right) => {
+  const seenFingerprints = new Set<string>();
+  return items.filter((item) => {
+    const fingerprint = attentionFingerprint(item);
+    if (seenFingerprints.has(fingerprint)) {
+      return false;
+    }
+    seenFingerprints.add(fingerprint);
+    return true;
+  }).sort((left, right) => {
     const toneScore = { danger: 0, warning: 1, neutral: 2 } as const;
     const toneDelta = toneScore[left.tone] - toneScore[right.tone];
     return toneDelta !== 0 ? toneDelta : attentionTime(right.createdAt) - attentionTime(left.createdAt);

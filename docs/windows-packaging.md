@@ -2,7 +2,7 @@
 
 For personal use on the same machine, run the app from the repo instead of creating a new Windows executable:
 
-```bash
+```powershell
 npm run build
 npm start
 ```
@@ -43,8 +43,8 @@ Final distributables are copied to the detected Downloads folder. In WSL, the sc
 
 Typical final artifacts:
 
-- `Codex Agent Workbench-0.1.0-windows-x64-unpacked/`
-- `Codex Agent Workbench-0.1.0-macos-universal.dmg`
+- `Codex Agent Workbench-1.0.0-windows-x64-unpacked/`
+- `Codex Agent Workbench-1.0.0-macos-universal.dmg`
 
 Set `AWB_PACKAGE_OUTPUT_DIR=/path/to/output` to override the destination. `AWB_DOWNLOADS_DIR` is also supported for compatibility.
 

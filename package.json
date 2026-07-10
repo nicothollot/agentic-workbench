@@ -1,6 +1,6 @@
 {
   "name": "codex-agent-workbench",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Local-first Electron workbench for orchestrating Codex agents against a repository.",
   "main": "dist-electron/main/index.cjs",
   "type": "module",

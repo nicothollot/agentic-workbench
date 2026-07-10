@@ -18,7 +18,8 @@ import {
 import type { GoalCheckUpdateInput } from "@runtime/workflowRecommendations";
 import { createAgentSkeleton, createLocalProjectRecord } from "@shared/defaults";
 import { projectReviewLogBundleSchema } from "@shared/schemas";
-import type { AgentState, UltimateGoal } from "@shared/types";
+import { upsertWorkflowIncident } from "@shared/workflowExecution";
+import type { AgentState, ProjectWorkflowState, UltimateGoal } from "@shared/types";
 import { nowIso } from "@shared/utils";
 import { createTempDir, initGitRepo, commitAll, writeMockSettings } from "./helpers";
 
@@ -900,6 +901,8 @@ describe("integration flows", () => {
     await waitFor(
       () => getProjectRecord(service, projectId)?.agents.find((entry) => entry.id === agent.id)?.approvals[0]?.status === "approved"
     );
+    await expect(service.approve(projectId, agent.id, pendingApproval.id, "decline"))
+      .rejects.toThrow(/already been approved/);
   });
 
   it("keeps live thread instructions role-scoped and sends the task prompt once", async () => {
@@ -1290,6 +1293,136 @@ describe("integration flows", () => {
     expect(record?.workflow.stepProgress.coding.currentSubstep).toContain("Repair attempt 2");
     expect(record?.workflow.activityLog[0]?.title).toContain("Automatic repair attempt 2");
     expect(record?.localState.autopilotEnabled).toBe(true);
+  });
+
+  it("durably queues validation as soon as a repair coding checkpoint completes", async () => {
+    const root = await createSampleFolder("repair-checkpoint-validation-handoff");
+    const appData = await createTempDir("appdata-repair-checkpoint-validation-handoff");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Continue automatically from repair into validation.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-goal-repair-handoff",
+      sourceRecommendationId: "rec-repair-handoff",
+      summary: "Repair the validation failure and prove the handoff.",
+      executionBrief: "Checkpoint repair work before deterministic validation.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: ["npm test"],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.repair = {
+      ...workflow.repair,
+      status: "repairing",
+      attemptCount: 1,
+      maxAttempts: 3,
+      latestIssueSummary: "A deterministic check failed.",
+      latestFailureReason: "Repair the failing assertion."
+    };
+    workflow.stepProgress.coding.status = "running";
+    workflow.stepProgress.integrity.status = "failed";
+    workflow.autopilotPolicy = { ...workflow.autopilotPolicy, enabled: true };
+    project.record.localState.autopilotEnabled = true;
+    const scheduleWorkflowAutomation = vi.fn();
+    (service as any).scheduleWorkflowAutomation = scheduleWorkflowAutomation;
+
+    const repairAgent = {
+      ...createAgentSkeleton("coding", "Repair Coding Pass 1", "Repair the assertion.", "gpt-5.4"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "running" as const,
+      startedAt: "2026-04-12T00:01:00.000Z"
+    };
+    project.record.agents.unshift(repairAgent);
+
+    await (service as any).finalizeGitWriteAgent(project, repairAgent);
+
+    const record = getProjectRecord(service, selected.record.id);
+    expect(record?.workflow.repair.status).toBe("retrying_validation");
+    expect(record?.workflow.stepProgress.integrity).toMatchObject({
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Queued to validate the repair checkpoint"
+    });
+    expect(record?.workflow.activityLog[0]?.title).toBe("Repair checkpoint ready; validation queued");
+    expect(record?.workflow.execution.tag).toBe("validating");
+    expect(scheduleWorkflowAutomation).toHaveBeenCalledWith(
+      selected.record.id,
+      "repair checkpoint queued for validation"
+    );
+  });
+
+  it("queues another bounded repair when repair checkpoint finalization throws", async () => {
+    const root = await createSampleRepo("repair-checkpoint-finalization-error");
+    const appData = await createTempDir("appdata-repair-checkpoint-finalization-error");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Recover when a repair worktree cannot be checkpointed.",
+      confirmedAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-finalization-recovery",
+      sourceRecommendationId: "rec-finalization-recovery",
+      summary: "Finish a bounded repair after a checkpoint error.",
+      executionBrief: "Retry the repair without stranding automation.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: ["npm test"],
+      createdAt: "2026-04-12T00:00:00.000Z"
+    };
+    workflow.repair = {
+      ...workflow.repair,
+      status: "repairing",
+      attemptCount: 1,
+      maxAttempts: 3,
+      latestIssueSummary: "A deterministic check failed.",
+      latestFailureReason: "Repair the failing assertion."
+    };
+    workflow.stepProgress.coding.status = "running";
+    workflow.autopilotPolicy = { ...workflow.autopilotPolicy, enabled: true };
+    project.record.localState.autopilotEnabled = true;
+    const scheduleWorkflowAutomation = vi.fn();
+    (service as any).scheduleWorkflowAutomation = scheduleWorkflowAutomation;
+
+    const repairAgent = {
+      ...createAgentSkeleton("coding", "Repair Coding Pass 1", "Repair the assertion.", "gpt-5.4"),
+      workflowCycleNumber: workflow.workflowCycle.cycleNumber,
+      status: "running" as const,
+      startedAt: "2026-04-12T00:01:00.000Z",
+      worktree: {
+        baseDir: appData,
+        worktreePath: path.join(root, "missing-repair-worktree"),
+        branch: "awb/missing-repair-worktree",
+        targetBranch: "main"
+      }
+    };
+    project.record.agents.unshift(repairAgent);
+
+    await (service as any).finalizeGitWriteAgent(project, repairAgent);
+
+    const record = getProjectRecord(service, selected.record.id);
+    const incident = record?.workflow.incidents.find((entry) => entry.kind === "checkout");
+    expect(record?.workflow.repair).toMatchObject({ status: "repairing", attemptCount: 2 });
+    expect(incident).toMatchObject({
+      status: "resolving",
+      title: "Coding checkpoint finalization failed"
+    });
+    expect(incident?.userActionRequired).toBeUndefined();
+    expect(scheduleWorkflowAutomation).toHaveBeenCalledWith(
+      selected.record.id,
+      "coding checkpoint finalization failed; automatic recovery queued"
+    );
   });
 
   it("retries merge after conflicts are resolved manually", async () => {
@@ -1850,6 +1983,31 @@ describe("integration flows", () => {
     activeAgent.status = "running";
     activeAgent.startedAt = new Date().toISOString();
     activeAgent.threadId = "missing-thread";
+    activeAgent.approvals.push({
+      id: "interrupted-approval",
+      agentId: activeAgent.id,
+      kind: "command",
+      threadId: activeAgent.threadId,
+      serverRequestId: "approval-request-1",
+      summary: "Run a command before interruption",
+      command: "npm test",
+      filePaths: [],
+      createdAt: new Date().toISOString(),
+      status: "pending",
+      availableDecisions: ["accept", "decline"]
+    });
+    const approvalIncident = upsertWorkflowIncident(record!.workflow, {
+      kind: "approval",
+      severity: "warning",
+      sourceStep: "recommendation",
+      title: "Codex approval is waiting",
+      summary: "Run a command before interruption",
+      rootCause: "The agent requested command approval.",
+      evidenceRefs: ["approval:interrupted-approval"],
+      userActionRequired: "Review the command.",
+      primaryAction: { kind: "approve", label: "Review approval", targetId: "interrupted-approval" },
+      now: new Date().toISOString()
+    });
     const activeAgentWithoutThread = createAgentSkeleton("recommendation", "Interrupted Recommendation Without Thread", "Generate recommendations.", "gpt-5.4-mini");
     activeAgentWithoutThread.status = "running";
     activeAgentWithoutThread.startedAt = new Date().toISOString();
@@ -1865,6 +2023,10 @@ describe("integration flows", () => {
     const reopened = await serviceB.selectPendingInterface("local", localCandidate?.path);
     expect(reopened.record.agents.find((agent) => agent.id === activeAgent.id)?.status).toBe("disconnected");
     expect(reopened.record.agents.find((agent) => agent.id === activeAgentWithoutThread.id)?.status).toBe("disconnected");
+    expect(reopened.record.agents.find((agent) => agent.id === activeAgent.id)?.approvals[0]?.status).toBe("cancelled");
+    expect(reopened.record.workflow.incidents.find((incident) => incident.id === approvalIncident.id)).toMatchObject({
+      status: "superseded"
+    });
     expect(reopened.record.workflow.stepProgress.recommendation.status).toBe("waiting");
   });
 
@@ -3365,6 +3527,14 @@ describe("integration flows", () => {
     expect(retriedWorkflow.manualHandoff).toBeUndefined();
     expect(retriedWorkflow.repair.status).not.toBe("exhausted");
     expect(retriedWorkflow.activityLog.some((event) => event.title === "Manual retry requested")).toBe(true);
+    expect(retriedWorkflow.incidents.filter((incident) =>
+      incident.cycleNumber === retriedWorkflow.workflowCycle.cycleNumber &&
+      (incident.kind === "validation" || incident.kind === "environment" || incident.kind === "hygiene") &&
+      incident.status === "open"
+    )).toHaveLength(0);
+    expect(retriedWorkflow.incidents
+      .filter((incident) => incident.status === "resolving")
+      .every((incident) => !incident.userActionRequired)).toBe(true);
   }, 12_000);
 
   it("retries validation instead of coding after an environment blocker is resolved externally", async () => {
@@ -3535,6 +3705,18 @@ describe("integration flows", () => {
       shellSupported: true,
       createdAt: "2026-04-12T00:02:00.000Z"
     };
+    const externalRepairIncident = upsertWorkflowIncident(workflow as ProjectWorkflowState, {
+      kind: "checkout",
+      severity: "high",
+      sourceStep: "coding",
+      title: "Repair checkpoint finalization failed",
+      summary: "The repaired checkout still needs deterministic finalization.",
+      rootCause: "The prior checkpoint could not be finalized.",
+      involvedPaths: ["src/external-fix.ts"],
+      userActionRequired: "Repair the checkout, then revalidate it.",
+      primaryAction: { kind: "revalidate", label: "Revalidate repair" },
+      now: "2026-04-12T00:02:00.000Z"
+    });
 
     await mkdir(path.join(root, ".agent-workbench", "manual-handoff"), { recursive: true });
     await writeFile(path.join(root, ".agent-workbench", "manual-handoff", "codex-handoff.md"), "local handoff helper\n");
@@ -3556,6 +3738,9 @@ describe("integration flows", () => {
     expect(mergeAgent?.status).toBe("completed");
     expect(mergeAgent?.mergeReport?.summary).toContain("Externally repaired checkout was validated");
     expect(record?.workflow.manualHandoff).toBeUndefined();
+    expect(record?.workflow.incidents.find((incident) => incident.id === externalRepairIncident.id)).toMatchObject({
+      status: "resolved"
+    });
     expect(record?.workflow.workflowCycle.status).toBe("merged");
     expect(record?.workflow.activityLog.some((event) => event.title === "External repair revalidation requested")).toBe(true);
     expect(record?.workflow.activityLog.some((event) => event.title === "External repair integrated")).toBe(true);
@@ -3648,6 +3833,18 @@ describe("integration flows", () => {
         recordedAt: "2026-04-12T00:03:00.000Z"
       }
     ];
+    const resetIncident = upsertWorkflowIncident(workflow as ProjectWorkflowState, {
+      kind: "checkout",
+      severity: "high",
+      sourceStep: "merge",
+      title: "Opened checkout update blocked",
+      summary: "Validated changes could not be applied to the opened checkout.",
+      rootCause: "The opened checkout had an untracked file that would be overwritten.",
+      evidenceRefs: ["intervention:reset-merge-blocker"],
+      userActionRequired: "Remove the conflicting file and retry.",
+      primaryAction: { kind: "retry", label: "Retry merge" },
+      now: "2026-04-12T00:03:00.000Z"
+    });
     project.record.agents.push({
       ...createAgentSkeleton("coding", "Coding Pass 1", "Broken current-cycle change.", "gpt-5.4"),
       workflowCycleNumber: workflow.workflowCycle.cycleNumber,
@@ -3681,6 +3878,12 @@ describe("integration flows", () => {
     expect(record?.workflow.memory.knownOpenIssues.find((entry) => entry.id === "reset-human-issue")).toMatchObject({
       status: "resolved"
     });
+    expect(record?.workflow.incidents.find((entry) => entry.id === resetIncident.id)).toMatchObject({
+      status: "superseded"
+    });
+    expect(record?.workflow.journal.some((event) =>
+      event.incidentId === resetIncident.id && event.title.startsWith("Superseded by cycle reset:")
+    )).toBe(true);
     expect(record?.workflow.activityLog[0]?.title).toBe("Current workflow cycle reset");
   }, 12_000);
 
@@ -4212,6 +4415,15 @@ describe("integration flows", () => {
     await new Promise((resolve) => setTimeout(resolve, 450));
     expect(saveCount).toBe(0);
     expect(emitCount).toBe(0);
+    const updated = getProjectRecord(service, selected.record.id);
+    expect(updated?.agents.find((entry) => entry.id === agent.id)?.tokenUsage).toMatchObject({
+      inputTokens: 49,
+      totalTokens: 49
+    });
+    expect(updated?.workflow.metrics).toMatchObject({
+      totalInputTokens: 49,
+      totalTokens: 49
+    });
   });
 
   it("deduplicates repeated command status activity rows", async () => {

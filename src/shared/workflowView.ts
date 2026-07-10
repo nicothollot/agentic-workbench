@@ -435,13 +435,12 @@ const latestWorkflowAgent = (agents: AgentState[], category: AgentState["categor
     )[0];
 
 const latestValidationLedger = (workflow: ProjectWorkflowState, explicit?: ValidationLedger): ValidationLedger | undefined =>
-  explicit ?? workflow.validationLedgers
+  [...workflow.validationLedgers, ...(explicit ? [explicit] : [])]
     .filter((ledger) => ledger.cycleNumber === workflow.workflowCycle.cycleNumber)
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
 
 const latestRepoHygieneReport = (workflow: ProjectWorkflowState, explicit?: RepoHygieneReport): RepoHygieneReport | undefined =>
-  explicit ?? workflow.repoHygieneReports
-    .slice()
+  [...workflow.repoHygieneReports, ...(explicit ? [explicit] : [])]
     .sort((left, right) => Date.parse(right.scannedAt) - Date.parse(left.scannedAt))[0];
 
 export const deriveUserFacingWorkflowStatus = (
@@ -457,9 +456,14 @@ export const deriveUserFacingWorkflowStatus = (
   const agents = options.agents ?? [];
   const ledger = latestValidationLedger(workflow, options.validationLedger);
   const hygiene = latestRepoHygieneReport(workflow, options.repoHygieneReport);
-  const codingAgent = latestWorkflowAgent(agents, "coding");
-  const integrityAgent = latestWorkflowAgent(agents, "integrity");
-  const mergeAgent = latestWorkflowAgent(agents, "merge");
+  const cycleMatches = (agent: AgentState): boolean =>
+    agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber;
+  const cycleAgents = agents.filter(cycleMatches);
+  const codingAgent = latestWorkflowAgent(cycleAgents, "coding");
+  const integrityAgent = latestWorkflowAgent(cycleAgents, "integrity");
+  const mergeAgent = latestWorkflowAgent(cycleAgents, "merge");
+  const codingIsActive = cycleAgents.some((agent) => agent.category === "coding" && isWorkflowAutomationBlockingAgent(agent));
+  const integrityIsActive = cycleAgents.some((agent) => agent.category === "integrity" && isWorkflowAutomationBlockingAgent(agent));
   const pausePrefix = options.workflowPauseRequested || workflow.autopilotStatus?.pausedReason === "manual_pause_requested"
     ? "Paused by operator, "
     : "";
@@ -472,8 +476,6 @@ export const deriveUserFacingWorkflowStatus = (
     workflow.autopilotStatus?.pausedReason &&
     /start_coding|coding|checkpoint/i.test(workflow.autopilotStatus.lastCompletedAction ?? "")
   );
-  const cycleMatches = (agent: AgentState): boolean =>
-    agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber;
   const validationReachedByProgress = (
     workflow.stepProgress.coding.status === "completed" ||
     workflow.stepProgress.coding.runCount > 0 ||
@@ -484,34 +486,48 @@ export const deriveUserFacingWorkflowStatus = (
     workflow.workflowStage === "ready_to_merge" ||
     workflow.workflowStage === "repair_loop"
   );
-  const validationReachedByAgent = agents.some((agent) =>
-    cycleMatches(agent) &&
+  const validationReachedByAgent = cycleAgents.some((agent) =>
     (agent.category === "integrity" || agent.category === "merge") &&
     (agent.status !== "idle" || Boolean(agent.integrityReport) || Boolean(agent.mergeReport))
   );
 
-  if (hygiene?.mergeBlockingFindings.length) {
+  // Execution state is authoritative while the harness is actively resolving an
+  // earlier failure. The prior ledger/report remains useful history, but it must
+  // not keep the live status red while repair or revalidation is underway.
+  if (workflow.repair.status === "repairing") {
     return {
-      label: "Merge blocked by repository hygiene",
-      explanation: hygiene.summaryForHumans,
+      label: "Repair in progress",
+      explanation: codingAgent?.currentPhase ?? workflow.stepProgress.coding.currentActivity ?? workflow.repair.latestFailureReason ?? "The workflow is repairing the latest validation failure.",
+      tone: "running"
+    };
+  }
+  if (workflow.repair.status === "retrying_validation") {
+    return {
+      label: "Repair validation running",
+      explanation: integrityAgent?.currentPhase ?? workflow.stepProgress.integrity.currentActivity ?? "The workflow is validating the latest repair.",
+      tone: "running"
+    };
+  }
+  if (
+    workflow.manualHandoff ||
+    workflow.repair.status === "exhausted" ||
+    workflow.repair.status === "merge_conflicts" ||
+    workflow.workflowStopReason === "merge_conflicts"
+  ) {
+    return {
+      label: workflow.manualHandoff?.title ?? (workflow.repair.status === "merge_conflicts" ? "Merge conflicts detected" : "Automatic repair reached its limit"),
+      explanation: workflow.manualHandoff?.latestFailureReason ?? workflow.repair.latestFailureReason ?? workflow.repair.latestIssueSummary ?? "Manual recovery is required before the workflow can continue.",
       tone: "danger"
     };
   }
-  if (ledger?.unresolvedValidationFailures.length || ledger?.finalValidationStatus === "failed" || ledger?.finalValidationStatus === "partial") {
-    return {
-      label: "Merge blocked by validation failure",
-      explanation: ledger.summaryForHumans,
-      tone: ledger.finalValidationStatus === "partial" ? "warning" : "danger"
-    };
-  }
-  if (workflow.workflowStage === "coding_running" || agents.some((agent) => agent.category === "coding" && isWorkflowAutomationBlockingAgent(agent))) {
+  if (workflow.workflowStage === "coding_running" || codingIsActive) {
     return {
       label: "Running coding pass",
       explanation: codingAgent?.currentPhase ?? workflow.stepProgress.coding.message ?? "Implementation work is underway.",
       tone: "running"
     };
   }
-  if (workflow.workflowStage === "integrity_running" || agents.some((agent) => agent.category === "integrity" && isWorkflowAutomationBlockingAgent(agent))) {
+  if (workflow.workflowStage === "integrity_running" || integrityIsActive) {
     return {
       label: "Integrity validation running",
       explanation: integrityAgent?.currentPhase ?? workflow.stepProgress.integrity.message ?? "Deterministic validation is running.",
@@ -528,6 +544,53 @@ export const deriveUserFacingWorkflowStatus = (
       tone: "success"
     };
   }
+  if (workflow.workflowStage === "merged") {
+    return {
+      label: "Merge complete",
+      explanation: mergeAgent?.mergeReport?.summary ?? "Integration finished.",
+      tone: "success"
+    };
+  }
+  if (workflow.workflowStage === "cycle_complete") {
+    return {
+      label: "Cycle Complete",
+      explanation: "This workflow cycle completed successfully.",
+      tone: "success"
+    };
+  }
+  if (workflow.repair.status === "fixed") {
+    return {
+      label: "Repair validated",
+      explanation: ledger?.finalValidationStatus === "passed"
+        ? ledger.summaryForHumans
+        : "The latest repair passed validation and the workflow is preparing integration.",
+      tone: "success"
+    };
+  }
+  if (workflow.workflowStage === "ready_to_merge") {
+    return {
+      label: "Ready to merge",
+      explanation: ledger?.finalValidationStatus === "passed"
+        ? ledger.summaryForHumans
+        : "Current-cycle validation completed and the work is ready to integrate.",
+      tone: "success"
+    };
+  }
+
+  if (hygiene?.mergeBlockingFindings.length) {
+    return {
+      label: "Merge blocked by repository hygiene",
+      explanation: hygiene.summaryForHumans,
+      tone: "danger"
+    };
+  }
+  if (ledger?.unresolvedValidationFailures.length || ledger?.finalValidationStatus === "failed" || ledger?.finalValidationStatus === "partial") {
+    return {
+      label: "Merge blocked by validation failure",
+      explanation: ledger.summaryForHumans,
+      tone: ledger.finalValidationStatus === "partial" ? "warning" : "danger"
+    };
+  }
   if ((codingCheckpointed || legacyCodingCheckpointed) && (options.workflowPauseRequested || workflow.autopilotStatus?.pausedReason || workflow.workflowStage === "goal_ready" || workflow.stepProgress.integrity.status === "not_started")) {
     return {
       label: `${pausePrefix}Paused after coding checkpoint; awaiting integrity/merge`,
@@ -540,20 +603,6 @@ export const deriveUserFacingWorkflowStatus = (
       label: "Awaiting validation",
       explanation: ledger?.summaryForHumans ?? "No validation ledger has been recorded for this cycle.",
       tone: "warning"
-    };
-  }
-  if (workflow.workflowStage === "ready_to_merge" && ledger) {
-    return {
-      label: "Ready to merge",
-      explanation: ledger.summaryForHumans,
-      tone: "success"
-    };
-  }
-  if (workflow.workflowStage === "merged") {
-    return {
-      label: "Merge complete",
-      explanation: mergeAgent?.mergeReport?.summary ?? "Integration finished.",
-      tone: "success"
     };
   }
   return {

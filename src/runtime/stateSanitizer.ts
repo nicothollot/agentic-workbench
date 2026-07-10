@@ -16,6 +16,8 @@ import type {
   StrategicPlan,
   UltimateGoal,
   WorkflowActivityEvent,
+  WorkflowIncident,
+  WorkflowJournalEvent,
   WorkflowMemory,
   WorkflowRecommendationOption,
   WorkflowTaskMap,
@@ -569,6 +571,55 @@ const sanitizeWorkflowActivity = (
   }));
 };
 
+const sanitizeWorkflowIncidents = (
+  incidents: WorkflowIncident[] | undefined,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): WorkflowIncident[] => {
+  const maxEntries = options.renderer ? 60 : 200;
+  const entries = asArray(incidents);
+  if (entries.length > maxEntries && report) {
+    markChanged(report);
+  }
+  return entries.slice(0, maxEntries).map((incident) => ({
+    ...incident,
+    title: sanitizeChecklistEvidenceText(incident.title, 240, report),
+    summary: sanitizeChecklistEvidenceText(incident.summary, options.renderer ? 520 : 1_200, report),
+    rootCause: sanitizeChecklistEvidenceText(incident.rootCause, options.renderer ? 620 : 1_500, report),
+    evidenceRefs: asArray(incident.evidenceRefs).slice(0, options.renderer ? 16 : 40).map((entry) => sanitizeChecklistEvidenceText(entry, 500, report)),
+    involvedPaths: asArray(incident.involvedPaths).slice(0, 24),
+    automaticActions: asArray(incident.automaticActions).slice(0, 20).map((entry) => sanitizeChecklistEvidenceText(entry, 500, report)),
+    nextSystemAction: incident.nextSystemAction ? sanitizeChecklistEvidenceText(incident.nextSystemAction, 700, report) : incident.nextSystemAction,
+    userActionRequired: incident.userActionRequired ? sanitizeChecklistEvidenceText(incident.userActionRequired, 700, report) : incident.userActionRequired,
+    primaryAction: incident.primaryAction
+      ? { ...incident.primaryAction, label: sanitizeChecklistEvidenceText(incident.primaryAction.label, 120, report) }
+      : incident.primaryAction,
+    secondaryActions: asArray(incident.secondaryActions).slice(0, 6).map((action) => ({
+      ...action,
+      label: sanitizeChecklistEvidenceText(action.label, 120, report),
+      disabledReason: action.disabledReason ? sanitizeChecklistEvidenceText(action.disabledReason, 300, report) : action.disabledReason
+    }))
+  }));
+};
+
+const sanitizeWorkflowJournal = (
+  journal: WorkflowJournalEvent[] | undefined,
+  report?: StateSanitizerReport,
+  options: { renderer?: boolean } = {}
+): WorkflowJournalEvent[] => {
+  const maxEntries = options.renderer ? 160 : 1_000;
+  const entries = asArray(journal);
+  if (entries.length > maxEntries && report) {
+    markChanged(report);
+  }
+  return entries.slice(0, maxEntries).map((event) => ({
+    ...event,
+    title: sanitizeChecklistEvidenceText(event.title, 240, report),
+    summary: event.summary ? sanitizeChecklistEvidenceText(event.summary, options.renderer ? 500 : 1_200, report) : event.summary,
+    evidenceRefs: asArray(event.evidenceRefs).slice(0, options.renderer ? 12 : 30).map((entry) => sanitizeChecklistEvidenceText(entry, 500, report))
+  }));
+};
+
 export const sanitizeWorkflowState = (
   workflow: ProjectWorkflowState,
   report?: StateSanitizerReport,
@@ -580,6 +631,8 @@ export const sanitizeWorkflowState = (
 
   return {
     ...workflow,
+    incidents: sanitizeWorkflowIncidents(workflow.incidents, report, options),
+    journal: sanitizeWorkflowJournal(workflow.journal, report, options),
     ultimateGoal: sanitizeUltimateGoal(ultimateGoal, report, options),
     goalCharter: sanitizeGoalCharter(workflow.goalCharter, ultimateGoal, report, options) ?? workflow.goalCharter,
   goalChecklist: sanitizeGoalChecklist(workflow.goalChecklist, report, {

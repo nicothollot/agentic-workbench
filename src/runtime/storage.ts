@@ -395,6 +395,7 @@ const redactString = (value: string, replacements: PathReplacement[]): string =>
     next = next.split(replacement.from).join(replacement.to);
   }
   return next
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]")
     .replace(/AGENT_WORKBENCH_CREDENTIAL\s+({[^\r\n]+})/g, "AGENT_WORKBENCH_CREDENTIAL [redacted]")
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b/g, "[redacted-secret]")
     .replace(/\b(?:ghp|github_pat)_[A-Za-z0-9_]{16,}\b/g, "[redacted-token]")
@@ -402,6 +403,7 @@ const redactString = (value: string, replacements: PathReplacement[]): string =>
     .replace(/\b(?:[A-Za-z]:\\Users\\[^\s"'`]+|\/(?:home|Users|mnt|var|tmp|private|Volumes)\/[^\s"'`]+)/g, "<local-path>")
     .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[redacted-token]")
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]")
+    .replace(/\b(https?:\/\/)([^/\s:@]+):([^@\s/]+)@/gi, "$1[redacted]@")
     .replace(
       /\b(api[_\s-]?key|secret(?:[_\s-]?key)?|token|access[_\s-]?token|refresh[_\s-]?token|client[_\s-]?secret|authorization|password)\b(\s*[:=]\s*["']?)([A-Za-z0-9_./+=~:-]{12,})(["']?)/gi,
       "$1$2[redacted]$4"
@@ -426,6 +428,162 @@ const sanitizeReviewValue = (value: unknown, replacements: PathReplacement[]): u
   }
 
   return value;
+};
+
+const portableOmittedKeys = new Set([
+  "activeRunId",
+  "apiKey",
+  "authorization",
+  "clientSecret",
+  "cwd",
+  "effectKey",
+  "gitRoot",
+  "itemId",
+  "outputReference",
+  "password",
+  "projectAccess",
+  "raw",
+  "refreshToken",
+  "secretKey",
+  "serverRequestId",
+  "threadId",
+  "turnId",
+  "worktree"
+]);
+
+const portableSensitiveKeys = new Set([
+  "accesstoken",
+  "apikey",
+  "authorization",
+  "clientsecret",
+  "credential",
+  "credentials",
+  "password",
+  "refreshtoken",
+  "secret",
+  "secretkey",
+  "token"
+]);
+
+const portableBlankKeys = new Set(["output", "outputSnippet"]);
+
+const sanitizePortableValue = (value: unknown, replacements: PathReplacement[]): unknown => {
+  if (typeof value === "string") {
+    return redactString(value, replacements);
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizePortableValue(entry, replacements));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).flatMap(([key, entry]) => {
+        if (portableOmittedKeys.has(key) || portableSensitiveKeys.has(key.replace(/[^a-z0-9]/gi, "").toLowerCase())) {
+          return [];
+        }
+        if (portableBlankKeys.has(key)) {
+          return [[key, ""]];
+        }
+        return [[key, sanitizePortableValue(entry, replacements)]];
+      })
+    );
+  }
+  return value;
+};
+
+const portableAgentStatus = (status: LocalProjectRecord["agents"][number]["status"]): LocalProjectRecord["agents"][number]["status"] =>
+  status === "starting" || status === "running" || status === "waiting_approval" ? "idle" : status;
+
+const sanitizePortableAgent = (
+  agent: LocalProjectRecord["agents"][number],
+  replacements: PathReplacement[]
+): LocalProjectRecord["agents"][number] => {
+  const sanitized = sanitizePortableValue(agent, replacements) as LocalProjectRecord["agents"][number];
+  const wasLive = agent.status === "starting" || agent.status === "running" || agent.status === "waiting_approval";
+  return {
+    ...sanitized,
+    status: portableAgentStatus(agent.status),
+    currentPhase: wasLive ? "Portable history; live execution was not transferred" : sanitized.currentPhase,
+    currentSubtask: wasLive ? undefined : sanitized.currentSubtask,
+    approvals: sanitized.approvals
+      .filter((approval) => approval.status !== "pending")
+      .map((approval) => ({
+        ...approval,
+        command: undefined,
+        cwd: undefined,
+        availableDecisions: []
+      })),
+    commandLog: sanitized.commandLog.map((command) => ({
+      ...command,
+      cwd: undefined,
+      output: ""
+    })),
+    events: sanitized.events.map((event) => ({
+      ...event,
+      raw: undefined
+    })),
+    threadId: undefined,
+    worktree: undefined,
+    outputReference: undefined
+  };
+};
+
+const sanitizePortableWorkflow = (
+  workflow: LocalProjectRecord["workflow"],
+  replacements: PathReplacement[],
+  exportedAt: string
+): LocalProjectRecord["workflow"] => {
+  const sanitized = sanitizePortableValue(workflow, replacements) as LocalProjectRecord["workflow"];
+  return {
+    ...sanitized,
+    execution: {
+      ...sanitized.execution,
+      activeRunId: undefined,
+      effectKey: undefined
+    },
+    autopilotStatus: undefined,
+    incidents: sanitized.incidents.map((incident) => incident.kind === "approval" && (incident.status === "open" || incident.status === "resolving")
+      ? {
+        ...incident,
+        status: "superseded",
+        userActionRequired: undefined,
+        primaryAction: undefined,
+        secondaryActions: [],
+        automaticActions: [...incident.automaticActions, "Live approval state was intentionally excluded from the portable interface."],
+        updatedAt: exportedAt,
+        resolvedAt: exportedAt
+      }
+      : incident)
+  };
+};
+
+const sanitizePortableInterface = (
+  portable: PortableProjectInterface,
+  record: LocalProjectRecord
+): PortableProjectInterface => {
+  const replacements = collectPathReplacements(record);
+  const sanitized = sanitizePortableValue(portable, replacements) as PortableProjectInterface;
+  return {
+    ...sanitized,
+    identity: {
+      ...sanitized.identity,
+      gitRoot: undefined
+    },
+    validation: {
+      ...sanitized.validation,
+      projectAccess: undefined
+    },
+    localStateDefaults: {
+      ...sanitized.localStateDefaults,
+      selectedFile: undefined,
+      treeFilter: "",
+      activeAgentId: undefined,
+      workflowPauseRequested: false,
+      lastOpenedAt: undefined
+    },
+    workflow: sanitizePortableWorkflow(portable.workflow, replacements, portable.exportedAt),
+    stats: sanitized.stats ? { ...sanitized.stats, projectRoot: "." } : undefined,
+    agents: portable.agents.map((agent) => sanitizePortableAgent(agent, replacements))
+  };
 };
 
 const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
@@ -456,7 +614,9 @@ export class WorkbenchStorage {
   ) {}
 
   private buildPortableInterfacePayload(record: LocalProjectRecord): PortableProjectInterface {
-    const portable = createPortableInterface(record);
+    const portable = JSON.parse(JSON.stringify(
+      sanitizePortableInterface(createPortableInterface(record), record)
+    )) as PortableProjectInterface;
     const payloadWithoutChecksum = {
       ...portable,
       checksum: ""
@@ -1246,7 +1406,23 @@ export class WorkbenchStorage {
   async readPortableInterface(interfacePath: string): Promise<PortableProjectInterface | null> {
     try {
       const raw = await readFile(interfacePath, "utf8");
-      return portableInterfaceSchema.parse(JSON.parse(raw));
+      const value = JSON.parse(raw) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+      }
+      const serialized = value as Record<string, unknown>;
+      if (typeof serialized.checksum !== "string" || serialized.checksum.length === 0) {
+        return null;
+      }
+      const expectedChecksum = sha256(stableStringify({
+        ...serialized,
+        checksum: ""
+      }));
+      const isLegacyV1 = serialized.schemaVersion === 1;
+      if (!isLegacyV1 && serialized.checksum !== expectedChecksum) {
+        return null;
+      }
+      return portableInterfaceSchema.parse(value);
     } catch {
       return null;
     }

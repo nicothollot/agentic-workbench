@@ -45,6 +45,7 @@ import {
   requestWorkflowPreviewRequestSchema,
   setAutopilotPolicyRequestSchema,
   setWorkflowModeRequestSchema,
+  workflowDashboardRequestSchema,
   workflowPreviewCheckpointRequestSchema,
   visualExportCaptureRequestSchema,
   visualExportSessionRequestSchema,
@@ -98,6 +99,7 @@ import {
   workflowStatusSummary
 } from "@shared/workflowView";
 import { buildOperatorWorkflowViewModel, suspiciousPathReason } from "@shared/operatorWorkflowView";
+import { upsertWorkflowIncident } from "@shared/workflowExecution";
 import { reduceAgentRuntimeEvent } from "@runtime/runtimeEvents";
 import { AppService } from "@runtime/appService";
 import { WorkbenchStorage } from "@runtime/storage";
@@ -1985,6 +1987,19 @@ describe("schema validation and IPC", () => {
       reasoningEffort: "high"
     }).reasoningEffort).toBe("high");
     expect(approvalDecisionRequestSchema.parse({ projectId: "p", agentId: "a", approvalId: "x", decision: "accept" }).decision).toBe("accept");
+    expect(workflowDashboardRequestSchema.parse({
+      projectId: "p",
+      timeline: {
+        from: "2026-04-01T00:00:00.000Z",
+        to: new Date("2026-04-30T23:59:59.000Z"),
+        limit: 25
+      }
+    }).timeline).toMatchObject({
+      from: "2026-04-01T00:00:00.000Z",
+      to: new Date("2026-04-30T23:59:59.000Z"),
+      offset: 0,
+      limit: 25
+    });
     expect(downloadInterfaceRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(downloadLogsRequestSchema.parse({ projectId: "p" }).projectId).toBe("p");
     expect(visualExportStartRequestSchema.parse({
@@ -3592,6 +3607,33 @@ describe("workflow state", () => {
     expect(shouldAutopilotPause({ workflow, projectAccessStatus: "failed" }, policy).reason).toBe("project_access_validation_failed");
   });
 
+  it("lets a bounded repair strategy continue through a repeated validation signature", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.ultimateGoal = {
+      ...emptyUltimateGoal("user"),
+      summary: "Finish the bounded repair loop.",
+      confirmedAt: "2026-04-07T00:00:00.000Z"
+    };
+    workflow.workflowCycle = { cycleNumber: 9, acceptanceCriteria: [], status: "repair_loop" };
+    workflow.workflowStopReason = "integrity_failed";
+    workflow.repair = { ...workflow.repair, status: "repairing", attemptCount: 2, maxAttempts: 3 };
+    const failedAgents = ["2026-04-07T00:01:00.000Z", "2026-04-07T00:02:00.000Z"].map((generatedAt) => ({
+      ...createAgentSkeleton("integrity", "Integrity Agent", "Validate.", "gpt-5.4-mini"),
+      status: "failed" as const,
+      workflowCycleNumber: 9,
+      integrityReport: {
+        summary: "Typecheck failed in the same module.",
+        checks: [{ name: "typecheck", command: "npm run typecheck", status: "failed" as const, outputSnippet: "TS2322" }],
+        risks: ["Typecheck failed in src/workflow.ts."],
+        generatedAt
+      }
+    }));
+    const policy = validateAutopilotPolicy({ enabled: true, profile: "balanced" });
+
+    expect(hasRepeatedAutopilotFailure(workflow, failedAgents)).toBe(true);
+    expect(shouldAutopilotPause({ workflow, agents: failedAgents }, policy)).toMatchObject({ shouldPause: false });
+  });
+
   it("does not let resolved historical failures pause a completed cycle", () => {
     const workflow = defaultProjectWorkflowState();
     workflow.ultimateGoal = {
@@ -3643,11 +3685,11 @@ describe("workflow state", () => {
     };
     const policy = validateAutopilotPolicy({ enabled: true, profile: "balanced" });
 
-    expect(hasRepeatedAutopilotFailure(workflow, [firstConflict, secondConflict, successfulMerge])).toBe(true);
+    expect(hasRepeatedAutopilotFailure(workflow, [firstConflict, secondConflict, successfulMerge])).toBe(false);
     expect(shouldAutopilotPause({
       workflow,
       agents: [firstConflict, secondConflict, successfulMerge]
-    }, policy).reason).toBe("repeated_failure");
+    }, policy).shouldPause).toBe(false);
 
     workflow.workflowCycle.status = "completed";
     workflow.workflowStage = "cycle_complete";
@@ -4493,6 +4535,250 @@ describe("workflow view helpers", () => {
       id: "repair:revalidate",
       title: "Repair needs revalidation"
     }));
+  });
+
+  it("projects active repair and revalidation ahead of retained failure evidence", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 7;
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "integrity_failed";
+    const failedLedger = {
+      ...finalizeValidationLedger({
+        ...createValidationLedger({ cycleNumber: 7, testCommands: ["npm test"] }),
+        commandResults: [makeLedgerCommandResult({ command: "npm test", exitCode: 1, stdout: "AssertionError" })]
+      }),
+      updatedAt: "2026-04-07T00:02:00.000Z"
+    };
+    const failedHygiene = {
+      status: "failed" as const,
+      scannedAt: "2026-04-07T00:02:00.000Z",
+      scannedRef: "integrity:7",
+      forbiddenFiles: ["EADME.md"],
+      cleanedFiles: [],
+      warnings: [],
+      mergeBlockingFindings: ["EADME.md looks like a typo path."],
+      summaryForHumans: "Repository hygiene failed."
+    };
+    workflow.validationLedgers = [failedLedger];
+    workflow.repoHygieneReports = [failedHygiene];
+    workflow.repair = {
+      attemptCount: 1,
+      maxAttempts: 4,
+      status: "repairing",
+      latestIssueSummary: "Tests and hygiene failed.",
+      latestFailureReason: "npm test failed and EADME.md must be repaired.",
+      lastUpdatedAt: "2026-04-07T00:03:00.000Z"
+    };
+
+    expect(deriveUserFacingWorkflowStatus(workflow)).toMatchObject({
+      label: "Repair in progress",
+      tone: "running"
+    });
+    expect(buildOperatorWorkflowViewModel({ workflow }).currentStatus).toMatchObject({
+      primaryLabel: "Repair in progress",
+      nextOperatorAction: "The system is repairing the current failure; validation will run automatically next.",
+      severity: "running"
+    });
+
+    workflow.repair.status = "retrying_validation";
+    workflow.stepProgress.integrity.currentActivity = "Re-running npm test";
+
+    expect(deriveUserFacingWorkflowStatus(workflow)).toMatchObject({
+      label: "Repair validation running",
+      explanation: "Re-running npm test",
+      tone: "running"
+    });
+    expect(buildOperatorWorkflowViewModel({ workflow }).currentStatus.nextOperatorAction)
+      .toBe("The system is revalidating the repair; merge will continue automatically if validation passes.");
+  });
+
+  it("uses one structured incident instead of duplicating its manual handoff", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 12;
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "repair_budget_exhausted";
+    workflow.repair = {
+      ...workflow.repair,
+      status: "exhausted",
+      attemptCount: 3,
+      maxAttempts: 3,
+      latestFailureReason: "The same assertion remains unresolved."
+    };
+    workflow.manualHandoff = {
+      reason: "repair_exhausted",
+      title: "Automatic repair needs a decision",
+      whatSystemWasTryingToDo: "Repair the failed assertion.",
+      validationIssue: "npm test failed.",
+      latestFailureReason: "The same assertion remains unresolved.",
+      involvedPaths: ["src/workflow.ts"],
+      shellSupported: true,
+      createdAt: "2026-04-07T00:03:00.000Z"
+    };
+    const incident = upsertWorkflowIncident(workflow, {
+      kind: "validation",
+      severity: "high",
+      sourceStep: "integrity",
+      title: "Validation repair budget exhausted",
+      summary: "npm test still fails after three repairs.",
+      rootCause: "The same assertion remains unresolved.",
+      involvedPaths: ["src/workflow.ts"],
+      userActionRequired: "Review the failed assertion, repair manually, or reset the cycle.",
+      primaryAction: { kind: "open_shell", label: "Open repair agent" },
+      now: "2026-04-07T00:03:00.000Z"
+    });
+
+    const attentionItems = buildWorkflowAttentionItems({
+      workflow,
+      approvals: [],
+      userInputRequests: [],
+      humanInterventions: [],
+      credentialRequests: [],
+      timeline: buildWorkflowTimelineSteps(workflow),
+      agents: []
+    });
+
+    expect(attentionItems).toEqual([
+      expect.objectContaining({
+        id: `incident:${incident.id}`,
+        title: incident.title,
+        target: "manual-handoff"
+      })
+    ]);
+  });
+
+  it("keeps a superseded integrity failure in history instead of active attention", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 8;
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "integrity_failed";
+    workflow.stepProgress.integrity.status = "failed";
+    workflow.stepProgress.integrity.warning = "npm test failed before the repair.";
+    const failedIntegrityAgent: AgentState = {
+      ...createAgentSkeleton("integrity", "Integrity Pass 1", "Validate cycle 8", "gpt-5.4"),
+      id: "integrity-failed-8",
+      workflowCycleNumber: 8,
+      status: "failed",
+      completedAt: "2026-04-07T00:02:00.000Z",
+      integrityReport: {
+        summary: "npm test failed before repair.",
+        checks: [{ name: "Tests", command: "npm test", status: "failed", outputSnippet: "AssertionError" }],
+        risks: ["Tests failed."],
+        generatedAt: "2026-04-07T00:02:00.000Z"
+      }
+    };
+    const passingIntegrityAgent: AgentState = {
+      ...createAgentSkeleton("integrity", "Integrity Pass 2", "Revalidate cycle 8", "gpt-5.4"),
+      id: "integrity-passed-8",
+      workflowCycleNumber: 8,
+      status: "completed",
+      completedAt: "2026-04-07T00:05:00.000Z",
+      integrityReport: {
+        summary: "All validation passed after repair.",
+        checks: [{ name: "Tests", command: "npm test", status: "passed", outputSnippet: "passed" }],
+        risks: [],
+        generatedAt: "2026-04-07T00:05:00.000Z"
+      }
+    };
+
+    const attentionItems = buildWorkflowAttentionItems({
+      workflow,
+      approvals: [],
+      userInputRequests: [],
+      humanInterventions: [],
+      credentialRequests: [],
+      timeline: buildWorkflowTimelineSteps(workflow),
+      agents: [failedIntegrityAgent, passingIntegrityAgent]
+    });
+
+    expect(attentionItems).toEqual([]);
+  });
+
+  it("deduplicates a manual repair blocker from failed-agent and timeline copies", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 9;
+    workflow.workflowStage = "repair_loop";
+    workflow.workflowStopReason = "repair_budget_exhausted";
+    workflow.stepProgress.integrity.status = "failed";
+    workflow.stepProgress.integrity.warning = "npm test still fails.";
+    workflow.repair = {
+      attemptCount: 3,
+      maxAttempts: 3,
+      status: "exhausted",
+      latestIssueSummary: "Tests still fail.",
+      latestFailureReason: "npm test still fails.",
+      lastUpdatedAt: "2026-04-07T00:05:00.000Z"
+    };
+    workflow.manualHandoff = {
+      reason: "repair_exhausted",
+      title: "Automatic repair reached its limit",
+      whatSystemWasTryingToDo: "Repair the current cycle",
+      validationIssue: "Tests still fail.",
+      latestFailureReason: "npm test still fails.",
+      involvedPaths: ["src/index.ts"],
+      shellSupported: true,
+      createdAt: "2026-04-07T00:05:00.000Z"
+    };
+    const failedIntegrityAgent: AgentState = {
+      ...createAgentSkeleton("integrity", "Integrity Pass 3", "Validate cycle 9", "gpt-5.4"),
+      workflowCycleNumber: 9,
+      status: "failed",
+      completedAt: "2026-04-07T00:04:00.000Z",
+      integrityReport: {
+        summary: "npm test still fails.",
+        checks: [{ name: "Tests", command: "npm test", status: "failed", outputSnippet: "failed" }],
+        risks: ["Tests failed."],
+        generatedAt: "2026-04-07T00:04:00.000Z"
+      }
+    };
+
+    const attentionItems = buildWorkflowAttentionItems({
+      workflow,
+      approvals: [],
+      userInputRequests: [],
+      humanInterventions: [],
+      credentialRequests: [],
+      timeline: buildWorkflowTimelineSteps(workflow),
+      agents: [failedIntegrityAgent]
+    });
+
+    expect(attentionItems).toEqual([
+      expect.objectContaining({
+        id: "manual-handoff:repair_exhausted",
+        title: "Automatic repair reached its limit"
+      })
+    ]);
+  });
+
+  it("uses the newest current-cycle validation result even when a stale failure is supplied explicitly", () => {
+    const workflow = defaultProjectWorkflowState();
+    workflow.workflowCycle.cycleNumber = 10;
+    workflow.workflowStage = "repair_loop";
+    const failedLedger = {
+      ...finalizeValidationLedger({
+        ...createValidationLedger({ cycleNumber: 10, testCommands: ["npm test"] }),
+        commandResults: [makeLedgerCommandResult({ command: "npm test", exitCode: 1, stdout: "AssertionError" })]
+      }),
+      createdAt: "2026-04-07T00:01:00.000Z",
+      updatedAt: "2026-04-07T00:02:00.000Z"
+    };
+    const passedLedger = {
+      ...finalizeValidationLedger({
+        ...createValidationLedger({ cycleNumber: 10, testCommands: ["npm test"] }),
+        commandResults: [makeLedgerCommandResult({ command: "npm test", exitCode: 0, stdout: "passed" })]
+      }),
+      createdAt: "2026-04-07T00:04:00.000Z",
+      updatedAt: "2026-04-07T00:05:00.000Z"
+    };
+    workflow.validationLedgers = [failedLedger, passedLedger];
+
+    const status = deriveUserFacingWorkflowStatus(workflow, { validationLedger: failedLedger });
+    const view = buildOperatorWorkflowViewModel({ workflow, validationLedger: failedLedger });
+
+    expect(status.label).not.toBe("Merge blocked by validation failure");
+    expect(view.currentCycle.validationSummary.finalStatus).toBe("passed");
+    expect(view.currentCycle.validationSummary.failedAttempts).toBe(0);
+    expect(view.historySummary.validationTrend).toContain("failed");
+    expect(view.historySummary.validationTrend).toContain("passed");
   });
 
   it("distinguishes early repair stops from configured repair-budget exhaustion", () => {
@@ -9418,7 +9704,7 @@ describe("AppService workflow performance guards", () => {
     expect(source).not.toContain("Promise.all([\n      window.workbench.getAgentFullOutput");
   });
 
-  it("keeps Command Center simple-mode labels and full-output actions visible", async () => {
+  it("keeps Mission Control labels and full-output actions visible", async () => {
     const appSource = await readFile(path.join(process.cwd(), "src/renderer/App.tsx"), "utf8");
     const commandCenterSource = await readFile(path.join(process.cwd(), "src/renderer/components/CommandCenter.tsx"), "utf8");
 
@@ -9427,14 +9713,14 @@ describe("AppService workflow performance guards", () => {
     expect(appSource).toContain("health={commandCenterHealth}");
     expect(appSource).toContain("onOpenOutput={(agent) => openAgentOutputById(agent)}");
     expect(appSource).toContain("<button className=\"primary-button\" type=\"button\" onClick={() => onOpenOutput(agent)}>View full output</button>");
-    expect(commandCenterSource).toContain("Current focus");
-    expect(commandCenterSource).toContain("Why this matters");
-    expect(commandCenterSource).toContain("What changed so far");
-    expect(commandCenterSource).toContain("Needs your attention");
-    expect(commandCenterSource).toContain("No validation, hygiene, checklist, or planner blocker is currently recorded.");
-    expect(commandCenterSource).toContain("Last result");
-    expect(commandCenterSource).toContain("Next step");
-    expect(commandCenterSource).toContain("Project health");
+    expect(commandCenterSource).toContain("Mission control");
+    expect(commandCenterSource).toContain("Ultimate goal");
+    expect(commandCenterSource).toContain("Live execution map");
+    expect(commandCenterSource).toContain("Causal timeline");
+    expect(commandCenterSource).toContain("Needs you");
+    expect(commandCenterSource).toContain("Latest result");
+    expect(commandCenterSource).toContain("Planned handoff");
+    expect(commandCenterSource).toContain("Progress, changes, and project health");
   });
 
   it("keeps key design tokens above readable contrast thresholds", async () => {

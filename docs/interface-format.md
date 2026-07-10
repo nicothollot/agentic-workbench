@@ -12,6 +12,7 @@ Top-level fields:
 - `validation`
 - `layout`
 - `localStateDefaults`
+- `workflow`
 - `overview`
 - `stats`
 - `dependencies`
@@ -21,16 +22,27 @@ Top-level fields:
 Properties:
 
 - versioned and schema-validated
-- checksumed before write
+- version 2 is checksummed before write and verified before import
 - project-identity-aware
 - portable across machines
 - intentionally free of auth state and secrets
+
+Portable export retains redacted workflow history, reports, journal events, incident evidence, model metadata, token totals, and command outcomes. It removes live Codex thread/run handles, worktree locations, pending approval payloads, raw event payloads, command output, project-access probes, and machine-local UI selections. Known project/worktree paths and common credential-shaped values are redacted before the checksum is calculated.
+
+Schema versions 1 and 2 are accepted. Version 1 data is hydrated and migrated by the runtime; its historical writer hashed JavaScript `undefined` properties that JSON omitted, so v1 imports require the checksum field but cannot reliably recompute it from disk. Version 2 uses a JSON-canonical checksum and verifies it strictly. Future versions are rejected instead of being silently stripped or rewritten by an older app.
 
 The runtime excludes `.agent-workbench` from repository fingerprinting so exporting the file does not invalidate the project identity by itself.
 
 Generated review logs, visuals, repair reports, transcripts, and workflow histories are not part of the Agentic Workbench source tree. Keep them under the target project's `.agent-workbench/` subdirectories or machine-local app data, and never commit them to the `agentic-workbench` repo root.
 
 ## Workflow Diagnostics
+
+Interface schema v2 extends the existing workflow envelope with canonical execution, incidents, journal, and metrics. Version 1 files are accepted and migrated on load; their retained activity, agents, validation records, and workflow decisions are preserved.
+
+- `execution`: the revisioned canonical state for the active cycle, including active step/run, repair attempt, validation kind, resume state, and linked incident.
+- `incidents`: deduplicated blockers with root cause, evidence references, automatic actions, next system action, and explicit user action when one is actually required.
+- `journal`: an ordered causal record of transitions, agents, validation, repairs, merges, approvals, incidents, and migrations.
+- `metrics`: persisted aggregate token counters used by the dashboard, with per-agent structured usage retained alongside it.
 
 Workflow state can include versioned diagnostic objects used by the operator UI and review-log export:
 

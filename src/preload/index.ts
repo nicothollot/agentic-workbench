@@ -60,6 +60,7 @@ import type {
   WorkflowCycleListResponse,
   WorkbenchState
 } from "@shared/types";
+import type { WorkflowDashboardSnapshot, WorkflowTimelineQuery } from "@shared/workflowDashboard";
 
 const invoke = async <T>(channel: string, payload?: unknown): Promise<T> => await ipcRenderer.invoke(channel, payload) as T;
 const STATE_UPDATE_COALESCE_MS = 150;
@@ -118,6 +119,7 @@ export interface WorkbenchApi {
   getAgent(projectId: string, agentId: string): Promise<AgentState>;
   listWorkflowCycles(projectId: string, options?: { cursor?: string; limit?: number }): Promise<WorkflowCycleListResponse>;
   getWorkflowCycle(projectId: string, cycleId: string): Promise<WorkflowCycleDetail>;
+  getWorkflowDashboard(projectId: string, timeline?: WorkflowTimelineQuery): Promise<WorkflowDashboardSnapshot>;
   listCycleAgents(projectId: string, cycleId: string): Promise<CycleAgentListResponse>;
   getAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptResponse>;
   getAgentFullOutput(projectId: string, agentId: string): Promise<AgentFullOutputResponse>;
@@ -399,6 +401,8 @@ const api: WorkbenchApi = {
     await invoke<WorkflowCycleListResponse>("project:listWorkflowCycles", { projectId, ...options }),
   getWorkflowCycle: async (projectId, cycleId) =>
     await invoke<WorkflowCycleDetail>("project:getWorkflowCycle", { projectId, cycleId }),
+  getWorkflowDashboard: async (projectId, timeline = {}) =>
+    await invoke<WorkflowDashboardSnapshot>("workflow:getDashboard", { projectId, timeline }),
   listCycleAgents: async (projectId, cycleId) =>
     await invoke<CycleAgentListResponse>("project:listCycleAgents", { projectId, cycleId }),
   getAgentTranscript: async (projectId, agentId) =>

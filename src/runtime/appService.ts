@@ -5,7 +5,7 @@ import { nanoid } from "nanoid";
 import type { ServerNotification, ServerRequest } from "@generated/app-server";
 import type { JsonValue } from "@generated/app-server/serde_json/JsonValue";
 import type { SandboxPolicy, ToolRequestUserInputQuestion } from "@generated/app-server/v2";
-import { APP_VERSION, PORTABLE_INTERFACE_PATH, USER_INPUT_REQUESTS_PATH } from "@shared/constants";
+import { APP_VERSION, PORTABLE_INTERFACE_PATH, PORTABLE_INTERFACE_VERSION, USER_INPUT_REQUESTS_PATH } from "@shared/constants";
 import { createAgentSkeleton, createLocalProjectRecord, defaultLocalState, defaultProjectCredentialsState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
 import { createDefaultGoalCharter, listAutopilotPresets as buildAutopilotPresets } from "@shared/goalCharter";
 import { agentRoles } from "@shared/agentRoles";
@@ -113,6 +113,7 @@ import type {
   WorkflowCycleListResponse,
   WorkflowCycleStatus,
   WorkflowCycleSummaryView,
+  WorkflowIncident,
   WorkflowStepId,
   StructuredRecommendationFailureCategory,
   WorkPackage,
@@ -160,6 +161,15 @@ import {
   finalizeValidationLedger
 } from "@shared/validationLedger";
 import { deriveLegacyWorkflowDiagnostics } from "@shared/workflowMigration";
+import { buildWorkflowDashboard, type WorkflowDashboardSnapshot, type WorkflowTimelineQuery } from "@shared/workflowDashboard";
+import {
+  appendWorkflowJournalEvent,
+  ensureWorkflowV2State,
+  markWorkflowIncidentsResolving,
+  resolveWorkflowIncidents,
+  synchronizeWorkflowExecution,
+  upsertWorkflowIncident
+} from "@shared/workflowExecution";
 import { buildDeterministicDirectorySummary, buildDeterministicFileSummary, buildDeterministicOverview } from "./fileSummary";
 import {
   applyBranchToProjectCheckout,
@@ -1783,6 +1793,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       scopedGoal: workflow.scopedGoal,
       repair: workflow.repair
     });
+    ensureWorkflowV2State(workflow, record.agents ?? []);
     record.workflow = workflow;
     return workflow;
   }
@@ -2002,6 +2013,30 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
+  private markCurrentWorkflowIncidentsResolving(
+    workflow: ProjectWorkflowState,
+    predicate: (incident: WorkflowIncident) => boolean,
+    nextSystemAction: string
+  ): WorkflowIncident[] {
+    const incidents = markWorkflowIncidentsResolving(
+      workflow,
+      (incident) => incident.cycleNumber === workflow.workflowCycle.cycleNumber && predicate(incident),
+      nextSystemAction
+    );
+    for (const incident of incidents) {
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: "waiting",
+        stepId: incident.sourceStep,
+        title: `Recovery accepted: ${incident.title}`,
+        summary: nextSystemAction,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+    }
+    return incidents;
+  }
+
   private recordWorkflowActivity(
     workflow: ProjectWorkflowState,
     entry: Omit<ProjectWorkflowState["activityLog"][number], "id" | "timestamp">
@@ -2027,6 +2062,25 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       timestamp,
       ...entry,
       detail
+    });
+    appendWorkflowJournalEvent(workflow, {
+      kind: entry.source === "validation"
+        ? "validation"
+        : entry.source === "approval"
+          ? "approval"
+          : entry.source === "agent"
+            ? "agent"
+            : entry.stepId === "merge"
+              ? "merge"
+              : entry.stepId === "coding" && /repair/i.test(entry.title)
+                ? "repair"
+                : "system",
+      status: entry.status,
+      stepId: entry.stepId ?? getWorkflowActiveStepId(workflow),
+      title: entry.title,
+      summary: detail,
+      agentId: entry.agentId,
+      occurredAt: timestamp
     });
     if (workflow.activityLog.length > 400) {
       workflow.activityLog.length = 400;
@@ -2840,6 +2894,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         : {
           highRiskPackageRequiresApproval: autopilotPause.highRiskPackageRequiresApproval
         }
+    });
+    synchronizeWorkflowExecution(workflow, project.record.agents, {
+      workflowPauseRequested: project.record.localState.workflowPauseRequested
     });
     this.refreshWorkflowMemory(workflow);
     this.logWorkflowPerf(`syncWorkflowState ${project.record.identity.projectName}: ${Math.round(performance.now() - startedAt)}ms`);
@@ -5661,7 +5718,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private buildValidationSnapshot(scan: RepoScanResult, gitMetadata: GitMetadata, projectAccess?: ProjectAccessProbe) {
     return {
-      interfaceSchemaVersion: 1,
+      interfaceSchemaVersion: PORTABLE_INTERFACE_VERSION,
       appMinVersion: APP_VERSION,
       lastValidatedAt: nowIso(),
       gitHead: gitMetadata.head,
@@ -6410,6 +6467,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private extractTokenUsage(agent: AgentState): string | undefined {
+    if (agent.tokenUsage) {
+      const parts = [
+        `${agent.tokenUsage.totalTokens.toLocaleString("en-US")} total`,
+        `${agent.tokenUsage.inputTokens.toLocaleString("en-US")} input`,
+        `${agent.tokenUsage.outputTokens.toLocaleString("en-US")} output`
+      ];
+      if (agent.tokenUsage.reasoningOutputTokens > 0) {
+        parts.push(`${agent.tokenUsage.reasoningOutputTokens.toLocaleString("en-US")} reasoning`);
+      }
+      return `${parts.join(" · ")} tokens`;
+    }
     const tokenEvent = agent.events.find((event) => {
       const raw = typeof event.raw === "string" ? event.raw : event.raw ? JSON.stringify(event.raw) : "";
       return /token/i.test(`${event.title} ${event.detail ?? ""} ${raw}`);
@@ -6418,6 +6486,27 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return undefined;
     }
     return compactText(tokenEvent.detail ?? tokenEvent.title, 160);
+  }
+
+  private recomputeWorkflowTokenMetrics(project: LoadedProject, updatedAt = nowIso()): void {
+    const totals = project.record.agents.reduce((result, entry) => {
+      if (!entry.tokenUsage) {
+        return result;
+      }
+      result.totalInputTokens += entry.tokenUsage.inputTokens;
+      result.totalCachedInputTokens += entry.tokenUsage.cachedInputTokens;
+      result.totalOutputTokens += entry.tokenUsage.outputTokens;
+      result.totalReasoningTokens += entry.tokenUsage.reasoningOutputTokens;
+      result.totalTokens += entry.tokenUsage.totalTokens;
+      return result;
+    }, {
+      totalInputTokens: 0,
+      totalCachedInputTokens: 0,
+      totalOutputTokens: 0,
+      totalReasoningTokens: 0,
+      totalTokens: 0
+    });
+    project.record.workflow.metrics = { ...totals, updatedAt };
   }
 
   private cycleAgents(project: LoadedProject, cycleNumber: number): AgentState[] {
@@ -6818,6 +6907,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       checklistChangeRecords: this.cycleChecklistChangeRecords(project, cycleNumber),
       goalChangeProposalRecords: this.cycleGoalChangeProposalRecords(project, cycleNumber)
     };
+  }
+
+  getWorkflowDashboard(projectId: string, timeline: WorkflowTimelineQuery = {}): WorkflowDashboardSnapshot {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    return buildWorkflowDashboard(workflow, project.record.agents, { timeline });
   }
 
   listCycleAgents(projectId: string, cycleId: string): CycleAgentListResponse {
@@ -7522,6 +7617,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ...portable.localStateDefaults,
           lastOpenedAt: nowIso()
         };
+        record.workflow = portable.workflow;
         record.summaryCache = portable.summaryCache;
         record.agents = portable.agents;
         record.overview = portable.overview;
@@ -11743,6 +11839,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         workflow.repair.latestFailureReason ??
         "Deterministic merge reported conflicts.";
       const queued = this.queueManualMergeRetry(projectId, latestFailureReason);
+      this.markCurrentWorkflowIncidentsResolving(
+        workflow,
+        (incident) => incident.kind === "merge_conflict" || incident.kind === "checkout" || incident.kind === "hygiene",
+        queued
+          ? "Inspect the resolved integration worktree and retry deterministic merge."
+          : "Wait for the merge retry already in progress."
+      );
       this.resetWorkflowStepProgress(workflow, "merge", {
         status: "waiting",
         requiresUserInput: false,
@@ -11788,6 +11891,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         latestIssueSummary: workflow.manualHandoff.validationIssue,
         latestFailureReason
       });
+      this.markCurrentWorkflowIncidentsResolving(
+        workflow,
+        (incident) => incident.kind === "validation" || incident.kind === "environment" || incident.kind === "hygiene",
+        "Rerun deterministic validation against the externally corrected environment."
+      );
       this.resetWorkflowStepProgress(workflow, "integrity", {
         status: "waiting",
         requiresUserInput: false,
@@ -11814,6 +11922,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     this.resetWorkflowRepairState(workflow);
+    this.markCurrentWorkflowIncidentsResolving(
+      workflow,
+      (incident) =>
+        incident.kind === "validation" ||
+        incident.kind === "environment" ||
+        incident.kind === "hygiene" ||
+        incident.kind === "checkout" ||
+        incident.kind === "runtime" ||
+        incident.kind === "recovery",
+      "Start a fresh coding pass for the saved scoped goal, then validate it."
+    );
     this.resetWorkflowStepProgress(workflow, "coding", {
       status: "waiting",
       requiresUserInput: false,
@@ -11870,6 +11989,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       latestIssueSummary: priorIssue,
       latestFailureReason: EXTERNAL_REPAIR_REVALIDATION_REASON
     });
+    this.markCurrentWorkflowIncidentsResolving(
+      workflow,
+      (incident) =>
+        incident.kind === "validation" ||
+        incident.kind === "environment" ||
+        incident.kind === "hygiene" ||
+        incident.kind === "checkout" ||
+        incident.kind === "runtime" ||
+        incident.kind === "recovery",
+      "Validate the externally repaired checkout, then continue only if every deterministic gate passes."
+    );
     this.updateWorkflowStepProgress(workflow, "coding", {
       requiresUserInput: false,
       currentActivity: "External repair completed",
@@ -11977,6 +12107,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       (intervention) => intervention.blocking && intervention.status === "pending",
       `Resolved by resetting workflow cycle ${cycleNumber}.`
     );
+    const supersededIncidents = resolveWorkflowIncidents(
+      workflow,
+      (incident) => incident.cycleNumber === cycleNumber,
+      "superseded"
+    );
+    for (const incident of supersededIncidents) {
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: "completed",
+        stepId: incident.sourceStep,
+        title: `Superseded by cycle reset: ${incident.title}`,
+        summary: `Workflow cycle ${cycleNumber} was reset to its saved start state.`,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+    }
     workflow.manualHandoff = undefined;
     workflow.cycleContract = approvedRecommendation
       ? buildCycleContract(workflow, {
@@ -12177,6 +12323,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     this.resetWorkflowRepairState(workflow);
     workflow.manualHandoff = undefined;
+    this.resolveCompletedMergeIncidents(workflow, mergeAgent, mergeAgent.mergeReport.summary);
     this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "integrity" || issue.source === "merge" || issue.source === "coding");
     this.resolveWorkflowHumanInterventions(
       workflow,
@@ -12233,6 +12380,47 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
     workflow.humanInterventions.unshift(intervention);
     this.recordWorkflowOpenIssue(workflow, intervention.title, intervention.description, "human");
+    const linkedIncident = workflow.incidents.find((incident) =>
+      incident.cycleNumber === workflow.workflowCycle.cycleNumber &&
+      (incident.status === "open" || incident.status === "resolving") &&
+      (incident.rootCause === intervention.reason || incident.summary === intervention.description)
+    );
+    const incident = linkedIncident ?? upsertWorkflowIncident(workflow, {
+      kind: intervention.kind === "credentials" || intervention.kind === "api_access" || intervention.kind === "account_creation"
+        ? "credential"
+        : "user_input",
+      severity: intervention.severity === "low"
+        ? "info"
+        : intervention.severity === "medium"
+          ? "warning"
+          : intervention.severity,
+      sourceStep: options?.stepId ?? getWorkflowActiveStepId(workflow),
+      title: intervention.title,
+      summary: intervention.description,
+      rootCause: intervention.reason,
+      evidenceRefs: [`intervention:${intervention.id}`],
+      automaticActions: [],
+      userActionRequired: intervention.description,
+      primaryAction: intervention.kind === "credentials" || intervention.kind === "api_access" || intervention.kind === "account_creation"
+        ? { kind: "open_credentials", label: "Open credentials" }
+        : { kind: "provide_input", label: "Provide input", targetId: intervention.id },
+      secondaryActions: [{ kind: "view_details", label: "Review request" }],
+      status: "open"
+    });
+    if (linkedIncident) {
+      incident.evidenceRefs = unique([...incident.evidenceRefs, `intervention:${intervention.id}`]);
+      incident.userActionRequired ??= intervention.description;
+      incident.updatedAt = nowIso();
+    }
+    appendWorkflowJournalEvent(workflow, {
+      kind: "incident",
+      status: "waiting",
+      stepId: options?.stepId ?? getWorkflowActiveStepId(workflow),
+      title: incident.title,
+      summary: incident.userActionRequired ?? incident.rootCause,
+      incidentId: incident.id,
+      evidenceRefs: incident.evidenceRefs
+    });
     this.recordWorkflowActivity(workflow, {
       source: "workflow",
       status: "waiting",
@@ -12266,6 +12454,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     intervention.resolutionNotes = resolutionNotes || undefined;
     intervention.resolvedAt = nowIso();
     this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "human" && issue.title === intervention.title);
+    const resolvedIncidents = resolveWorkflowIncidents(
+      workflow,
+      (incident) =>
+        incident.evidenceRefs.includes(`intervention:${intervention.id}`) ||
+        (incident.title === intervention.title && incident.cycleNumber === workflow.workflowCycle.cycleNumber),
+      status === "dismissed" ? "superseded" : "resolved"
+    );
+    for (const incident of resolvedIncidents) {
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: "completed",
+        stepId: incident.sourceStep,
+        title: `${status === "dismissed" ? "Dismissed" : "Resolved"}: ${incident.title}`,
+        summary: resolutionNotes || intervention.description,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+    }
     this.recordAcceptedDecision(workflow, {
       kind: "human_intervention",
       title: intervention.title,
@@ -13274,22 +13480,48 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (!approval) {
       throw new Error(`Unknown approval: ${approvalId}`);
     }
+    if (approval.status !== "pending") {
+      throw new Error(`Approval ${approvalId} has already been ${approval.status}.`);
+    }
 
     approval.status = decision === "decline" || decision === "cancel" ? "rejected" : "approved";
 
-    if (this.transport && approval.serverRequestId !== undefined) {
-      let result: unknown = { decision };
-      if (approval.kind === "permissions") {
-        result = {
-          permissions: {},
-          scope: decision === "acceptForSession" ? "session" : "turn"
-        };
+    try {
+      if (this.transport && approval.serverRequestId !== undefined) {
+        let result: unknown = { decision };
+        if (approval.kind === "permissions") {
+          result = {
+            permissions: {},
+            scope: decision === "acceptForSession" ? "session" : "turn"
+          };
+        }
+        await this.transport.respond(approval.serverRequestId, result);
       }
-      await this.transport.respond(approval.serverRequestId, result);
+    } catch (error) {
+      approval.status = "pending";
+      throw error;
     }
 
     reduceAgentRuntimeEvent(agent, { kind: "approval-resolved", approvalId, decision });
-    this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+    const workflow = this.ensureWorkflowState(project.record);
+    const resolvedIncidents = resolveWorkflowIncidents(
+      workflow,
+      (incident) => incident.evidenceRefs.includes(`approval:${approvalId}`),
+      decision === "decline" || decision === "cancel" ? "superseded" : "resolved"
+    );
+    for (const incident of resolvedIncidents) {
+      appendWorkflowJournalEvent(workflow, {
+        kind: "approval",
+        status: "completed",
+        stepId: incident.sourceStep,
+        title: `${decision === "decline" || decision === "cancel" ? "Declined" : "Approved"}: ${incident.title}`,
+        summary: approval.summary,
+        agentId: agent.id,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+    }
+    this.mirrorLatestAgentEventToWorkflow(workflow, agent);
     await this.persistProjectUpdate(project, true);
   }
 
@@ -13410,13 +13642,69 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.updateAgentChangedFiles(project, agent, [...agent.changedFiles, ...paths]);
   }
 
+  private markRepairCheckpointReadyForValidation(project: LoadedProject, agent: AgentState): boolean {
+    const workflow = this.ensureWorkflowState(project.record);
+    if (agent.category !== "coding" || workflow.repair.status !== "repairing") {
+      return false;
+    }
+
+    this.updateWorkflowRepairState(workflow, { status: "retrying_validation" });
+    this.resetWorkflowStepProgress(workflow, "integrity", {
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Queued to validate the repair checkpoint",
+      currentSubstep: `Validation retry ${workflow.repair.attemptCount} of ${workflow.repair.maxAttempts}`,
+      latestProgressNote: agent.changedFiles.length > 0
+        ? `${agent.changedFiles.length} changed file${agent.changedFiles.length === 1 ? "" : "s"} checkpointed.`
+        : "The repair agent completed without additional checkout changes.",
+      message: "The repair checkpoint is saved. Deterministic validation is the next automatic action.",
+      warning: undefined
+    });
+    this.resetWorkflowStepProgress(workflow, "merge", {
+      status: "waiting",
+      requiresUserInput: false,
+      currentActivity: "Waiting for repair validation",
+      message: "Integration remains gated until the repair passes validation."
+    });
+    for (const incident of workflow.incidents) {
+      if (
+        incident.cycleNumber === workflow.workflowCycle.cycleNumber &&
+        (incident.status === "open" || incident.status === "resolving") &&
+        (incident.kind === "validation" || incident.kind === "environment" || incident.kind === "hygiene")
+      ) {
+        incident.status = "resolving";
+        incident.nextSystemAction = "Run deterministic validation against the saved repair checkpoint.";
+        incident.updatedAt = nowIso();
+      }
+    }
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: "Repair checkpoint ready; validation queued",
+      detail: `Repair attempt ${workflow.repair.attemptCount} of ${workflow.repair.maxAttempts} completed. Validation will run next.`,
+      stepId: "integrity",
+      agentId: agent.id,
+      agentCategory: "coding"
+    });
+    this.syncWorkflowState(project);
+    return true;
+  }
+
   private async finalizeGitWriteAgent(project: LoadedProject, agent: AgentState): Promise<void> {
     if (!agent.worktree?.worktreePath || !agent.worktree.branch) {
       agent.status = "completed";
       agent.completedAt ??= nowIso();
       this.syncWorkflowStepProgressFromAgent(project, agent);
       this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-      await this.persistProjectUpdate(project, agent.category === "coding");
+      const repairValidationQueued = this.markRepairCheckpointReadyForValidation(project, agent);
+      await this.persistProjectUpdate(project, agent.category === "coding"
+        ? {
+          save: "immediate",
+          emit: "coalesced",
+          automate: true,
+          reason: repairValidationQueued ? "repair checkpoint queued for validation" : "coding checkpoint completed"
+        }
+        : undefined);
       return;
     }
 
@@ -13462,6 +13750,37 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ],
           automate: true
         });
+        const currentWorkflow = this.ensureWorkflowState(project.record);
+        const hygieneIncident = upsertWorkflowIncident(currentWorkflow, {
+          kind: "hygiene",
+          severity: queuedAutomaticRepair ? "warning" : "high",
+          sourceStep: "coding",
+          title: "Repository hygiene blocked the coding checkpoint",
+          summary: detail,
+          rootCause: detail,
+          evidenceRefs: [hygieneReport.scannedRef],
+          involvedPaths: [...hygieneReport.forbiddenFiles, ...hygieneReport.cleanedFiles],
+          automaticActions: queuedAutomaticRepair
+            ? [`Queued repair attempt ${currentWorkflow.repair.attemptCount} of ${currentWorkflow.repair.maxAttempts}.`]
+            : [],
+          nextSystemAction: queuedAutomaticRepair ? "Start a scoped cleanup pass, then checkpoint and revalidate." : undefined,
+          userActionRequired: queuedAutomaticRepair ? undefined : "Remove the forbidden repository artifacts, then retry the current goal.",
+          primaryAction: queuedAutomaticRepair
+            ? { kind: "view_details", label: "Watch automatic cleanup" }
+            : { kind: "retry", label: "Retry current goal" },
+          secondaryActions: [{ kind: "view_details", label: "Review hygiene evidence" }],
+          status: queuedAutomaticRepair ? "resolving" : "open"
+        });
+        appendWorkflowJournalEvent(currentWorkflow, {
+          kind: "incident",
+          status: queuedAutomaticRepair ? "waiting" : "failed",
+          stepId: "coding",
+          title: hygieneIncident.title,
+          summary: hygieneIncident.rootCause,
+          agentId: agent.id,
+          incidentId: hygieneIncident.id,
+          evidenceRefs: hygieneIncident.evidenceRefs
+        });
         await this.persistProjectUpdate(project, queuedAutomaticRepair
           ? {
             save: "immediate",
@@ -13498,7 +13817,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         agent.completedAt = nowIso();
         this.syncWorkflowStepProgressFromAgent(project, agent);
         this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-        await this.persistProjectUpdate(project, agent.category === "coding");
+        const repairValidationQueued = this.markRepairCheckpointReadyForValidation(project, agent);
+        await this.persistProjectUpdate(project, agent.category === "coding"
+          ? {
+            save: "immediate",
+            emit: "coalesced",
+            automate: true,
+            reason: repairValidationQueued ? "repair checkpoint queued for validation" : "coding checkpoint completed"
+          }
+          : undefined);
         return;
       }
 
@@ -13528,7 +13855,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       agent.completedAt = nowIso();
       this.syncWorkflowStepProgressFromAgent(project, agent);
       this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-      await this.persistProjectUpdate(project, true);
+      const repairValidationQueued = this.markRepairCheckpointReadyForValidation(project, agent);
+      await this.persistProjectUpdate(project, {
+        save: "immediate",
+        emit: "coalesced",
+        automate: true,
+        reason: repairValidationQueued ? "repair checkpoint queued for validation" : "coding checkpoint completed"
+      });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       agent.status = "failed";
@@ -13541,8 +13874,82 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         detail
       });
       this.syncWorkflowStepProgressFromAgent(project, agent);
-      this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-      await this.persistProjectUpdate(project);
+      const workflow = this.ensureWorkflowState(project.record);
+      this.mirrorLatestAgentEventToWorkflow(workflow, agent);
+      if (agent.category !== "coding") {
+        await this.persistProjectUpdate(project);
+        return;
+      }
+      const queuedAutomaticRepair = this.queueAutomaticWorkflowRepair(project, {
+        sourceStep: "coding",
+        issueSummary: "The coding worktree could not be finalized into a validated checkpoint.",
+        latestFailureReason: detail,
+        involvedPaths: agent.changedFiles,
+        automate: true
+      });
+      if (!queuedAutomaticRepair && workflow.repair.status !== "exhausted") {
+        workflow.manualHandoff = {
+          reason: "repair_exhausted",
+          title: "Worktree checkpoint could not be finalized",
+          whatSystemWasTryingToDo: workflow.scopedGoal?.summary ?? "Save the coding result for deterministic validation",
+          validationIssue: "The coding or repair agent finished, but its Git worktree could not be checkpointed safely.",
+          latestFailureReason: detail,
+          involvedPaths: unique(agent.changedFiles).slice(0, 8),
+          shellSupported: process.platform === "win32",
+          createdAt: nowIso()
+        };
+        this.updateWorkflowRepairState(workflow, {
+          status: "exhausted",
+          latestIssueSummary: "The coding worktree could not be finalized into a validated checkpoint.",
+          latestFailureReason: detail
+        });
+        project.record.localState.workflowPauseRequested = true;
+      }
+      const incident = upsertWorkflowIncident(workflow, {
+        kind: "checkout",
+        severity: queuedAutomaticRepair ? "warning" : "high",
+        sourceStep: "coding",
+        title: "Coding checkpoint finalization failed",
+        summary: "The agent finished its turn, but Workbench could not safely save the worktree checkpoint.",
+        rootCause: detail,
+        involvedPaths: agent.changedFiles,
+        evidenceRefs: [`agent:${agent.id}`],
+        automaticActions: queuedAutomaticRepair
+          ? [`Queued repair attempt ${workflow.repair.attemptCount} of ${workflow.repair.maxAttempts}.`]
+          : [],
+        nextSystemAction: queuedAutomaticRepair ? "Start a fresh repair pass, then checkpoint and validate it." : undefined,
+        userActionRequired: queuedAutomaticRepair
+          ? undefined
+          : "Review the worktree/Git error, then retry the current scoped goal.",
+        primaryAction: queuedAutomaticRepair
+          ? { kind: "view_details", label: "Watch automatic recovery" }
+          : { kind: "retry", label: "Retry current goal" },
+        secondaryActions: [{ kind: "view_details", label: "Review finalization evidence" }],
+        status: queuedAutomaticRepair ? "resolving" : "open"
+      });
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: queuedAutomaticRepair ? "waiting" : "failed",
+        stepId: "coding",
+        title: incident.title,
+        summary: detail,
+        agentId: agent.id,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, queuedAutomaticRepair
+        ? {
+          save: "immediate",
+          emit: "coalesced",
+          automate: true,
+          reason: "coding checkpoint finalization failed; automatic recovery queued"
+        }
+        : {
+          save: "immediate",
+          emit: "coalesced",
+          reason: "coding checkpoint finalization failed; operator recovery required"
+        });
     }
   }
 
@@ -13919,6 +14326,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     agent.completedAt = nowIso();
     if (passed) {
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "integrity");
+      const resolvedIncidents = resolveWorkflowIncidents(
+        workflow,
+        (incident) => incident.cycleNumber === workflow.workflowCycle.cycleNumber &&
+          (incident.kind === "validation" || incident.kind === "environment" || incident.kind === "hygiene")
+      );
+      for (const incident of resolvedIncidents) {
+        appendWorkflowJournalEvent(workflow, {
+          kind: "incident",
+          status: "completed",
+          stepId: "integrity",
+          title: `Resolved: ${incident.title}`,
+          summary: agent.integrityReport.summary,
+          agentId: agent.id,
+          incidentId: incident.id,
+          evidenceRefs: ledger.commandResults.map((result) => result.commandId)
+        });
+      }
       if (workflow.repair.attemptCount > 0) {
         this.updateWorkflowRepairState(workflow, {
           status: "fixed",
@@ -13974,6 +14398,47 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         status: exhausted ? "exhausted" : "repairing",
         latestIssueSummary: agent.integrityReport.summary,
         latestFailureReason: failureAssessment.latestFailureReason
+      });
+      const failedCommandResults = ledger.commandResults.filter((result) => result.status === "failed" || result.status === "timed_out");
+      const incidentKind = failureAssessment.kind === "environment_blocker" ? "environment" : "validation";
+      const incident = upsertWorkflowIncident(workflow, {
+        kind: incidentKind,
+        severity: exhausted ? "high" : "warning",
+        sourceStep: "integrity",
+        title: failureAssessment.kind === "environment_blocker"
+          ? "Validation environment needs attention"
+          : `Validation failed${workflow.repair.attemptCount ? ` · repair ${workflow.repair.attemptCount}/${workflow.repair.maxAttempts}` : ""}`,
+        summary: agent.integrityReport.summary,
+        rootCause: failureAssessment.latestFailureReason,
+        evidenceRefs: failedCommandResults.map((result) => result.commandId),
+        involvedPaths: unique(failedCommandResults.flatMap((result) => result.relatedFiles)),
+        automaticActions: canQueueAnotherRepair
+          ? [`Queued repair attempt ${nextAttemptCount} of ${workflow.repair.maxAttempts}.`, "Validation will rerun after the repair checkpoint."]
+          : [],
+        nextSystemAction: canQueueAnotherRepair ? "Start a scoped repair coding pass, then rerun deterministic validation." : undefined,
+        userActionRequired: exhausted
+          ? failureAssessment.kind === "environment_blocker"
+            ? "Restore the missing validation tool or dependency, then choose Revalidate repair."
+            : "Review the failed command evidence, repair manually, retry the goal, or reset the cycle."
+          : undefined,
+        primaryAction: exhausted
+          ? { kind: "revalidate", label: "Revalidate repair" }
+          : { kind: "view_details", label: "Watch automatic repair" },
+        secondaryActions: exhausted ? [
+          { kind: "open_shell", label: "Repair in Codex" },
+          { kind: "reset_cycle", label: "Reset cycle" }
+        ] : [],
+        status: canQueueAnotherRepair ? "resolving" : "open"
+      });
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: canQueueAnotherRepair ? "waiting" : "failed",
+        stepId: "integrity",
+        title: incident.title,
+        summary: incident.rootCause,
+        agentId: agent.id,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
       });
       for (const risk of risks) {
         this.recordWorkflowOpenIssue(workflow, "Integrity follow-up required", risk, "integrity");
@@ -14218,6 +14683,30 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
+  private resolveCompletedMergeIncidents(
+    workflow: ProjectWorkflowState,
+    mergeAgent: AgentState,
+    summary: string
+  ): void {
+    const resolved = resolveWorkflowIncidents(
+      workflow,
+      (incident) => incident.cycleNumber === workflow.workflowCycle.cycleNumber &&
+        (incident.sourceStep === "merge" || incident.kind === "merge_conflict" || incident.kind === "checkout")
+    );
+    for (const incident of resolved) {
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: "completed",
+        stepId: "merge",
+        title: `Resolved: ${incident.title}`,
+        summary,
+        agentId: mergeAgent.id,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+    }
+  }
+
   private async tryFinalizeResolvedMergeConflictWorktree(project: LoadedProject): Promise<boolean> {
     if (project.scan.kind !== "git") {
       return false;
@@ -14338,6 +14827,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     this.resetWorkflowRepairState(workflow);
+    this.resolveCompletedMergeIncidents(workflow, mergeAgent, mergeAgent.mergeReport.summary);
     this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
     this.resolveWorkflowHumanInterventions(
       workflow,
@@ -14503,6 +14993,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           detail,
           stepId: "integrity"
         });
+        const incident = upsertWorkflowIncident(workflow, {
+          kind: "validation",
+          severity: "warning",
+          sourceStep: "merge",
+          title: "Merge is waiting for current validation evidence",
+          summary: mergeAgent.mergeReport.summary,
+          rootCause: detail,
+          evidenceRefs: [],
+          automaticActions: ["Queued deterministic validation before retrying integration."],
+          nextSystemAction: "Rebuild the current-cycle validation ledger, then retry merge.",
+          primaryAction: { kind: "view_details", label: "Watch validation" },
+          secondaryActions: [],
+          status: "resolving"
+        });
+        appendWorkflowJournalEvent(workflow, {
+          kind: "incident",
+          status: "waiting",
+          stepId: "integrity",
+          title: incident.title,
+          summary: incident.rootCause,
+          agentId: mergeAgent.id,
+          incidentId: incident.id
+        });
         this.syncWorkflowState(project);
         await this.persistProjectUpdate(project, {
           save: "immediate",
@@ -14529,6 +15042,45 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ],
         repairable: !environmentOnlyValidationBlocker,
         automate
+      });
+      const mergeGateIncident = upsertWorkflowIncident(workflow, {
+        kind: preMergeHygieneReport.mergeBlockingFindings.length > 0
+          ? "hygiene"
+          : environmentOnlyValidationBlocker
+            ? "environment"
+            : "validation",
+        severity: queuedAutomaticRepair ? "warning" : "high",
+        sourceStep: "merge",
+        title: preMergeHygieneReport.mergeBlockingFindings.length > 0
+          ? "Repository hygiene blocked integration"
+          : "Validation blocked integration",
+        summary: mergeAgent.mergeReport.summary,
+        rootCause: detail,
+        evidenceRefs: [
+          preMergeHygieneReport.scannedRef,
+          ...(latestLedger ? [`validation-ledger:${latestLedger.cycleNumber}:${latestLedger.updatedAt}`] : [])
+        ],
+        involvedPaths: [...preMergeHygieneReport.forbiddenFiles, ...preMergeHygieneReport.cleanedFiles],
+        automaticActions: queuedAutomaticRepair
+          ? [`Queued repair attempt ${workflow.repair.attemptCount} of ${workflow.repair.maxAttempts}.`]
+          : [],
+        nextSystemAction: queuedAutomaticRepair ? "Repair the gate failure, revalidate, then retry integration." : undefined,
+        userActionRequired: queuedAutomaticRepair ? undefined : "Resolve the validation or hygiene gate, then revalidate the current repair.",
+        primaryAction: queuedAutomaticRepair
+          ? { kind: "view_details", label: "Watch automatic repair" }
+          : { kind: "revalidate", label: "Revalidate repair" },
+        secondaryActions: [{ kind: "view_details", label: "Review gate evidence" }],
+        status: queuedAutomaticRepair ? "resolving" : "open"
+      });
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: queuedAutomaticRepair ? "waiting" : "failed",
+        stepId: "merge",
+        title: mergeGateIncident.title,
+        summary: mergeGateIncident.rootCause,
+        agentId: mergeAgent.id,
+        incidentId: mergeGateIncident.id,
+        evidenceRefs: mergeGateIncident.evidenceRefs
       });
       this.syncWorkflowState(project);
       await this.persistProjectUpdate(project, queuedAutomaticRepair
@@ -14575,6 +15127,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           stepId: "merge"
         });
       }
+      this.resolveCompletedMergeIncidents(workflow, mergeAgent, mergeAgent.mergeReport.summary);
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
       this.resolveWorkflowHumanInterventions(
         workflow,
@@ -14654,6 +15207,34 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         mergeResult.conflicts.join(", ") || "Deterministic merge reported conflicts.",
         "merge"
       );
+      const conflictIncident = upsertWorkflowIncident(workflow, {
+        kind: "merge_conflict",
+        severity: "high",
+        sourceStep: "merge",
+        title: "Merge conflicts need one focused resolution",
+        summary: mergeAgent.mergeReport.summary,
+        rootCause: latestFailureReason,
+        involvedPaths: this.getMergeConflictHandoffPaths(mergeResult.conflicts),
+        evidenceRefs: mergeResult.conflicts,
+        automaticActions: ["Preserved the integration worktree and conflict evidence."],
+        userActionRequired: "Resolve the listed conflicts in the preserved integration worktree, then retry the current goal.",
+        primaryAction: { kind: "open_shell", label: "Open repair agent" },
+        secondaryActions: [
+          { kind: "retry", label: "Retry merge" },
+          { kind: "view_details", label: "Review conflicts" }
+        ],
+        status: "open"
+      });
+      appendWorkflowJournalEvent(workflow, {
+        kind: "incident",
+        status: "failed",
+        stepId: "merge",
+        title: conflictIncident.title,
+        summary: conflictIncident.rootCause,
+        agentId: mergeAgent.id,
+        incidentId: conflictIncident.id,
+        evidenceRefs: conflictIncident.evidenceRefs
+      });
       this.recordWorkflowActivity(workflow, {
         source: "workflow",
         status: "failed",
@@ -14709,6 +15290,36 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ],
           automate
         });
+        const hygieneIncident = upsertWorkflowIncident(workflow, {
+          kind: "hygiene",
+          severity: queuedAutomaticRepair ? "warning" : "high",
+          sourceStep: "merge",
+          title: "Repository hygiene blocked merge finalization",
+          summary: mergeAgent.mergeReport.summary,
+          rootCause: detail,
+          evidenceRefs: [integrationHygieneReport.scannedRef],
+          involvedPaths: [...integrationHygieneReport.forbiddenFiles, ...integrationHygieneReport.cleanedFiles],
+          automaticActions: queuedAutomaticRepair
+            ? [`Queued repair attempt ${workflow.repair.attemptCount} of ${workflow.repair.maxAttempts}.`]
+            : [],
+          nextSystemAction: queuedAutomaticRepair ? "Clean the integration result, revalidate, then merge again." : undefined,
+          userActionRequired: queuedAutomaticRepair ? undefined : "Remove the forbidden artifacts, then retry integration.",
+          primaryAction: queuedAutomaticRepair
+            ? { kind: "view_details", label: "Watch automatic cleanup" }
+            : { kind: "retry", label: "Retry merge" },
+          secondaryActions: [{ kind: "view_details", label: "Review hygiene evidence" }],
+          status: queuedAutomaticRepair ? "resolving" : "open"
+        });
+        appendWorkflowJournalEvent(workflow, {
+          kind: "incident",
+          status: queuedAutomaticRepair ? "waiting" : "failed",
+          stepId: "merge",
+          title: hygieneIncident.title,
+          summary: hygieneIncident.rootCause,
+          agentId: mergeAgent.id,
+          incidentId: hygieneIncident.id,
+          evidenceRefs: hygieneIncident.evidenceRefs
+        });
         this.syncWorkflowState(project);
         await this.persistProjectUpdate(project, queuedAutomaticRepair
           ? {
@@ -14730,6 +15341,33 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         mergeAgent.status = "failed";
         mergeAgent.completedAt = nowIso();
         this.recordWorkflowOpenIssue(workflow, "Opened checkout was not updated", detail, "merge");
+        const checkoutIncident = upsertWorkflowIncident(workflow, {
+          kind: "checkout",
+          severity: "high",
+          sourceStep: "merge",
+          title: "Validated work could not update the opened checkout",
+          summary: mergeAgent.mergeReport.summary,
+          rootCause: detail,
+          evidenceRefs: integrationBranch ? [`branch:${integrationBranch}`] : [],
+          automaticActions: ["Kept the validated integration branch intact."],
+          userActionRequired: "Clear the checkout obstruction, then retry merge without rebuilding the validated work.",
+          primaryAction: { kind: "retry", label: "Retry merge" },
+          secondaryActions: [
+            { kind: "open_shell", label: "Open repair agent" },
+            { kind: "view_details", label: "Review checkout error" }
+          ],
+          status: "open"
+        });
+        appendWorkflowJournalEvent(workflow, {
+          kind: "incident",
+          status: "failed",
+          stepId: "merge",
+          title: checkoutIncident.title,
+          summary: checkoutIncident.rootCause,
+          agentId: mergeAgent.id,
+          incidentId: checkoutIncident.id,
+          evidenceRefs: checkoutIncident.evidenceRefs
+        });
         if (!workflow.humanInterventions.some((entry) => entry.status === "pending" && entry.title === "Opened checkout update blocked")) {
           await this.createHumanInterventionRecord(project, {
             kind: "other",
@@ -14778,6 +15416,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         await this.persistProjectUpdate(project, false);
         return;
       }
+      this.resolveCompletedMergeIncidents(workflow, mergeAgent, mergeAgent.mergeReport.summary);
       this.resolveWorkflowOpenIssues(workflow, (issue) => issue.source === "merge");
       this.resolveWorkflowHumanInterventions(
         workflow,
@@ -15729,12 +16368,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
-  private cancelPendingApprovalsForInterruptedAgent(agent: AgentState): void {
+  private cancelPendingApprovalsForInterruptedAgent(agent: AgentState): string[] {
+    const cancelledApprovalIds: string[] = [];
     for (const approval of agent.approvals) {
       if (approval.status === "pending") {
         approval.status = "cancelled";
+        cancelledApprovalIds.push(approval.id);
       }
     }
+    return cancelledApprovalIds;
   }
 
   private markAgentDisconnected(project: LoadedProject, agent: AgentState, reason: string): void {
@@ -15743,7 +16385,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.interfaceCreationRepairAttempts.delete(agent.threadId);
     }
 
-    this.cancelPendingApprovalsForInterruptedAgent(agent);
+    const cancelledApprovalIds = this.cancelPendingApprovalsForInterruptedAgent(agent);
     agent.status = "disconnected";
     agent.completedAt = nowIso();
     agent.currentPhase = "Interrupted; recovery available";
@@ -15755,7 +16397,30 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       detail: reason
     });
     this.syncWorkflowStepProgressFromAgent(project, agent);
-    this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+    const workflow = this.ensureWorkflowState(project.record);
+    if (cancelledApprovalIds.length > 0) {
+      const cancelledApprovalIdSet = new Set(cancelledApprovalIds);
+      const resolvedIncidents = resolveWorkflowIncidents(
+        workflow,
+        (incident) => incident.evidenceRefs.some((reference) =>
+          reference.startsWith("approval:") && cancelledApprovalIdSet.has(reference.slice("approval:".length))
+        ),
+        "superseded"
+      );
+      for (const incident of resolvedIncidents) {
+        appendWorkflowJournalEvent(workflow, {
+          kind: "approval",
+          status: "completed",
+          stepId: incident.sourceStep,
+          title: `Cancelled with interrupted agent: ${incident.title}`,
+          summary: reason,
+          agentId: agent.id,
+          incidentId: incident.id,
+          evidenceRefs: incident.evidenceRefs
+        });
+      }
+    }
+    this.mirrorLatestAgentEventToWorkflow(workflow, agent);
   }
 
   private markActiveAgentsDisconnected(project: LoadedProject, reason: string): AgentState[] {
@@ -15997,9 +16662,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     switch (notification.method) {
-      case "thread/tokenUsage/updated":
-        agent.lastActivityAt = nowIso();
+      case "thread/tokenUsage/updated": {
+        const updatedAt = nowIso();
+        agent.lastActivityAt = updatedAt;
+        agent.tokenUsage = {
+          ...notification.params.tokenUsage.total,
+          modelContextWindow: notification.params.tokenUsage.modelContextWindow,
+          updatedAt
+        };
+        this.recomputeWorkflowTokenMetrics(project, updatedAt);
         break;
+      }
       case "turn/plan/updated": {
         const detail = [
           notification.params.explanation ?? undefined,
@@ -16659,7 +17332,34 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       kind: "approval-request",
       approval
     });
-    this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
+    const workflow = this.ensureWorkflowState(project.record);
+    const approvalStep = this.getWorkflowStepIdForAgent(agent) ?? getWorkflowActiveStepId(workflow);
+    const approvalIncident = upsertWorkflowIncident(workflow, {
+      kind: "approval",
+      severity: "warning",
+      sourceStep: approvalStep,
+      title: "Codex approval is waiting",
+      summary: approval.summary,
+      rootCause: approval.reason ?? approval.summary,
+      evidenceRefs: [`approval:${approval.id}`],
+      involvedPaths: approval.filePaths,
+      automaticActions: ["Paused only the requesting agent; the approval remains explicit."],
+      userActionRequired: "Review the exact command, file change, or permission request and choose an approval decision.",
+      primaryAction: { kind: "approve", label: "Review approval", targetId: approval.id },
+      secondaryActions: [{ kind: "view_details", label: "View request details" }],
+      status: "open"
+    });
+    appendWorkflowJournalEvent(workflow, {
+      kind: "approval",
+      status: "waiting",
+      stepId: approvalStep,
+      title: approvalIncident.title,
+      summary: approvalIncident.summary,
+      agentId: agent.id,
+      incidentId: approvalIncident.id,
+      evidenceRefs: approvalIncident.evidenceRefs
+    });
+    this.mirrorLatestAgentEventToWorkflow(workflow, agent);
     await this.persistProjectUpdate(project);
   }
 }

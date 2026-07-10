@@ -16,13 +16,13 @@ import {
   deriveWorkflowRuntimeStatus,
   getWorkflowRecoveryCandidate,
   workflowActionGuide,
-  workflowRunStateLabel,
   workflowSectionProminence,
   workflowStageGuidance,
   workflowStageLabel,
   workflowStatusSummary
 } from "@shared/workflowView";
 import { buildOperatorWorkflowViewModel, suspiciousPathReason, type OperatorChangedFileGroup, type OperatorWorkflowViewModel } from "@shared/operatorWorkflowView";
+import type { WorkflowDashboardMetrics } from "@shared/workflowDashboard";
 import { isWorkflowAutomationBlockingAgent } from "@shared/workflow";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
@@ -38,10 +38,14 @@ import type {
   AgentReasoningMode,
   AgentState,
   AgentTranscriptResponse,
+  AppAppearanceDensity,
+  AppAppearanceTheme,
+  AppMotionMode,
   AutopilotPreset,
   AutopilotPolicy,
   AutopilotProfile,
   AutopilotStrategy,
+  ApprovalDecision,
   ApprovalRequestRecord,
   CredentialEntryMetadata,
   DiscoveredModel,
@@ -241,6 +245,9 @@ type SettingsDraftState = {
   autoApproveGitCommits: boolean;
   autoApproveGitPushes: boolean;
   considerPaidServices: boolean;
+  appearanceTheme: AppAppearanceTheme;
+  appearanceDensity: AppAppearanceDensity;
+  motionMode: AppMotionMode;
 };
 
 type SettingsDraftUpdate = {
@@ -259,6 +266,9 @@ type SettingsDraftUpdate = {
   autoApproveGitCommits?: boolean;
   autoApproveGitPushes?: boolean;
   considerPaidServices?: boolean;
+  appearanceTheme?: AppAppearanceTheme;
+  appearanceDensity?: AppAppearanceDensity;
+  motionMode?: AppMotionMode;
 };
 
 type GoalCharterDraftState = {
@@ -371,6 +381,23 @@ type VisualExportScrollMetrics = {
 const delay = async (durationMs: number): Promise<void> =>
   await new Promise((resolve) => window.setTimeout(resolve, durationMs));
 
+const useAppAppearance = (
+  theme: AppAppearanceTheme,
+  density: AppAppearanceDensity,
+  motion: AppMotionMode
+): void => {
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    root.dataset.density = density;
+    root.dataset.motion = motion;
+    root.style.colorScheme = theme === "catc-light" ? "light" : "dark";
+  }, [density, motion, theme]);
+};
+
+const approvalRequestKey = (approval: Pick<ApprovalRequestRecord, "agentId" | "id">): string =>
+  `${approval.agentId}:${approval.id}`;
+
 const waitForVisualRender = async (): Promise<void> => {
   await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)));
   await new Promise((resolve) => window.requestAnimationFrame(() => resolve(undefined)));
@@ -455,19 +482,19 @@ const buildVisualExportCaptureTargets = (
 };
 
 const normalizeWorkspaceTab = (tab?: string): WorkspaceVisualTabId => {
+  if (WORKSPACE_TAB_IDS.has(tab as WorkspaceVisualTabId)) {
+    return tab as WorkspaceVisualTabId;
+  }
   if (tab === "reports") {
     return "workflow";
   }
-  if (tab === "runs" || tab === "logs" || tab === "agents") {
+  if (tab === "agents") {
     return "history";
-  }
-  if (tab === "credentials") {
-    return "settings";
   }
   if (tab === "file" || tab === "diff") {
     return "repository";
   }
-  return WORKSPACE_TAB_IDS.has(tab as WorkspaceVisualTabId) ? tab as WorkspaceVisualTabId : "overview";
+  return "overview";
 };
 
 const buildUltimateGoalFormatGuide = (projectName: string): string => [
@@ -1001,30 +1028,6 @@ const goalCheckSourceLabel = (source: ProjectWorkflowState["goalChecklist"][numb
     deterministic: "Deterministic"
   })[source];
 
-type WorkflowChecklistGroupSummary = {
-  id: string;
-  title: string;
-  openCount: number;
-  metCount: number;
-  unknownCount: number;
-  blockedCount: number;
-  totalCount: number;
-  representative?: string;
-  relatedPaths: string[];
-};
-
-type WorkflowChecklistOverview = {
-  percentComplete?: number;
-  requiredMet: number;
-  requiredTotal: number;
-  openRequired: number;
-  unknownCount: number;
-  groups: WorkflowChecklistGroupSummary[];
-  topOpenGroups: WorkflowChecklistGroupSummary[];
-  topMetGroups: WorkflowChecklistGroupSummary[];
-  topUnknownGroups: WorkflowChecklistGroupSummary[];
-};
-
 const summarizeText = (value?: string, fallback = "Not available", maxLength = 180): string => {
   const normalized = (value ?? "").replace(/\s+/g, " ").trim();
   if (!normalized) {
@@ -1097,134 +1100,6 @@ const getWorkflowLastUpdatedAt = (workflow?: ProjectWorkflowState, agents: Agent
     .filter((time) => time > 0);
 
   return timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : undefined;
-};
-
-const inferWorkflowChecklistGroupTitle = (check: ProjectWorkflowState["goalChecklist"][number]): string => {
-  const text = `${check.title} ${check.description} ${check.evidence} ${check.relatedPaths.join(" ")}`.toLowerCase();
-  if (/\bcompany|companies|employer|firm|profile page|company page\b/.test(text)) {
-    return "Company pages";
-  }
-  if (/\bquestion bank|questions|practice problem|prompt|answer key\b/.test(text)) {
-    return "Question bank";
-  }
-  if (/\bcompensation|salary|pay band|source context|offer|level\b/.test(text)) {
-    return "Compensation/source context";
-  }
-  if (/\bprovenance|citation|citations|source|sources|reference|attribution\b/.test(text)) {
-    return "Source provenance";
-  }
-  if (/\bmental math|arithmetic|estimation|calculation|calculate\b/.test(text)) {
-    return "Mental math";
-  }
-  if (/\blocal data|persistence|persist|storage|database|cache|indexeddb|sqlite\b/.test(text)) {
-    return "Local data/persistence";
-  }
-  if (/\btest|tests|validation|validate|integrity|lint|typecheck|build\b/.test(text)) {
-    return "Testing/validation";
-  }
-  if (/\bworkflow|agent|cycle|approval|autopilot|blocker\b/.test(text)) {
-    return "Workflow operations";
-  }
-  if (/\bui|ux|layout|screen|responsive|visual|navigation\b/.test(text)) {
-    return "Interface";
-  }
-  return goalCheckSourceLabel(check.source);
-};
-
-const buildWorkflowChecklistGroups = (
-  checklist: ProjectWorkflowState["goalChecklist"],
-  taskMap?: ProjectWorkflowState["taskMap"]
-): WorkflowChecklistGroupSummary[] => {
-  const checksById = new Map(checklist.map((check) => [check.id, check]));
-
-  if (taskMap?.groups.length) {
-    return taskMap.groups.map((group) => {
-      const checks = group.checkIds.map((id) => checksById.get(id)).filter((check): check is ProjectWorkflowState["goalChecklist"][number] => Boolean(check));
-      const unknownCount = checks.filter((check) => check.status === "unknown").length;
-      const blockedCount = checks.filter((check) =>
-        check.status !== "met" &&
-        check.status !== "not_applicable" &&
-        /\b(block|blocked|fail|failed|missing|required)\b/i.test(`${check.title} ${check.description} ${check.evidence}`)
-      ).length;
-
-      return {
-        id: group.id,
-        title: group.title,
-        openCount: group.openCheckCount,
-        metCount: group.metCheckCount,
-        unknownCount,
-        blockedCount,
-        totalCount: Math.max(group.checkIds.length, group.openCheckCount + group.metCheckCount),
-        representative: group.representativeChecks[0] ?? checks[0]?.title,
-        relatedPaths: uniqueSortedStrings([...group.relatedPaths, ...checks.flatMap((check) => check.relatedPaths)]).slice(0, 5)
-      };
-    });
-  }
-
-  const groups = new Map<string, WorkflowChecklistGroupSummary>();
-  for (const check of checklist) {
-    const title = inferWorkflowChecklistGroupTitle(check);
-    const existing = groups.get(title) ?? {
-      id: title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
-      title,
-      openCount: 0,
-      metCount: 0,
-      unknownCount: 0,
-      blockedCount: 0,
-      totalCount: 0,
-      representative: check.title,
-      relatedPaths: []
-    };
-
-    const isOpen = check.required && check.status !== "met" && check.status !== "not_applicable";
-    existing.totalCount += 1;
-    existing.openCount += isOpen ? 1 : 0;
-    existing.metCount += check.status === "met" ? 1 : 0;
-    existing.unknownCount += check.status === "unknown" ? 1 : 0;
-    existing.blockedCount += isOpen && /\b(block|blocked|fail|failed|missing|required)\b/i.test(`${check.title} ${check.description} ${check.evidence}`) ? 1 : 0;
-    existing.relatedPaths = uniqueSortedStrings([...existing.relatedPaths, ...check.relatedPaths]).slice(0, 5);
-    groups.set(title, existing);
-  }
-
-  return [...groups.values()];
-};
-
-const buildWorkflowChecklistOverview = (
-  workflow?: ProjectWorkflowState
-): WorkflowChecklistOverview => {
-  const checklist = workflow?.goalChecklist ?? [];
-  const requiredChecks = checklist.filter((check) => check.required && check.status !== "not_applicable");
-  const requiredMet = requiredChecks.filter((check) => check.status === "met").length;
-  const requiredTotal = requiredChecks.length;
-  const openRequired = requiredChecks.length - requiredMet;
-  const groups = buildWorkflowChecklistGroups(checklist, workflow?.taskMap);
-  const byOpen = [...groups].sort((left, right) =>
-    right.openCount - left.openCount ||
-    right.blockedCount - left.blockedCount ||
-    left.title.localeCompare(right.title)
-  );
-  const byMet = [...groups].sort((left, right) =>
-    right.metCount - left.metCount ||
-    left.title.localeCompare(right.title)
-  );
-  const byUnknown = [...groups].sort((left, right) =>
-    right.unknownCount - left.unknownCount ||
-    right.blockedCount - left.blockedCount ||
-    left.title.localeCompare(right.title)
-  );
-
-  return {
-    percentComplete: workflow?.ultimateGoalProgress?.percentComplete ??
-      (requiredTotal > 0 ? Math.round((requiredMet / requiredTotal) * 100) : undefined),
-    requiredMet,
-    requiredTotal,
-    openRequired,
-    unknownCount: requiredChecks.filter((check) => check.status === "unknown").length,
-    groups,
-    topOpenGroups: byOpen.filter((group) => group.openCount > 0).slice(0, 5),
-    topMetGroups: byMet.filter((group) => group.metCount > 0).slice(0, 4),
-    topUnknownGroups: byUnknown.filter((group) => group.unknownCount > 0 || group.blockedCount > 0).slice(0, 4)
-  };
 };
 
 const getCurrentCycleChangedFiles = (workflow: ProjectWorkflowState | undefined, agents: AgentState[]): string[] => {
@@ -2488,115 +2363,6 @@ const AgentLane = ({
   </section>
 );
 
-const OverviewMetricCard = ({
-  label,
-  value,
-  detail,
-  tone
-}: {
-  label: string;
-  value: string | number;
-  detail: string;
-  tone?: "good" | "warning" | "danger";
-}) => (
-  <article className={`overview-metric-card ${tone ? `overview-metric-card--${tone}` : ""}`}>
-    <span>{label}</span>
-    <strong>{value}</strong>
-    <p>{detail}</p>
-  </article>
-);
-
-const OverviewAttentionSummary = ({
-  items,
-  onOpenWorkflow,
-  onOpenLogs,
-  onOpenCredentials
-}: {
-  items: WorkflowAttentionItem[];
-  onOpenWorkflow: () => void;
-  onOpenLogs: () => void;
-  onOpenCredentials: () => void;
-}) => {
-  const visibleItems = items.slice(0, 5);
-  const hiddenCount = Math.max(0, items.length - visibleItems.length);
-
-  return (
-    <article className={`overview-attention-card ${items.length === 0 ? "overview-attention-card--empty" : ""}`}>
-      <SectionTitle
-        eyebrow="Attention"
-        title="What needs attention"
-        meta={<span className={`badge ${items.some((item) => item.tone === "danger") ? "badge-incompatible" : "badge-exact"}`}>{items.length}</span>}
-      />
-      {items.length === 0 ? (
-        <p className="overview-attention-card__empty">No urgent attention needed.</p>
-      ) : (
-        <div className="overview-attention-list">
-          {visibleItems.map((item) => {
-            const action = item.target === "credentials"
-              ? { label: "Credentials", onClick: onOpenCredentials }
-              : item.kind === "approval"
-                ? { label: "Logs", onClick: onOpenLogs }
-                : { label: "Workflow", onClick: onOpenWorkflow };
-            return (
-              <div key={item.id} className={`overview-attention-item overview-attention-item--${item.tone}`}>
-                <div>
-                  <div className="candidate-card__title-row">
-                    <strong>{item.title}</strong>
-                    <span className="badge">{workflowAttentionKindLabel(item.kind)}</span>
-                  </div>
-                  <p>{item.detail}</p>
-                </div>
-                <button className="secondary-button" type="button" onClick={action.onClick}>{action.label}</button>
-              </div>
-            );
-          })}
-          {hiddenCount > 0 ? <p className="agent-card__subtle">{hiddenCount} more item{hiddenCount === 1 ? "" : "s"} in Workflow.</p> : null}
-        </div>
-      )}
-    </article>
-  );
-};
-
-const OverviewActivitySnapshot = ({ events }: { events: WorkflowActivityEvent[] }) => (
-  <article className="overview-activity-card">
-    <SectionTitle eyebrow="Recent" title="Recent activity" meta={<span className="badge">{events.length}</span>} />
-    {events.length ? (
-      <div className="overview-activity-list">
-        {events.slice(0, 6).map((event) => (
-          <div key={event.id} className="overview-activity-row">
-            <span>{formatClockTime(event.timestamp)}</span>
-            <strong>{workflowActivitySourceLabel(event.source)}</strong>
-            <p>{event.title}{event.detail ? ` - ${summarizeText(event.detail, "", 105)}` : ""}</p>
-            <span className={`badge workflow-transcript__badge workflow-transcript__badge--${event.status}`}>{workflowEventStatusLabel(event.status)}</span>
-          </div>
-        ))}
-      </div>
-    ) : (
-      <p className="overview-attention-card__empty">Workflow activity will appear once work starts.</p>
-    )}
-  </article>
-);
-
-const QuickNavigationCard = ({
-  title,
-  detail,
-  meta,
-  onClick
-}: {
-  title: string;
-  detail: string;
-  meta?: string;
-  onClick: () => void;
-}) => (
-  <button className="quick-nav-card" type="button" onClick={onClick}>
-    <div>
-      <strong>{title}</strong>
-      <p>{detail}</p>
-    </div>
-    {meta ? <span className="badge">{meta}</span> : null}
-  </button>
-);
-
 const RunRow = ({
   agent,
   workflow,
@@ -2856,6 +2622,65 @@ const RunDetailPanel = ({
         />
       </div>
     </article>
+  );
+};
+
+const compactMetricNumber = (value: number): string => new Intl.NumberFormat(undefined, {
+  notation: value >= 10_000 ? "compact" : "standard",
+  maximumFractionDigits: value >= 10_000 ? 1 : 0
+}).format(value);
+
+const WorkflowAnalyticsSummary = ({ metrics }: { metrics: WorkflowDashboardMetrics | null }) => {
+  const rate = (value?: number): string => value === undefined ? "—" : `${Math.round(value)}%`;
+  const cards = [
+    {
+      label: "Cycles completed",
+      value: metrics?.cycles.observed ? `${metrics.cycles.completed}/${metrics.cycles.observed}` : "—",
+      detail: metrics?.cycles.failed ? `${metrics.cycles.failed} blocked or failed` : metrics?.cycles.observed ? "No failed cycle recorded" : "No completed cycle yet",
+      tone: metrics?.cycles.failed ? "danger" : "neutral"
+    },
+    {
+      label: "First-pass validation",
+      value: rate(metrics?.validation.firstPassRatePercent),
+      detail: metrics?.validation.cyclesValidated ? `${metrics.validation.firstPassPassed} of ${metrics.validation.cyclesValidated} passed first try` : "Waiting for validation evidence",
+      tone: metrics?.validation.firstPassRatePercent === 100 ? "success" : "neutral"
+    },
+    {
+      label: "Repair success",
+      value: rate(metrics?.validation.repairSuccessRatePercent),
+      detail: metrics?.validation.repairCyclesAttempted ? `${metrics.validation.repairCyclesSucceeded} of ${metrics.validation.repairCyclesAttempted} recovered` : "No repair cycle observed",
+      tone: metrics?.validation.repairSuccessRatePercent === 100 ? "success" : "neutral"
+    },
+    {
+      label: "Commands / files",
+      value: metrics ? `${compactMetricNumber(metrics.work.commandExecutions)} / ${compactMetricNumber(metrics.work.uniqueFiles)}` : "—",
+      detail: metrics ? `${metrics.work.uniqueCommands} unique commands · ${metrics.work.fileReferences} file references` : "No work evidence yet",
+      tone: "neutral"
+    },
+    {
+      label: "Total tokens",
+      value: metrics?.agents.tokens.totalTokens ? compactMetricNumber(metrics.agents.tokens.totalTokens) : "—",
+      detail: metrics?.agents.agentsWithTokenUsage ? `${metrics.agents.agentsWithTokenUsage} run${metrics.agents.agentsWithTokenUsage === 1 ? "" : "s"} reporting usage` : "Usage will appear during agent runs",
+      tone: "neutral"
+    }
+  ];
+
+  return (
+    <section className="runs-analytics" aria-label="Workflow analytics summary">
+      <div className="runs-analytics__heading">
+        <div><span className="eyebrow">Analytics</span><h2>Workflow efficiency</h2></div>
+        <span>Local journal + run evidence</span>
+      </div>
+      <div className="runs-analytics__grid">
+        {cards.map((card) => (
+          <article key={card.label} className={`runs-analytics__metric runs-analytics__metric--${card.tone}`}>
+            <span>{card.label}</span>
+            <strong>{card.value}</strong>
+            <p>{card.detail}</p>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 };
 
@@ -3580,7 +3405,8 @@ const LogsPanel = ({
   onActivityPageChange,
   onCommandPageChange,
   onApprove,
-  onReject
+  onReject,
+  isApprovalBusy
 }: {
   logFeed: LogFeedView;
   agents: AgentState[];
@@ -3591,6 +3417,7 @@ const LogsPanel = ({
   onCommandPageChange: (pageIndex: number) => void;
   onApprove: (approval: ApprovalRequestRecord) => void;
   onReject: (approval: ApprovalRequestRecord) => void;
+  isApprovalBusy: (approval: ApprovalRequestRecord) => boolean;
 }) => {
   const [filter, setFilter] = useState<LogFilterId>("all");
   const [search, setSearch] = useState("");
@@ -3705,8 +3532,10 @@ const LogsPanel = ({
                   <span>{approval.kind} · Requested {formatDateTime(approval.createdAt)}</span>
                 </div>
                 <div className="actions-row">
-                  <button className="primary-button" type="button" onClick={() => onApprove(approval)}>Accept</button>
-                  <button className="secondary-button" type="button" onClick={() => onReject(approval)}>Reject</button>
+                  <button className="primary-button" type="button" disabled={isApprovalBusy(approval)} onClick={() => onApprove(approval)}>
+                    {isApprovalBusy(approval) ? "Submitting..." : "Accept"}
+                  </button>
+                  <button className="secondary-button" type="button" disabled={isApprovalBusy(approval)} onClick={() => onReject(approval)}>Reject</button>
                 </div>
               </article>
             ))}
@@ -5322,6 +5151,7 @@ const WorkflowNeedsAttentionPanel = ({
   items,
   onApprove,
   onReject,
+  isApprovalBusy,
   onOpenCredentials,
   onViewDetails,
   onRetryManualHandoff,
@@ -5335,6 +5165,7 @@ const WorkflowNeedsAttentionPanel = ({
   items: WorkflowAttentionItem[];
   onApprove: (approval: ApprovalRequestRecord) => void;
   onReject: (approval: ApprovalRequestRecord) => void;
+  isApprovalBusy: (approval: ApprovalRequestRecord) => boolean;
   onOpenCredentials: () => void;
   onViewDetails: (target?: WorkflowAttentionItem["target"]) => void;
   onRetryManualHandoff: () => void;
@@ -5380,8 +5211,10 @@ const WorkflowNeedsAttentionPanel = ({
                 </div>
                 {approval ? (
                   <div className="workflow-attention-item__actions">
-                    <button className="primary-button" onClick={() => onApprove(approval)} type="button">Accept</button>
-                    <button className="secondary-button" onClick={() => onReject(approval)} type="button">Reject</button>
+                    <button className="primary-button" disabled={isApprovalBusy(approval)} onClick={() => onApprove(approval)} type="button">
+                      {isApprovalBusy(approval) ? "Submitting..." : "Accept"}
+                    </button>
+                    <button className="secondary-button" disabled={isApprovalBusy(approval)} onClick={() => onReject(approval)} type="button">Reject</button>
                   </div>
                 ) : item.target === "credentials" ? (
                   <button className="secondary-button" onClick={onOpenCredentials} type="button">Open credentials</button>
@@ -6604,23 +6437,6 @@ const LiveUpdatesPanel = ({
   );
 };
 
-const WorkspaceTabButton = ({
-  label,
-  active,
-  count,
-  onClick
-}: {
-  label: string;
-  active: boolean;
-  count?: number;
-  onClick: () => void;
-}) => (
-  <button className={`workspace-tab ${active ? "workspace-tab--active" : ""}`} onClick={onClick} type="button">
-    <span>{label}</span>
-    {typeof count === "number" ? <span className="workspace-tab__count">{count}</span> : null}
-  </button>
-);
-
 const ModelOptionCard = ({
   model,
   selected,
@@ -7597,6 +7413,51 @@ const SettingsDialog = ({
           Tune agent run defaults and open diagnostics only when you need them. Developer Tools no longer open automatically on launch.
         </p>
         <div className="notice">{availabilityMessage(state)}</div>
+        <div className="settings-section settings-appearance">
+          <div className="settings-card settings-appearance__card">
+            <div className="settings-section__heading">
+              <strong>Appearance</strong>
+              <span className="badge">Workspace</span>
+            </div>
+            <p className="settings-card__copy">Choose the visual character, information density, and motion level used across every workspace.</p>
+            <div className="settings-theme-grid" role="radiogroup" aria-label="Color theme">
+              {([
+                { id: "catc-dark", label: "CATC Dark", detail: "Refined navy and warm gold", swatches: ["#091525", "#172a42", "#d9b873"] },
+                { id: "catc-light", label: "CATC Light", detail: "Editorial ivory and navy", swatches: ["#f5f1e9", "#ffffff", "#18304d"] },
+                { id: "space", label: "Space", detail: "Deep indigo and electric cyan", swatches: ["#07091a", "#15163b", "#64d8ff"] }
+              ] as const).map((theme) => (
+                <button
+                  key={theme.id}
+                  className={`settings-theme-option ${settingsDraft.appearanceTheme === theme.id ? "is-selected" : ""}`}
+                  type="button"
+                  role="radio"
+                  aria-checked={settingsDraft.appearanceTheme === theme.id}
+                  onClick={() => onChange({ appearanceTheme: theme.id })}
+                >
+                  <span className="settings-theme-option__preview">{theme.swatches.map((color) => <span key={color} style={{ background: color }} />)}</span>
+                  <span><strong>{theme.label}</strong><small>{theme.detail}</small></span>
+                </button>
+              ))}
+            </div>
+            <div className="settings-appearance__controls">
+              <label className="form-field">
+                <span>Density</span>
+                <select className="input" value={settingsDraft.appearanceDensity} onChange={(event) => onChange({ appearanceDensity: event.target.value as AppAppearanceDensity })}>
+                  <option value="comfortable">Comfortable</option>
+                  <option value="compact">Compact</option>
+                </select>
+              </label>
+              <label className="form-field">
+                <span>Motion</span>
+                <select className="input" value={settingsDraft.motionMode} onChange={(event) => onChange({ motionMode: event.target.value as AppMotionMode })}>
+                  <option value="system">Match system</option>
+                  <option value="full">Full</option>
+                  <option value="reduced">Reduced</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </div>
         <GoalCharterSettingsPanel
           project={activeProject}
           draft={goalCharterDraft}
@@ -8045,23 +7906,34 @@ const StatusChip = ({ label, tone }: { label: string; tone: StatusChipTone }) =>
 const TopBar = ({
   projectName,
   projectContext,
+  pageTitle,
   statusLabel,
   statusTone,
   primaryAction,
-  utilityActions
+  utilityActions,
+  onToggleNavigation,
+  onToggleOperatorRail
 }: {
   projectName: string;
   projectContext: string;
+  pageTitle?: string;
   statusLabel: string;
   statusTone: ShellStatusTone;
   primaryAction?: ShellAction;
   utilityActions: ShellAction[];
+  onToggleNavigation?: () => void;
+  onToggleOperatorRail?: () => void;
 }) => (
   <header className="top-app-bar">
     <div className="top-app-bar__identity">
+      {onToggleNavigation ? (
+        <button className="shell-icon-button shell-mobile-menu" type="button" aria-label="Open navigation" onClick={onToggleNavigation}>
+          <span aria-hidden="true">☰</span>
+        </button>
+      ) : null}
       <img className="top-app-bar__icon" src={interfaceIconUrl} alt="" />
       <div className="top-app-bar__titles">
-        <div className="top-app-bar__app">{APP_NAME}</div>
+        <div className="top-app-bar__app">{pageTitle ?? APP_NAME}</div>
         <div className="top-app-bar__project">
           <strong>{projectName}</strong>
           <span>{projectContext}</span>
@@ -8085,9 +7957,207 @@ const TopBar = ({
           ))}
         </div>
       </details>
+      {onToggleOperatorRail ? (
+        <button className="shell-icon-button top-app-bar__rail-toggle" type="button" aria-label="Toggle operator rail" onClick={onToggleOperatorRail}>
+          <span aria-hidden="true">◫</span>
+        </button>
+      ) : null}
     </div>
   </header>
 );
+
+type WorkbenchNavigationItem = {
+  id: WorkspaceVisualTabId;
+  label: string;
+  description: string;
+  count?: number;
+};
+
+const NavigationIcon = ({ id }: { id: WorkspaceVisualTabId }) => {
+  const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  const shape = (() => {
+    switch (id) {
+      case "overview": return <><rect x="3" y="3" width="7" height="7" rx="1" {...common} /><rect x="14" y="3" width="7" height="7" rx="1" {...common} /><rect x="3" y="14" width="7" height="7" rx="1" {...common} /><rect x="14" y="14" width="7" height="7" rx="1" {...common} /></>;
+      case "workflow": return <><circle cx="5" cy="12" r="2" {...common} /><circle cx="19" cy="5" r="2" {...common} /><circle cx="19" cy="19" r="2" {...common} /><path d="M7 12h5a4 4 0 0 0 4-4V7M12 12a4 4 0 0 1 4 4v1" {...common} /></>;
+      case "history": return <><circle cx="12" cy="12" r="9" {...common} /><path d="M12 7v5l3 2M3.5 8H1V4" {...common} /></>;
+      case "runs": return <><rect x="3" y="4" width="18" height="16" rx="3" {...common} /><path d="m10 9 5 3-5 3Z" {...common} /></>;
+      case "logs": return <><path d="M5 4h14M5 9h14M5 14h9M5 19h11" {...common} /><circle cx="3" cy="4" r=".5" fill="currentColor" /><circle cx="3" cy="9" r=".5" fill="currentColor" /><circle cx="3" cy="14" r=".5" fill="currentColor" /><circle cx="3" cy="19" r=".5" fill="currentColor" /></>;
+      case "repository": return <><path d="M3 7.5h7l2-3h9v15H3Z" {...common} /><path d="M8 12h8M8 16h5" {...common} /></>;
+      case "credentials": return <><circle cx="8" cy="12" r="4" {...common} /><path d="M12 12h9M18 12v3M15 12v2" {...common} /></>;
+      case "settings": return <><circle cx="12" cy="12" r="3" {...common} /><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1" {...common} /></>;
+    }
+  })();
+  return <svg className="workbench-nav__icon" viewBox="0 0 24 24" aria-hidden="true">{shape}</svg>;
+};
+
+const WorkbenchNavigation = ({
+  projectName,
+  activeTab,
+  items,
+  collapsed,
+  mobileOpen,
+  theme,
+  onSelect,
+  onCollapse,
+  onCloseMobile,
+  onShowLauncher,
+  onCycleTheme
+}: {
+  projectName: string;
+  activeTab: WorkspaceVisualTabId;
+  items: WorkbenchNavigationItem[];
+  collapsed: boolean;
+  mobileOpen: boolean;
+  theme: AppAppearanceTheme;
+  onSelect: (tab: WorkspaceVisualTabId) => void;
+  onCollapse: () => void;
+  onCloseMobile: () => void;
+  onShowLauncher: () => void;
+  onCycleTheme: () => void;
+}) => (
+  <>
+    <button className={`workbench-nav-scrim ${mobileOpen ? "is-visible" : ""}`} type="button" aria-label="Close navigation" onClick={onCloseMobile} />
+    <aside className={`workbench-nav ${collapsed ? "workbench-nav--collapsed" : ""} ${mobileOpen ? "workbench-nav--mobile-open" : ""}`} aria-label="Workspace navigation">
+      <div className="workbench-nav__brand">
+        <img src={interfaceIconUrl} alt="" />
+        <div><strong>CATC</strong><span>Agent Workbench</span></div>
+        <button className="shell-icon-button workbench-nav__close-mobile" type="button" aria-label="Close navigation" onClick={onCloseMobile}>×</button>
+      </div>
+      <button className="workbench-nav__project" type="button" onClick={onShowLauncher} title="Return to workspace launcher">
+        <span className="workbench-nav__project-mark">{projectName.slice(0, 1).toUpperCase()}</span>
+        <span><small>Active workspace</small><strong>{projectName}</strong></span>
+        <span aria-hidden="true">⌄</span>
+      </button>
+      <nav className="workbench-nav__items">
+        <span className="workbench-nav__section-label">Operate</span>
+        {items.slice(0, 6).map((item) => (
+          <button key={item.id} className={`workbench-nav__item ${activeTab === item.id ? "is-active" : ""}`} type="button" title={collapsed ? item.label : item.description} aria-current={activeTab === item.id ? "page" : undefined} onClick={() => { onSelect(item.id); onCloseMobile(); }}>
+            <NavigationIcon id={item.id} />
+            <span className="workbench-nav__item-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
+            {typeof item.count === "number" && item.count > 0 ? <span className="workbench-nav__count">{item.count > 99 ? "99+" : item.count}</span> : null}
+          </button>
+        ))}
+        <span className="workbench-nav__section-label">Configure</span>
+        {items.slice(6).map((item) => (
+          <button key={item.id} className={`workbench-nav__item ${activeTab === item.id ? "is-active" : ""}`} type="button" title={collapsed ? item.label : item.description} aria-current={activeTab === item.id ? "page" : undefined} onClick={() => { onSelect(item.id); onCloseMobile(); }}>
+            <NavigationIcon id={item.id} />
+            <span className="workbench-nav__item-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
+            {typeof item.count === "number" && item.count > 0 ? <span className="workbench-nav__count">{item.count > 99 ? "99+" : item.count}</span> : null}
+          </button>
+        ))}
+      </nav>
+      <div className="workbench-nav__footer">
+        <button className="workbench-nav__utility" type="button" onClick={onCycleTheme} title="Switch color theme"><span aria-hidden="true">◐</span><span>Theme · {theme.replace("catc-", "")}</span></button>
+        <button className="workbench-nav__utility workbench-nav__collapse" type="button" onClick={onCollapse}><span aria-hidden="true">{collapsed ? "›" : "‹"}</span><span>{collapsed ? "Expand" : "Collapse"}</span></button>
+      </div>
+    </aside>
+  </>
+);
+
+const OperatorRail = ({
+  collapsed,
+  statusLabel,
+  statusTone,
+  cycleLabel,
+  stageLabel,
+  agentLabel,
+  focus,
+  autopilotEnabled,
+  workflowPauseRequested,
+  primaryAction,
+  attention,
+  approvals,
+  onToggle,
+  onOpenWorkflow,
+  onOpenSettings,
+  onToggleAutopilot,
+  onTogglePause,
+  onApprove,
+  onReject,
+  isApprovalBusy
+}: {
+  collapsed: boolean;
+  statusLabel: string;
+  statusTone: ShellStatusTone;
+  cycleLabel: string;
+  stageLabel: string;
+  agentLabel: string;
+  focus: string;
+  autopilotEnabled: boolean;
+  workflowPauseRequested: boolean;
+  primaryAction?: ShellAction;
+  attention: WorkflowAttentionItem[];
+  approvals: ApprovalRequestRecord[];
+  onToggle: () => void;
+  onOpenWorkflow: () => void;
+  onOpenSettings: () => void;
+  onToggleAutopilot: () => void;
+  onTogglePause: () => void;
+  onApprove: (approval: ApprovalRequestRecord) => void;
+  onReject: (approval: ApprovalRequestRecord) => void;
+  isApprovalBusy: (approval: ApprovalRequestRecord) => boolean;
+}) => {
+  if (collapsed) {
+    return (
+      <aside className="operator-rail operator-rail--collapsed" aria-label="Collapsed operator rail">
+        <button className="shell-icon-button" type="button" aria-label="Expand operator rail" onClick={onToggle}>‹</button>
+        <span className={`operator-rail__signal operator-rail__signal--${statusTone}`} title={statusLabel} />
+        {attention.length + approvals.length > 0 ? <span className="operator-rail__collapsed-count">{attention.length + approvals.length}</span> : null}
+        <button className="shell-icon-button" type="button" aria-label="Open workflow" onClick={onOpenWorkflow}><NavigationIcon id="workflow" /></button>
+      </aside>
+    );
+  }
+
+  return (
+    <aside className="operator-rail" aria-label="Operator controls">
+      <header className="operator-rail__header">
+        <div><span className="eyebrow">Operator rail</span><strong>Live control</strong></div>
+        <button className="shell-icon-button" type="button" aria-label="Collapse operator rail" onClick={onToggle}>›</button>
+      </header>
+      <div className={`operator-rail__state operator-rail__state--${statusTone}`}>
+        <div className="operator-rail__state-title"><span className={`operator-rail__signal operator-rail__signal--${statusTone}`} /><strong>{statusLabel}</strong><span>{cycleLabel}</span></div>
+        <p>{focus}</p>
+        <dl>
+          <div><dt>Phase</dt><dd>{stageLabel}</dd></div>
+          <div><dt>Agent</dt><dd>{agentLabel}</dd></div>
+        </dl>
+      </div>
+      <section className="operator-rail__controls">
+        <span className="operator-rail__label">Workflow controls</span>
+        {primaryAction ? <button className="primary-button" type="button" disabled={primaryAction.disabled} onClick={primaryAction.onClick}>{primaryAction.label}</button> : <button className="primary-button" type="button" onClick={onOpenWorkflow}>Open workflow</button>}
+        <div className="operator-rail__control-grid">
+          <button className={workflowPauseRequested ? "secondary-button is-active" : "secondary-button"} type="button" onClick={onTogglePause}>{workflowPauseRequested ? "Continue" : "Pause"}</button>
+          <button className={autopilotEnabled ? "secondary-button is-active" : "secondary-button"} type="button" onClick={onToggleAutopilot}>Autopilot {autopilotEnabled ? "on" : "off"}</button>
+        </div>
+      </section>
+      <section className="operator-rail__queue">
+        <div className="operator-rail__section-heading"><span>Needs attention</span><strong>{attention.length + approvals.length}</strong></div>
+        <div className="operator-rail__queue-scroll">
+          {approvals.map((approval) => (
+            <article key={`${approval.agentId}:${approval.id}`} className="operator-rail__approval">
+              <span>Approval · {approval.kind}</span>
+              <strong>{approval.summary}</strong>
+              <p>{approval.reason ?? approval.command ?? "Review before the workflow can continue."}</p>
+              <div>
+                <button type="button" disabled={isApprovalBusy(approval)} onClick={() => onApprove(approval)}>
+                  {isApprovalBusy(approval) ? "Submitting..." : "Approve"}
+                </button>
+                <button type="button" disabled={isApprovalBusy(approval)} onClick={() => onReject(approval)}>Reject</button>
+              </div>
+            </article>
+          ))}
+          {attention.map((item) => (
+            <button key={item.id} className={`operator-rail__attention operator-rail__attention--${item.tone}`} type="button" onClick={item.target === "credentials" ? onOpenSettings : onOpenWorkflow}>
+              <span>{workflowAttentionKindLabel(item.kind)}</span><strong>{item.title}</strong><p>{item.detail}</p>
+            </button>
+          ))}
+          {!approvals.length && !attention.length ? <div className="operator-rail__clear"><span aria-hidden="true">✓</span><strong>All clear</strong><p>No approval or intervention is waiting.</p></div> : null}
+        </div>
+      </section>
+      <footer className="operator-rail__footer"><button type="button" onClick={onOpenWorkflow}>Workflow details</button><button type="button" onClick={onOpenSettings}>Settings</button></footer>
+    </aside>
+  );
+};
 
 const ProjectStatusStrip = ({ items }: { items: Array<string | JSX.Element> }) => (
   <section className="project-status-strip" aria-label="Project status">
@@ -8259,6 +8329,11 @@ const FormattedSummaryText = ({ value }: { value?: string }) => {
 const RepositoryPathChatApp = () => {
   const params = useMemo(repositoryPathChatParams, []);
   const [state, setState] = useState<WorkbenchState | null>(null);
+  useAppAppearance(
+    state?.settings.appearanceTheme ?? "catc-dark",
+    state?.settings.appearanceDensity ?? "comfortable",
+    state?.settings.motionMode ?? "system"
+  );
   const [initialStateLoading, setInitialStateLoading] = useState(true);
   const [fileSummary, setFileSummary] = useState<FileSummary | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
@@ -8602,6 +8677,9 @@ const WorkbenchApp = () => {
   const [repositoryPathActionBusy, setRepositoryPathActionBusy] = useState<{ path: string; action: "summary" | "question" | "window" }>();
   const [customRecommendationPrompt, setCustomRecommendationPrompt] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [navigationCollapsed, setNavigationCollapsed] = useState(() => window.localStorage.getItem("catc.navigationCollapsed") === "true");
+  const [operatorRailCollapsed, setOperatorRailCollapsed] = useState(() => window.localStorage.getItem("catc.operatorRailCollapsed") === "true");
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [showExistingChoice, setShowExistingChoice] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState({
     executionMode: "local" as ExecutionMode,
@@ -8618,7 +8696,10 @@ const WorkbenchApp = () => {
     autoApproveCommands: false,
     autoApproveGitCommits: false,
     autoApproveGitPushes: false,
-    considerPaidServices: false
+    considerPaidServices: false,
+    appearanceTheme: "catc-dark" as AppAppearanceTheme,
+    appearanceDensity: "comfortable" as AppAppearanceDensity,
+    motionMode: "system" as AppMotionMode
   });
   const [notice, setNotice] = useState<NoticeState>();
   const [launchIntent, setLaunchIntent] = useState<ProjectLoadIntent>("open");
@@ -8655,6 +8736,7 @@ const WorkbenchApp = () => {
   const [visualExtractBusy, setVisualExtractBusy] = useState(false);
   const [userInputSubmitBusyId, setUserInputSubmitBusyId] = useState<string>();
   const [userInputAttachmentBusyId, setUserInputAttachmentBusyId] = useState<string>();
+  const [approvalBusyKeys, setApprovalBusyKeys] = useState<ReadonlySet<string>>(() => new Set());
   const [workflowAgentPageIndex, setWorkflowAgentPageIndex] = useState(0);
   const [manualAgentPageIndex, setManualAgentPageIndex] = useState(0);
   const [workflowAgentPage, setWorkflowAgentPage] = useState<AgentPageView>({
@@ -8671,6 +8753,10 @@ const WorkbenchApp = () => {
     limit: AGENT_HISTORY_PAGE_SIZE,
     loading: false
   });
+  const [workflowDashboard, setWorkflowDashboard] = useState<{
+    projectId: string;
+    metrics: WorkflowDashboardMetrics;
+  } | null>(null);
   const [agentDetail, setAgentDetail] = useState<AgentState>();
   const [activityLogPageIndex, setActivityLogPageIndex] = useState(0);
   const [commandLogPageIndex, setCommandLogPageIndex] = useState(0);
@@ -8679,6 +8765,7 @@ const WorkbenchApp = () => {
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
   const promptedCodexUpdateCommandsRef = useRef<Set<string>>(new Set());
   const runCodexUpdateRef = useRef<(approvedCommand?: string) => Promise<void>>(() => Promise.resolve());
+  const approvalBusyKeysRef = useRef<Set<string>>(new Set());
   const [repositoryData, setRepositoryData] = useState<RepositoryDataView>(() => emptyRepositoryData());
   const revealRepositoryPathRef = useRef<(relativePath: string) => Promise<void>>(() => Promise.resolve());
   const [repositoryScanStatus, setRepositoryScanStatus] = useState<RepositoryScanStatus | null>(null);
@@ -8788,6 +8875,16 @@ const WorkbenchApp = () => {
   const settingsAutoApproveGitCommits = state?.settings.autoApproveGitCommits ?? false;
   const settingsAutoApproveGitPushes = state?.settings.autoApproveGitPushes ?? false;
   const settingsConsiderPaidServices = state?.settings.considerPaidServices ?? false;
+  const settingsAppearanceTheme = state?.settings.appearanceTheme ?? "catc-dark";
+  const settingsAppearanceDensity = state?.settings.appearanceDensity ?? "comfortable";
+  const settingsMotionMode = state?.settings.motionMode ?? "system";
+  useAppAppearance(settingsAppearanceTheme, settingsAppearanceDensity, settingsMotionMode);
+  useEffect(() => {
+    window.localStorage.setItem("catc.navigationCollapsed", String(navigationCollapsed));
+  }, [navigationCollapsed]);
+  useEffect(() => {
+    window.localStorage.setItem("catc.operatorRailCollapsed", String(operatorRailCollapsed));
+  }, [operatorRailCollapsed]);
   const githubStatus = state?.github;
   const githubLinked = githubStatus?.state === "linked" || githubStatus?.state === "needs_ssh";
   const githubSshReady = githubStatus?.sshReady ?? false;
@@ -8873,6 +8970,9 @@ const WorkbenchApp = () => {
     [allAgents]
   );
   const workflowAgents = useMemo(() => allAgents.filter((agent) => agent.category !== "manual"), [allAgents]);
+  const workflowMetrics = workflowDashboard && workflowDashboard.projectId === activeProjectId
+    ? workflowDashboard.metrics
+    : null;
   const workflowHasActiveAgent = useMemo(() => workflowAgents.some(isWorkflowAutomationBlockingAgent), [workflowAgents]);
   const manualAgents = useMemo(() => allAgents.filter((agent) => agent.category === "manual"), [allAgents]);
   const goalAgents = useMemo(() => workflowAgents.filter((agent) => agent.category === "bootstrap" || agent.category === "goal"), [workflowAgents]);
@@ -9067,10 +9167,6 @@ const WorkbenchApp = () => {
     () => getWorkflowLastUpdatedAt(workflow, workflowAgents),
     [workflow, workflowAgents]
   );
-  const workflowChecklistOverview = useMemo(
-    () => buildWorkflowChecklistOverview(workflow),
-    [workflow]
-  );
   const currentWorkflowChangedFiles = useMemo(
     () => getCurrentCycleChangedFiles(workflow, workflowAgents),
     [workflow, workflowAgents]
@@ -9148,25 +9244,6 @@ const WorkbenchApp = () => {
   );
   const selectedWorkspaceTab: WorkspaceVisualTabId = activeWorkspaceTabOverride ?? normalizeWorkspaceTab(activeProject?.record.layout.activeCenterTab);
   const activeWorkspaceTab = useDeferredValue(selectedWorkspaceTab);
-  const workflowRunState = workflow && activeProject
-    ? workflowRuntimeStatus?.status === "running"
-      ? "Running"
-      : workflowRuntimeStatus?.status === "recovering"
-        ? "Recovering"
-        : workflowRuntimeStatus?.status === "starting-agent"
-          ? "Starting agent"
-      : workflowRuntimeStatus?.status === "stale-running"
-        ? "Needs recovery"
-        : workflowRuntimeStatus?.status === "awaiting-approval"
-          ? "Awaiting approval"
-          : workflowRuntimeStatus?.status === "paused"
-            ? "Paused"
-            : workflowRuntimeStatus?.status === "blocked"
-              ? "Blocked"
-              : workflowRuntimeStatus?.status === "completed"
-                ? "Completed"
-                : workflowRunStateLabel(workflow, activeProject.record.identity.kind, workflowPendingApprovals.length > 0, autopilotEnabled, workflowObjective)
-    : "Running automatically";
   const activeStageGuidance = workflow ? workflowStageGuidance(workflow.workflowStage) : null;
   const workflowLead = workflow
     ? workflowRuntimeStatus?.status === "recovering"
@@ -9357,7 +9434,10 @@ const WorkbenchApp = () => {
       current.autoApproveCommands === settingsAutoApproveCommands &&
       current.autoApproveGitCommits === settingsAutoApproveGitCommits &&
       current.autoApproveGitPushes === settingsAutoApproveGitPushes &&
-      current.considerPaidServices === settingsConsiderPaidServices
+      current.considerPaidServices === settingsConsiderPaidServices &&
+      current.appearanceTheme === settingsAppearanceTheme &&
+      current.appearanceDensity === settingsAppearanceDensity &&
+      current.motionMode === settingsMotionMode
         ? current
         : {
           executionMode: settingsExecutionMode,
@@ -9374,7 +9454,10 @@ const WorkbenchApp = () => {
           autoApproveCommands: settingsAutoApproveCommands,
           autoApproveGitCommits: settingsAutoApproveGitCommits,
           autoApproveGitPushes: settingsAutoApproveGitPushes,
-          considerPaidServices: settingsConsiderPaidServices
+          considerPaidServices: settingsConsiderPaidServices,
+          appearanceTheme: settingsAppearanceTheme,
+          appearanceDensity: settingsAppearanceDensity,
+          motionMode: settingsMotionMode
         }
     );
   }, [
@@ -9386,6 +9469,9 @@ const WorkbenchApp = () => {
     settingsAgentReasoningEfforts,
     settingsAgentReasoningMode,
     settingsConsiderPaidServices,
+    settingsAppearanceDensity,
+    settingsAppearanceTheme,
+    settingsMotionMode,
     settingsCodexBinaryPath,
     settingsCodexHome,
     settingsDistroName,
@@ -9451,7 +9537,37 @@ const WorkbenchApp = () => {
     setRepositoryScanLimits(null);
     setHistoryData(emptyHistoryData());
     setAgentOutputViewer(undefined);
+    setWorkflowDashboard(null);
   }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!activeProjectId || activeWorkspaceTab !== "runs") {
+      return;
+    }
+
+    let cancelled = false;
+    void window.workbench.getWorkflowDashboard(activeProjectId, { limit: 1 })
+      .then((dashboard) => {
+        if (!cancelled) {
+          setWorkflowDashboard({ projectId: activeProjectId, metrics: dashboard.metrics });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          handleError(error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeProjectId,
+    activeWorkspaceTab,
+    agentHistoryVersion,
+    workflow?.execution?.revision,
+    workflow?.metrics.updatedAt
+  ]);
 
   useEffect(() => {
     if (!activeProjectId || activeWorkspaceTab !== "runs") {
@@ -9903,6 +10019,38 @@ const WorkbenchApp = () => {
 
   const handleError = (error: unknown) => {
     setNotice({ message: error instanceof Error ? error.message : String(error), tone: "error" });
+  };
+
+  const isApprovalBusy = (approval: ApprovalRequestRecord): boolean =>
+    approvalBusyKeys.has(approvalRequestKey(approval));
+
+  const resolveApproval = async (approval: ApprovalRequestRecord, decision: ApprovalDecision): Promise<void> => {
+    if (!activeProjectId) {
+      return;
+    }
+    const key = approvalRequestKey(approval);
+    if (approvalBusyKeysRef.current.has(key)) {
+      return;
+    }
+
+    approvalBusyKeysRef.current.add(key);
+    setApprovalBusyKeys((current) => new Set(current).add(key));
+    try {
+      setNotice(undefined);
+      await window.workbench.approve(activeProjectId, approval.agentId, approval.id, decision);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      approvalBusyKeysRef.current.delete(key);
+      setApprovalBusyKeys((current) => {
+        if (!current.has(key)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
   };
 
   const loadMoreHistoryCycles = () => {
@@ -11539,9 +11687,24 @@ const WorkbenchApp = () => {
         autoApproveCommands: settingsDraft.autoApproveCommands,
         autoApproveGitCommits: settingsDraft.autoApproveGitCommits,
         autoApproveGitPushes: settingsDraft.autoApproveGitPushes,
-        considerPaidServices: settingsDraft.considerPaidServices
+        considerPaidServices: settingsDraft.considerPaidServices,
+        appearanceTheme: settingsDraft.appearanceTheme,
+        appearanceDensity: settingsDraft.appearanceDensity,
+        motionMode: settingsDraft.motionMode
       });
       setShowSettings(false);
+    } catch (error) {
+      handleError(error);
+    }
+  };
+
+  const cycleAppearanceTheme = async () => {
+    const themes: AppAppearanceTheme[] = ["catc-dark", "catc-light", "space"];
+    const currentIndex = themes.indexOf(settingsAppearanceTheme);
+    const appearanceTheme = themes[(currentIndex + 1) % themes.length];
+    try {
+      setNotice(undefined);
+      await window.workbench.updateSettings({ appearanceTheme });
     } catch (error) {
       handleError(error);
     }
@@ -11631,7 +11794,10 @@ const WorkbenchApp = () => {
       autoApproveCommands: next.autoApproveCommands ?? current.autoApproveCommands,
       autoApproveGitCommits: next.autoApproveGitCommits ?? current.autoApproveGitCommits,
       autoApproveGitPushes: next.autoApproveGitPushes ?? current.autoApproveGitPushes,
-      considerPaidServices: next.considerPaidServices ?? current.considerPaidServices
+      considerPaidServices: next.considerPaidServices ?? current.considerPaidServices,
+      appearanceTheme: next.appearanceTheme ?? current.appearanceTheme,
+      appearanceDensity: next.appearanceDensity ?? current.appearanceDensity,
+      motionMode: next.motionMode ?? current.motionMode
     };
   });
 
@@ -12411,18 +12577,48 @@ const WorkbenchApp = () => {
       Open Workflow
     </button>
   );
+  const workspaceNavigationItems: WorkbenchNavigationItem[] = [
+    { id: "overview", label: "Overview", description: "Mission status and timeline" },
+    { id: "workflow", label: "Workflow", description: "Operate the active cycle", count: pendingUserInputRequests.length + pendingHumanInterventions.length + workflowPendingApprovals.length },
+    { id: "history", label: "Timeline", description: "Cycle history and outcomes", count: historyData.total || allAgents.length },
+    { id: "runs", label: "Runs", description: "Inspect every agent run", count: totalRunsCount || allAgents.length },
+    { id: "logs", label: "Logs", description: "Commands and raw events", count: pendingApprovals.length },
+    { id: "repository", label: "Repository", description: "Files, health, and summaries", count: activeProject.record.stats?.includedFiles },
+    { id: "credentials", label: "Credentials", description: "Stored access and requests", count: workflowCredentialRequests.length },
+    { id: "settings", label: "Settings", description: "Runtime, models, and appearance" }
+  ];
+  const activePageTitle = workspaceNavigationItems.find((item) => item.id === selectedWorkspaceTab)?.label ?? "Overview";
 
   return (
-    <div className="shell shell--workspace">
+    <div className={`shell shell--workspace ${navigationCollapsed ? "shell--nav-collapsed" : ""} ${operatorRailCollapsed ? "shell--rail-collapsed" : ""}`} data-theme={settingsAppearanceTheme} data-density={settingsAppearanceDensity} data-motion={settingsMotionMode}>
+      <WorkbenchNavigation
+        projectName={activeProject.record.identity.projectName}
+        activeTab={selectedWorkspaceTab}
+        items={workspaceNavigationItems}
+        collapsed={navigationCollapsed}
+        mobileOpen={mobileNavigationOpen}
+        theme={settingsAppearanceTheme}
+        onSelect={setWorkspaceTab}
+        onCollapse={() => setNavigationCollapsed((current) => !current)}
+        onCloseMobile={() => setMobileNavigationOpen(false)}
+        onShowLauncher={() => void showLauncher()}
+        onCycleTheme={() => void cycleAppearanceTheme()}
+      />
+
+      <section className="workbench-center">
       <TopBar
         projectName={activeProject.record.identity.projectName}
         projectContext={projectBranchOrPath}
+        pageTitle={activePageTitle}
         statusLabel={workflowShellStatus.label}
         statusTone={workflowShellStatus.tone}
         primaryAction={topBarPrimaryAction}
         utilityActions={utilityActions}
+        onToggleNavigation={() => setMobileNavigationOpen(true)}
+        onToggleOperatorRail={() => setOperatorRailCollapsed((current) => !current)}
       />
 
+      <div className="workbench-center__scroll">
       <ProjectStatusStrip items={projectStatusItems} />
 
       {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
@@ -12487,43 +12683,14 @@ const WorkbenchApp = () => {
       ) : null}
 
       <main className="project-workbench">
-        <div className="workspace-tabs">
-          <WorkspaceTabButton
-            label="Overview"
-            active={selectedWorkspaceTab === "overview"}
-            onClick={() => void setWorkspaceTab("overview")}
-          />
-          <WorkspaceTabButton
-            label="Workflow"
-            active={selectedWorkspaceTab === "workflow"}
-            count={pendingUserInputRequests.length + pendingHumanInterventions.length}
-            onClick={() => void setWorkspaceTab("workflow")}
-          />
-          <WorkspaceTabButton
-            label="History"
-            active={selectedWorkspaceTab === "history"}
-            count={historyData.total || allAgents.length}
-            onClick={() => void setWorkspaceTab("history")}
-          />
-          <WorkspaceTabButton
-            label="Repository"
-            active={selectedWorkspaceTab === "repository"}
-            count={activeProject.record.stats?.includedFiles}
-            onClick={() => void setWorkspaceTab("repository")}
-          />
-          <WorkspaceTabButton
-            label="Settings"
-            active={selectedWorkspaceTab === "settings"}
-            count={(activeProject.record.credentials?.requests ?? []).filter((request) => request.status === "pending").length}
-            onClick={() => void setWorkspaceTab("settings")}
-          />
-        </div>
-
         {activeWorkspaceTab === "overview" ? (
           <section className="overview-page">
             <CommandCenter
               projectName={activeProject.record.identity.projectName}
               projectContext={projectBranchOrPath}
+              goal={summarizeText(workflowGoalView?.currentGoal ?? workflowGlanceGoal, "Set the Ultimate Goal to begin the mission.", 280)}
+              cycleLabel={workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "Not started"}
+              autopilotLabel={`${autopilotEnabled ? "On" : "Off"} · ${autopilotProfileLabel(autopilotProfile)}`}
               currentFocus={workflowCurrentFocus}
               focusSummary={operatorWorkflowView.currentStatus.secondaryExplanation}
               focusChips={commandCenterFocusChips}
@@ -12541,37 +12708,14 @@ const WorkbenchApp = () => {
               lastResult={commandCenterLastResult}
               nextStep={commandCenterNextStep}
               health={commandCenterHealth}
+              pipeline={workflowTimeline}
+              timeline={recentActivity}
               primaryAction={commandCenterPrimaryAction}
               onOpenWorkflow={() => void setWorkspaceTab("workflow")}
               onOpenHistory={() => void setWorkspaceTab("history")}
               onOpenRepository={() => void setWorkspaceTab("repository")}
               onOpenSettings={() => void setWorkspaceTab("settings")}
             />
-
-            <section className="overview-executive-header">
-              <div className="overview-executive-header__main">
-                <div className="eyebrow">Home</div>
-                <h2>{activeProject.record.identity.projectName}</h2>
-                <p>{summarizeText(activeProject.record.overview?.summary ?? activeProject.record.overview?.whatProjectDoes ?? activeProject.record.stats?.explanation, "Interface creation is still in progress for this project.", 240)}</p>
-                <div className="overview-executive-header__meta">
-                  <span>{projectBranchOrPath}</span>
-                  <span>Updated {formatDateTime(workflowLastUpdatedAt ?? latestProjectUpdate)}</span>
-                  <span>{workflowStageText}</span>
-                  <span>{workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No cycle"}</span>
-                </div>
-              </div>
-              <div className="overview-executive-header__status">
-                <StatusChip label={workflowShellStatus.label} tone={workflowShellStatus.tone} />
-                {latestValidationLedger ? (
-                  <StatusChip
-                    label={ledgerValidationHealth.label}
-                    tone={ledgerValidationHealth.tone === "blocked" ? "error" : ledgerValidationHealth.tone as StatusChipTone}
-                  />
-                ) : null}
-                <ValidationBadge status={activeProject.validationStatus} />
-                {activeProject.record.overview ? <SourceBadge source={activeProject.record.overview.source} /> : <span className="badge">Overview pending</span>}
-              </div>
-            </section>
 
             {ultimateGoalMissing ? (
               <section className="overview-goal-empty-state">
@@ -12586,123 +12730,20 @@ const WorkbenchApp = () => {
                 </div>
               </section>
             ) : null}
-
-            <GoalCharterOverviewCard
-              workflow={workflow}
-              presets={autopilotPresets}
-              onEditStrategy={() => void setWorkspaceTab("settings")}
-              onOpenWorkflow={() => void setWorkspaceTab("workflow")}
-              onDetectGoal={() => void detectUltimateGoal()}
-              onAcceptDetectedGoal={() => void saveUltimateGoal()}
-              onRejectDetectedGoal={() => void rejectDetectedGoal()}
-              onAcceptGoalProposal={(proposalId) => void acceptGoalProposal(proposalId)}
-              onRejectGoalProposal={(proposalId) => void rejectGoalProposal(proposalId)}
-            />
-
-            <section className="overview-health-grid" aria-label="Health snapshot">
-              <OverviewMetricCard
-                label="Workflow status"
-                value={workflowShellStatus.label}
-                detail={summarizeText(workflowRunState, "Workflow status unavailable.", 96)}
-                tone={workflowShellStatus.tone === "blocked" ? "danger" : workflowShellStatus.tone === "completed" ? "good" : undefined}
-              />
-              <OverviewMetricCard
-                label="Current stage"
-                value={workflowStageText}
-                detail={summarizeText(workflowCurrentPhase, "No active phase.", 96)}
-              />
-              <OverviewMetricCard
-                label="Approvals pending"
-                value={pendingApprovals.length}
-                detail={pendingApprovals.length ? "Explicit review is required." : "No approvals waiting."}
-                tone={pendingApprovals.length ? "warning" : "good"}
-              />
-              <OverviewMetricCard
-                label="Blockers / warnings"
-                value={workflowAttentionItems.length}
-                detail={workflowAttentionItems.length ? "Review attention items below." : "No blocking attention item is currently recorded."}
-                tone={workflowAttentionItems.some((item) => item.tone === "danger") ? "danger" : workflowAttentionItems.length ? "warning" : "good"}
-              />
-              <OverviewMetricCard
-                label="Repo hygiene"
-                value={latestRepoHygieneReport?.status ?? "pending"}
-                detail={summarizeText(latestRepoHygieneReport?.summaryForHumans, "No hygiene scan has completed for this cycle.", 96)}
-                tone={latestRepoHygieneReport?.status === "failed" || latestRepoHygieneReport?.status === "unknown" ? "danger" : latestRepoHygieneReport?.status === "passed" ? "good" : latestRepoHygieneReport?.status === "warnings" ? "warning" : undefined}
-              />
-              <OverviewMetricCard
-                label="Last run status"
-                value={allAgents[0]?.status ?? "No runs"}
-                detail={allAgents[0] ? summarizeText(allAgents[0].name, "Latest run", 96) : "Start from Workflow or run a recommendation."}
-                tone={allAgents[0]?.status === "completed" ? "good" : allAgents[0]?.status === "failed" || allAgents[0]?.status === "conflicted" || allAgents[0]?.status === "disconnected" ? "danger" : undefined}
-              />
-              <OverviewMetricCard
-                label="Goal progress"
-                value={typeof workflowChecklistOverview.percentComplete === "number" ? `${workflowChecklistOverview.percentComplete}%` : workflowChecklistSummary}
-                detail={workflowChecklistOverview.requiredTotal ? `${workflowChecklistOverview.requiredMet}/${workflowChecklistOverview.requiredTotal} required checks met` : "Goal checklist not generated yet."}
-                tone={workflowChecklistOverview.openRequired === 0 && workflowChecklistOverview.requiredTotal > 0 ? "good" : undefined}
-              />
-            </section>
-
-            <section className="overview-main-grid">
-              <OverviewAttentionSummary
-                items={workflowAttentionItems}
+            <details className="mission-goal-charter">
+              <summary><span><span className="eyebrow">Mission definition</span><strong>Goal charter, strategy, and proposals</strong></span><span>Open</span></summary>
+              <GoalCharterOverviewCard
+                workflow={workflow}
+                presets={autopilotPresets}
+                onEditStrategy={() => void setWorkspaceTab("settings")}
                 onOpenWorkflow={() => void setWorkspaceTab("workflow")}
-                onOpenLogs={() => void setWorkspaceTab("history")}
-                onOpenCredentials={() => void setWorkspaceTab("settings")}
+                onDetectGoal={() => void detectUltimateGoal()}
+                onAcceptDetectedGoal={() => void saveUltimateGoal()}
+                onRejectDetectedGoal={() => void rejectDetectedGoal()}
+                onAcceptGoalProposal={(proposalId) => void acceptGoalProposal(proposalId)}
+                onRejectGoalProposal={(proposalId) => void rejectGoalProposal(proposalId)}
               />
-              <article className="overview-current-work-card">
-                <SectionTitle eyebrow="Current work" title="Active workflow snapshot" />
-                <div className="overview-current-work-card__goal">
-                  <span className="workflow-option__label">Current goal</span>
-                  <strong>{summarizeText(workflowGlanceGoal, "Set the Ultimate Goal.", 150)}</strong>
-                </div>
-                <div className="overview-current-work-card__facts">
-                  <div>
-                    <span>Agent/stage</span>
-                    <strong>{workflowAgentLabel}</strong>
-                  </div>
-                  <div>
-                    <span>Status</span>
-                    <strong>{workflowStageText}</strong>
-                  </div>
-                </div>
-                <div>
-                  <span className="workflow-option__label">Next recommended action</span>
-                  <p>{summarizeText(operatorWorkflowView.currentStatus.nextOperatorAction, "No validation, hygiene, checklist, or planner blocker is currently recorded.", 160)}</p>
-                </div>
-                <div className="actions-row">
-                  <button className="primary-button" type="button" onClick={() => void setWorkspaceTab("workflow")}>Open Workflow</button>
-                  {!workflow?.ultimateGoal.confirmedAt ? (
-                    <button className="secondary-button" type="button" onClick={() => void detectUltimateGoal()}>
-                      Auto-detect Ultimate Goal
-                    </button>
-                  ) : null}
-                </div>
-              </article>
-            </section>
-
-            <section className="overview-secondary-grid">
-              <OverviewActivitySnapshot events={recentActivity} />
-              <article className="overview-quick-nav-card">
-                <SectionTitle eyebrow="Next" title="Quick navigation" />
-                <div className="overview-quick-nav-grid">
-                  <QuickNavigationCard title="Open Workflow" detail="Operate the active cycle and resolve workflow decisions." meta={workflowStageText} onClick={() => void setWorkspaceTab("workflow")} />
-                  <QuickNavigationCard title="Open History" detail="Understand completed cycles and inspect full agent output." meta={`${historyData.total || allAgents.length} runs`} onClick={() => void setWorkspaceTab("history")} />
-                  <QuickNavigationCard title="View Repository" detail="Open repository scan details, files, and summaries." meta={`${activeProject.record.stats?.includedFiles ?? 0} files`} onClick={() => void setWorkspaceTab("repository")} />
-                  <QuickNavigationCard title="Open Settings" detail="Runtime readiness, Codex updates, credentials, and model defaults." meta={`${workflowCredentialRequests.length} credential requests`} onClick={() => void setWorkspaceTab("settings")} />
-                </div>
-              </article>
-            </section>
-
-            <section className="overview-repo-health">
-              <div>
-                <span className="workflow-option__label">Repository health</span>
-                <p>
-                  {activeProject.record.stats?.testsPresent ? "Tests detected" : "No tests detected"} · {activeProject.record.stats?.primaryManagers?.join(", ") || "Unknown toolchain"} · {activeProject.record.validation.branch ?? activeProject.record.validation.projectKind}
-                </p>
-              </div>
-              <button className="secondary-button" type="button" onClick={() => void setWorkspaceTab("repository")}>Repository details</button>
-            </section>
+            </details>
           </section>
         ) : null}
 
@@ -12832,8 +12873,9 @@ const WorkbenchApp = () => {
               ) : null}
               <WorkflowNeedsAttentionPanel
                 items={workflowAttentionItems}
-                onApprove={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}
-                onReject={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}
+                onApprove={(approval) => void resolveApproval(approval, "accept")}
+                onReject={(approval) => void resolveApproval(approval, "decline")}
+                isApprovalBusy={isApprovalBusy}
                 onOpenCredentials={() => void setWorkspaceTab("settings")}
                 onViewDetails={(target) => {
                   if (target === "user-input") {
@@ -13539,8 +13581,10 @@ const WorkbenchApp = () => {
                                 <div>{approval.reason ?? approval.command ?? "Approval required"}</div>
                               </div>
                               <div className="actions-row">
-                                <button className="primary-button" onClick={() => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}>Accept</button>
-                                <button className="secondary-button" onClick={() => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}>Reject</button>
+                                <button className="primary-button" disabled={isApprovalBusy(approval)} onClick={() => void resolveApproval(approval, "accept")}>
+                                  {isApprovalBusy(approval) ? "Submitting..." : "Accept"}
+                                </button>
+                                <button className="secondary-button" disabled={isApprovalBusy(approval)} onClick={() => void resolveApproval(approval, "decline")}>Reject</button>
                               </div>
                             </div>
                           )) : <div className="empty-copy">No approvals are currently waiting.</div>}
@@ -13852,13 +13896,15 @@ const WorkbenchApp = () => {
             commandLogPageIndex={commandLogPageIndex}
             onActivityPageChange={setActivityLogPageIndex}
             onCommandPageChange={setCommandLogPageIndex}
-            onApprove={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "accept")}
-            onReject={(approval) => void window.workbench.approve(activeProject.record.id, approval.agentId, approval.id, "decline")}
+            onApprove={(approval) => void resolveApproval(approval, "accept")}
+            onReject={(approval) => void resolveApproval(approval, "decline")}
+            isApprovalBusy={isApprovalBusy}
           />
         ) : null}
 
         {activeWorkspaceTab === "runs" ? (
           <section className="workflow-control-center panel agent-history-workspace">
+            <WorkflowAnalyticsSummary metrics={workflowMetrics} />
             <RunsReviewPage
               agents={runsPageAgents}
               totalAgents={totalRunsCount}
@@ -13944,6 +13990,31 @@ const WorkbenchApp = () => {
           </div>
         ) : null}
       </main>
+      </div>
+      </section>
+
+      <OperatorRail
+        collapsed={operatorRailCollapsed}
+        statusLabel={workflowShellStatus.label}
+        statusTone={workflowShellStatus.tone}
+        cycleLabel={workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No cycle"}
+        stageLabel={workflowStageText}
+        agentLabel={workflowAgentLabel}
+        focus={workflowCurrentFocus}
+        autopilotEnabled={autopilotEnabled}
+        workflowPauseRequested={workflowPauseRequested}
+        primaryAction={topBarPrimaryAction}
+        attention={workflowAttentionItems.filter((item) => item.kind !== "approval").slice(0, 12)}
+        approvals={pendingApprovals.slice(0, 12)}
+        onToggle={() => setOperatorRailCollapsed((current) => !current)}
+        onOpenWorkflow={() => void setWorkspaceTab("workflow")}
+        onOpenSettings={() => void setWorkspaceTab("settings")}
+        onToggleAutopilot={() => void toggleAutopilot()}
+        onTogglePause={() => void toggleWorkflowPause()}
+        onApprove={(approval) => void resolveApproval(approval, "accept")}
+        onReject={(approval) => void resolveApproval(approval, "decline")}
+        isApprovalBusy={isApprovalBusy}
+      />
 
       <AgentOutputViewer
         viewer={agentOutputViewer}

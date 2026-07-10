@@ -309,6 +309,18 @@ const failureSignature = (agent: AgentState): string | undefined => {
   return normalized.length > 8 ? normalized : undefined;
 };
 
+const agentOutcomeTime = (agent: AgentState): number => {
+  const value =
+    agent.integrityReport?.generatedAt ??
+    agent.mergeReport?.generatedAt ??
+    agent.completedAt ??
+    agent.lastActivityAt ??
+    agent.startedAt ??
+    agent.createdAt;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
 export const hasRepeatedAutopilotFailure = (
   workflow: ProjectWorkflowState,
   agents: AgentState[] = []
@@ -317,12 +329,26 @@ export const hasRepeatedAutopilotFailure = (
     return false;
   }
 
-  const signatures = agents
+  const cycleAgents = agents.filter((agent) =>
+    agent.category !== "manual" &&
+    (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+  );
+  const latestSuccessfulOutcomeByCategory = new Map<AgentState["category"], number>();
+  for (const agent of cycleAgents) {
+    if (agent.status === "completed") {
+      latestSuccessfulOutcomeByCategory.set(
+        agent.category,
+        Math.max(latestSuccessfulOutcomeByCategory.get(agent.category) ?? 0, agentOutcomeTime(agent))
+      );
+    }
+  }
+
+  const signatures = cycleAgents
     .filter((agent) =>
       agent.category !== "manual" &&
       (agent.status === "failed" || agent.status === "conflicted" || agent.status === "disconnected") &&
       (agent.status !== "disconnected" || !agent.recoveryHandledAt) &&
-      (agent.workflowCycleNumber === undefined || agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber)
+      (latestSuccessfulOutcomeByCategory.get(agent.category) ?? 0) <= agentOutcomeTime(agent)
     )
     .map(failureSignature)
     .filter((entry): entry is string => Boolean(entry));
@@ -383,7 +409,10 @@ export const shouldAutopilotPause = (
   if (workflow.repair.status === "exhausted" || workflow.workflowStopReason === "repair_budget_exhausted") {
     return pauseDecision("repair_budget_exhausted", workflow.repair.latestFailureReason ?? "The workflow exhausted its repair budget.", highRiskPackageRequiresApproval);
   }
-  if (state.repeatedFailure || hasRepeatedAutopilotFailure(workflow, agents)) {
+  const boundedRepairStillRunning =
+    (workflow.repair.status === "repairing" || workflow.repair.status === "retrying_validation") &&
+    workflow.repair.attemptCount <= workflow.repair.maxAttempts;
+  if (!boundedRepairStillRunning && (state.repeatedFailure || hasRepeatedAutopilotFailure(workflow, agents))) {
     return pauseDecision("repeated_failure", "The same workflow failure repeated in this cycle.", highRiskPackageRequiresApproval);
   }
   if (state.goalChangeRequiresApproval) {

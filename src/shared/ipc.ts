@@ -356,6 +356,24 @@ export const plannerCycleRecordRequestSchema = z.object({
   cycleId: z.string().min(1)
 });
 
+export const workflowDashboardRequestSchema = z.object({
+  projectId: z.string().min(1),
+  timeline: z.object({
+    cycleNumbers: z.array(z.number().int().positive()).max(50).optional(),
+    phases: z.array(z.enum(["goal", "recommendation", "planning", "coding", "integrity", "repair", "merge", "complete", "system"])).max(9).optional(),
+    kinds: z.array(z.enum(["cycle", "phase", "activity", "validation", "checklist"])).max(5).optional(),
+    statuses: z.array(z.enum(["info", "pending", "running", "waiting", "completed", "failed", "blocked"])).max(7).optional(),
+    agentIds: z.array(z.string().min(1)).max(100).optional(),
+    incidentIds: z.array(z.string().min(1)).max(100).optional(),
+    query: z.string().max(500).optional(),
+    from: z.union([z.string(), z.number(), z.date()]).optional(),
+    to: z.union([z.string(), z.number(), z.date()]).optional(),
+    sortOrder: z.enum(["ascending", "descending"]).optional(),
+    offset: z.number().int().min(0).default(0),
+    limit: z.number().int().min(1).max(500).default(100)
+  }).default({ offset: 0, limit: 100 })
+});
+
 export const approveRecommendationRequestSchema = z.object({
   projectId: z.string().min(1),
   recommendationId: z.string().min(1)
@@ -558,6 +576,7 @@ export type IpcChannel =
   | "project:updateUiState"
   | "project:openProjectShell"
   | "workflow:openRepairAgent"
+  | "workflow:getDashboard"
   | "credentials:saveEntry"
   | "credentials:deleteEntry"
   | "credentials:updateRequest"

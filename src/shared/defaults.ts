@@ -3,6 +3,7 @@ import { APP_VERSION, DEFAULT_CODEX_BINARY, DEFAULT_DISTRO_NAME, DEFAULT_WORKTRE
 import { DEFAULT_AGENT_REASONING_EFFORTS, DEFAULT_AGENT_REASONING_MODE } from "./modelConfig";
 import { createDefaultAutopilotPolicy } from "./autopilotPolicy";
 import { createDefaultGoalCharter } from "./goalCharter";
+import { WORKFLOW_SCHEMA_VERSION } from "./types";
 import type {
   AgentCategory,
   AgentFreshnessMarker,
@@ -41,7 +42,10 @@ export const defaultSettings = (): AppSettings => ({
   autoApproveCommands: false,
   autoApproveGitCommits: false,
   autoApproveGitPushes: false,
-  considerPaidServices: false
+  considerPaidServices: false,
+  appearanceTheme: "catc-dark",
+  appearanceDensity: "comfortable",
+  motionMode: "system"
 });
 
 export const defaultLayout = (): LayoutConfig => ({
@@ -157,46 +161,68 @@ export const defaultWorkflowStepProgressState = (): Record<WorkflowStepId, Workf
     workflowStepOrder.map((stepId) => [stepId, defaultWorkflowStepProgress(stepId)])
   ) as Record<WorkflowStepId, WorkflowStepProgress>;
 
-export const defaultProjectWorkflowState = (): ProjectWorkflowState => ({
-  ultimateGoal: emptyUltimateGoal(),
-  goalCharter: createDefaultGoalCharter(),
-  workflowMode: "normal",
-  previewRequest: {
-    status: "none",
-    remainingCycles: 1
-  },
-  autopilotPolicy: createDefaultAutopilotPolicy(false),
-  goalChecklist: [],
-  taskMap: {
-    groups: [],
-    totalRequiredChecks: 0,
-    openRequiredChecks: 0,
-    updatedAt: new Date(0).toISOString()
-  },
-  workPackages: [],
-  strategicPlans: [],
-  plannerDecisions: [],
-  checklistChanges: [],
-  cycleRetrospectives: [],
-  evidenceObservations: [],
-  checklistDeltas: [],
-  recommendationHealth: defaultRecommendationHealth(),
-  evidenceCommands: [],
-  validationLedgers: [],
-  repoHygieneReports: [],
-  workflowCycle: defaultWorkflowCycle(),
-  workflowStage: "charter_needed",
-  repairLoopCount: 0,
-  appeal: defaultWorkflowAppealState(),
-  repair: defaultWorkflowRepairState(),
-  workflowBudgets: defaultWorkflowBudgets(),
-  workflowStopReason: "charter_missing",
-  humanInterventions: [],
-  recommendations: [],
-  stepProgress: defaultWorkflowStepProgressState(),
-  memory: defaultWorkflowMemory(),
-  activityLog: []
-});
+export const defaultProjectWorkflowState = (): ProjectWorkflowState => {
+  const createdAt = nowIso();
+  return {
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    execution: {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      revision: 1,
+      cycleNumber: 1,
+      tag: "needs_goal",
+      stepId: "ultimate_goal",
+      enteredAt: createdAt,
+      updatedAt: createdAt
+    },
+    incidents: [],
+    journal: [],
+    metrics: {
+      totalInputTokens: 0,
+      totalCachedInputTokens: 0,
+      totalOutputTokens: 0,
+      totalReasoningTokens: 0,
+      totalTokens: 0
+    },
+    ultimateGoal: emptyUltimateGoal(),
+    goalCharter: createDefaultGoalCharter(),
+    workflowMode: "normal",
+    previewRequest: {
+      status: "none",
+      remainingCycles: 1
+    },
+    autopilotPolicy: createDefaultAutopilotPolicy(false),
+    goalChecklist: [],
+    taskMap: {
+      groups: [],
+      totalRequiredChecks: 0,
+      openRequiredChecks: 0,
+      updatedAt: new Date(0).toISOString()
+    },
+    workPackages: [],
+    strategicPlans: [],
+    plannerDecisions: [],
+    checklistChanges: [],
+    cycleRetrospectives: [],
+    evidenceObservations: [],
+    checklistDeltas: [],
+    recommendationHealth: defaultRecommendationHealth(),
+    evidenceCommands: [],
+    validationLedgers: [],
+    repoHygieneReports: [],
+    workflowCycle: defaultWorkflowCycle(),
+    workflowStage: "charter_needed",
+    repairLoopCount: 0,
+    appeal: defaultWorkflowAppealState(),
+    repair: defaultWorkflowRepairState(),
+    workflowBudgets: defaultWorkflowBudgets(),
+    workflowStopReason: "charter_missing",
+    humanInterventions: [],
+    recommendations: [],
+    stepProgress: defaultWorkflowStepProgressState(),
+    memory: defaultWorkflowMemory(),
+    activityLog: []
+  };
+};
 
 export const emptyValidationSnapshot = (projectKind: ValidationSnapshot["projectKind"]): ValidationSnapshot => ({
   interfaceSchemaVersion: PORTABLE_INTERFACE_VERSION,
@@ -247,19 +273,36 @@ export const createLocalProjectRecord = (
   credentials: defaultProjectCredentialsState()
 });
 
-export const createPortableInterface = (record: LocalProjectRecord): PortableProjectInterface => ({
-  schemaVersion: PORTABLE_INTERFACE_VERSION,
-  appMinVersion: APP_VERSION,
-  exportedAt: nowIso(),
-  checksum: "",
-  identity: record.identity,
-  validation: record.validation,
-  layout: record.layout,
-  localStateDefaults: record.localState,
-  workflow: record.workflow,
-  overview: record.overview,
-  stats: record.stats,
-  dependencies: record.dependencies,
-  summaryCache: record.summaryCache,
-  agents: record.agents
-});
+export const createPortableInterface = (record: LocalProjectRecord): PortableProjectInterface => {
+  const identity = { ...record.identity };
+  const validation = { ...record.validation };
+  delete identity.gitRoot;
+  delete validation.projectAccess;
+  return {
+    schemaVersion: PORTABLE_INTERFACE_VERSION,
+    appMinVersion: APP_VERSION,
+    exportedAt: nowIso(),
+    checksum: "",
+    identity,
+    validation: {
+      ...validation,
+      interfaceSchemaVersion: PORTABLE_INTERFACE_VERSION,
+      appMinVersion: APP_VERSION
+    },
+    layout: record.layout,
+    localStateDefaults: {
+      ...record.localState,
+      selectedFile: undefined,
+      treeFilter: "",
+      activeAgentId: undefined,
+      workflowPauseRequested: false,
+      lastOpenedAt: undefined
+    },
+    workflow: record.workflow,
+    overview: record.overview,
+    stats: record.stats ? { ...record.stats, projectRoot: "." } : undefined,
+    dependencies: record.dependencies,
+    summaryCache: record.summaryCache,
+    agents: record.agents
+  };
+};

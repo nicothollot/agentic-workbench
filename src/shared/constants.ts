@@ -1,7 +1,7 @@
 export const APP_NAME = "Codex Agent Workbench";
-export const APP_VERSION = "0.1.0";
+export const APP_VERSION = "1.0.0";
 export const APP_ID = "com.codex.agentworkbench";
-export const PORTABLE_INTERFACE_VERSION = 1;
+export const PORTABLE_INTERFACE_VERSION = 2;
 export const REVIEW_LOG_BUNDLE_VERSION = 1;
 export const PORTABLE_INTERFACE_PATH = ".agent-workbench/interface.json";
 export const USER_INPUT_REQUESTS_PATH = ".agent-workbench/input-requests";
