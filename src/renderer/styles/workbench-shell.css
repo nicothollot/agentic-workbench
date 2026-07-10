@@ -210,6 +210,31 @@ body {
     var(--ui-bg);
 }
 
+/*
+ * The launcher can be substantially taller than a short desktop viewport.
+ * Keep its scroll port pinned to the Electron content area rather than
+ * centering it in the legacy multi-row .shell grid, which can place the
+ * beginning of the launcher above the reachable scroll range on startup.
+ */
+.shell--launcher {
+  position: fixed;
+  inset: 0;
+  display: block;
+  width: auto;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  padding: 32px 24px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-padding-top: 1px;
+}
+
+.shell--launcher .launcher-shell {
+  margin-inline: auto;
+}
+
 .shell--launcher .loader-card,
 .shell--loader .loader-card {
   border: 1px solid var(--ui-border);

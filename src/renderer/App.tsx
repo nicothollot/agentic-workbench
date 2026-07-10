@@ -8764,6 +8764,7 @@ const WorkbenchApp = () => {
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
   const workbenchScrollRef = useRef<HTMLDivElement | null>(null);
+  const launcherScrollRef = useRef<HTMLDivElement | null>(null);
   const promptedCodexUpdateCommandsRef = useRef<Set<string>>(new Set());
   const runCodexUpdateRef = useRef<(approvedCommand?: string) => Promise<void>>(() => Promise.resolve());
   const approvalBusyKeysRef = useRef<Set<string>>(new Set());
@@ -9250,6 +9251,7 @@ const WorkbenchApp = () => {
     const resetViewportScroll = () => {
       window.scrollTo(0, 0);
       workbenchScrollRef.current?.scrollTo({ top: 0, left: 0, behavior: "instant" });
+      launcherScrollRef.current?.scrollTo({ top: 0, left: 0, behavior: "instant" });
     };
     resetViewportScroll();
     const frameId = window.requestAnimationFrame(resetViewportScroll);
@@ -11994,7 +11996,7 @@ const WorkbenchApp = () => {
     const createActionLabel = createWorkspaceUsesGitHub ? "Select Folder & Initialize GitHub" : "Select Folder & Use As-Is";
 
     return (
-      <div className="shell shell--launcher">
+      <div ref={launcherScrollRef} className="shell shell--launcher">
         <div className="loader-card loader-card--wide launcher-shell">
           <BrandHeader
             title={APP_NAME}
