@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
+import { startTransition, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 import { APP_NAME, PROJECT_SHELL_LAUNCHER_CMD_PATH, PROJECT_SHELL_LAUNCH_LOG_PATH } from "@shared/constants";
 import {
   DEFAULT_AGENT_REASONING_EFFORTS,
@@ -386,7 +386,7 @@ const useAppAppearance = (
   density: AppAppearanceDensity,
   motion: AppMotionMode
 ): void => {
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = document.documentElement;
     root.dataset.theme = theme;
     root.dataset.density = density;
@@ -1827,7 +1827,7 @@ const RepoTree = ({
       .sort((left, right) => left.parentPath.localeCompare(right.parentPath));
   }, [childrenByParent, expandedPaths]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const node = treeRef.current;
     if (!node || typeof ResizeObserver === "undefined") {
       return;
@@ -8763,6 +8763,7 @@ const WorkbenchApp = () => {
   const [activeWorkspaceTabOverride, setActiveWorkspaceTabOverride] = useState<WorkspaceVisualTabId>();
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
+  const workbenchScrollRef = useRef<HTMLDivElement | null>(null);
   const promptedCodexUpdateCommandsRef = useRef<Set<string>>(new Set());
   const runCodexUpdateRef = useRef<(approvedCommand?: string) => Promise<void>>(() => Promise.resolve());
   const approvalBusyKeysRef = useRef<Set<string>>(new Set());
@@ -9244,6 +9245,17 @@ const WorkbenchApp = () => {
   );
   const selectedWorkspaceTab: WorkspaceVisualTabId = activeWorkspaceTabOverride ?? normalizeWorkspaceTab(activeProject?.record.layout.activeCenterTab);
   const activeWorkspaceTab = useDeferredValue(selectedWorkspaceTab);
+
+  useLayoutEffect(() => {
+    const resetViewportScroll = () => {
+      window.scrollTo(0, 0);
+      workbenchScrollRef.current?.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    };
+    resetViewportScroll();
+    const frameId = window.requestAnimationFrame(resetViewportScroll);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [activeProjectId, activeWorkspaceTab, stateLoaded]);
+
   const activeStageGuidance = workflow ? workflowStageGuidance(workflow.workflowStage) : null;
   const workflowLead = workflow
     ? workflowRuntimeStatus?.status === "recovering"
@@ -12618,7 +12630,7 @@ const WorkbenchApp = () => {
         onToggleOperatorRail={() => setOperatorRailCollapsed((current) => !current)}
       />
 
-      <div className="workbench-center__scroll">
+      <div ref={workbenchScrollRef} className="workbench-center__scroll">
       <ProjectStatusStrip items={projectStatusItems} />
 
       {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
