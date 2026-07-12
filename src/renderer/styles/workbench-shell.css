@@ -12,7 +12,7 @@
   --ui-surface-hover: rgba(230, 238, 248, 0.075);
   --ui-text: #f3f0e9;
   --ui-text-muted: #b0bdcb;
-  --ui-text-faint: #8998aa;
+  --ui-text-faint: #9baabd;
   --ui-border: rgba(168, 185, 207, 0.17);
   --ui-border-strong: rgba(180, 198, 220, 0.34);
   --ui-accent: #dfbd7c;
@@ -113,7 +113,7 @@
   --ui-surface-hover: rgba(18, 43, 70, 0.075);
   --ui-text: #17283d;
   --ui-text-muted: #526277;
-  --ui-text-faint: #6d7c8d;
+  --ui-text-faint: #5d6d7e;
   --ui-border: rgba(23, 40, 61, 0.14);
   --ui-border-strong: rgba(23, 40, 61, 0.28);
   --ui-accent: #8c6428;
@@ -158,7 +158,7 @@
   --ui-surface-hover: rgba(154, 179, 255, 0.095);
   --ui-text: #f1f3ff;
   --ui-text-muted: #b6bddc;
-  --ui-text-faint: #8d96bc;
+  --ui-text-faint: #a3acd0;
   --ui-border: rgba(155, 171, 235, 0.18);
   --ui-border-strong: rgba(155, 171, 235, 0.34);
   --ui-accent: #b29cff;
@@ -279,6 +279,42 @@ body {
 .shell--loader .secondary-button { border-color: var(--ui-border-strong); background: var(--ui-surface-subtle); color: var(--ui-text); }
 .shell--launcher .primary-button { background: var(--ui-accent); color: var(--ui-on-accent); }
 
+.shell--launcher .runtime-readiness-panel {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-raised);
+  color: var(--ui-text);
+}
+
+.shell--launcher .runtime-readiness-panel--blocked {
+  border-color: color-mix(in srgb, var(--ui-danger) 42%, transparent);
+  background: color-mix(in srgb, var(--ui-danger) 9%, var(--ui-surface-raised));
+}
+
+.shell--launcher .runtime-readiness-check,
+.shell--launcher .runtime-readiness-check--passed,
+.shell--launcher .runtime-readiness-check--checking {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-subtle);
+  color: var(--ui-text);
+}
+
+.shell--launcher .runtime-readiness-check--failed {
+  border-color: color-mix(in srgb, var(--ui-danger) 38%, transparent);
+  background: color-mix(in srgb, var(--ui-danger) 8%, var(--ui-surface-raised));
+}
+
+.shell--launcher .runtime-readiness-check--warning {
+  border-color: color-mix(in srgb, var(--ui-warning) 38%, transparent);
+  background: color-mix(in srgb, var(--ui-warning) 8%, var(--ui-surface-raised));
+}
+
+.shell--launcher .runtime-readiness-panel p,
+.shell--launcher .runtime-readiness-check p,
+.shell--launcher .runtime-readiness-check .lane-note span { color: var(--ui-text-muted); }
+.shell--launcher .runtime-readiness-panel strong,
+.shell--launcher .runtime-readiness-check strong { color: var(--ui-text); }
+.shell--launcher .runtime-readiness-check .lane-note { border-color: var(--ui-border); background: var(--ui-surface-subtle); }
+
 .repository-chat-shell {
   height: 100dvh;
   min-height: 0;
@@ -329,6 +365,7 @@ body {
     radial-gradient(circle at 72% -20%, var(--ui-accent-glow), transparent 35%),
     var(--ui-bg);
   transition: grid-template-columns 180ms ease;
+  --brand-ink: var(--ui-text);
 }
 
 .shell--workspace.shell--nav-collapsed { grid-template-columns: 68px minmax(0, 1fr) 360px; }
@@ -364,6 +401,7 @@ body {
   min-height: 0;
   overflow: hidden;
   border-inline: 1px solid var(--ui-border);
+  container: workbench / inline-size;
 }
 
 .workbench-center__scroll {
@@ -1166,6 +1204,168 @@ button.operator-rail__attention { cursor: pointer; }
   .settings-appearance__controls { grid-template-columns: 1fr; }
   .runs-analytics__heading { align-items: flex-start; flex-direction: column; }
   .runs-analytics__grid { grid-template-columns: 1fr 1fr; }
+}
+
+/*
+ * The center workspace is narrower than the Electron viewport whenever either
+ * rail is open. Size its content from the space it actually receives so cards
+ * never collapse prose into fragments or push copy outside their surfaces.
+ */
+@container workbench (max-width: 1180px) {
+  .mission-brief-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mission-brief--now { grid-column: 1 / -1; }
+  .mission-timeline-layout { grid-template-columns: 1fr; }
+  .mission-event-inspector { min-height: 220px; }
+
+  .workflow-operator-header,
+  .workflow-operator-grid--top,
+  .workflow-operator-grid--plan,
+  .workflow-operator-grid--history,
+  .operator-contract-subgrid,
+  .operator-raw-grid,
+  .goal-charter-card__strategy,
+  .logs-header,
+  .credentials-header,
+  .repository-header,
+  .logs-toolbar,
+  .logs-main-grid,
+  .credentials-layout,
+  .repository-browser-layout,
+  .repository-report-layout,
+  .history-page-header,
+  .history-cycle-card__summary,
+  .runs-page-header,
+  .runs-pager-grid,
+  .runs-toolbar,
+  .run-row,
+  .runs-detail-card__header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workflow-stage-timeline { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .workflow-status-strip { grid-template-columns: repeat(3, minmax(180px, 1fr)); }
+  .repository-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .repository-fact-card--wide { grid-column: span 2; }
+  .repository-tree-panel { position: static; }
+  .logs-header__stats { grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
+  .history-page-header__stats,
+  .history-cycle-card__facts,
+  .history-agent-card__grid,
+  .history-cycle-card__insights,
+  .history-cycle-card__lists,
+  .history-agent-card__sections,
+  .history-cycle-detail-grid,
+  .runs-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .overview-executive-header,
+  .overview-main-grid,
+  .overview-secondary-grid { grid-template-columns: minmax(0, 1fr); }
+  .overview-health-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .project-overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@container workbench (max-width: 760px) {
+  .mission-hero { grid-template-columns: minmax(0, 1fr); padding: 20px; }
+  .mission-hero__actions { justify-content: flex-start; }
+  .mission-hero__facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mission-brief-grid,
+  .mission-evidence-grid { grid-template-columns: minmax(0, 1fr); }
+  .mission-brief--now { grid-column: auto; }
+  .mission-stage-detail { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .mission-stage-detail small { text-align: left; }
+  .mission-panel__heading { align-items: flex-start; flex-direction: column; }
+
+  .workflow-stage-timeline,
+  .workflow-status-strip,
+  .workflow-operator-header__facts,
+  .workflow-now-card__grid,
+  .workflow-checklist-card__stats,
+  .workflow-autopilot-compact__grid,
+  .workflow-autopilot-settings__grid,
+  .workflow-plan-card__grid,
+  .workflow-checklist-card__groups,
+  .goal-charter-card__goals,
+  .goal-charter-card__strategy,
+  .goal-charter-card__lists,
+  .strategy-field-grid,
+  .strategy-budget-grid,
+  .strategy-stop-grid,
+  .settings-theme-grid,
+  .settings-appearance__controls,
+  .project-overview-metrics,
+  .overview-health-grid,
+  .overview-current-work-card__facts,
+  .runs-page-header__stats,
+  .runs-detail-grid,
+  .run-evidence-grid,
+  .logs-header__stats,
+  .repository-summary-grid,
+  .repository-two-column,
+  .repository-coverage-grid,
+  .history-page-header__stats,
+  .history-cycle-card__facts,
+  .history-cycle-card__insights,
+  .history-cycle-card__lists,
+  .history-cycle-detail-grid,
+  .history-agent-card__grid,
+  .history-agent-card__sections {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .repository-fact-card--wide { grid-column: auto; }
+  .workflow-attention-item,
+  .workflow-activity-mini__row,
+  .log-event-row,
+  .log-approval-card,
+  .credential-request-card,
+  .credential-table-row,
+  .overview-attention-item,
+  .overview-activity-row,
+  .quick-nav-card,
+  .run-evidence-row,
+  .history-cycle-card__summary,
+  .history-agent-card__header,
+  .agent-transcript-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .top-app-bar,
+  .top-app-bar__identity,
+  .top-app-bar__actions,
+  .top-app-bar__project {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
+/* Keep prose readable while still permitting genuinely unbroken paths/tokens. */
+.shell--workspace :where(article, section, header, main, aside, div) { min-width: 0; }
+.shell--workspace :where(p, li, dd, small, strong, code) {
+  word-break: normal;
+  overflow-wrap: break-word;
+  hyphens: none;
+}
+.shell--workspace :where(.repository-path-card__header strong, .tree-row__label, .credential-table-row__main span, pre) {
+  overflow-wrap: anywhere;
+}
+
+.workbench-nav__project small,
+.workbench-nav__item-copy small,
+.operator-rail__label,
+.operator-rail__attention span,
+.operator-rail__approval > span,
+.operator-rail__approval p,
+.operator-rail__clear p,
+.settings-theme-option small {
+  font-size: max(0.68rem, 11px);
+  line-height: 1.4;
+}
+
+.shell--visual-exporting *,
+.shell--visual-exporting *::before,
+.shell--visual-exporting *::after {
+  scroll-behavior: auto !important;
+  animation: none !important;
+  transition: none !important;
 }
 
 @media (prefers-reduced-motion: reduce) {

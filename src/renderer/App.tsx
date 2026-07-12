@@ -27,6 +27,7 @@ import { isWorkflowAutomationBlockingAgent } from "@shared/workflow";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
 import { CommandCenter, type CommandCenterHealthItem, type CommandCenterItem, type CommandCenterTone } from "./components/CommandCenter";
+import { buildVisualExportCaptureTargets, getVisualExportScrollMetrics } from "./visualExport";
 import { createDefaultAutopilotStrategy, goalRestrictivenessMode, listAutopilotPresets as defaultAutopilotPresets } from "@shared/goalCharter";
 import type {
   AgentCategory,
@@ -80,7 +81,6 @@ import type {
   UltimateGoalImportPreview,
   UltimateGoalProgressEstimate,
   UltimateGoal,
-  VisualExportCaptureTarget,
   VisualExportTab,
   ValidationStatus,
   WorkflowActivityEvent,
@@ -340,7 +340,10 @@ const WORKSPACE_VISUAL_TABS: VisualExportTab[] = [
   { id: "overview", label: "Overview" },
   { id: "workflow", label: "Workflow" },
   { id: "history", label: "History" },
+  { id: "runs", label: "Runs" },
+  { id: "logs", label: "Logs" },
   { id: "repository", label: "Repository" },
+  { id: "credentials", label: "Credentials" },
   { id: "settings", label: "Settings" }
 ];
 const WORKSPACE_TAB_IDS = new Set<WorkspaceVisualTabId>(WORKSPACE_VISUAL_TABS.map((tab) => tab.id));
@@ -369,13 +372,6 @@ type VisualExportReadiness = {
   historyLoading: boolean;
   workflowAgentPageLoading: boolean;
   manualAgentPageLoading: boolean;
-};
-
-type VisualExportScrollMetrics = {
-  totalHeight: number;
-  maxScrollY: number;
-  viewportWidth: number;
-  viewportHeight: number;
 };
 
 const delay = async (durationMs: number): Promise<void> =>
@@ -417,68 +413,6 @@ const waitForVisualCondition = async (
     await delay(80);
   }
   throw new Error(`Timed out waiting for ${description}.`);
-};
-
-const getVisualExportScrollMetrics = (): VisualExportScrollMetrics => {
-  const scrollingElement = document.scrollingElement ?? document.documentElement;
-  const viewportWidth = Math.ceil(window.innerWidth);
-  const viewportHeight = Math.ceil(window.innerHeight);
-  const totalHeight = Math.ceil(Math.max(
-    scrollingElement.scrollHeight,
-    document.documentElement.scrollHeight,
-    document.body.scrollHeight,
-    viewportHeight
-  ));
-
-  return {
-    totalHeight,
-    maxScrollY: Math.max(0, totalHeight - viewportHeight),
-    viewportWidth,
-    viewportHeight
-  };
-};
-
-const buildVisualExportCaptureTargets = (
-  tab: VisualExportTab,
-  metrics: VisualExportScrollMetrics
-): VisualExportCaptureTarget[] => {
-  const targets: VisualExportCaptureTarget[] = [];
-  let nextStartY = 0;
-
-  while (nextStartY < metrics.totalHeight) {
-    const scrollY = Math.min(nextStartY, metrics.maxScrollY);
-    const cropTop = nextStartY - scrollY;
-    const sliceHeight = Math.min(metrics.viewportHeight - cropTop, metrics.totalHeight - nextStartY);
-    if (sliceHeight <= 0) {
-      break;
-    }
-
-    targets.push({
-      tab,
-      pageIndex: targets.length,
-      pageCount: 1,
-      scrollY,
-      cropTop,
-      sliceHeight,
-      viewportWidth: metrics.viewportWidth,
-      viewportHeight: metrics.viewportHeight
-    });
-    nextStartY += sliceHeight;
-  }
-
-  const pageCount = Math.max(1, targets.length);
-  return targets.length
-    ? targets.map((target) => ({ ...target, pageCount }))
-    : [{
-      tab,
-      pageIndex: 0,
-      pageCount,
-      scrollY: 0,
-      cropTop: 0,
-      sliceHeight: metrics.viewportHeight,
-      viewportWidth: metrics.viewportWidth,
-      viewportHeight: metrics.viewportHeight
-    }];
 };
 
 const normalizeWorkspaceTab = (tab?: string): WorkspaceVisualTabId => {
@@ -10551,7 +10485,7 @@ const WorkbenchApp = () => {
       );
     }
 
-    window.scrollTo(0, 0);
+    workbenchScrollRef.current?.scrollTo({ top: 0, left: 0, behavior: "instant" });
     await waitForVisualRender();
   };
 
@@ -10561,8 +10495,12 @@ const WorkbenchApp = () => {
     }
 
     const projectId = activeProject.record.id;
+    const scrollContainer = workbenchScrollRef.current;
+    if (!scrollContainer) {
+      throw new Error("The workspace scroll area is not available for visual extraction.");
+    }
     const originalTab = selectedWorkspaceTab;
-    const originalScrollY = window.scrollY;
+    const originalScrollY = scrollContainer.scrollTop;
     let exportId: string | undefined;
 
     try {
@@ -10578,9 +10516,12 @@ const WorkbenchApp = () => {
         setActiveWorkspaceTabOverride(tab.id);
         await window.workbench.updateLayout(projectId, { activeCenterTab: tab.id });
         await waitForVisualTabReady(projectId, tab);
-        const captureTargets = buildVisualExportCaptureTargets(tab, getVisualExportScrollMetrics());
+        const captureTargets = buildVisualExportCaptureTargets(tab, getVisualExportScrollMetrics(scrollContainer, {
+          width: window.innerWidth,
+          height: window.innerHeight
+        }));
         for (const target of captureTargets) {
-          window.scrollTo(0, target.scrollY);
+          scrollContainer.scrollTo({ top: target.scrollY, left: 0, behavior: "instant" });
           await waitForVisualRender();
           await window.workbench.captureVisualExportPage(exportId, target);
         }
@@ -10600,7 +10541,7 @@ const WorkbenchApp = () => {
         setActiveWorkspaceTabOverride(originalTab);
         await window.workbench.updateLayout(projectId, { activeCenterTab: originalTab }).catch(() => undefined);
         await waitForVisualRender();
-        window.scrollTo(0, originalScrollY);
+        scrollContainer.scrollTo({ top: originalScrollY, left: 0, behavior: "instant" });
       }
     }
   };
@@ -12604,7 +12545,7 @@ const WorkbenchApp = () => {
   const activePageTitle = workspaceNavigationItems.find((item) => item.id === selectedWorkspaceTab)?.label ?? "Overview";
 
   return (
-    <div className={`shell shell--workspace ${navigationCollapsed ? "shell--nav-collapsed" : ""} ${operatorRailCollapsed ? "shell--rail-collapsed" : ""}`} data-theme={settingsAppearanceTheme} data-density={settingsAppearanceDensity} data-motion={settingsMotionMode}>
+    <div className={`shell shell--workspace ${navigationCollapsed ? "shell--nav-collapsed" : ""} ${operatorRailCollapsed ? "shell--rail-collapsed" : ""} ${visualExtractBusy ? "shell--visual-exporting" : ""}`} data-theme={settingsAppearanceTheme} data-density={settingsAppearanceDensity} data-motion={settingsMotionMode}>
       <WorkbenchNavigation
         projectName={activeProject.record.identity.projectName}
         activeTab={selectedWorkspaceTab}
