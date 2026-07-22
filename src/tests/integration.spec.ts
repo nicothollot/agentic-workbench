@@ -743,10 +743,11 @@ describe("integration flows", () => {
     const appData = await createTempDir("appdata-workflow-model-config");
     const service = await createService(appData);
     await service.updateSettings({
-      interfaceCreationModel: "gpt-5.4",
+      interfaceCreationModel: "gpt-5.6-luna",
+      agentModelMode: "manual",
       agentReasoningMode: "manual",
       agentReasoningEfforts: {
-        goal: "xhigh"
+        goal: "high"
       }
     });
 
@@ -758,8 +759,8 @@ describe("integration flows", () => {
     await waitFor(() => getProjectRecord(service, selected.record.id)?.agents.some((agent) => agent.category === "goal"));
 
     const goalAgent = getProjectRecord(service, selected.record.id)?.agents.find((agent) => agent.category === "goal");
-    expect(goalAgent?.model).toBe("gpt-5.4");
-    expect(goalAgent?.reasoningEffort).toBe("xhigh");
+    expect(goalAgent?.model).toBe("gpt-5.6-luna");
+    expect(goalAgent?.reasoningEffort).toBe("high");
     expect(goalAgent?.reasoningEffortSource).toBe("manual");
   });
 
@@ -1011,7 +1012,7 @@ describe("integration flows", () => {
 
     const tools = transport.threadStarts.at(-1)?.dynamicTools;
     expect(tools).toHaveLength(1);
-    expect(tools?.[0]).toMatchObject({ type: "namespace", name: "browser" });
+    expect(tools?.[0]).toMatchObject({ type: "namespace", name: "workbench_preview" });
     if (tools?.[0]?.type === "namespace") {
       expect(tools[0].tools.map((tool) => tool.name)).toEqual([
         "start",

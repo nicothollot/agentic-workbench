@@ -275,7 +275,7 @@ const request = (
     threadId: agent.threadId ?? `thread-${agent.id}`,
     turnId: "turn-1",
     callId: `call-${id}`,
-    namespace: "browser",
+    namespace: "workbench_preview",
     tool,
     arguments: args
   }
@@ -305,7 +305,7 @@ const responseText = (response: DynamicToolCallResponse): string =>
     .join("\n");
 
 describe("AppService dynamic browser ownership", () => {
-  it("does not let browser.start replace operator, pre-merge, or another agent's active session", async () => {
+  it("does not let workbench_preview.start replace operator, pre-merge, or another agent's active session", async () => {
     const { runtime, project, agentA, agentB, broker, transport } = await createHarness();
 
     broker.activeSession = createSession(project.record.id, "operator-session");

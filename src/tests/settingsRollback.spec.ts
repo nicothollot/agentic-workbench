@@ -96,6 +96,7 @@ describe("AppService settings rollback", () => {
       const update: Partial<AppSettings> = {
         maxRepairCycles: targetRepairCycles,
         interfaceCreationModel: targetModel,
+        agentModelMode: "manual",
         interfaceCreationReasoningEffort: targetReasoningEffort,
         agentReasoningMode: "manual",
         agentReasoningEfforts: {

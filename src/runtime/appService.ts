@@ -393,9 +393,11 @@ const WSL_WINDOWS_MOUNT_PATH = /^\/mnt\/[a-z](?:\/|$)/i;
 const VALIDATION_COMMAND_APPROVAL_REASON =
   "This repository-defined validation command can execute project code. Its approval is bound to the exact command and current checkout contents.";
 
+const PREVIEW_TOOL_NAMESPACE = "workbench_preview";
+
 const browserDynamicTools: DynamicToolSpec[] = [{
   type: "namespace",
-  name: "browser",
+  name: PREVIEW_TOOL_NAMESPACE,
   description: "Inspect and interact with the trusted loopback preview created for the active project. Start the preview first, then use opaque element references returned by snapshots.",
   tools: [
     {
@@ -19054,14 +19056,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
             this.agentBrowserSessions.delete(agent.id);
           }
           throw new Error(
-            "browser.start cannot replace the active pre-merge browser gate. Wait for it to finish or stop it from Preview."
+            `${PREVIEW_TOOL_NAMESPACE}.start cannot replace the active pre-merge browser gate. Wait for it to finish or stop it from Preview.`
           );
         }
         if (!requesterOwnsSession) {
           throw new Error(
             ownerAgentId
-              ? "browser.start cannot replace another agent's active browser session."
-              : "browser.start cannot replace the operator's active browser preview. Stop it from Preview first."
+              ? `${PREVIEW_TOOL_NAMESPACE}.start cannot replace another agent's active browser session.`
+              : `${PREVIEW_TOOL_NAMESPACE}.start cannot replace the operator's active browser preview. Stop it from Preview first.`
           );
         }
         if (activeSession.status === "trust_required") {
@@ -19130,7 +19132,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         if (ownership) {
           this.agentBrowserSessions.delete(agent.id);
         }
-        throw new Error("This agent does not own a ready browser preview. Call browser.start first.");
+        throw new Error(`This agent does not own a ready browser preview. Call ${PREVIEW_TOOL_NAMESPACE}.start first.`);
       }
 
       const activeSession = broker.getProjection(project.record.id).activeSession;
@@ -19140,13 +19142,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         this.agentBrowserSessionOwner(project.record.id, ownership.sessionId) !== agent.id
       ) {
         this.agentBrowserSessions.delete(agent.id);
-        throw new Error("This agent's browser session is stale and can no longer be used. Call browser.start again.");
+        throw new Error(`This agent's browser session is stale and can no longer be used. Call ${PREVIEW_TOOL_NAMESPACE}.start again.`);
       }
       if (activeSession.checkpointKind !== "explicit" || activeSession.status !== "ready") {
         if (!this.isLivePreviewSession(activeSession) || activeSession.checkpointKind !== "explicit") {
           this.agentBrowserSessions.delete(agent.id);
         }
-        throw new Error("This agent's browser session is not ready. Call browser.start again when Preview is available.");
+        throw new Error(`This agent's browser session is not ready. Call ${PREVIEW_TOOL_NAMESPACE}.start again when Preview is available.`);
       }
 
       try {
@@ -19181,7 +19183,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     const response: DynamicToolCallResponse = { contentItems: [], success: false };
     try {
-      if (request.params.namespace !== "browser") {
+      if (request.params.namespace !== PREVIEW_TOOL_NAMESPACE) {
         throw new Error(`Unsupported dynamic tool namespace: ${request.params.namespace ?? "none"}`);
       }
       const broker = this.requirePreviewBroker();
