@@ -28,6 +28,9 @@ export const commitAll = async (root: string, message: string): Promise<void> =>
 export const writeMockSettings = async (appDataDir: string): Promise<void> => {
   const settings = defaultSettings();
   settings.mockMode = true;
+  // Integration fixtures intentionally opt into repository command execution.
+  // Production defaults remain explicit-approval-first.
+  settings.autoApproveCommands = true;
   settings.worktreeBaseDir = path.join(appDataDir, "worktrees");
   settings.githubAccount = {
     username: "awb-tests",

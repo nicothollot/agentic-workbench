@@ -1,14 +1,17 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { nanoid } from "nanoid";
+import { DEFAULT_WORKTREE_BASE_DIR } from "@shared/constants";
+import { detectProjectPathKind, uncWslToLinuxPath, windowsPathToWslPath } from "@shared/pathUtils";
 import { slugify } from "@shared/utils";
 import type { AppSettings, WorktreeAssignment } from "@shared/types";
 import type { GitMetadata } from "./repoScanner";
 import { resolveExecutionMode, RuntimeCommandExecutor } from "./execution";
-import { joinExecutionPathWithinProject } from "./projectBoundary";
 
 type RuntimeSettings = Pick<AppSettings, "executionMode" | "distroName">;
 const WORKBENCH_GIT_EXCLUDE_ENTRY = ".agent-workbench/";
+const WORKTREE_BASE_ENV = "AWB_MANAGED_WORKTREE_BASE";
 
 const execGit = async (settings: RuntimeSettings, projectRoot: string, args: string[]): Promise<string> => {
   const executor = new RuntimeCommandExecutor(settings);
@@ -25,7 +28,120 @@ const normalizeOptionalOutput = (value: string): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
-const getPathModule = (value: string): path.PlatformPath => value.includes("\\") ? path.win32 : path.posix;
+const getPathModule = (value: string): path.PlatformPath =>
+  /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(value) ? path.win32 : path.posix;
+
+const assertValidConfiguredBaseDir = (configuredBaseDir: string): string => {
+  const trimmed = configuredBaseDir.trim();
+  if (!trimmed || trimmed.includes("\0")) {
+    throw new Error("The managed worktree base directory must be a non-empty path.");
+  }
+  return trimmed;
+};
+
+export const resolveLocalManagedWorktreeBaseDir = (
+  configuredBaseDir: string,
+  homeDirectory = os.homedir()
+): string => {
+  const configured = assertValidConfiguredBaseDir(configuredBaseDir);
+  const homePathModule = getPathModule(homeDirectory);
+  const expanded = configured === "~"
+    ? homeDirectory
+    : configured.startsWith("~/") || configured.startsWith("~\\")
+      ? homePathModule.join(homeDirectory, configured.slice(2))
+      : configured;
+  const pathModule = getPathModule(expanded || homeDirectory);
+  return pathModule.normalize(pathModule.isAbsolute(expanded) ? expanded : pathModule.resolve(homeDirectory, expanded));
+};
+
+export const buildWslManagedWorktreeBaseResolutionSpec = (
+  configuredBaseDir: string
+): { command: string; args: string[]; env: Record<string, string> } => ({
+  command: "sh",
+  args: [
+    "-c",
+    [
+      "set -eu",
+      `value="\${${WORKTREE_BASE_ENV}}"`,
+      "case \"$value\" in",
+      "  '~') resolved=\"$HOME\" ;;",
+      "  '~/'*) resolved=\"$HOME/${value#~/}\" ;;",
+      "  /*) resolved=\"$value\" ;;",
+      "  *) resolved=\"$HOME/$value\" ;;",
+      "esac",
+      "mkdir -p -- \"$resolved\"",
+      "cd -- \"$resolved\"",
+      "pwd -P"
+    ].join("\n")
+  ],
+  env: {
+    [WORKTREE_BASE_ENV]: assertValidConfiguredBaseDir(configuredBaseDir)
+  }
+});
+
+export const normalizeManagedWorktreeBaseForExecution = (
+  configuredBaseDir: string,
+  settings: RuntimeSettings,
+  platform: NodeJS.Platform = process.platform
+): string => {
+  const configured = assertValidConfiguredBaseDir(configuredBaseDir);
+  if (resolveExecutionMode(settings, platform) !== "wsl") {
+    return configured;
+  }
+
+  const kind = detectProjectPathKind(configured);
+  if (kind === "windows") {
+    return windowsPathToWslPath(configured);
+  }
+  if (kind === "wsl-unc") {
+    const parsed = uncWslToLinuxPath(configured);
+    if (parsed.distroName.localeCompare(settings.distroName, undefined, { sensitivity: "accent" }) !== 0) {
+      throw new Error(
+        `The managed worktree base uses WSL distro "${parsed.distroName}", but execution is configured for "${settings.distroName}".`
+      );
+    }
+    return parsed.linuxPath;
+  }
+  return configured.replace(/\\/g, "/");
+};
+
+export const resolveManagedWorktreeBaseDir = async (
+  projectRoot: string,
+  configuredBaseDir: string,
+  settings: RuntimeSettings,
+  platform: NodeJS.Platform = process.platform
+): Promise<string> => {
+  if (resolveExecutionMode(settings, platform) !== "wsl") {
+    const resolved = resolveLocalManagedWorktreeBaseDir(configuredBaseDir);
+    await mkdir(resolved, { recursive: true });
+    return resolved;
+  }
+
+  const executor = new RuntimeCommandExecutor(settings, platform);
+  const spec = buildWslManagedWorktreeBaseResolutionSpec(
+    normalizeManagedWorktreeBaseForExecution(configuredBaseDir, settings, platform)
+  );
+  const { stdout } = await executor.execStructuredCommand({
+    ...spec,
+    cwd: projectRoot,
+    timeoutMs: 15_000
+  });
+  const resolved = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1);
+  if (!resolved || !path.posix.isAbsolute(resolved)) {
+    throw new Error("WSL did not return an absolute managed worktree base directory.");
+  }
+  return path.posix.normalize(resolved);
+};
+
+const joinManagedWorktreePath = (baseDir: string, ...segments: string[]): string => {
+  const pathModule = getPathModule(baseDir);
+  const normalizedBase = pathModule.normalize(baseDir);
+  const candidate = pathModule.join(normalizedBase, ...segments);
+  if (!isContainedPath(normalizedBase, candidate) || candidate === normalizedBase) {
+    throw new Error("The managed worktree path escaped its configured base directory.");
+  }
+  return candidate;
+};
 
 const isContainedPath = (root: string, candidate: string): boolean => {
   const pathModule = getPathModule(root);
@@ -149,22 +265,34 @@ export const readGitMetadata = async (projectRoot: string, settings: RuntimeSett
 
 export const createWorktreeAssignment = async (
   projectRoot: string,
-  _baseDir: string,
+  configuredBaseDir: string,
   projectSlug: string,
   agentSlug: string,
   targetBranch: string,
-  settings: RuntimeSettings
+  settings: RuntimeSettings,
+  platform: NodeJS.Platform = process.platform
 ): Promise<WorktreeAssignment> => {
-  const branch = `awb/${slugify(projectSlug)}/${slugify(agentSlug)}-${nanoid(6).toLowerCase()}`;
-  const baseDir = getManagedWorktreeBaseDir(projectRoot);
-  const worktreePath = joinExecutionPathWithinProject(
-    projectRoot,
-    ".agent-workbench",
-    "worktrees",
-    slugify(projectSlug),
-    slugify(agentSlug),
+  const normalizedProjectSlug = slugify(projectSlug) || "project";
+  const normalizedAgentSlug = slugify(agentSlug) || "agent";
+  const branch = `awb/${normalizedProjectSlug}/${normalizedAgentSlug}-${nanoid(6).toLowerCase()}`;
+  const baseDir = await resolveManagedWorktreeBaseDir(projectRoot, configuredBaseDir, settings, platform);
+  const worktreePath = joinManagedWorktreePath(
+    baseDir,
+    normalizedProjectSlug,
+    normalizedAgentSlug,
     nanoid(6)
   );
+
+  if (resolveExecutionMode(settings, platform) === "wsl") {
+    const executor = new RuntimeCommandExecutor(settings, platform);
+    await executor.execStructuredCommand({
+      command: "mkdir",
+      args: ["-p", path.posix.dirname(worktreePath)],
+      timeoutMs: 15_000
+    });
+  } else {
+    await mkdir(getPathModule(worktreePath).dirname(worktreePath), { recursive: true });
+  }
 
   await ensureManagedWorktreeGitExclude(projectRoot, settings);
   await execGit(settings, projectRoot, ["worktree", "add", "-b", branch, worktreePath, targetBranch]);
@@ -177,8 +305,11 @@ export const createWorktreeAssignment = async (
   };
 };
 
-export const getManagedWorktreeBaseDir = (projectRoot: string): string =>
-  joinExecutionPathWithinProject(projectRoot, ".agent-workbench", "worktrees");
+export const getManagedWorktreeBaseDir = (
+  _projectRoot: string,
+  configuredBaseDir = DEFAULT_WORKTREE_BASE_DIR,
+  homeDirectory = os.homedir()
+): string => resolveLocalManagedWorktreeBaseDir(configuredBaseDir, homeDirectory);
 
 export const listWorktrees = async (projectRoot: string, settings: RuntimeSettings): Promise<Array<{ path: string; branch?: string }>> => {
   const output = await execGit(settings, projectRoot, ["worktree", "list", "--porcelain"]);

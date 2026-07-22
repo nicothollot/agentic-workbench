@@ -18,7 +18,15 @@ export default defineConfig(({ command }) => ({
   },
   build: {
     outDir: "dist",
-    sourcemap: true
+    sourcemap: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "react-vendor": ["react", "react-dom", "react-dom/client"],
+          "ui-vendor": ["@radix-ui/react-scroll-area", "@radix-ui/react-separator", "clsx"]
+        }
+      }
+    }
   },
   server: {
     port: 5173,

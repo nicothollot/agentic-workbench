@@ -27,7 +27,26 @@ import { isWorkflowAutomationBlockingAgent } from "@shared/workflow";
 import { buildWorkflowAttentionItems, type WorkflowAttentionItem } from "./workflowAttention";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows, type RepositoryChildrenByParent } from "./repositoryTree";
 import { CommandCenter, type CommandCenterHealthItem, type CommandCenterItem, type CommandCenterTone } from "./components/CommandCenter";
+import { ActivityWorkspace, PreviewWorkspace, type ActivitySummaryItem } from "./components/WorkspacePages";
 import { buildVisualExportCaptureTargets, getVisualExportScrollMetrics } from "./visualExport";
+import {
+  editProjectDraft,
+  hydrateProjectDraft,
+  isCurrentProjectRequest,
+  markProjectDraftClean,
+  projectScopedText,
+  resolveProjectDraft,
+  settingsSaveShouldClose,
+  type ProjectDraftMap,
+  type ProjectRequestIdentity
+} from "./projectDraftState";
+import {
+  isPersistedWorkspaceRoute,
+  normalizeWorkspaceTab,
+  parseRememberedWorkspaceRoute,
+  workspaceRouteStorageKey,
+  type WorkspaceRouteId
+} from "./workspaceRouting";
 import { createDefaultAutopilotStrategy, goalRestrictivenessMode, listAutopilotPresets as defaultAutopilotPresets } from "@shared/goalCharter";
 import type {
   AgentCategory,
@@ -294,9 +313,19 @@ type GoalCharterDraftUpdate = Partial<Omit<GoalCharterDraftState, "autopilotStra
   autopilotStrategy?: AutopilotStrategy;
 };
 
+type UltimateGoalDraftState = {
+  summary: string;
+  detailedIntent: string;
+  successCriteria: string;
+  constraints: string;
+  nonGoals: string;
+  targetAudience: string;
+  qualityBar: string;
+};
+
 type GoalCharterAiBusyState =
-  | { kind: "polish"; field: GoalCharterDraftTextField }
-  | { kind: "generate" };
+  | { kind: "polish"; field: GoalCharterDraftTextField; projectId: string; requestId: number }
+  | { kind: "generate"; projectId: string; requestId: number };
 
 type StatusChipTone =
   | "running"
@@ -346,7 +375,6 @@ const WORKSPACE_VISUAL_TABS: VisualExportTab[] = [
   { id: "credentials", label: "Credentials" },
   { id: "settings", label: "Settings" }
 ];
-const WORKSPACE_TAB_IDS = new Set<WorkspaceVisualTabId>(WORKSPACE_VISUAL_TABS.map((tab) => tab.id));
 const VISUAL_EXPORT_READY_TIMEOUT_MS = 5_000;
 const AGENT_BACKED_WORKFLOW_COMMANDS = new Set([
   "run-recommendation",
@@ -413,22 +441,6 @@ const waitForVisualCondition = async (
     await delay(80);
   }
   throw new Error(`Timed out waiting for ${description}.`);
-};
-
-const normalizeWorkspaceTab = (tab?: string): WorkspaceVisualTabId => {
-  if (WORKSPACE_TAB_IDS.has(tab as WorkspaceVisualTabId)) {
-    return tab as WorkspaceVisualTabId;
-  }
-  if (tab === "reports") {
-    return "workflow";
-  }
-  if (tab === "agents") {
-    return "history";
-  }
-  if (tab === "file" || tab === "diff") {
-    return "repository";
-  }
-  return "overview";
 };
 
 const buildUltimateGoalFormatGuide = (projectName: string): string => [
@@ -862,6 +874,8 @@ const previewStatusLabel = (status?: NonNullable<ProjectWorkflowState["previewRe
       return "Preview completed";
     case "cancelled":
       return "Preview cancelled";
+    case "failed":
+      return "Preview failed";
     case "none":
     default:
       return "No preview";
@@ -876,6 +890,8 @@ const previewButtonLabel = (status?: NonNullable<ProjectWorkflowState["previewRe
       return "Generating Preview";
     case "ready":
       return "Preview Ready";
+    case "failed":
+      return "Retry Preview";
     default:
       return "Generate Preview";
   }
@@ -1499,6 +1515,19 @@ const cloneStrategy = (strategy?: AutopilotStrategy): AutopilotStrategy => {
     autonomyBudget: {
       ...base.autonomyBudget
     }
+  };
+};
+
+const ultimateGoalDraftFromWorkflow = (workflow?: ProjectWorkflowState): UltimateGoalDraftState => {
+  const goal = workflow?.ultimateGoal;
+  return {
+    summary: goal?.summary ?? "",
+    detailedIntent: goal?.detailedIntent ?? "",
+    successCriteria: fromLineList(goal?.successCriteria),
+    constraints: fromLineList(goal?.constraints),
+    nonGoals: fromLineList(goal?.nonGoals),
+    targetAudience: goal?.targetAudience ?? "",
+    qualityBar: goal?.qualityBar ?? ""
   };
 };
 
@@ -5956,7 +5985,7 @@ const WorkflowAutopilotPanel = ({
   continueDisabledReason?: string;
 }) => {
   const policy = autopilotPolicy;
-  const previewCanRequest = previewStatus === "none" || previewStatus === "completed" || previewStatus === "cancelled";
+  const previewCanRequest = previewStatus === "none" || previewStatus === "completed" || previewStatus === "cancelled" || previewStatus === "failed";
   const previewCanCancel = previewStatus === "queued";
   const previewCanComplete = previewStatus === "ready";
   const canContinue = !commandBusy && (canContinueWorkflow || workflowPauseRequested || previewCanComplete || recoveryAvailable || Boolean(autopilotPausedReason));
@@ -6720,6 +6749,7 @@ const GoalCharterSettingsPanel = ({
   aiReasoningEffort,
   generatePrompt,
   aiBusy,
+  dirty,
   onChange,
   onSave,
   onApplyPreset,
@@ -6741,6 +6771,7 @@ const GoalCharterSettingsPanel = ({
   aiReasoningEffort: InterfaceReasoningEffort;
   generatePrompt: string;
   aiBusy?: GoalCharterAiBusyState;
+  dirty: boolean;
   onChange: (next: GoalCharterDraftUpdate) => void;
   onSave: () => void;
   onApplyPreset: (preset: AutopilotPreset) => void;
@@ -7237,7 +7268,12 @@ const GoalCharterSettingsPanel = ({
         </div>
       </div>
       <div className="actions-row">
-        <button className="primary-button" type="button" onClick={onSave}>Save Goal Charter and Strategy</button>
+        <span className="settings-card__copy" aria-live="polite">
+          {dirty ? "Goal Charter or strategy changes are not saved yet." : "Goal Charter and strategy match the saved project."}
+        </span>
+        <button className="primary-button" type="button" onClick={onSave} disabled={!dirty || Boolean(aiBusy)}>
+          {dirty ? "Save Goal Charter and Strategy" : "Goal Charter saved"}
+        </button>
       </div>
     </div>
   );
@@ -7247,6 +7283,9 @@ const SettingsDialog = ({
   state,
   activeProject,
   settingsDraft,
+  settingsDirty = false,
+  settingsSaving = false,
+  goalCharterDirty = false,
   goalCharterDraft,
   goalCharterAiModel,
   goalCharterAiReasoningEffort,
@@ -7288,6 +7327,9 @@ const SettingsDialog = ({
   state: WorkbenchState;
   activeProject?: LoadedProjectView;
   settingsDraft: SettingsDraftState;
+  settingsDirty?: boolean;
+  settingsSaving?: boolean;
+  goalCharterDirty?: boolean;
   goalCharterDraft: GoalCharterDraftState;
   goalCharterAiModel: string;
   goalCharterAiReasoningEffort: InterfaceReasoningEffort;
@@ -7326,6 +7368,49 @@ const SettingsDialog = ({
   workflowCycleResetBusy?: boolean;
   mode?: "modal" | "page";
 }) => {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    if (mode !== "modal") {
+      return;
+    }
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frameId = window.requestAnimationFrame(() => panelRef.current?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !panelRef.current) {
+        return;
+      }
+      const focusable = [...panelRef.current.querySelectorAll<HTMLElement>("button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])")];
+      if (!focusable.length) {
+        event.preventDefault();
+        panelRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === panelRef.current)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      document.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [mode]);
+
   const selectedModel = state.availableModels.find((model) => model.model === settingsDraft.interfaceCreationModel);
   const supportedReasoningEfforts = selectedModel?.supportedReasoningEfforts.length
     ? selectedModel.supportedReasoningEfforts
@@ -7341,12 +7426,31 @@ const SettingsDialog = ({
   };
 
   const panel = (
-      <div className={`settings-panel ${mode === "page" ? "settings-panel--page" : ""}`}>
-        <SectionTitle eyebrow="Preferences" title="Settings" meta={<img className="settings-panel__icon" src={interfaceIconUrl} alt="" />} />
+      <div
+        ref={panelRef}
+        className={`settings-panel ${mode === "page" ? "settings-panel--page" : ""} ${settingsSaving ? "settings-panel--saving" : ""}`}
+        role={mode === "modal" ? "dialog" : undefined}
+        aria-modal={mode === "modal" ? true : undefined}
+        aria-label={mode === "modal" ? "Settings" : undefined}
+        aria-busy={settingsSaving}
+        tabIndex={mode === "modal" ? -1 : undefined}
+      >
+        <SectionTitle
+          eyebrow="Preferences"
+          title="Settings"
+          meta={<span className="settings-panel__state"><img className="settings-panel__icon" src={interfaceIconUrl} alt="" />{settingsSaving ? <span className="badge">Saving</span> : settingsDirty ? <span className="badge">Unsaved settings</span> : goalCharterDirty ? <span className="badge">Unsaved Goal Charter</span> : <span className="badge">Up to date</span>}</span>}
+        />
         <p className="settings-panel__copy">
           Tune agent run defaults and open diagnostics only when you need them. Developer Tools no longer open automatically on launch.
         </p>
         <div className="notice">{availabilityMessage(state)}</div>
+        <div className="actions-row settings-save-bar" aria-live="polite">
+          <span>{settingsSaving ? "Saving preferences…" : settingsDirty && goalCharterDirty ? "Settings and the Goal Charter both have unsaved changes." : settingsDirty ? "You have unsaved preference changes." : goalCharterDirty ? "Settings are saved. Save the project Goal Charter before leaving." : "Preferences match the saved configuration."}</span>
+          <button className="primary-button" disabled={!settingsDirty || settingsSaving} onClick={onSave}>{settingsSaving ? "Saving…" : "Save Settings"}</button>
+          <button className="secondary-button" disabled={settingsSaving || goalCharterDirty} onClick={onClose} title={goalCharterDirty ? "Save the project Goal Charter before leaving Settings." : undefined}>
+            {goalCharterDirty ? "Save Goal Charter first" : settingsDirty ? "Cancel settings changes" : "Close"}
+          </button>
+        </div>
         <div className="settings-section settings-appearance">
           <div className="settings-card settings-appearance__card">
             <div className="settings-section__heading">
@@ -7356,9 +7460,9 @@ const SettingsDialog = ({
             <p className="settings-card__copy">Choose the visual character, information density, and motion level used across every workspace.</p>
             <div className="settings-theme-grid" role="radiogroup" aria-label="Color theme">
               {([
-                { id: "catc-dark", label: "CATC Dark", detail: "Refined navy and warm gold", swatches: ["#091525", "#172a42", "#d9b873"] },
-                { id: "catc-light", label: "CATC Light", detail: "Editorial ivory and navy", swatches: ["#f5f1e9", "#ffffff", "#18304d"] },
-                { id: "space", label: "Space", detail: "Deep indigo and electric cyan", swatches: ["#07091a", "#15163b", "#64d8ff"] }
+                { id: "catc-dark", label: "CATC Dark", detail: "Refined navy and warm gold", swatches: ["#0f2747", "#1b385a", "#b89a6a"] },
+                { id: "catc-light", label: "CATC Light", detail: "Editorial ivory and navy", swatches: ["#f7f2ea", "#fffdf9", "#0f2747"] },
+                { id: "space", label: "Space", detail: "Deep navy and cool blue", swatches: ["#071225", "#102645", "#8ec5eb"] }
               ] as const).map((theme) => (
                 <button
                   key={theme.id}
@@ -7366,6 +7470,7 @@ const SettingsDialog = ({
                   type="button"
                   role="radio"
                   aria-checked={settingsDraft.appearanceTheme === theme.id}
+                  disabled={settingsSaving}
                   onClick={() => onChange({ appearanceTheme: theme.id })}
                 >
                   <span className="settings-theme-option__preview">{theme.swatches.map((color) => <span key={color} style={{ background: color }} />)}</span>
@@ -7376,14 +7481,14 @@ const SettingsDialog = ({
             <div className="settings-appearance__controls">
               <label className="form-field">
                 <span>Density</span>
-                <select className="input" value={settingsDraft.appearanceDensity} onChange={(event) => onChange({ appearanceDensity: event.target.value as AppAppearanceDensity })}>
+                <select className="input" disabled={settingsSaving} value={settingsDraft.appearanceDensity} onChange={(event) => onChange({ appearanceDensity: event.target.value as AppAppearanceDensity })}>
                   <option value="comfortable">Comfortable</option>
                   <option value="compact">Compact</option>
                 </select>
               </label>
               <label className="form-field">
                 <span>Motion</span>
-                <select className="input" value={settingsDraft.motionMode} onChange={(event) => onChange({ motionMode: event.target.value as AppMotionMode })}>
+                <select className="input" disabled={settingsSaving} value={settingsDraft.motionMode} onChange={(event) => onChange({ motionMode: event.target.value as AppMotionMode })}>
                   <option value="system">Match system</option>
                   <option value="full">Full</option>
                   <option value="reduced">Reduced</option>
@@ -7401,6 +7506,7 @@ const SettingsDialog = ({
           aiReasoningEffort={goalCharterAiReasoningEffort}
           generatePrompt={goalCharterGeneratePrompt}
           aiBusy={goalCharterAiBusy}
+          dirty={goalCharterDirty}
           onChange={onGoalCharterChange}
           onSave={onSaveGoalCharter}
           onApplyPreset={onApplyAutopilotPreset}
@@ -7751,10 +7857,6 @@ const SettingsDialog = ({
             </div>
           </div>
         </div>
-        <div className="actions-row">
-          <button className="primary-button" onClick={onSave}>Save Settings</button>
-          <button className="secondary-button" onClick={onClose}>Close</button>
-        </div>
       </div>
   );
 
@@ -7846,7 +7948,9 @@ const TopBar = ({
   primaryAction,
   utilityActions,
   onToggleNavigation,
-  onToggleOperatorRail
+  onToggleAttention,
+  attentionCount = 0,
+  attentionOpen = false
 }: {
   projectName: string;
   projectContext: string;
@@ -7856,7 +7960,9 @@ const TopBar = ({
   primaryAction?: ShellAction;
   utilityActions: ShellAction[];
   onToggleNavigation?: () => void;
-  onToggleOperatorRail?: () => void;
+  onToggleAttention?: () => void;
+  attentionCount?: number;
+  attentionOpen?: boolean;
 }) => (
   <header className="top-app-bar">
     <div className="top-app-bar__identity">
@@ -7891,9 +7997,17 @@ const TopBar = ({
           ))}
         </div>
       </details>
-      {onToggleOperatorRail ? (
-        <button className="shell-icon-button top-app-bar__rail-toggle" type="button" aria-label="Toggle operator rail" onClick={onToggleOperatorRail}>
-          <span aria-hidden="true">◫</span>
+      {onToggleAttention ? (
+        <button
+          className="shell-icon-button top-app-bar__rail-toggle attention-toggle"
+          type="button"
+          aria-label={attentionOpen ? "Close attention queue" : "Open attention queue"}
+          aria-haspopup="dialog"
+          aria-expanded={attentionOpen}
+          onClick={onToggleAttention}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg>
+          {attentionCount > 0 ? <span className="attention-toggle__count">{attentionCount > 99 ? "99+" : attentionCount}</span> : null}
         </button>
       ) : null}
     </div>
@@ -7901,17 +8015,20 @@ const TopBar = ({
 );
 
 type WorkbenchNavigationItem = {
-  id: WorkspaceVisualTabId;
+  id: WorkspaceRouteId;
   label: string;
   description: string;
+  section: "primary" | "advanced";
   count?: number;
 };
 
-const NavigationIcon = ({ id }: { id: WorkspaceVisualTabId }) => {
+const NavigationIcon = ({ id }: { id: WorkspaceRouteId }) => {
   const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   const shape = (() => {
     switch (id) {
       case "overview": return <><rect x="3" y="3" width="7" height="7" rx="1" {...common} /><rect x="14" y="3" width="7" height="7" rx="1" {...common} /><rect x="3" y="14" width="7" height="7" rx="1" {...common} /><rect x="14" y="14" width="7" height="7" rx="1" {...common} /></>;
+      case "preview": return <><rect x="2.5" y="4" width="19" height="14" rx="2.5" {...common} /><path d="M8 21h8M12 18v3M9.5 8.5l6 3.5-6 3.5Z" {...common} /></>;
+      case "activity": return <><path d="M3 12h4l2.5-6 4.5 12 2.5-6H21" {...common} /></>;
       case "workflow": return <><circle cx="5" cy="12" r="2" {...common} /><circle cx="19" cy="5" r="2" {...common} /><circle cx="19" cy="19" r="2" {...common} /><path d="M7 12h5a4 4 0 0 0 4-4V7M12 12a4 4 0 0 1 4 4v1" {...common} /></>;
       case "history": return <><circle cx="12" cy="12" r="9" {...common} /><path d="M12 7v5l3 2M3.5 8H1V4" {...common} /></>;
       case "runs": return <><rect x="3" y="4" width="18" height="16" rx="3" {...common} /><path d="m10 9 5 3-5 3Z" {...common} /></>;
@@ -7926,30 +8043,38 @@ const NavigationIcon = ({ id }: { id: WorkspaceVisualTabId }) => {
 
 const WorkbenchNavigation = ({
   projectName,
-  activeTab,
+  activeRoute,
   items,
   collapsed,
   mobileOpen,
+  advancedOpen,
   theme,
   onSelect,
+  onToggleAdvanced,
   onCollapse,
   onCloseMobile,
   onShowLauncher,
   onCycleTheme
 }: {
   projectName: string;
-  activeTab: WorkspaceVisualTabId;
+  activeRoute: WorkspaceRouteId;
   items: WorkbenchNavigationItem[];
   collapsed: boolean;
   mobileOpen: boolean;
+  advancedOpen: boolean;
   theme: AppAppearanceTheme;
-  onSelect: (tab: WorkspaceVisualTabId) => void;
+  onSelect: (route: WorkspaceRouteId) => void;
+  onToggleAdvanced: () => void;
   onCollapse: () => void;
   onCloseMobile: () => void;
   onShowLauncher: () => void;
   onCycleTheme: () => void;
-}) => (
-  <>
+}) => {
+  const primaryItems = items.filter((item) => item.section === "primary");
+  const advancedItems = items.filter((item) => item.section === "advanced");
+  const advancedActive = advancedItems.some((item) => item.id === activeRoute);
+
+  return <>
     <button className={`workbench-nav-scrim ${mobileOpen ? "is-visible" : ""}`} type="button" aria-label="Close navigation" onClick={onCloseMobile} />
     <aside className={`workbench-nav ${collapsed ? "workbench-nav--collapsed" : ""} ${mobileOpen ? "workbench-nav--mobile-open" : ""}`} aria-label="Workspace navigation">
       <div className="workbench-nav__brand">
@@ -7962,23 +8087,38 @@ const WorkbenchNavigation = ({
         <span><small>Active workspace</small><strong>{projectName}</strong></span>
         <span aria-hidden="true">⌄</span>
       </button>
-      <nav className="workbench-nav__items">
-        <span className="workbench-nav__section-label">Operate</span>
-        {items.slice(0, 6).map((item) => (
-          <button key={item.id} className={`workbench-nav__item ${activeTab === item.id ? "is-active" : ""}`} type="button" title={collapsed ? item.label : item.description} aria-current={activeTab === item.id ? "page" : undefined} onClick={() => { onSelect(item.id); onCloseMobile(); }}>
+      <nav className="workbench-nav__items" aria-label="Workspace navigation">
+        <span className="workbench-nav__section-label">Workspace</span>
+        {primaryItems.map((item) => (
+          <button key={item.id} className={`workbench-nav__item ${activeRoute === item.id ? "is-active" : ""}`} type="button" title={collapsed ? item.label : item.description} aria-current={activeRoute === item.id ? "page" : undefined} onClick={() => { onSelect(item.id); onCloseMobile(); }}>
             <NavigationIcon id={item.id} />
             <span className="workbench-nav__item-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
             {typeof item.count === "number" && item.count > 0 ? <span className="workbench-nav__count">{item.count > 99 ? "99+" : item.count}</span> : null}
           </button>
         ))}
-        <span className="workbench-nav__section-label">Configure</span>
-        {items.slice(6).map((item) => (
-          <button key={item.id} className={`workbench-nav__item ${activeTab === item.id ? "is-active" : ""}`} type="button" title={collapsed ? item.label : item.description} aria-current={activeTab === item.id ? "page" : undefined} onClick={() => { onSelect(item.id); onCloseMobile(); }}>
-            <NavigationIcon id={item.id} />
-            <span className="workbench-nav__item-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
-            {typeof item.count === "number" && item.count > 0 ? <span className="workbench-nav__count">{item.count > 99 ? "99+" : item.count}</span> : null}
-          </button>
-        ))}
+        <button
+          className={`workbench-nav__advanced-toggle ${advancedActive ? "has-active-route" : ""}`}
+          type="button"
+          aria-expanded={advancedOpen}
+          aria-controls="workbench-advanced-navigation"
+          title={collapsed ? "Advanced workspace views" : undefined}
+          onClick={onToggleAdvanced}
+        >
+          <span className="workbench-nav__advanced-icon" aria-hidden="true">•••</span>
+          <span>Advanced</span>
+          <span aria-hidden="true">{advancedOpen ? "⌃" : "⌄"}</span>
+        </button>
+        {advancedOpen ? (
+          <div id="workbench-advanced-navigation" className="workbench-nav__advanced-items">
+            {advancedItems.map((item) => (
+              <button key={item.id} className={`workbench-nav__item ${activeRoute === item.id ? "is-active" : ""}`} type="button" title={collapsed ? item.label : item.description} aria-current={activeRoute === item.id ? "page" : undefined} onClick={() => { onSelect(item.id); onCloseMobile(); }}>
+                <NavigationIcon id={item.id} />
+                <span className="workbench-nav__item-copy"><strong>{item.label}</strong><small>{item.description}</small></span>
+                {typeof item.count === "number" && item.count > 0 ? <span className="workbench-nav__count">{item.count > 99 ? "99+" : item.count}</span> : null}
+              </button>
+            ))}
+          </div>
+        ) : null}
       </nav>
       <div className="workbench-nav__footer">
         <button className="workbench-nav__utility" type="button" onClick={onCycleTheme} title="Switch color theme"><span aria-hidden="true">◐</span><span>Theme · {theme.replace("catc-", "")}</span></button>
@@ -7986,10 +8126,10 @@ const WorkbenchNavigation = ({
       </div>
     </aside>
   </>
-);
+};
 
-const OperatorRail = ({
-  collapsed,
+const AttentionDrawer = ({
+  open,
   statusLabel,
   statusTone,
   cycleLabel,
@@ -8001,8 +8141,9 @@ const OperatorRail = ({
   primaryAction,
   attention,
   approvals,
-  onToggle,
+  onClose,
   onOpenWorkflow,
+  onOpenCredentials,
   onOpenSettings,
   onToggleAutopilot,
   onTogglePause,
@@ -8010,7 +8151,7 @@ const OperatorRail = ({
   onReject,
   isApprovalBusy
 }: {
-  collapsed: boolean;
+  open: boolean;
   statusLabel: string;
   statusTone: ShellStatusTone;
   cycleLabel: string;
@@ -8022,8 +8163,9 @@ const OperatorRail = ({
   primaryAction?: ShellAction;
   attention: WorkflowAttentionItem[];
   approvals: ApprovalRequestRecord[];
-  onToggle: () => void;
+  onClose: () => void;
   onOpenWorkflow: () => void;
+  onOpenCredentials: () => void;
   onOpenSettings: () => void;
   onToggleAutopilot: () => void;
   onTogglePause: () => void;
@@ -8031,22 +8173,59 @@ const OperatorRail = ({
   onReject: (approval: ApprovalRequestRecord) => void;
   isApprovalBusy: (approval: ApprovalRequestRecord) => boolean;
 }) => {
-  if (collapsed) {
-    return (
-      <aside className="operator-rail operator-rail--collapsed" aria-label="Collapsed operator rail">
-        <button className="shell-icon-button" type="button" aria-label="Expand operator rail" onClick={onToggle}>‹</button>
-        <span className={`operator-rail__signal operator-rail__signal--${statusTone}`} title={statusLabel} />
-        {attention.length + approvals.length > 0 ? <span className="operator-rail__collapsed-count">{attention.length + approvals.length}</span> : null}
-        <button className="shell-icon-button" type="button" aria-label="Open workflow" onClick={onOpenWorkflow}><NavigationIcon id="workflow" /></button>
-      </aside>
-    );
+  const drawerRef = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frameId = window.requestAnimationFrame(() => drawerRef.current?.querySelector<HTMLElement>("button")?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !drawerRef.current) {
+        return;
+      }
+      const focusable = [...drawerRef.current.querySelectorAll<HTMLElement>("button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])")];
+      if (!focusable.length) {
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      document.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [open]);
+
+  if (!open) {
+    return null;
   }
 
   return (
-    <aside className="operator-rail" aria-label="Operator controls">
+    <>
+    <button className="attention-drawer-scrim" type="button" aria-label="Close attention queue" onClick={onClose} />
+    <aside ref={drawerRef} className="operator-rail operator-rail--drawer" role="dialog" aria-modal="true" aria-labelledby="attention-drawer-title">
       <header className="operator-rail__header">
-        <div><span className="eyebrow">Operator rail</span><strong>Live control</strong></div>
-        <button className="shell-icon-button" type="button" aria-label="Collapse operator rail" onClick={onToggle}>›</button>
+        <div><span className="eyebrow">Attention queue</span><strong id="attention-drawer-title">Review and control</strong></div>
+        <button className="shell-icon-button" type="button" aria-label="Close attention queue" onClick={onClose}>×</button>
       </header>
       <div className={`operator-rail__state operator-rail__state--${statusTone}`}>
         <div className="operator-rail__state-title"><span className={`operator-rail__signal operator-rail__signal--${statusTone}`} /><strong>{statusLabel}</strong><span>{cycleLabel}</span></div>
@@ -8081,7 +8260,7 @@ const OperatorRail = ({
             </article>
           ))}
           {attention.map((item) => (
-            <button key={item.id} className={`operator-rail__attention operator-rail__attention--${item.tone}`} type="button" onClick={item.target === "credentials" ? onOpenSettings : onOpenWorkflow}>
+            <button key={item.id} className={`operator-rail__attention operator-rail__attention--${item.tone}`} type="button" onClick={item.target === "credentials" ? onOpenCredentials : onOpenWorkflow}>
               <span>{workflowAttentionKindLabel(item.kind)}</span><strong>{item.title}</strong><p>{item.detail}</p>
             </button>
           ))}
@@ -8090,6 +8269,7 @@ const OperatorRail = ({
       </section>
       <footer className="operator-rail__footer"><button type="button" onClick={onOpenWorkflow}>Workflow details</button><button type="button" onClick={onOpenSettings}>Settings</button></footer>
     </aside>
+    </>
   );
 };
 
@@ -8107,7 +8287,6 @@ const LauncherActionCard = ({
   copy,
   actionLabel,
   onAction,
-  featured = false,
   disabled = false
 }: {
   eyebrow: string;
@@ -8115,18 +8294,87 @@ const LauncherActionCard = ({
   copy: string;
   actionLabel: string;
   onAction: () => void;
-  featured?: boolean;
   disabled?: boolean;
 }) => (
-  <article className={`overview-card launcher-action ${featured ? "launcher-action--featured" : ""}`}>
-    <div className="eyebrow">{eyebrow}</div>
-    <h3>{title}</h3>
-    <p>{copy}</p>
-    <div className="actions-row">
-      <button className={featured ? "primary-button" : "secondary-button"} disabled={disabled} onClick={onAction}>{actionLabel}</button>
-    </div>
-  </article>
+  <button className="launcher-action" type="button" disabled={disabled} onClick={onAction}>
+    <span className="launcher-action__copy">
+      <span className="launcher-action__eyebrow">{eyebrow}</span>
+      <strong>{title}</strong>
+      <span>{copy}</span>
+    </span>
+    <span className="launcher-action__cta">
+      {actionLabel}
+      <span aria-hidden="true">→</span>
+    </span>
+  </button>
 );
+
+const LauncherReadinessSummary = ({
+  report,
+  availability,
+  onRunChecks,
+  onOpenSettings,
+  busy
+}: {
+  report: RuntimeReadinessReport;
+  availability: string;
+  onRunChecks: () => void;
+  onOpenSettings: () => void;
+  busy: boolean;
+}) => {
+  const statusChip = runtimeReadinessStatusChip(report);
+  const attentionChecks = report.checks.filter((check) => check.status !== "passed");
+  const statusTitle = report.status === "blocked"
+    ? "Setup needs attention"
+    : report.status === "checking"
+      ? "Checking your setup"
+      : "Ready for a new workspace";
+
+  return (
+    <aside className={`launcher-readiness launcher-readiness--${report.status}`} aria-labelledby="launcher-readiness-title">
+      <div className="launcher-readiness__heading">
+        <div>
+          <span className="launcher-kicker">Environment</span>
+          <strong id="launcher-readiness-title">{statusTitle}</strong>
+        </div>
+        <StatusChip {...statusChip} />
+      </div>
+      <p>{report.summary}</p>
+      <div className="launcher-readiness__availability">{availability}</div>
+      <details className="launcher-readiness__details">
+        <summary>
+          <span>{report.checks.length} setup {report.checks.length === 1 ? "check" : "checks"}</span>
+          <span>{attentionChecks.length ? `${attentionChecks.length} need attention` : "View details"}</span>
+        </summary>
+        <div className="launcher-readiness__details-body">
+          {report.checkedAt ? <div className="launcher-readiness__checked">Last checked {formatDateTime(report.checkedAt)}</div> : null}
+          <div className="launcher-readiness__checks">
+            {report.checks.map((check) => {
+              const checkChip = runtimeDependencyStatusChip(check.status);
+              return (
+                <div key={check.id} className={`launcher-readiness__check launcher-readiness__check--${check.status}`}>
+                  <div>
+                    <strong>{check.label}</strong>
+                    <StatusChip {...checkChip} />
+                  </div>
+                  <p>{check.message}</p>
+                  {check.fixInApp && check.status !== "passed" ? <p><strong>In Workbench:</strong> {check.fixInApp}</p> : null}
+                  {check.manualCommand && check.status !== "passed" ? <code>{check.manualCommand}</code> : null}
+                </div>
+              );
+            })}
+          </div>
+          <div className="actions-row launcher-readiness__actions">
+            <button className="primary-button" type="button" disabled={busy || report.status === "checking"} onClick={onRunChecks}>
+              {busy || report.status === "checking" ? "Checking…" : "Run setup checks"}
+            </button>
+            <button className="secondary-button" type="button" onClick={onOpenSettings}>Open settings</button>
+          </div>
+        </div>
+      </details>
+    </aside>
+  );
+};
 
 type RepositoryPathChatMessage = {
   id: string;
@@ -8612,7 +8860,8 @@ const WorkbenchApp = () => {
   const [customRecommendationPrompt, setCustomRecommendationPrompt] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [navigationCollapsed, setNavigationCollapsed] = useState(() => window.localStorage.getItem("catc.navigationCollapsed") === "true");
-  const [operatorRailCollapsed, setOperatorRailCollapsed] = useState(() => window.localStorage.getItem("catc.operatorRailCollapsed") === "true");
+  const [attentionDrawerOpen, setAttentionDrawerOpen] = useState(false);
+  const [advancedNavigationOpen, setAdvancedNavigationOpen] = useState(() => window.localStorage.getItem("catc.advancedNavigationOpen") === "true");
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [showExistingChoice, setShowExistingChoice] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState({
@@ -8635,26 +8884,24 @@ const WorkbenchApp = () => {
     appearanceDensity: "comfortable" as AppAppearanceDensity,
     motionMode: "system" as AppMotionMode
   });
+  const [settingsDraftDirty, setSettingsDraftDirty] = useState(false);
+  const [settingsSaveBusy, setSettingsSaveBusy] = useState(false);
+  const settingsSaveBusyRef = useRef(false);
+  const goalCharterDraftDirtyRef = useRef(false);
   const [notice, setNotice] = useState<NoticeState>();
   const [launchIntent, setLaunchIntent] = useState<ProjectLoadIntent>("open");
   const [projectCreationMode, setProjectCreationMode] = useState<ProjectCreationMode>("initialize_github");
   const [treeFilterDraft, setTreeFilterDraft] = useState("");
   const [repositorySearchResultIndex, setRepositorySearchResultIndex] = useState(0);
   const [focusedAgentId, setFocusedAgentId] = useState<string>();
-  const [ultimateGoalDraft, setUltimateGoalDraft] = useState({
-    summary: "",
-    detailedIntent: "",
-    successCriteria: "",
-    constraints: "",
-    nonGoals: "",
-    targetAudience: "",
-    qualityBar: ""
-  });
-  const [goalCharterDraft, setGoalCharterDraft] = useState<GoalCharterDraftState>(() => goalCharterDraftFromWorkflow());
+  const [ultimateGoalDrafts, setUltimateGoalDrafts] = useState<ProjectDraftMap<UltimateGoalDraftState>>({});
+  const [goalCharterDrafts, setGoalCharterDrafts] = useState<ProjectDraftMap<GoalCharterDraftState>>({});
   const [goalCharterAiModel, setGoalCharterAiModel] = useState("");
   const [goalCharterAiReasoningEffort, setGoalCharterAiReasoningEffort] = useState<InterfaceReasoningEffort>("medium");
-  const [goalCharterGeneratePrompt, setGoalCharterGeneratePrompt] = useState("");
+  const [goalCharterGeneratePrompts, setGoalCharterGeneratePrompts] = useState<Record<string, string>>({});
   const [goalCharterAiBusy, setGoalCharterAiBusy] = useState<GoalCharterAiBusyState>();
+  const goalCharterAiRequestSequenceRef = useRef(0);
+  const activeProjectContextRef = useRef<{ projectId?: string; epoch: number }>({ epoch: 0 });
   const [autopilotPresets, setAutopilotPresets] = useState<AutopilotPreset[]>(() => defaultAutopilotPresets());
   const [ultimateGoalImportPreview, setUltimateGoalImportPreview] = useState<UltimateGoalImportPreview | null>(null);
   const [interventionNotes, setInterventionNotes] = useState<Record<string, string>>({});
@@ -8663,6 +8910,7 @@ const WorkbenchApp = () => {
   const [shellLaunchBusy, setShellLaunchBusy] = useState(false);
   const [repairAgentLaunchBusy, setRepairAgentLaunchBusy] = useState(false);
   const [workflowCommandBusyKey, setWorkflowCommandBusyKey] = useState<string>();
+  const [previewCommandBusyKey, setPreviewCommandBusyKey] = useState<string>();
   const [runtimeCheckBusy, setRuntimeCheckBusy] = useState(false);
   const [codexUpdateBusy, setCodexUpdateBusy] = useState(false);
   const [codexUpdateBusyLabel, setCodexUpdateBusyLabel] = useState<string>();
@@ -8694,7 +8942,7 @@ const WorkbenchApp = () => {
   const [agentDetail, setAgentDetail] = useState<AgentState>();
   const [activityLogPageIndex, setActivityLogPageIndex] = useState(0);
   const [commandLogPageIndex, setCommandLogPageIndex] = useState(0);
-  const [activeWorkspaceTabOverride, setActiveWorkspaceTabOverride] = useState<WorkspaceVisualTabId>();
+  const [activeWorkspaceTabOverride, setActiveWorkspaceTabOverride] = useState<WorkspaceRouteId>();
   const tabLayoutPersistTimerRef = useRef<number | undefined>(undefined);
   const tabLayoutPersistRequestRef = useRef<{ projectId: string; tab: WorkspaceVisualTabId } | undefined>(undefined);
   const workbenchScrollRef = useRef<HTMLDivElement | null>(null);
@@ -8814,26 +9062,62 @@ const WorkbenchApp = () => {
   const settingsAppearanceTheme = state?.settings.appearanceTheme ?? "catc-dark";
   const settingsAppearanceDensity = state?.settings.appearanceDensity ?? "comfortable";
   const settingsMotionMode = state?.settings.motionMode ?? "system";
-  useAppAppearance(settingsAppearanceTheme, settingsAppearanceDensity, settingsMotionMode);
+  const persistedWorkspaceTab = normalizeWorkspaceTab(activeProject?.record.layout.activeCenterTab);
+  const activeWorkspaceRoute: WorkspaceRouteId = activeWorkspaceTabOverride ?? persistedWorkspaceTab;
+  const settingsAppearancePreviewActive = showSettings || activeWorkspaceRoute === "settings";
+  const activeAppearanceTheme = settingsAppearancePreviewActive ? settingsDraft.appearanceTheme : settingsAppearanceTheme;
+  const activeAppearanceDensity = settingsAppearancePreviewActive ? settingsDraft.appearanceDensity : settingsAppearanceDensity;
+  const activeMotionMode = settingsAppearancePreviewActive ? settingsDraft.motionMode : settingsMotionMode;
+  useAppAppearance(activeAppearanceTheme, activeAppearanceDensity, activeMotionMode);
   useEffect(() => {
     window.localStorage.setItem("catc.navigationCollapsed", String(navigationCollapsed));
   }, [navigationCollapsed]);
   useEffect(() => {
-    window.localStorage.setItem("catc.operatorRailCollapsed", String(operatorRailCollapsed));
-  }, [operatorRailCollapsed]);
+    window.localStorage.setItem("catc.advancedNavigationOpen", String(advancedNavigationOpen));
+  }, [advancedNavigationOpen]);
   const githubStatus = state?.github;
   const githubLinked = githubStatus?.state === "linked" || githubStatus?.state === "needs_ssh";
   const githubSshReady = githubStatus?.sshReady ?? false;
-  const launcherActionsLocked = !githubLinked;
   const createWorkspaceUsesGitHub = projectCreationMode === "initialize_github";
   const createWorkspaceLocked = createWorkspaceUsesGitHub && !githubSshReady;
   const activeProjectId = activeProject?.record.id;
   const workflow = activeProject?.record.workflow;
+  useLayoutEffect(() => {
+    if (activeProjectContextRef.current.projectId !== activeProjectId) {
+      activeProjectContextRef.current = {
+        projectId: activeProjectId,
+        epoch: activeProjectContextRef.current.epoch + 1
+      };
+    }
+  }, [activeProjectId]);
+  const ultimateGoalSourceDraft = useMemo(
+    () => ultimateGoalDraftFromWorkflow(workflow),
+    [workflow]
+  );
+  const ultimateGoalSourceKey = JSON.stringify(ultimateGoalSourceDraft);
+  const ultimateGoalDraftEntry = activeProjectId
+    ? resolveProjectDraft(ultimateGoalDrafts, activeProjectId, ultimateGoalSourceDraft, ultimateGoalSourceKey)
+    : { draft: ultimateGoalSourceDraft, dirty: false, sourceKey: ultimateGoalSourceKey };
+  const ultimateGoalDraft = ultimateGoalDraftEntry.draft;
+  const goalCharterSourceDraft = useMemo(
+    () => goalCharterDraftFromWorkflow(workflow),
+    [workflow]
+  );
+  const goalCharterSourceKey = JSON.stringify(goalCharterSourceDraft);
+  const goalCharterDraftEntry = activeProjectId
+    ? resolveProjectDraft(goalCharterDrafts, activeProjectId, goalCharterSourceDraft, goalCharterSourceKey)
+    : { draft: goalCharterSourceDraft, dirty: false, sourceKey: goalCharterSourceKey };
+  const goalCharterDraft = goalCharterDraftEntry.draft;
+  const goalCharterDraftDirty = goalCharterDraftEntry.dirty;
+  goalCharterDraftDirtyRef.current = goalCharterDraftDirty;
+  const goalCharterGeneratePrompt = projectScopedText(goalCharterGeneratePrompts, activeProjectId);
+  const activeGoalCharterAiBusy = goalCharterAiBusy?.projectId === activeProjectId ? goalCharterAiBusy : undefined;
   const workflowCanRevalidateRepair = canRevalidateExternalRepair(workflow);
   const runtimeReadiness = state?.runtimeReadiness;
   const agentActionsBlocked = Boolean(runtimeReadiness?.blockAgentActions);
   const activeWorkflowCommandBusy = Boolean(activeProjectId && workflowCommandBusyKey?.startsWith(`${activeProjectId}:`));
   const workflowCommandBusy = activeWorkflowCommandBusy || agentActionsBlocked;
+  const previewCommandBusy = Boolean(activeProjectId && previewCommandBusyKey?.startsWith(`${activeProjectId}:`));
   const workflowCommandBusyReason = activeWorkflowCommandBusy
     ? "Workflow command is already running."
     : agentActionsBlocked
@@ -8891,6 +9175,11 @@ const WorkbenchApp = () => {
   const workflowMode = workflow?.workflowMode ?? "normal";
   const previewRequest = workflow?.previewRequest;
   const previewStatus = previewRequest?.status ?? "none";
+  const previewProjection = state?.preview && activeProjectId && (
+    state.preview.activeSession?.projectId === activeProjectId ||
+    state.preview.readiness?.projectId === activeProjectId ||
+    state.preview.latestReport?.projectId === activeProjectId
+  ) ? state.preview : undefined;
   const previewDisabledReason = workflow && !workflow.ultimateGoal.confirmedAt
     ? "Confirm the Ultimate Goal first."
     : undefined;
@@ -9178,8 +9467,10 @@ const WorkbenchApp = () => {
       : undefined,
     [allAgents, selectedFile]
   );
-  const selectedWorkspaceTab: WorkspaceVisualTabId = activeWorkspaceTabOverride ?? normalizeWorkspaceTab(activeProject?.record.layout.activeCenterTab);
-  const activeWorkspaceTab = useDeferredValue(selectedWorkspaceTab);
+  const selectedWorkspaceTab: WorkspaceVisualTabId = isPersistedWorkspaceRoute(activeWorkspaceRoute)
+    ? activeWorkspaceRoute
+    : persistedWorkspaceTab;
+  const activeWorkspaceTab = activeWorkspaceRoute;
 
   useLayoutEffect(() => {
     const resetViewportScroll = () => {
@@ -9245,13 +9536,34 @@ const WorkbenchApp = () => {
     }
 
     setActiveWorkspaceTabOverride(tab);
+    window.localStorage.setItem(workspaceRouteStorageKey(activeProject.record.id), tab);
     scheduleWorkspaceTabPersist(activeProject.record.id, tab);
   };
+
+  const setWorkspaceRoute = (route: WorkspaceRouteId) => {
+    if (!activeProject) {
+      return;
+    }
+    if (isPersistedWorkspaceRoute(route)) {
+      setWorkspaceTab(route);
+    } else {
+      setActiveWorkspaceTabOverride(route);
+      window.localStorage.setItem(workspaceRouteStorageKey(activeProject.record.id), route);
+    }
+    setAttentionDrawerOpen(false);
+  };
+
+  useEffect(() => {
+    if (activeWorkspaceRoute !== "overview" && activeWorkspaceRoute !== "preview" && activeWorkspaceRoute !== "activity") {
+      setAdvancedNavigationOpen(true);
+    }
+    setAttentionDrawerOpen(false);
+  }, [activeWorkspaceRoute]);
 
   useEffect(() => {
     visualExportReadinessRef.current = {
       activeProjectId,
-      activeWorkspaceTab,
+      activeWorkspaceTab: selectedWorkspaceTab,
       logFeedProjectId: logFeed.projectId,
       logFeedLoading: logFeed.loading,
       repositoryProjectId: repositoryData.projectId,
@@ -9263,7 +9575,7 @@ const WorkbenchApp = () => {
     };
   }, [
     activeProjectId,
-    activeWorkspaceTab,
+    selectedWorkspaceTab,
     historyData.loading,
     historyData.projectId,
     logFeed.loading,
@@ -9275,33 +9587,43 @@ const WorkbenchApp = () => {
   ]);
 
   useEffect(() => {
-    if (selectedWorkspaceTab !== "workflow") {
+    if (activeWorkspaceRoute !== "workflow") {
       setWorkflowDetailsMounted(false);
     }
-  }, [selectedWorkspaceTab]);
+  }, [activeWorkspaceRoute]);
 
   useEffect(() => {
     document.title = activeProject ? `${activeProject.record.identity.projectName} · ${APP_NAME}` : APP_NAME;
   }, [activeProject]);
 
   useEffect(() => {
-    const goal = activeProject?.record.workflow.ultimateGoal;
-    setUltimateGoalDraft({
-      summary: goal?.summary ?? "",
-      detailedIntent: goal?.detailedIntent ?? "",
-      successCriteria: fromLineList(goal?.successCriteria),
-      constraints: fromLineList(goal?.constraints),
-      nonGoals: fromLineList(goal?.nonGoals),
-      targetAudience: goal?.targetAudience ?? "",
-      qualityBar: goal?.qualityBar ?? ""
-    });
-    setUltimateGoalImportPreview(null);
-    setInterventionNotes({});
-  }, [activeProject?.record.id, activeProject?.record.workflow.ultimateGoal]);
+    if (!activeProjectId) {
+      return;
+    }
+    setUltimateGoalDrafts((current) => hydrateProjectDraft(
+      current,
+      activeProjectId,
+      ultimateGoalSourceDraft,
+      ultimateGoalSourceKey
+    ));
+  }, [activeProjectId, ultimateGoalSourceDraft, ultimateGoalSourceKey]);
 
   useEffect(() => {
-    setGoalCharterDraft(goalCharterDraftFromWorkflow(activeProject?.record.workflow));
-  }, [activeProject?.record.id, activeProject?.record.workflow]);
+    if (!activeProjectId) {
+      return;
+    }
+    setGoalCharterDrafts((current) => hydrateProjectDraft(
+      current,
+      activeProjectId,
+      goalCharterSourceDraft,
+      goalCharterSourceKey
+    ));
+  }, [activeProjectId, goalCharterSourceDraft, goalCharterSourceKey]);
+
+  useEffect(() => {
+    setUltimateGoalImportPreview(null);
+    setInterventionNotes({});
+  }, [activeProjectId]);
 
   useEffect(() => {
     if (!stateLoaded) {
@@ -9361,7 +9683,9 @@ const WorkbenchApp = () => {
   }, [selectedFile]);
 
   useEffect(() => {
-    if (!stateLoaded || !showSettings) {
+    // Keep the inactive draft hydrated too. Otherwise opening Settings briefly
+    // reapplies its dark/comfortable initializer before this effect catches up.
+    if (!stateLoaded || settingsDraftDirty) {
       return;
     }
 
@@ -9429,7 +9753,7 @@ const WorkbenchApp = () => {
     settingsReasoning,
     settingsWarnOnMntMount,
     settingsWorktreeBaseDir,
-    showSettings,
+    settingsDraftDirty,
     stateLoaded
   ]);
 
@@ -9456,6 +9780,8 @@ const WorkbenchApp = () => {
       setCommandLogPageIndex(0);
       setAgentDetail(undefined);
       setActiveWorkspaceTabOverride(undefined);
+      setAttentionDrawerOpen(false);
+      setSettingsDraftDirty(false);
       setRepositoryData(emptyRepositoryData());
       setRepositoryScanStatus(null);
       setRepositoryScanLimits(null);
@@ -9479,7 +9805,12 @@ const WorkbenchApp = () => {
     setActivityLogPageIndex(0);
     setCommandLogPageIndex(0);
     setAgentDetail(undefined);
-    setActiveWorkspaceTabOverride(activeProjectId ? "overview" : undefined);
+    const savedRoute = activeProjectId
+      ? parseRememberedWorkspaceRoute(window.localStorage.getItem(workspaceRouteStorageKey(activeProjectId)))
+      : undefined;
+    setActiveWorkspaceTabOverride(savedRoute);
+    setAttentionDrawerOpen(false);
+    setSettingsDraftDirty(false);
     setRepositoryData(emptyRepositoryData());
     setRepositoryScanStatus(null);
     setRepositoryScanLimits(null);
@@ -10499,6 +10830,7 @@ const WorkbenchApp = () => {
     if (!scrollContainer) {
       throw new Error("The workspace scroll area is not available for visual extraction.");
     }
+    const originalRoute = activeWorkspaceRoute;
     const originalTab = selectedWorkspaceTab;
     const originalScrollY = scrollContainer.scrollTop;
     let exportId: string | undefined;
@@ -10538,7 +10870,7 @@ const WorkbenchApp = () => {
     } finally {
       setVisualExtractBusy(false);
       if (visualExportReadinessRef.current.activeProjectId === projectId) {
-        setActiveWorkspaceTabOverride(originalTab);
+        setActiveWorkspaceTabOverride(originalRoute);
         await window.workbench.updateLayout(projectId, { activeCenterTab: originalTab }).catch(() => undefined);
         await waitForVisualRender();
         scrollContainer.scrollTo({ top: originalScrollY, left: 0, behavior: "instant" });
@@ -10946,12 +11278,20 @@ const WorkbenchApp = () => {
       return;
     }
 
+    const projectId = activeProject.record.id;
     try {
+      setPreviewCommandBusyKey(`${projectId}:start`);
       setNotice(undefined);
-      await window.workbench.requestWorkflowPreview(activeProject.record.id);
-      showInfoNotice("Preview generation queued.");
+      const session = await window.workbench.startProjectPreview(projectId, "explicit");
+      showInfoNotice(
+        session.status === "trust_required"
+          ? "Review the detected preview command before it runs."
+          : "Local browser preview started."
+      );
     } catch (error) {
       handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
     }
   };
 
@@ -10960,13 +11300,141 @@ const WorkbenchApp = () => {
       return;
     }
 
+    const projectId = activeProject.record.id;
     try {
+      setPreviewCommandBusyKey(`${projectId}:cancel`);
       setNotice(undefined);
-      await window.workbench.cancelWorkflowPreview(activeProject.record.id);
+      const sessionId = previewProjection?.activeSession?.projectId === projectId
+        ? previewProjection.activeSession.id
+        : undefined;
+      if (sessionId) {
+        await window.workbench.stopProjectPreview(projectId, sessionId);
+      }
+      await window.workbench.cancelWorkflowPreview(projectId);
       showInfoNotice("Preview request cancelled.");
     } catch (error) {
       handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
     }
+  };
+
+  const refreshPreviewReadiness = async () => {
+    if (!activeProject) {
+      return;
+    }
+    const projectId = activeProject.record.id;
+    try {
+      setPreviewCommandBusyKey(`${projectId}:readiness`);
+      setNotice(undefined);
+      const readiness = await window.workbench.getPreviewReadiness(projectId);
+      showInfoNotice(readiness.message);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
+    }
+  };
+
+  const grantPreviewTrust = async () => {
+    if (!activeProject) {
+      return;
+    }
+    const projectId = activeProject.record.id;
+    const pendingSession = previewProjection?.activeSession;
+    if (!pendingSession || pendingSession.projectId !== projectId || pendingSession.status !== "trust_required") {
+      handleError(new Error("The pending preview command changed. Review the current Preview session before granting trust."));
+      return;
+    }
+    try {
+      setPreviewCommandBusyKey(`${projectId}:trust`);
+      setNotice(undefined);
+      const session = await window.workbench.grantPreviewTrust(projectId, pendingSession.id);
+      showInfoNotice(session.status === "ready" ? "Browser evidence is ready for review." : "Preview command trusted and started.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
+    }
+  };
+
+  const installPreviewBrowser = async () => {
+    if (!activeProject) {
+      return;
+    }
+    const projectId = activeProject.record.id;
+    try {
+      setPreviewCommandBusyKey(`${projectId}:install-browser`);
+      setNotice(undefined);
+      const readiness = await window.workbench.installPreviewBrowser(projectId);
+      showInfoNotice(readiness.message);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
+    }
+  };
+
+  const stopProjectPreview = async (sessionId: string) => {
+    if (!activeProject) {
+      return;
+    }
+    const projectId = activeProject.record.id;
+    try {
+      setPreviewCommandBusyKey(`${projectId}:stop`);
+      setNotice(undefined);
+      await window.workbench.stopProjectPreview(projectId, sessionId);
+      showInfoNotice("Local preview stopped. No project files were changed.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
+    }
+  };
+
+  const openPreviewInLocalBrowser = async (sessionId: string) => {
+    if (!activeProject) {
+      return;
+    }
+    const projectId = activeProject.record.id;
+    try {
+      setPreviewCommandBusyKey(`${projectId}:open-browser`);
+      setNotice(undefined);
+      await window.workbench.openPreviewExternal(projectId, sessionId);
+      showInfoNotice("Opened the validated local preview URL in your default Windows browser.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
+    }
+  };
+
+  const captureCurrentPreview = async (sessionId: string) => {
+    if (!activeProject) {
+      return;
+    }
+    const projectId = activeProject.record.id;
+    try {
+      setPreviewCommandBusyKey(`${projectId}:capture`);
+      setNotice(undefined);
+      await window.workbench.performPreviewAction(projectId, sessionId, { type: "snapshot" });
+      await window.workbench.performPreviewAction(projectId, sessionId, { type: "screenshot", label: "Manual review capture" });
+      showInfoNotice("Fresh browser evidence captured.");
+    } catch (error) {
+      handleError(error);
+    } finally {
+      setPreviewCommandBusyKey(undefined);
+    }
+  };
+
+  const loadPreviewArtifact = async (sessionId: string, artifactId: string) => {
+    if (!activeProject) {
+      throw new Error("Open a project before loading preview evidence.");
+    }
+    if (previewProjection?.activeSession?.id !== sessionId) {
+      throw new Error("This evidence belongs to a preview session that is no longer active.");
+    }
+    return await window.workbench.getPreviewArtifact(activeProject.record.id, sessionId, artifactId);
   };
 
   const completeWorkflowPreview = async () => {
@@ -11100,6 +11568,67 @@ const WorkbenchApp = () => {
     });
   };
 
+  const updateUltimateGoalDraft = (next: UltimateGoalDraftState) => {
+    if (!activeProjectId) {
+      return;
+    }
+    setUltimateGoalDrafts((current) => editProjectDraft(
+      current,
+      activeProjectId,
+      ultimateGoalSourceDraft,
+      ultimateGoalSourceKey,
+      () => next
+    ));
+  };
+
+  const updateGoalCharterDraft = (next: GoalCharterDraftUpdate) => {
+    if (!activeProjectId) {
+      return;
+    }
+    goalCharterDraftDirtyRef.current = true;
+    setGoalCharterDrafts((current) => editProjectDraft(
+      current,
+      activeProjectId,
+      goalCharterSourceDraft,
+      goalCharterSourceKey,
+      (draft) => ({
+        ...draft,
+        ...next,
+        autopilotStrategy: next.autopilotStrategy ? cloneStrategy(next.autopilotStrategy) : draft.autopilotStrategy
+      })
+    ));
+  };
+
+  const updateGoalCharterGeneratePrompt = (prompt: string) => {
+    if (!activeProjectId) {
+      return;
+    }
+    setGoalCharterGeneratePrompts((current) => ({ ...current, [activeProjectId]: prompt }));
+  };
+
+  const goalCharterRequestIsCurrent = (request: ProjectRequestIdentity): boolean =>
+    isCurrentProjectRequest(
+      request,
+      activeProjectContextRef.current.projectId,
+      activeProjectContextRef.current.epoch,
+      goalCharterAiRequestSequenceRef.current
+    );
+
+  const applyGoalCharterAiUpdate = (
+    request: ProjectRequestIdentity,
+    requestDraft: GoalCharterDraftState,
+    update: GoalCharterDraftUpdate
+  ) => {
+    goalCharterDraftDirtyRef.current = true;
+    setGoalCharterDrafts((current) => editProjectDraft(
+      current,
+      request.projectId,
+      requestDraft,
+      current[request.projectId]?.sourceKey ?? JSON.stringify(requestDraft),
+      (draft) => ({ ...draft, ...update })
+    ));
+  };
+
   const saveUltimateGoal = async () => {
     if (!activeProject) {
       return;
@@ -11125,6 +11654,7 @@ const WorkbenchApp = () => {
       if (Object.keys(importedCharterPatch).length > 0) {
         await window.workbench.updateGoalCharter(activeProject.record.id, importedCharterPatch);
       }
+      setUltimateGoalDrafts((current) => markProjectDraftClean(current, activeProject.record.id));
       setUltimateGoalImportPreview(null);
       showInfoNotice("Ultimate Goal confirmed.");
     } catch (error) {
@@ -11132,21 +11662,12 @@ const WorkbenchApp = () => {
     }
   };
 
-  const updateGoalCharterDraft = (next: GoalCharterDraftUpdate) => setGoalCharterDraft((current) => ({
-    ...current,
-    ...next,
-    autopilotStrategy: next.autopilotStrategy ? cloneStrategy(next.autopilotStrategy) : current.autopilotStrategy
-  }));
-
   const applyAutopilotPreset = (preset: AutopilotPreset) => {
-    setGoalCharterDraft((current) => ({
-      ...current,
-      autopilotStrategy: cloneStrategy(preset.strategy)
-    }));
+    updateGoalCharterDraft({ autopilotStrategy: cloneStrategy(preset.strategy) });
   };
 
   const polishGoalCharterField = async (field: GoalCharterDraftTextField) => {
-    if (!activeProject || goalCharterAiBusy) {
+    if (!activeProject || activeGoalCharterAiBusy) {
       return;
     }
     const value = goalCharterDraft[field].trim();
@@ -11159,30 +11680,38 @@ const WorkbenchApp = () => {
       return;
     }
 
+    const request: ProjectRequestIdentity = {
+      projectId: activeProject.record.id,
+      projectEpoch: activeProjectContextRef.current.epoch,
+      requestId: ++goalCharterAiRequestSequenceRef.current
+    };
+    const requestDraft = goalCharterDraft;
     try {
       setNotice(undefined);
-      setGoalCharterAiBusy({ kind: "polish", field });
-      const result = await window.workbench.polishGoalCharterField(activeProject.record.id, {
+      setGoalCharterAiBusy({ kind: "polish", field, projectId: request.projectId, requestId: request.requestId });
+      const result = await window.workbench.polishGoalCharterField(request.projectId, {
         field,
         value,
-        currentDraft: goalCharterDraftAiPayload(goalCharterDraft),
+        currentDraft: goalCharterDraftAiPayload(requestDraft),
         model: goalCharterAiModel,
         reasoningEffort: goalCharterAiReasoningEffort
       });
-      setGoalCharterDraft((current) => ({
-        ...current,
-        [result.field]: result.value
-      }));
+      if (!goalCharterRequestIsCurrent(request)) {
+        return;
+      }
+      applyGoalCharterAiUpdate(request, requestDraft, { [result.field]: result.value });
       showInfoNotice("Polished the Goal Charter field. Review before saving.");
     } catch (error) {
-      handleError(error);
+      if (goalCharterRequestIsCurrent(request)) {
+        handleError(error);
+      }
     } finally {
-      setGoalCharterAiBusy(undefined);
+      setGoalCharterAiBusy((current) => current?.requestId === request.requestId ? undefined : current);
     }
   };
 
   const generateGoalCharterDraft = async () => {
-    if (!activeProject || goalCharterAiBusy) {
+    if (!activeProject || activeGoalCharterAiBusy) {
       return;
     }
     const prompt = goalCharterGeneratePrompt.trim();
@@ -11195,24 +11724,32 @@ const WorkbenchApp = () => {
       return;
     }
 
+    const request: ProjectRequestIdentity = {
+      projectId: activeProject.record.id,
+      projectEpoch: activeProjectContextRef.current.epoch,
+      requestId: ++goalCharterAiRequestSequenceRef.current
+    };
+    const requestDraft = goalCharterDraft;
     try {
       setNotice(undefined);
-      setGoalCharterAiBusy({ kind: "generate" });
-      const result = await window.workbench.generateGoalCharterDraft(activeProject.record.id, {
+      setGoalCharterAiBusy({ kind: "generate", projectId: request.projectId, requestId: request.requestId });
+      const result = await window.workbench.generateGoalCharterDraft(request.projectId, {
         prompt,
-        currentDraft: goalCharterDraftAiPayload(goalCharterDraft),
+        currentDraft: goalCharterDraftAiPayload(requestDraft),
         model: goalCharterAiModel,
         reasoningEffort: goalCharterAiReasoningEffort
       });
-      setGoalCharterDraft((current) => ({
-        ...current,
-        ...goalCharterDraftUpdateFromAi(result.draft)
-      }));
+      if (!goalCharterRequestIsCurrent(request)) {
+        return;
+      }
+      applyGoalCharterAiUpdate(request, requestDraft, goalCharterDraftUpdateFromAi(result.draft));
       showInfoNotice("Generated a Goal Charter draft. Review and save it when it matches your intent.");
     } catch (error) {
-      handleError(error);
+      if (goalCharterRequestIsCurrent(request)) {
+        handleError(error);
+      }
     } finally {
-      setGoalCharterAiBusy(undefined);
+      setGoalCharterAiBusy((current) => current?.requestId === request.requestId ? undefined : current);
     }
   };
 
@@ -11253,6 +11790,7 @@ const WorkbenchApp = () => {
         definitionOfDone: toLineList(draft.definitionOfDone),
         autopilotStrategy: draft.autopilotStrategy
       });
+      setGoalCharterDrafts((current) => markProjectDraftClean(current, projectId));
       setUltimateGoalImportPreview(null);
       showInfoNotice("Goal Charter and Autopilot Strategy saved.");
     } catch (error) {
@@ -11343,7 +11881,7 @@ const WorkbenchApp = () => {
     try {
       setNotice(undefined);
       const detected = await window.workbench.detectUltimateGoal(activeProject.record.id);
-      setUltimateGoalDraft({
+      updateUltimateGoalDraft({
         summary: detected.summary,
         detailedIntent: detected.detailedIntent,
         successCriteria: fromLineList(detected.successCriteria),
@@ -11370,7 +11908,7 @@ const WorkbenchApp = () => {
       if (!imported) {
         return;
       }
-      setUltimateGoalDraft({
+      updateUltimateGoalDraft({
         summary: imported.goal.summary,
         detailedIntent: imported.goal.detailedIntent,
         successCriteria: fromLineList(imported.goal.successCriteria),
@@ -11379,10 +11917,7 @@ const WorkbenchApp = () => {
         targetAudience: imported.goal.targetAudience,
         qualityBar: imported.goal.qualityBar
       });
-      setGoalCharterDraft((current) => ({
-        ...current,
-        ...goalCharterDraftUpdateFromImport(imported)
-      }));
+      updateGoalCharterDraft(goalCharterDraftUpdateFromImport(imported));
       setUltimateGoalImportPreview(imported);
       showInfoNotice(
         imported.completeness === "complete"
@@ -11400,7 +11935,7 @@ const WorkbenchApp = () => {
       return;
     }
 
-    setUltimateGoalDraft({
+    updateUltimateGoalDraft({
       summary: detected.summary,
       detailedIntent: detected.detailedIntent,
       successCriteria: fromLineList(detected.successCriteria),
@@ -11625,6 +12160,11 @@ const WorkbenchApp = () => {
   };
 
   const saveSettings = async () => {
+    if (!state || settingsSaveBusyRef.current) {
+      return;
+    }
+    settingsSaveBusyRef.current = true;
+    setSettingsSaveBusy(true);
     try {
       setNotice(undefined);
       await window.workbench.updateSettings({
@@ -11646,20 +12186,36 @@ const WorkbenchApp = () => {
         appearanceTheme: settingsDraft.appearanceTheme,
         appearanceDensity: settingsDraft.appearanceDensity,
         motionMode: settingsDraft.motionMode
-      });
-      setShowSettings(false);
+      }, state.settingsRevision);
+      setSettingsDraftDirty(false);
+      if (settingsSaveShouldClose(goalCharterDraftDirtyRef.current)) {
+        setShowSettings(false);
+      } else {
+        showInfoNotice("Settings saved. Your project Goal Charter still has unsaved changes; save it before leaving Settings.");
+      }
     } catch (error) {
       handleError(error);
+    } finally {
+      settingsSaveBusyRef.current = false;
+      setSettingsSaveBusy(false);
     }
   };
 
   const cycleAppearanceTheme = async () => {
+    if (!state || settingsSaveBusyRef.current) {
+      return;
+    }
     const themes: AppAppearanceTheme[] = ["catc-dark", "catc-light", "space"];
-    const currentIndex = themes.indexOf(settingsAppearanceTheme);
+    const currentIndex = themes.indexOf(activeAppearanceTheme);
     const appearanceTheme = themes[(currentIndex + 1) % themes.length];
+    if (settingsAppearancePreviewActive) {
+      setSettingsDraftDirty(true);
+      setSettingsDraft((current) => ({ ...current, appearanceTheme }));
+      return;
+    }
     try {
       setNotice(undefined);
-      await window.workbench.updateSettings({ appearanceTheme });
+      await window.workbench.updateSettings({ appearanceTheme }, state.settingsRevision);
     } catch (error) {
       handleError(error);
     }
@@ -11719,7 +12275,12 @@ const WorkbenchApp = () => {
     );
   }
 
-  const updateSettingsDraft = (next: SettingsDraftUpdate) => setSettingsDraft((current) => {
+  const updateSettingsDraft = (next: SettingsDraftUpdate) => {
+    if (settingsSaveBusyRef.current) {
+      return;
+    }
+    setSettingsDraftDirty(true);
+    setSettingsDraft((current) => {
     const nextModel = next.interfaceCreationModel ?? current.interfaceCreationModel;
     const nextReasoning = resolveInterfaceCreationReasoningEffort(
       modelOptionsByName.get(nextModel),
@@ -11734,7 +12295,7 @@ const WorkbenchApp = () => {
         resolveAgentReasoningEffort(modelOptionsByName.get(nextModel), category, agentCategoryLabel(category), "manual", rawAgentReasoningEfforts[category])
       ])
     ) as Record<AgentCategory, InterfaceReasoningEffort>;
-    return {
+      return {
       executionMode: next.executionMode ?? current.executionMode,
       distroName: next.distroName ?? current.distroName,
       codexBinaryPath: next.codexBinaryPath ?? current.codexBinaryPath,
@@ -11753,8 +12314,9 @@ const WorkbenchApp = () => {
       appearanceTheme: next.appearanceTheme ?? current.appearanceTheme,
       appearanceDensity: next.appearanceDensity ?? current.appearanceDensity,
       motionMode: next.motionMode ?? current.motionMode
-    };
-  });
+      };
+    });
+  };
 
   const settingsDialog = showSettings && state ? (
     <SettingsDialog
@@ -11762,17 +12324,20 @@ const WorkbenchApp = () => {
       activeProject={activeProject}
       github={state.github}
       settingsDraft={settingsDraft}
+      settingsDirty={settingsDraftDirty}
+      settingsSaving={settingsSaveBusy}
+      goalCharterDirty={goalCharterDraftDirty}
       goalCharterDraft={goalCharterDraft}
       goalCharterAiModel={goalCharterAiModel}
       goalCharterAiReasoningEffort={goalCharterAiReasoningEffort}
       goalCharterGeneratePrompt={goalCharterGeneratePrompt}
-      goalCharterAiBusy={goalCharterAiBusy}
+      goalCharterAiBusy={activeGoalCharterAiBusy}
       autopilotPresets={autopilotPresets}
       onChange={updateSettingsDraft}
       onGoalCharterChange={updateGoalCharterDraft}
       onGoalCharterAiModelChange={setGoalCharterAiModel}
       onGoalCharterAiReasoningEffortChange={setGoalCharterAiReasoningEffort}
-      onGoalCharterGeneratePromptChange={setGoalCharterGeneratePrompt}
+      onGoalCharterGeneratePromptChange={updateGoalCharterGeneratePrompt}
       onPolishGoalCharterField={(field) => void polishGoalCharterField(field)}
       onGenerateGoalCharterDraft={() => void generateGoalCharterDraft()}
       onSave={saveSettings}
@@ -11782,7 +12347,17 @@ const WorkbenchApp = () => {
       onRejectDetectedGoal={() => void rejectDetectedGoal()}
       onImportUltimateGoalText={() => void importUltimateGoalText()}
       onDownloadUltimateGoalFormat={downloadUltimateGoalFormat}
-      onClose={() => setShowSettings(false)}
+      onClose={() => {
+        if (settingsSaveBusyRef.current) {
+          return;
+        }
+        if (!settingsSaveShouldClose(goalCharterDraftDirty)) {
+          setNotice({ message: "Save the project Goal Charter and strategy before closing Settings.", tone: "error" });
+          return;
+        }
+        setSettingsDraftDirty(false);
+        setShowSettings(false);
+      }}
       onOpenDevTools={() => void openDevTools()}
       onRefreshGitHubStatus={() => void refreshGitHubStatus()}
       onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
@@ -11930,81 +12505,73 @@ const WorkbenchApp = () => {
   }
 
   if (!activeProject) {
-    const createModeTitle = createWorkspaceUsesGitHub ? "Initialize new GitHub repo" : "Use folder as-is";
+    const createModeTitle = createWorkspaceUsesGitHub ? "Create a GitHub repository" : "Keep the folder local";
     const createModeCopy = createWorkspaceUsesGitHub
-      ? "Select a project folder and prepare it as an SSH-backed GitHub repository when needed."
-      : "Select a project folder, scan it, and keep it local without creating or pushing a GitHub repository.";
-    const createActionLabel = createWorkspaceUsesGitHub ? "Select Folder & Initialize GitHub" : "Select Folder & Use As-Is";
+      ? "Choose a folder and prepare it as an SSH-backed GitHub repository when needed."
+      : "Choose a folder, scan it, and keep it on this computer without creating or pushing a GitHub repository.";
+    const createActionLabel = createWorkspaceUsesGitHub ? "Create GitHub workspace" : "Use local folder";
 
     return (
       <div ref={launcherScrollRef} className="shell shell--launcher">
         <div className="loader-card loader-card--wide launcher-shell">
           <BrandHeader
             title={APP_NAME}
-            subtitle="Desktop launcher"
+            subtitle="Workspace launcher"
             actions={
               <div className="actions-row">
-                <button className="secondary-button" onClick={() => setShowSettings(true)}>Open Settings</button>
-                <button className="secondary-button" onClick={() => void quitApp()}>Exit App</button>
+                <button className="secondary-button" type="button" onClick={() => setShowSettings(true)}>Settings</button>
+                <button className="secondary-button" type="button" onClick={() => void quitApp()}>Exit</button>
               </div>
             }
           />
           <section className="hero-card launcher-hero">
             <div className="hero-card__content">
-              <div className="eyebrow">Start here</div>
-              <h2>Open a repository, create a workspace, or resume a recent project.</h2>
+              <div className="launcher-kicker">Start a workspace</div>
+              <h2>Begin with the project you want to build.</h2>
               <p className="hero-card__lead">
-                Choose whether a new workspace should create a GitHub repository or use the selected folder exactly as it is.
+                Open an existing project or choose how Workbench should prepare a new folder. Agent runs, approvals, previews, and evidence stay together here.
               </p>
               <div className="workspace-create-mode" aria-label="New workspace creation mode">
                 <div className="workspace-create-mode__header">
-                  <span>New workspace mode</span>
+                  <span>For a new workspace</span>
                   <strong>{createModeTitle}</strong>
                 </div>
-                <div className="segmented-control">
+                <div className="segmented-control" role="group" aria-label="How to prepare a new workspace">
                   <button
                     className={createWorkspaceUsesGitHub ? "segmented-control__button segmented-control__button--active" : "segmented-control__button"}
                     type="button"
+                    aria-pressed={createWorkspaceUsesGitHub}
                     onClick={() => setProjectCreationMode("initialize_github")}
                   >
-                    Initialize GitHub Repo
+                    Create GitHub repository
                   </button>
                   <button
                     className={!createWorkspaceUsesGitHub ? "segmented-control__button segmented-control__button--active" : "segmented-control__button"}
                     type="button"
+                    aria-pressed={!createWorkspaceUsesGitHub}
                     onClick={() => setProjectCreationMode("use_folder_as_is")}
                   >
-                    Use Folder As-Is
+                    Keep folder local
                   </button>
                 </div>
                 <p>{createModeCopy}</p>
               </div>
-              <div className="actions-row">
-                <button className="primary-button" disabled={launcherActionsLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("open")}>
-                  {projectLoadBusy === "open" ? <LoadingIndicator label="Opening" compact /> : "Open GitHub Repo"}
+              <div className="actions-row launcher-hero__actions">
+                <button className="primary-button" type="button" disabled={Boolean(projectLoadBusy)} onClick={() => void openFolder("open")}>
+                  {projectLoadBusy === "open" ? <LoadingIndicator label="Opening" compact /> : "Open a project"}
                 </button>
-                <button className="secondary-button" disabled={createWorkspaceLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("create")}>
+                <button className="secondary-button" type="button" disabled={createWorkspaceLocked || Boolean(projectLoadBusy)} onClick={() => void openFolder("create")}>
                   {projectLoadBusy === "create" ? <LoadingIndicator label={createWorkspaceUsesGitHub ? "Initializing" : "Scanning"} compact /> : createActionLabel}
                 </button>
               </div>
             </div>
-            <div className="hero-card__aside">
-              <div className="metric-card">
-                <span className="metric-card__label">Recent projects</span>
-                <strong>{recentProjects.length}</strong>
-                <span>{recentProjects.length ? "Ready to reopen in this window" : "No saved workspaces yet"}</span>
-              </div>
-              <div className="notice">{availabilityMessage(state)}</div>
-              {state.runtimeReadiness.blockAgentActions ? (
-                <RuntimeReadinessPanel
-                  report={state.runtimeReadiness}
-                  onRunChecks={() => void checkRuntimeReadiness()}
-                  onOpenSettings={() => setShowSettings(true)}
-                  busy={runtimeCheckBusy}
-                  compact
-                />
-              ) : null}
-            </div>
+            <LauncherReadinessSummary
+              report={state.runtimeReadiness}
+              availability={availabilityMessage(state)}
+              onRunChecks={() => void checkRuntimeReadiness()}
+              onOpenSettings={() => setShowSettings(true)}
+              busy={runtimeCheckBusy}
+            />
           </section>
           {notice ? <div className={notice.tone === "error" ? "notice notice--error" : "notice"}>{notice.message}</div> : null}
           <CodexUpdateProgressNotice label={codexUpdateBusyLabel} />
@@ -12027,53 +12594,24 @@ const WorkbenchApp = () => {
             <div className={createWorkspaceUsesGitHub ? "notice notice--error" : "notice"}>
               {createWorkspaceUsesGitHub
                 ? githubStatus.message
-                : "GitHub is not linked. Local-only workspace creation is still available; GitHub-backed opening, imports, and initialization remain disabled."}
+                : "GitHub is not linked. Opening projects, importing interfaces, and local-only workspaces remain available; GitHub initialization and remote operations require linking."}
             </div>
           ) : null}
           {githubStatus?.state === "needs_ssh" ? <div className="notice">{githubStatus.message}</div> : null}
           <section className="launcher-grid">
-            <div className="launcher-actions">
-              <LauncherActionCard
-                eyebrow="Primary"
-                title="Open GitHub Repo"
-                copy="Choose a GitHub-backed repository folder and load it into this window without spawning a second blank workspace."
-                actionLabel="Choose Folder"
-                onAction={() => void openFolder("open")}
-                featured
-                disabled={launcherActionsLocked || Boolean(projectLoadBusy)}
-              />
-              <LauncherActionCard
-                eyebrow="Create"
-                title="New Workspace"
-                copy={createModeCopy}
-                actionLabel={createActionLabel}
-                onAction={() => void openFolder("create")}
-                disabled={createWorkspaceLocked || Boolean(projectLoadBusy)}
-              />
-              <LauncherActionCard
-                eyebrow="Import"
-                title="Import Interface"
-                copy="Bring in a portable interface file, validate it against a project folder, and open the result in the same window."
-                actionLabel="Import Interface"
-                onAction={() => void importBundle()}
-                disabled={launcherActionsLocked || Boolean(projectLoadBusy)}
-              />
-              <LauncherActionCard
-                eyebrow="Preferences"
-                title="Settings"
-                copy="Update interface creation defaults, inspect model availability, or open Developer Tools manually when needed."
-                actionLabel="Open Settings"
-                onAction={() => setShowSettings(true)}
-              />
-            </div>
             <section className="panel panel--recent launcher-recents">
-              <SectionTitle eyebrow="Reopen" title="Recent Projects" />
+              <SectionTitle
+                eyebrow="Your work"
+                title="Recent workspaces"
+                meta={<span className="launcher-recents__count">{recentProjects.length} saved</span>}
+              />
               <div className="recent-list">
                 {recentProjects.length ? recentProjects.map((project) => (
                   <button
                     key={project.record.id}
                     className="recent-project"
-                    disabled={launcherActionsLocked || Boolean(openingRecentProjectId)}
+                    type="button"
+                    disabled={Boolean(openingRecentProjectId)}
                     onClick={() => void openRecentProject(project.record.id)}
                   >
                     <div>
@@ -12089,7 +12627,27 @@ const WorkbenchApp = () => {
                       <ValidationBadge status={project.validationStatus} />
                     </div>
                   </button>
-                )) : <div className="empty-copy">No saved projects yet. Open a folder to create the first workspace.</div>}
+                )) : <div className="empty-copy">No saved workspaces yet. Open a project folder to get started.</div>}
+              </div>
+            </section>
+            <section className="panel launcher-tools">
+              <SectionTitle eyebrow="More options" title="Import or configure" />
+              <div className="launcher-actions">
+                <LauncherActionCard
+                  eyebrow="Portable interface"
+                  title="Import saved work"
+                  copy="Validate an interface file against its project folder, then open it in this window."
+                  actionLabel="Import interface"
+                  onAction={() => void importBundle()}
+                  disabled={Boolean(projectLoadBusy)}
+                />
+                <LauncherActionCard
+                  eyebrow="Preferences"
+                  title="Configure Workbench"
+                  copy="Choose agent defaults, appearance, model access, and runtime settings."
+                  actionLabel="Open settings"
+                  onAction={() => setShowSettings(true)}
+                />
               </div>
             </section>
           </section>
@@ -12167,7 +12725,7 @@ const WorkbenchApp = () => {
   const utilityActions: ShellAction[] = [
     { label: "Home", onClick: () => void showLauncher() },
     { label: "Settings", onClick: () => void setWorkspaceTab("settings") },
-    { label: "Open Another Folder", disabled: !githubLinked, onClick: () => void openFolder("open") },
+    { label: "Open Another Folder", onClick: () => void openFolder("open") },
     { label: "Export to Project", onClick: () => void exportInterfaceToProject() },
     { label: "Download Interface", onClick: () => void downloadInterface() },
     { label: "Download Logs", onClick: () => void downloadLogs() },
@@ -12181,7 +12739,9 @@ const WorkbenchApp = () => {
     projectBranchOrPath,
     `last updated ${formatClockTime(latestProjectUpdate)}`,
     `workflow ${workflowShellStatus.label.toLowerCase()}`,
-    `${pendingApprovals.length} approvals pending`
+    `${pendingApprovals.length} approvals pending`,
+    ...(activeProject.record.validation.projectAccess ? [`access ${activeProject.record.validation.projectAccess.status}`] : []),
+    ...(activeProject.record.interfaceCreation ? [`interface ${activeProject.record.interfaceCreation.status}`] : [])
   ];
   const scrollWorkflowSectionIntoView = (elementId: string) => {
     setWorkspaceTab("workflow");
@@ -12533,27 +13093,45 @@ const WorkbenchApp = () => {
     </button>
   );
   const workspaceNavigationItems: WorkbenchNavigationItem[] = [
-    { id: "overview", label: "Overview", description: "Mission status and timeline" },
-    { id: "workflow", label: "Workflow", description: "Operate the active cycle", count: pendingUserInputRequests.length + pendingHumanInterventions.length + workflowPendingApprovals.length },
-    { id: "history", label: "Timeline", description: "Cycle history and outcomes", count: historyData.total || allAgents.length },
-    { id: "runs", label: "Runs", description: "Inspect every agent run", count: totalRunsCount || allAgents.length },
-    { id: "logs", label: "Logs", description: "Commands and raw events", count: pendingApprovals.length },
-    { id: "repository", label: "Repository", description: "Files, health, and summaries", count: activeProject.record.stats?.includedFiles },
-    { id: "credentials", label: "Credentials", description: "Stored access and requests", count: workflowCredentialRequests.length },
-    { id: "settings", label: "Settings", description: "Runtime, models, and appearance" }
+    { id: "overview", label: "Mission", description: "Goal, progress, and next action", section: "primary" },
+    { id: "preview", label: "Preview", description: "Browser evidence and review", section: "primary", count: previewStatus === "ready" ? 1 : undefined },
+    { id: "activity", label: "Activity", description: "Decisions and recent outcomes", section: "primary", count: workflowAttentionItems.length },
+    { id: "workflow", label: "Build details", description: "Operate and inspect the active cycle", section: "advanced", count: pendingUserInputRequests.length + pendingHumanInterventions.length + workflowPendingApprovals.length },
+    { id: "history", label: "Timeline", description: "Cycle history and outcomes", section: "advanced", count: historyData.total || allAgents.length },
+    { id: "runs", label: "Runs", description: "Inspect every agent run", section: "advanced", count: totalRunsCount || allAgents.length },
+    { id: "logs", label: "Logs", description: "Commands and raw events", section: "advanced", count: pendingApprovals.length },
+    { id: "repository", label: "Repository", description: "Files, health, and summaries", section: "advanced", count: activeProject.record.stats?.includedFiles },
+    { id: "credentials", label: "Credentials", description: "Stored access and requests", section: "advanced", count: workflowCredentialRequests.length },
+    { id: "settings", label: "Settings", description: "Runtime, models, and appearance", section: "advanced" }
   ];
-  const activePageTitle = workspaceNavigationItems.find((item) => item.id === selectedWorkspaceTab)?.label ?? "Overview";
+  const activePageTitle = workspaceNavigationItems.find((item) => item.id === activeWorkspaceRoute)?.label ?? "Mission";
+  const activityAttention: ActivitySummaryItem[] = workflowAttentionItems.slice(0, 16).map((item) => ({
+    id: item.id,
+    title: item.title,
+    detail: item.detail,
+    meta: item.target === "credentials" ? "Credentials" : workflowAttentionKindLabel(item.kind),
+    tone: item.tone
+  }));
+  const activityEvents: ActivitySummaryItem[] = recentActivity.map((event) => ({
+    id: event.id,
+    title: event.title,
+    detail: summarizeText(event.detail, workflowActivitySourceLabel(event.source), 220),
+    meta: `${formatClockTime(event.timestamp)} · ${workflowActivitySourceLabel(event.source)}`,
+    tone: event.status === "failed" ? "danger" : event.status === "waiting" ? "warning" : event.status === "completed" ? "success" : "neutral"
+  }));
 
   return (
-    <div className={`shell shell--workspace ${navigationCollapsed ? "shell--nav-collapsed" : ""} ${operatorRailCollapsed ? "shell--rail-collapsed" : ""} ${visualExtractBusy ? "shell--visual-exporting" : ""}`} data-theme={settingsAppearanceTheme} data-density={settingsAppearanceDensity} data-motion={settingsMotionMode}>
+    <div className={`shell shell--workspace ${navigationCollapsed ? "shell--nav-collapsed" : ""} ${visualExtractBusy ? "shell--visual-exporting" : ""}`} data-theme={activeAppearanceTheme} data-density={activeAppearanceDensity} data-motion={activeMotionMode}>
       <WorkbenchNavigation
         projectName={activeProject.record.identity.projectName}
-        activeTab={selectedWorkspaceTab}
+        activeRoute={activeWorkspaceRoute}
         items={workspaceNavigationItems}
         collapsed={navigationCollapsed}
         mobileOpen={mobileNavigationOpen}
-        theme={settingsAppearanceTheme}
-        onSelect={setWorkspaceTab}
+        advancedOpen={advancedNavigationOpen}
+        theme={activeAppearanceTheme}
+        onSelect={setWorkspaceRoute}
+        onToggleAdvanced={() => setAdvancedNavigationOpen((current) => !current)}
         onCollapse={() => setNavigationCollapsed((current) => !current)}
         onCloseMobile={() => setMobileNavigationOpen(false)}
         onShowLauncher={() => void showLauncher()}
@@ -12570,7 +13148,9 @@ const WorkbenchApp = () => {
         primaryAction={topBarPrimaryAction}
         utilityActions={utilityActions}
         onToggleNavigation={() => setMobileNavigationOpen(true)}
-        onToggleOperatorRail={() => setOperatorRailCollapsed((current) => !current)}
+        onToggleAttention={() => setAttentionDrawerOpen((current) => !current)}
+        attentionCount={workflowAttentionItems.length + pendingApprovals.length}
+        attentionOpen={attentionDrawerOpen}
       />
 
       <div ref={workbenchScrollRef} className="workbench-center__scroll">
@@ -12586,7 +13166,7 @@ const WorkbenchApp = () => {
           busy={runtimeCheckBusy}
         />
       ) : null}
-      {activeProject.record.validation.projectAccess ? (
+      {activeProject.record.validation.projectAccess?.status === "failed" ? (
         <section
           className={
             activeProject.record.validation.projectAccess.status === "failed"
@@ -12599,7 +13179,7 @@ const WorkbenchApp = () => {
           {activeProject.record.validation.projectAccess.error ? <div>{activeProject.record.validation.projectAccess.error}</div> : null}
         </section>
       ) : null}
-      {activeProject.record.interfaceCreation ? (
+      {activeProject.record.interfaceCreation && activeProject.record.interfaceCreation.status !== "completed" ? (
         <section className={`notice notice--status notice--${activeProject.record.interfaceCreation.status}`}>
           <div className="candidate-card__title-row">
             <strong>Creating Interface</strong>
@@ -12622,7 +13202,7 @@ const WorkbenchApp = () => {
           {activeProject.record.interfaceCreation.lastError ? <div>{activeProject.record.interfaceCreation.lastError}</div> : null}
         </section>
       ) : null}
-      {ultimateGoalMissing ? (
+      {ultimateGoalMissing && activeWorkspaceTab === "workflow" ? (
         <section className="notice notice--status notice--pending">
           <div className="candidate-card__title-row">
             <strong>Recommended next step: set the Ultimate Goal</strong>
@@ -12638,6 +13218,49 @@ const WorkbenchApp = () => {
       ) : null}
 
       <main className="project-workbench">
+        {activeWorkspaceTab === "preview" ? (
+          <PreviewWorkspace
+            status={previewStatus}
+            preview={previewProjection}
+            reason={previewRequest?.reason}
+            evidence={previewRequest?.evidence ?? []}
+            evidenceKind={previewRequest?.evidenceKind}
+            previewSessionId={previewRequest?.previewSessionId}
+            previewGateReportId={previewRequest?.previewGateReportId}
+            requestedAt={previewRequest?.requestedAt}
+            startedAt={previewRequest?.startedAt}
+            completedAt={previewRequest?.completedAt}
+            busy={previewCommandBusy}
+            onRequest={() => void requestWorkflowPreview()}
+            onCancel={() => void cancelWorkflowPreview()}
+            onComplete={() => void completeWorkflowPreview()}
+            onOpenBuild={() => void setWorkspaceTab("workflow")}
+            onRefreshReadiness={() => void refreshPreviewReadiness()}
+            onGrantTrust={() => void grantPreviewTrust()}
+            onInstallBrowser={() => void installPreviewBrowser()}
+            onStart={() => void requestWorkflowPreview()}
+            onStop={(sessionId) => void stopProjectPreview(sessionId)}
+            onRetry={() => void requestWorkflowPreview()}
+            onOpenLocalBrowser={(sessionId) => void openPreviewInLocalBrowser(sessionId)}
+            onCapture={(sessionId) => void captureCurrentPreview(sessionId)}
+            onLoadArtifact={loadPreviewArtifact}
+          />
+        ) : null}
+
+        {activeWorkspaceTab === "activity" ? (
+          <ActivityWorkspace
+            attention={activityAttention}
+            events={activityEvents}
+            runningAgents={allAgents.filter(isWorkflowAgentActive).length}
+            totalRuns={totalRunsCount || allAgents.length}
+            onOpenTimeline={() => void setWorkspaceTab("history")}
+            onOpenRuns={() => void setWorkspaceTab("runs")}
+            onOpenLogs={() => void setWorkspaceTab("logs")}
+            onOpenBuild={() => void setWorkspaceTab("workflow")}
+            onOpenAccess={() => void setWorkspaceTab("credentials")}
+          />
+        ) : null}
+
         {activeWorkspaceTab === "overview" ? (
           <section className="overview-page">
             <CommandCenter
@@ -12831,7 +13454,7 @@ const WorkbenchApp = () => {
                 onApprove={(approval) => void resolveApproval(approval, "accept")}
                 onReject={(approval) => void resolveApproval(approval, "decline")}
                 isApprovalBusy={isApprovalBusy}
-                onOpenCredentials={() => void setWorkspaceTab("settings")}
+                onOpenCredentials={() => void setWorkspaceTab("credentials")}
                 onViewDetails={(target) => {
                   if (target === "user-input") {
                     openWorkflowDetailsAndScroll("workflow-user-input-requests");
@@ -13604,26 +14227,26 @@ const WorkbenchApp = () => {
                       className="input"
                       placeholder="One-sentence Ultimate Goal"
                       value={ultimateGoalDraft.summary}
-                      onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, summary: event.target.value })}
+                      onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, summary: event.target.value })}
                     />
                     <textarea
                       className="textarea"
                       placeholder="Detailed intent"
                       value={ultimateGoalDraft.detailedIntent}
-                      onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, detailedIntent: event.target.value })}
+                      onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, detailedIntent: event.target.value })}
                     />
                     <div className="workflow-two-column">
                       <textarea
                         className="textarea"
                         placeholder="Success criteria, one per line"
                         value={ultimateGoalDraft.successCriteria}
-                        onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, successCriteria: event.target.value })}
+                        onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, successCriteria: event.target.value })}
                       />
                       <textarea
                         className="textarea"
                         placeholder="Constraints, one per line"
                         value={ultimateGoalDraft.constraints}
-                        onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, constraints: event.target.value })}
+                        onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, constraints: event.target.value })}
                       />
                     </div>
                     <div className="workflow-two-column">
@@ -13631,20 +14254,20 @@ const WorkbenchApp = () => {
                         className="textarea"
                         placeholder="Non-goals, one per line"
                         value={ultimateGoalDraft.nonGoals}
-                        onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, nonGoals: event.target.value })}
+                        onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, nonGoals: event.target.value })}
                       />
                       <textarea
                         className="textarea"
                         placeholder="Quality bar"
                         value={ultimateGoalDraft.qualityBar}
-                        onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, qualityBar: event.target.value })}
+                        onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, qualityBar: event.target.value })}
                       />
                     </div>
                     <input
                       className="input"
                       placeholder="Target audience"
                       value={ultimateGoalDraft.targetAudience}
-                      onChange={(event) => setUltimateGoalDraft({ ...ultimateGoalDraft, targetAudience: event.target.value })}
+                      onChange={(event) => updateUltimateGoalDraft({ ...ultimateGoalDraft, targetAudience: event.target.value })}
                     />
                   </div>
                   <div className="actions-row">
@@ -13882,7 +14505,7 @@ const WorkbenchApp = () => {
               onWorkflowPageChange={setWorkflowAgentPageIndex}
               onManualPageChange={setManualAgentPageIndex}
               onOpenWorkflow={() => void setWorkspaceTab("workflow")}
-              onOpenLogs={() => void setWorkspaceTab("history")}
+              onOpenLogs={() => void setWorkspaceTab("logs")}
               onOpenOutput={(agent) => openAgentOutputById(agent)}
               onManualPromptChange={setManualAgentPrompt}
               onManualModelChange={setManualAgentModel}
@@ -13905,17 +14528,20 @@ const WorkbenchApp = () => {
               activeProject={activeProject}
               github={state.github}
               settingsDraft={settingsDraft}
+              settingsDirty={settingsDraftDirty}
+              settingsSaving={settingsSaveBusy}
+              goalCharterDirty={goalCharterDraftDirty}
               goalCharterDraft={goalCharterDraft}
               goalCharterAiModel={goalCharterAiModel}
               goalCharterAiReasoningEffort={goalCharterAiReasoningEffort}
               goalCharterGeneratePrompt={goalCharterGeneratePrompt}
-              goalCharterAiBusy={goalCharterAiBusy}
+              goalCharterAiBusy={activeGoalCharterAiBusy}
               autopilotPresets={autopilotPresets}
               onChange={updateSettingsDraft}
               onGoalCharterChange={updateGoalCharterDraft}
               onGoalCharterAiModelChange={setGoalCharterAiModel}
               onGoalCharterAiReasoningEffortChange={setGoalCharterAiReasoningEffort}
-              onGoalCharterGeneratePromptChange={setGoalCharterGeneratePrompt}
+              onGoalCharterGeneratePromptChange={updateGoalCharterGeneratePrompt}
               onPolishGoalCharterField={(field) => void polishGoalCharterField(field)}
               onGenerateGoalCharterDraft={() => void generateGoalCharterDraft()}
               onSave={saveSettings}
@@ -13925,7 +14551,17 @@ const WorkbenchApp = () => {
               onRejectDetectedGoal={() => void rejectDetectedGoal()}
               onImportUltimateGoalText={() => void importUltimateGoalText()}
               onDownloadUltimateGoalFormat={downloadUltimateGoalFormat}
-              onClose={() => void setWorkspaceTab("overview")}
+              onClose={() => {
+                if (settingsSaveBusyRef.current) {
+                  return;
+                }
+                if (!settingsSaveShouldClose(goalCharterDraftDirty)) {
+                  setNotice({ message: "Save the project Goal Charter and strategy before leaving Settings.", tone: "error" });
+                  return;
+                }
+                setSettingsDraftDirty(false);
+                void setWorkspaceTab("overview");
+              }}
               onOpenDevTools={() => void openDevTools()}
               onRefreshGitHubStatus={() => void refreshGitHubStatus()}
               onCheckRuntimeReadiness={() => void checkRuntimeReadiness()}
@@ -13941,15 +14577,14 @@ const WorkbenchApp = () => {
               workflowRepairRevalidationBusy={workflowCommandBusyKey === `${activeProjectId}:revalidate-repair`}
               workflowCycleResetBusy={workflowCommandBusyKey === `${activeProjectId}:reset-cycle`}
             />
-            <CredentialsPanel project={activeProject} onSaved={showInfoNotice} onError={handleError} />
           </div>
         ) : null}
       </main>
       </div>
       </section>
 
-      <OperatorRail
-        collapsed={operatorRailCollapsed}
+      <AttentionDrawer
+        open={attentionDrawerOpen}
         statusLabel={workflowShellStatus.label}
         statusTone={workflowShellStatus.tone}
         cycleLabel={workflow ? `Cycle ${workflow.workflowCycle.cycleNumber}` : "No cycle"}
@@ -13961,8 +14596,9 @@ const WorkbenchApp = () => {
         primaryAction={topBarPrimaryAction}
         attention={workflowAttentionItems.filter((item) => item.kind !== "approval").slice(0, 12)}
         approvals={pendingApprovals.slice(0, 12)}
-        onToggle={() => setOperatorRailCollapsed((current) => !current)}
+        onClose={() => setAttentionDrawerOpen(false)}
         onOpenWorkflow={() => void setWorkspaceTab("workflow")}
+        onOpenCredentials={() => void setWorkspaceTab("credentials")}
         onOpenSettings={() => void setWorkspaceTab("settings")}
         onToggleAutopilot={() => void toggleAutopilot()}
         onTogglePause={() => void toggleWorkflowPause()}

@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import type { AppSettings } from "@shared/types";
-import { toProjectRelativePath, windowsPathToWslPath, wslPathToWindowsPath } from "@shared/pathUtils";
+import { executionPathToHostPath, toProjectRelativePath, windowsPathToWslPath, wslPathToWindowsPath } from "@shared/pathUtils";
 
 const WINDOWS_ABSOLUTE_PATH = /^(?:[a-zA-Z]:[\\/]|\\\\)/;
 
@@ -142,6 +142,19 @@ export const assertHostPathWithinProjectRoot = async (
   return candidateCanonicalPath;
 };
 
+const assertHostPathWithinApprovedRoot = async (
+  approvedRootHostPath: string,
+  candidatePath: string,
+  operation: string
+): Promise<string> => {
+  const canonicalApprovedRoot = await canonicalizeExistingPath(approvedRootHostPath);
+  const candidateCanonicalPath = await canonicalizeTargetPath(candidatePath);
+  if (!isContainedPath(canonicalApprovedRoot, candidateCanonicalPath)) {
+    throw new ProjectBoundaryError(`${operation} was rejected because it would access a path outside its approved root.`);
+  }
+  return candidateCanonicalPath;
+};
+
 export const assertProjectRelativeHostPath = async (
   projectRootHostPath: string,
   relativePath: string,
@@ -199,4 +212,68 @@ export const assertExecutionPathWithinProjectRoot = async (
   await assertHostPathWithinProjectRoot(projectRootHostPath, resolved.hostPath, operation);
 
   return resolved;
+};
+
+/**
+ * Validates a project operation that may run either in the checkout or in one
+ * of Workbench's explicitly managed external roots. Callers must pass resolved
+ * managed roots (for example WorktreeAssignment.baseDir), never an unchecked
+ * user-supplied path.
+ */
+export const assertExecutionPathWithinApprovedRoots = async (
+  projectRootExecutionPath: string,
+  candidateExecutionPath: string,
+  projectRootHostPath: string,
+  approvedExternalExecutionRoots: string[],
+  settings: Pick<AppSettings, "executionMode" | "distroName">,
+  distroName: string | undefined,
+  operation: string,
+  platform: NodeJS.Platform = process.platform
+): Promise<{ executionPath: string; hostPath: string; approvedRoot: string }> => {
+  try {
+    const projectResult = await assertExecutionPathWithinProjectRoot(
+      projectRootExecutionPath,
+      candidateExecutionPath,
+      projectRootHostPath,
+      settings,
+      distroName,
+      operation
+    );
+    return {
+      ...projectResult,
+      approvedRoot: projectRootExecutionPath
+    };
+  } catch (error) {
+    if (!(error instanceof ProjectBoundaryError)) {
+      throw error;
+    }
+  }
+
+  if (hasUnsafeTraversal(candidateExecutionPath)) {
+    throw new ProjectBoundaryError(`${operation} was rejected because it contains unsafe path traversal.`);
+  }
+
+  for (const approvedRoot of approvedExternalExecutionRoots.filter(Boolean)) {
+    const relative = findContainedRelativePath(approvedRoot, candidateExecutionPath);
+    if (relative === undefined) {
+      continue;
+    }
+
+    const approvedRootHostPath = executionPathToHostPath(approvedRoot, settings, distroName, platform);
+    const candidateHostPath = executionPathToHostPath(candidateExecutionPath, settings, distroName, platform);
+    if (findContainedRelativePath(approvedRootHostPath, candidateHostPath) === undefined) {
+      continue;
+    }
+
+    await assertHostPathWithinApprovedRoot(approvedRootHostPath, candidateHostPath, operation);
+    return {
+      executionPath: candidateExecutionPath,
+      hostPath: candidateHostPath,
+      approvedRoot
+    };
+  }
+
+  throw new ProjectBoundaryError(
+    `${operation} was rejected because it would escape both the active project folder and the configured managed-worktree roots.`
+  );
 };

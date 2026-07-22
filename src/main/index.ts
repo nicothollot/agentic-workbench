@@ -1,12 +1,25 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, screen, shell } from "electron";
+import log from "electron-log/main";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { z } from "zod";
 import { APP_ID, APP_NAME } from "@shared/constants";
 import { getPreloadEntryPath, getRendererEntryPath } from "@shared/electronAppPaths";
+import {
+  RENDERER_DELTA_HARD_BYTES,
+  RENDERER_STATE_PROTOCOL_VERSION,
+  diffWorkbenchState,
+  rendererEnvelopeBytes,
+  rendererDeltaEnvelopeSchema,
+  rendererSnapshotEnvelopeSchema,
+  validateRendererState,
+  type RendererDeltaEnvelope,
+  type RendererSnapshotEnvelope
+} from "@shared/stateStream";
 import {
   advanceWorkflowStageRequestSchema,
   agentDetailRequestSchema,
@@ -56,6 +69,11 @@ import {
   goalChangeProposalRequestSchema,
   plannerCycleRecordRequestSchema,
   manageUserInputRequestAttachmentsSchema,
+  previewActionRequestSchema,
+  previewArtifactRequestSchema,
+  previewProjectRequestSchema,
+  previewSessionRequestSchema,
+  previewStartRequestSchema,
   requestWorkflowPreviewRequestSchema,
   revalidateWorkflowRepairRequestSchema,
   resetWorkflowCycleRequestSchema,
@@ -63,6 +81,7 @@ import {
   runRecommendationRequestSchema,
   setAutopilotPolicyRequestSchema,
   setWorkflowModeRequestSchema,
+  settingsUpdateRequestSchema,
   strategicPlanRequestSchema,
   submitUserInputRequestResponseSchema,
   requestHumanInterventionRequestSchema,
@@ -80,13 +99,17 @@ import {
   visualExportStartRequestSchema
 } from "@shared/ipc";
 import type { VisualExportCaptureTarget, VisualExportTab, WorkbenchState } from "@shared/types";
-import { appSettingsSchema } from "@shared/schemas";
 import { AppService } from "@runtime/appService";
+import { decideRendererNavigation } from "./navigationPolicy";
+import { MINIMUM_WINDOW_SIZE, WindowStateStore, clampWindowBounds, defaultWindowBounds } from "./windowState";
 
 let mainWindow: BrowserWindow | undefined;
 let appService: AppService | undefined;
 let quitRequested = false;
 const secondaryWindows = new Set<BrowserWindow>();
+const rendererStateStreamId = randomUUID();
+let rendererStateRevision = 0;
+let rendererStateSnapshot: WorkbenchState | undefined;
 
 type VisualExportCapture = {
   target: VisualExportCaptureTarget;
@@ -104,6 +127,18 @@ type VisualExportSession = {
 };
 
 const visualExportSessions = new Map<string, VisualExportSession>();
+
+const rendererDisplayMetricsSchema = z.object({
+  innerWidth: z.number().nonnegative(),
+  innerHeight: z.number().nonnegative(),
+  devicePixelRatio: z.number().positive(),
+  rootBounds: z.object({
+    x: z.number(),
+    y: z.number(),
+    width: z.number().nonnegative(),
+    height: z.number().nonnegative()
+  }).nullable()
+});
 
 const interfaceIconPath = (): string =>
   path.join(app.getAppPath(), "assets", "branding", "interface_icon.png");
@@ -264,8 +299,96 @@ if (process.platform === "win32") {
   app.setAppUserModelId(APP_ID);
 }
 
-const sendState = (state: WorkbenchState): void => {
-  mainWindow?.webContents.send("state:updated", state);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+}
+
+const isAllowedExternalUrl = (value: string): boolean => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+};
+
+const openAllowedExternalUrl = async (value: string): Promise<void> => {
+  if (!isAllowedExternalUrl(value)) {
+    log.warn(`[security] Blocked external URL with an unsupported scheme: ${value.slice(0, 160)}`);
+    return;
+  }
+  await shell.openExternal(value);
+};
+
+const attachRendererNavigationPolicy = (window: BrowserWindow, allowedDocumentUrl: string): void => {
+  const guard = (event: Electron.Event, targetUrl: string): void => {
+    const decision = decideRendererNavigation(targetUrl, allowedDocumentUrl);
+    if (decision === "allow") {
+      return;
+    }
+    event.preventDefault();
+    if (decision === "open_external") {
+      void openAllowedExternalUrl(targetUrl);
+    } else {
+      log.warn(`[security] Blocked renderer navigation: ${targetUrl.slice(0, 160)}`);
+    }
+  };
+  window.webContents.on("will-navigate", guard);
+  window.webContents.on("will-redirect", guard);
+};
+
+const rendererWindows = (): BrowserWindow[] =>
+  BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed());
+
+const currentRendererSnapshot = (): RendererSnapshotEnvelope => {
+  const state = rendererStateSnapshot ?? validateRendererState(appService?.getRendererState());
+  rendererStateSnapshot = state;
+  return rendererSnapshotEnvelopeSchema.parse({
+    protocolVersion: RENDERER_STATE_PROTOCOL_VERSION,
+    streamId: rendererStateStreamId,
+    revision: rendererStateRevision,
+    data: state
+  }) as RendererSnapshotEnvelope;
+};
+
+const sendState = (rawState: WorkbenchState): void => {
+  const state = validateRendererState(rawState);
+  if (!rendererStateSnapshot) {
+    rendererStateSnapshot = state;
+    return;
+  }
+
+  const operations = diffWorkbenchState(rendererStateSnapshot, state);
+  rendererStateSnapshot = state;
+  if (operations.length === 0) {
+    return;
+  }
+
+  const baseRevision = rendererStateRevision;
+  rendererStateRevision += 1;
+  const envelope = rendererDeltaEnvelopeSchema.parse({
+    protocolVersion: RENDERER_STATE_PROTOCOL_VERSION,
+    streamId: rendererStateStreamId,
+    baseRevision,
+    revision: rendererStateRevision,
+    operations
+  }) as RendererDeltaEnvelope;
+
+  if (rendererEnvelopeBytes(envelope) > RENDERER_DELTA_HARD_BYTES) {
+    for (const window of rendererWindows()) {
+      window.webContents.send("state:resync-required", {
+        protocolVersion: RENDERER_STATE_PROTOCOL_VERSION,
+        streamId: rendererStateStreamId,
+        revision: rendererStateRevision
+      });
+    }
+    return;
+  }
+
+  for (const window of rendererWindows()) {
+    window.webContents.send("state:delta", envelope);
+  }
 };
 
 const requestAppQuit = async (): Promise<void> => {
@@ -311,21 +434,68 @@ const attachWindowDiagnostics = (window: BrowserWindow, preloadEntryPath: string
   }
 };
 
+const recordDisplayDiagnostics = async (window: BrowserWindow, reason: string): Promise<void> => {
+  if (window.isDestroyed()) {
+    return;
+  }
+  try {
+    const rendererMetricsRaw: unknown = await window.webContents.executeJavaScript(`(() => {
+      const root = document.getElementById("root");
+      const bounds = root?.getBoundingClientRect();
+      return {
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        rootBounds: bounds ? { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } : null
+      };
+    })()`);
+    const rendererMetrics = rendererDisplayMetricsSchema.parse(rendererMetricsRaw);
+    const windowBounds = window.getBounds();
+    const display = screen.getDisplayMatching(windowBounds);
+    const diagnostic = {
+      reason,
+      displayId: display.id,
+      displayScaleFactor: display.scaleFactor,
+      zoomFactor: window.webContents.getZoomFactor(),
+      windowBounds,
+      contentBounds: window.getContentBounds(),
+      workArea: display.workArea,
+      ...rendererMetrics
+    };
+    log.info(`[display] ${JSON.stringify(diagnostic)}`);
+    appService?.recordDiagnostic(`Display diagnostics (${reason}): ${JSON.stringify(diagnostic)}`);
+  } catch (error) {
+    log.warn(`[display] Unable to capture viewport diagnostics: ${error instanceof Error ? error.message : String(error)}`);
+  }
+};
+
 const createMainWindow = async (): Promise<void> => {
   const icon = dockIcon();
   const appPath = app.getAppPath();
   const preloadEntryPath = getPreloadEntryPath(appPath);
   const rendererEntryPath = getRendererEntryPath(appPath);
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  const rendererDocumentUrl = devServerUrl
+    ? new URL(devServerUrl).toString()
+    : pathToFileURL(rendererEntryPath).toString();
+  const windowStateStore = new WindowStateStore(app.getPath("userData"));
+  const savedWindowState = await windowStateStore.load();
+  const workAreas = screen.getAllDisplays().map((display) => display.workArea);
+  const primaryWorkArea = screen.getPrimaryDisplay().workArea;
+  const initialBounds = savedWindowState
+    ? clampWindowBounds(savedWindowState.bounds, workAreas)
+    : defaultWindowBounds(primaryWorkArea);
+  const appearanceTheme = appService?.getState().settings.appearanceTheme ?? "catc-dark";
+  const backgroundColor = appearanceTheme === "catc-light" ? "#f7f2ea" : "#0f1b2d";
   mainWindow = new BrowserWindow({
-    width: 1480,
-    height: 940,
-    minWidth: 1040,
-    minHeight: 720,
+    ...initialBounds,
+    minWidth: MINIMUM_WINDOW_SIZE.width,
+    minHeight: MINIMUM_WINDOW_SIZE.height,
     title: APP_NAME,
     icon: windowIconPath(),
     show: false,
     autoHideMenuBar: true,
-    backgroundColor: "#f0e7da",
+    backgroundColor,
     webPreferences: {
       preload: preloadEntryPath,
       contextIsolation: true,
@@ -337,13 +507,61 @@ const createMainWindow = async (): Promise<void> => {
 
   attachWindowDiagnostics(mainWindow, preloadEntryPath, rendererEntryPath);
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
-    return { action: "deny" };
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  let diagnosticsTimer: ReturnType<typeof setTimeout> | undefined;
+  const persistWindowState = (): void => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+    const state = {
+      version: 1 as const,
+      bounds: mainWindow.getNormalBounds(),
+      maximized: mainWindow.isMaximized()
+    };
+    void windowStateStore.save(state).catch((error) => {
+      log.warn(`[window] Failed to persist window state: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
+  const scheduleWindowStatePersistence = (): void => {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+    }
+    persistTimer = setTimeout(persistWindowState, 250);
+  };
+  const scheduleDisplayDiagnostics = (reason: string): void => {
+    if (diagnosticsTimer) {
+      clearTimeout(diagnosticsTimer);
+    }
+    diagnosticsTimer = setTimeout(() => {
+      if (mainWindow) {
+        void recordDisplayDiagnostics(mainWindow, reason);
+      }
+    }, 350);
+  };
+  const handleDisplayMetricsChanged = (): void => scheduleDisplayDiagnostics("display-metrics-changed");
+  screen.on("display-metrics-changed", handleDisplayMetricsChanged);
+  mainWindow.on("move", scheduleWindowStatePersistence);
+  mainWindow.on("resize", () => {
+    scheduleWindowStatePersistence();
+    scheduleDisplayDiagnostics("resize");
+  });
+  mainWindow.on("maximize", scheduleWindowStatePersistence);
+  mainWindow.on("unmaximize", scheduleWindowStatePersistence);
+  mainWindow.on("close", persistWindowState);
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    mainWindow?.webContents.setZoomFactor(1);
+    scheduleDisplayDiagnostics("initial-load");
   });
 
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void openAllowedExternalUrl(url);
+    return { action: "deny" };
+  });
+  attachRendererNavigationPolicy(mainWindow, rendererDocumentUrl);
+
   mainWindow.once("ready-to-show", () => {
-    if (mainWindow && !mainWindow.isMaximized()) {
+    if (mainWindow && savedWindowState?.maximized && !mainWindow.isMaximized()) {
       mainWindow.maximize();
     }
     mainWindow?.show();
@@ -353,7 +571,6 @@ const createMainWindow = async (): Promise<void> => {
     app.dock?.setIcon(icon);
   }
 
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
     await mainWindow.loadURL(devServerUrl);
   } else {
@@ -361,6 +578,13 @@ const createMainWindow = async (): Promise<void> => {
   }
 
   mainWindow.on("closed", () => {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+    }
+    if (diagnosticsTimer) {
+      clearTimeout(diagnosticsTimer);
+    }
+    screen.removeListener("display-metrics-changed", handleDisplayMetricsChanged);
     mainWindow = undefined;
   });
 };
@@ -392,12 +616,17 @@ const createRepositoryPathWindow = async (projectId: string, relativePath: strin
 
   secondaryWindows.add(repositoryWindow);
   attachWindowDiagnostics(repositoryWindow, preloadEntryPath, rendererEntryPath);
+  repositoryWindow.webContents.on("did-finish-load", () => {
+    if (!repositoryWindow.isDestroyed()) {
+      repositoryWindow.webContents.setZoomFactor(1);
+    }
+  });
   repositoryWindow.once("ready-to-show", () => repositoryWindow.show());
   repositoryWindow.on("closed", () => {
     secondaryWindows.delete(repositoryWindow);
   });
   repositoryWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    void openAllowedExternalUrl(url);
     return { action: "deny" };
   });
 
@@ -408,6 +637,10 @@ const createRepositoryPathWindow = async (projectId: string, relativePath: strin
     ...(initialQuestion ? { initialQuestion } : {})
   };
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  const rendererDocumentUrl = devServerUrl
+    ? new URL(devServerUrl).toString()
+    : pathToFileURL(rendererEntryPath).toString();
+  attachRendererNavigationPolicy(repositoryWindow, rendererDocumentUrl);
   if (devServerUrl) {
     const url = new URL(devServerUrl);
     for (const [key, value] of Object.entries(query)) {
@@ -420,10 +653,18 @@ const createRepositoryPathWindow = async (projectId: string, relativePath: strin
 };
 
 const registerIpc = (): void => {
+  ipcMain.handle("state:subscribe", () => currentRendererSnapshot());
+  ipcMain.handle("state:resync", () => currentRendererSnapshot());
   ipcMain.handle("app:getState", () => appService?.getRendererState());
   ipcMain.handle("github:refreshStatus", async () => await appService?.refreshGitHubStatus());
   ipcMain.handle("settings:get", () => appService?.getState().settings);
-  ipcMain.handle("settings:update", async (_event, payload) => appService?.updateSettings(appSettingsSchema.partial().parse(payload)));
+  ipcMain.handle("settings:update", async (_event, payload) => {
+    const request = settingsUpdateRequestSchema.parse(payload);
+    return await appService?.updateSettings(
+      request.patch,
+      "baseRevision" in request ? request.baseRevision : undefined
+    );
+  });
   ipcMain.handle("app:showLauncher", () => appService?.showLauncher());
   ipcMain.handle("app:openDevTools", () => {
     if (!mainWindow) {
@@ -847,6 +1088,53 @@ const registerIpc = (): void => {
     const parsed = workflowPreviewCheckpointRequestSchema.parse(payload);
     return await appService?.completeWorkflowPreview(parsed.projectId);
   });
+  ipcMain.handle("preview:getReadiness", async (_event, payload) => {
+    const parsed = previewProjectRequestSchema.parse(payload);
+    return await appService?.getPreviewReadiness(parsed.projectId);
+  });
+  ipcMain.handle("preview:grantTrust", async (_event, payload) => {
+    const parsed = previewSessionRequestSchema.parse(payload);
+    return await appService?.grantPreviewTrust(parsed.projectId, parsed.sessionId);
+  });
+  ipcMain.handle("preview:installBrowser", async (_event, payload) => {
+    const parsed = previewProjectRequestSchema.parse(payload);
+    return await appService?.installPreviewBrowser(parsed.projectId);
+  });
+  ipcMain.handle("preview:start", async (_event, payload) => {
+    const parsed = previewStartRequestSchema.parse(payload);
+    return await appService?.startProjectPreview(parsed.projectId, parsed.checkpointKind);
+  });
+  ipcMain.handle("preview:stop", async (_event, payload) => {
+    const parsed = previewSessionRequestSchema.parse(payload);
+    await appService?.stopProjectPreview(parsed.projectId, parsed.sessionId);
+  });
+  ipcMain.handle("preview:performAction", async (_event, payload) => {
+    const parsed = previewActionRequestSchema.parse(payload);
+    return await appService?.performPreviewAction(parsed.projectId, parsed.sessionId, parsed.action);
+  });
+  ipcMain.handle("preview:getArtifact", async (_event, payload) => {
+    const parsed = previewArtifactRequestSchema.parse(payload);
+    return await appService?.getPreviewArtifact(parsed.projectId, parsed.sessionId, parsed.artifactId);
+  });
+  ipcMain.handle("preview:openExternal", async (_event, payload) => {
+    const parsed = previewSessionRequestSchema.parse(payload);
+    const previewUrl = appService?.getPreviewValidatedUrl(parsed.projectId, parsed.sessionId);
+    if (!previewUrl) {
+      throw new Error("The preview URL is not available.");
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3_000);
+    try {
+      await fetch(previewUrl, { method: "HEAD", signal: controller.signal });
+    } catch (error) {
+      throw new Error(
+        `The preview is not reachable from Windows yet. ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+    await shell.openExternal(previewUrl);
+  });
   ipcMain.handle("workflow:setAutopilotPolicy", async (_event, payload) => {
     const parsed = setAutopilotPolicyRequestSchema.parse(payload);
     return await appService?.setAutopilotPolicy(parsed.projectId, parsed.policy);
@@ -898,7 +1186,10 @@ const registerIpc = (): void => {
       throw new Error(error);
     }
   });
-  ipcMain.handle("project:revalidate", async (_event, projectId: string) => await appService?.revalidateProject(projectId));
+  ipcMain.handle("project:revalidate", async (_event, payload) => {
+    const parsed = projectOpenRequestSchema.parse(payload);
+    return await appService?.revalidateProject(parsed.projectId);
+  });
   ipcMain.handle("agent:create", async (_event, payload) => {
     const parsed = createAgentRequestSchema.parse(payload);
     return await appService?.createAgent(parsed.projectId, parsed.category, parsed.name, parsed.prompt, parsed.model, {
@@ -910,8 +1201,14 @@ const registerIpc = (): void => {
     const parsed = approvalDecisionRequestSchema.parse(payload);
     await appService?.approve(parsed.projectId, parsed.agentId, parsed.approvalId, parsed.decision);
   });
-  ipcMain.handle("agent:runIntegrity", async (_event, projectId: string) => await appService?.runIntegrity(projectId));
-  ipcMain.handle("agent:runMerge", async (_event, projectId: string) => await appService?.runMerge(projectId));
+  ipcMain.handle("agent:runIntegrity", async (_event, payload) => {
+    const parsed = projectOpenRequestSchema.parse(payload);
+    return await appService?.runIntegrity(parsed.projectId);
+  });
+  ipcMain.handle("agent:runMerge", async (_event, payload) => {
+    const parsed = projectOpenRequestSchema.parse(payload);
+    return await appService?.runMerge(parsed.projectId);
+  });
   ipcMain.handle("agent:runRecommendation", async (_event, payload) => {
     const parsed = runRecommendationRequestSchema.parse(payload);
     return await appService?.runRecommendation(parsed.projectId, false, parsed.customFocus);
@@ -987,8 +1284,25 @@ const registerIpc = (): void => {
   });
 };
 
-void app.whenReady().then(async () => {
-  appService = new AppService(app.getPath("userData"), safeStorage);
+if (hasSingleInstanceLock) {
+  log.initialize({ spyRendererConsole: true });
+  log.errorHandler.startCatching({ showDialog: false });
+  app.on("second-instance", () => {
+    if (!mainWindow) {
+      return;
+    }
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  void app.whenReady().then(async () => {
+  const previewWorkerPath = app.isPackaged
+    ? path.join(process.resourcesPath, "preview-broker", "worker.cjs")
+    : path.join(app.getAppPath(), "scripts", "preview-broker", "worker.cjs");
+  appService = new AppService(app.getPath("userData"), safeStorage, { previewWorkerPath });
   await appService.initialize({ deferStartupWork: true });
   appService.on("stateChanged", (state) => sendState(state));
   registerIpc();
@@ -1001,7 +1315,8 @@ void app.whenReady().then(async () => {
       await createMainWindow();
     }
   });
-});
+  });
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {

@@ -34,6 +34,11 @@ import type {
   LocalProjectState,
   LoadedProjectView,
   OpenProjectShellResult,
+  PreviewAction,
+  PreviewArtifactMetadata,
+  PreviewCheckpointKind,
+  PreviewReadiness,
+  PreviewSessionProjection,
   ProjectCreationMode,
   ProjectLogFeedResponse,
   ProjectLoadIntent,
@@ -61,9 +66,199 @@ import type {
   WorkbenchState
 } from "@shared/types";
 import type { WorkflowDashboardSnapshot, WorkflowTimelineQuery } from "@shared/workflowDashboard";
+import {
+  RENDERER_STATE_PROTOCOL_VERSION,
+  applyWorkbenchDelta,
+  validateRendererDeltaEnvelope,
+  validateRendererSnapshotEnvelope,
+  type RendererDeltaEnvelope,
+  type RendererSnapshotEnvelope
+} from "@shared/stateStream";
 
 const invoke = async <T>(channel: string, payload?: unknown): Promise<T> => await ipcRenderer.invoke(channel, payload) as T;
-const STATE_UPDATE_COALESCE_MS = 150;
+
+const stateListeners = new Set<(state: WorkbenchState) => void>();
+const pendingStateDeltas: RendererDeltaEnvelope[] = [];
+const MAX_PENDING_STATE_DELTAS = 512;
+let stateSnapshot: WorkbenchState | undefined;
+let stateStreamId: string | undefined;
+let stateRevision = -1;
+let stateSubscribeInFlight: Promise<WorkbenchState> | undefined;
+let stateResyncInFlight: Promise<WorkbenchState> | undefined;
+let stateResyncDirty = false;
+let stateNotificationQueued = false;
+
+const notifyStateListeners = (): void => {
+  if (stateNotificationQueued) {
+    return;
+  }
+  stateNotificationQueued = true;
+  queueMicrotask(() => {
+    stateNotificationQueued = false;
+    if (!stateSnapshot) {
+      return;
+    }
+    for (const listener of stateListeners) {
+      listener(stateSnapshot);
+    }
+  });
+};
+
+const bufferStateDelta = (envelope: RendererDeltaEnvelope): void => {
+  pendingStateDeltas.push(envelope);
+  if (pendingStateDeltas.length > MAX_PENDING_STATE_DELTAS) {
+    pendingStateDeltas.splice(0, pendingStateDeltas.length - MAX_PENDING_STATE_DELTAS);
+    // A bounded queue may no longer contain a complete revision chain. Force
+    // another authoritative snapshot instead of silently accepting a gap.
+    stateResyncDirty = true;
+  }
+};
+
+const replayPendingStateDeltas = (): boolean => {
+  if (!stateSnapshot || !stateStreamId || pendingStateDeltas.length === 0) {
+    return false;
+  }
+
+  let requiresResync = false;
+  const deferredDeltas: RendererDeltaEnvelope[] = [];
+  const buffered = pendingStateDeltas.splice(0).sort((left, right) => left.revision - right.revision);
+  for (const delta of buffered) {
+    if (delta.streamId !== stateStreamId) {
+      // A snapshot is authoritative about stream identity. Request one more
+      // snapshot for the mismatch, but do not carry an obsolete stream forever.
+      requiresResync = true;
+      continue;
+    }
+    if (delta.revision <= stateRevision) {
+      continue;
+    }
+    if (delta.baseRevision !== stateRevision) {
+      requiresResync = true;
+      if (delta.baseRevision > stateRevision) {
+        // The snapshot has not caught up to this delta's base yet. Preserve it
+        // for the next resync pass; dropping it here recreates the original race.
+        deferredDeltas.push(delta);
+      }
+      continue;
+    }
+    stateSnapshot = applyWorkbenchDelta(stateSnapshot, delta);
+    stateRevision = delta.revision;
+  }
+  pendingStateDeltas.push(...deferredDeltas);
+  return requiresResync;
+};
+
+const installStateSnapshot = (envelope: RendererSnapshotEnvelope): WorkbenchState => {
+  const sameStream = stateSnapshot !== undefined && envelope.streamId === stateStreamId;
+  // A resync response can race deltas already applied in preload. Never let a
+  // late, older snapshot move the same stream backwards.
+  if (!sameStream || envelope.revision > stateRevision) {
+    stateSnapshot = envelope.data;
+    stateStreamId = envelope.streamId;
+    stateRevision = envelope.revision;
+  }
+
+  stateResyncDirty = replayPendingStateDeltas() || stateResyncDirty;
+  notifyStateListeners();
+  return stateSnapshot!;
+};
+
+const resyncState = async (): Promise<WorkbenchState> => {
+  if (!stateResyncInFlight) {
+    stateResyncInFlight = (async () => {
+      do {
+        stateResyncDirty = false;
+        const value = await invoke<unknown>("state:resync");
+        installStateSnapshot(validateRendererSnapshotEnvelope(value));
+      } while (stateResyncDirty);
+      return stateSnapshot!;
+    })()
+      .finally(() => {
+        stateResyncInFlight = undefined;
+      });
+  }
+  return await stateResyncInFlight;
+};
+
+const subscribeState = async (): Promise<WorkbenchState> => {
+  if (stateSnapshot) {
+    return stateSnapshot;
+  }
+  if (!stateSubscribeInFlight) {
+    stateSubscribeInFlight = invoke<unknown>("state:subscribe")
+      .then((value) => {
+        const installed = installStateSnapshot(validateRendererSnapshotEnvelope(value));
+        if (stateResyncDirty) {
+          void resyncState().catch((error: unknown) => {
+            console.error("[preload] Renderer state resync failed after subscribe.", error);
+          });
+        }
+        return installed;
+      })
+      .finally(() => {
+        stateSubscribeInFlight = undefined;
+      });
+  }
+  return await stateSubscribeInFlight;
+};
+
+ipcRenderer.on("state:delta", (_event, rawEnvelope: unknown) => {
+  try {
+    const envelope = validateRendererDeltaEnvelope(rawEnvelope);
+    if (!stateSnapshot) {
+      bufferStateDelta(envelope);
+      void subscribeState().catch((error: unknown) => {
+        console.error("[preload] Renderer state subscription failed.", error);
+      });
+      return;
+    }
+    if (stateResyncInFlight) {
+      bufferStateDelta(envelope);
+      return;
+    }
+    if (envelope.streamId === stateStreamId && envelope.revision <= stateRevision) {
+      return;
+    }
+    if (
+      envelope.protocolVersion !== RENDERER_STATE_PROTOCOL_VERSION ||
+      envelope.streamId !== stateStreamId ||
+      envelope.baseRevision !== stateRevision
+    ) {
+      bufferStateDelta(envelope);
+      void resyncState().catch((error: unknown) => {
+        console.error("[preload] Renderer state resync failed.", error);
+      });
+      return;
+    }
+    stateSnapshot = applyWorkbenchDelta(stateSnapshot, envelope);
+    stateRevision = envelope.revision;
+    notifyStateListeners();
+  } catch (error) {
+    console.error("[preload] Rejected invalid renderer state delta.", error);
+    if (stateResyncInFlight) {
+      stateResyncDirty = true;
+    }
+    void resyncState().catch((resyncError: unknown) => {
+      console.error("[preload] Renderer state resync failed after an invalid delta.", resyncError);
+    });
+  }
+});
+
+ipcRenderer.on("state:resync-required", (_event, value: unknown) => {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    (value as { protocolVersion?: unknown }).protocolVersion !== RENDERER_STATE_PROTOCOL_VERSION
+  ) {
+    return;
+  }
+  if (stateResyncInFlight) {
+    stateResyncDirty = true;
+  }
+  void resyncState().catch((error: unknown) => {
+    console.error("[preload] Renderer state resync failed after a resync request.", error);
+  });
+});
 
 export interface WorkbenchApi {
   getState(): Promise<WorkbenchState>;
@@ -84,7 +279,7 @@ export interface WorkbenchApi {
   loadProject(inputPath: string, intent?: ProjectLoadIntent, creationMode?: ProjectCreationMode): Promise<ProjectLoadResult>;
   openProject(projectId: string): Promise<LoadedProjectView>;
   selectInterface(source: "portable" | "local" | "fresh", path?: string, freshBehavior?: "replace" | "duplicate"): Promise<LoadedProjectView>;
-  updateSettings(payload: Record<string, unknown>): Promise<unknown>;
+  updateSettings(payload: Record<string, unknown>, baseRevision?: number): Promise<unknown>;
   getFileSummary(projectId: string, relativePath: string): Promise<FileSummary>;
   getRepositoryView(projectId: string): Promise<ProjectRepositoryView>;
   getRepositorySummary(projectId: string): Promise<ProjectRepositorySummary>;
@@ -201,6 +396,18 @@ export interface WorkbenchApi {
   requestWorkflowPreview(projectId: string, reason?: string, remainingCycles?: number): Promise<ProjectWorkflowState>;
   cancelWorkflowPreview(projectId: string): Promise<ProjectWorkflowState>;
   completeWorkflowPreview(projectId: string): Promise<ProjectWorkflowState>;
+  getPreviewReadiness(projectId: string): Promise<PreviewReadiness>;
+  grantPreviewTrust(projectId: string, sessionId: string): Promise<PreviewSessionProjection>;
+  installPreviewBrowser(projectId: string): Promise<PreviewReadiness>;
+  startProjectPreview(projectId: string, checkpointKind?: PreviewCheckpointKind): Promise<PreviewSessionProjection>;
+  stopProjectPreview(projectId: string, sessionId: string): Promise<void>;
+  performPreviewAction(projectId: string, sessionId: string, action: PreviewAction): Promise<PreviewSessionProjection>;
+  getPreviewArtifact(
+    projectId: string,
+    sessionId: string,
+    artifactId: string
+  ): Promise<{ metadata: PreviewArtifactMetadata; bytes: Uint8Array }>;
+  openPreviewExternal(projectId: string, sessionId: string): Promise<void>;
   setAutopilotPolicy(projectId: string, policy: Partial<AutopilotPolicy>): Promise<ProjectWorkflowState>;
   advanceWorkflowStage(projectId: string): Promise<string>;
   recoverWorkflow(projectId: string): Promise<string>;
@@ -244,31 +451,13 @@ export interface WorkbenchApi {
 }
 
 const api: WorkbenchApi = {
-  getState: async () => await invoke<WorkbenchState>("app:getState"),
+  getState: async () => await subscribeState(),
   refreshGitHubStatus: async () => await invoke<GitHubStatus>("github:refreshStatus"),
   onStateUpdated: (listener) => {
-    let frameId: ReturnType<typeof setTimeout> | null = null;
-    let latestState: WorkbenchState | null = null;
-    const flush = (): void => {
-      frameId = null;
-      if (latestState) {
-        listener(latestState);
-        latestState = null;
-      }
-    };
-    const wrapped = (_event: Electron.IpcRendererEvent, state: WorkbenchState) => {
-      latestState = state;
-      if (frameId !== null) {
-        return;
-      }
-      frameId = setTimeout(flush, STATE_UPDATE_COALESCE_MS);
-    };
-    ipcRenderer.on("state:updated", wrapped);
+    stateListeners.add(listener);
+    void subscribeState();
     return () => {
-      if (frameId !== null) {
-        clearTimeout(frameId);
-      }
-      ipcRenderer.removeListener("state:updated", wrapped);
+      stateListeners.delete(listener);
     };
   },
   chooseFolder: async (options) => await invoke<string | null>("app:chooseFolder", options),
@@ -288,7 +477,10 @@ const api: WorkbenchApi = {
   openProject: async (projectId) => await invoke<LoadedProjectView>("project:open", { projectId }),
   selectInterface: async (source, path, freshBehavior) =>
     await invoke<LoadedProjectView>("project:selectInterface", { projectId: "pending", source, path, freshBehavior }),
-  updateSettings: async (payload) => await invoke<unknown>("settings:update", payload),
+  updateSettings: async (payload, baseRevision) => await invoke<unknown>(
+    "settings:update",
+    baseRevision === undefined ? payload : { patch: payload, baseRevision }
+  ),
   getFileSummary: async (projectId, relativePath) => await invoke<FileSummary>("project:getFileSummary", { projectId, relativePath }),
   getRepositoryView: async (projectId) => await invoke<ProjectRepositoryView>("project:getRepositoryView", { projectId }),
   getRepositorySummary: async (projectId) => await invoke<ProjectRepositorySummary>("project:getRepositorySummary", { projectId }),
@@ -368,6 +560,26 @@ const api: WorkbenchApi = {
     await invoke<ProjectWorkflowState>("workflow:requestPreview", { projectId, reason, remainingCycles }),
   cancelWorkflowPreview: async (projectId) => await invoke<ProjectWorkflowState>("workflow:cancelPreview", { projectId }),
   completeWorkflowPreview: async (projectId) => await invoke<ProjectWorkflowState>("workflow:completePreview", { projectId }),
+  getPreviewReadiness: async (projectId) =>
+    await invoke<PreviewReadiness>("preview:getReadiness", { projectId }),
+  grantPreviewTrust: async (projectId, sessionId) =>
+    await invoke<PreviewSessionProjection>("preview:grantTrust", { projectId, sessionId }),
+  installPreviewBrowser: async (projectId) =>
+    await invoke<PreviewReadiness>("preview:installBrowser", { projectId }),
+  startProjectPreview: async (projectId, checkpointKind = "explicit") =>
+    await invoke<PreviewSessionProjection>("preview:start", { projectId, checkpointKind }),
+  stopProjectPreview: async (projectId, sessionId) =>
+    await invoke<void>("preview:stop", { projectId, sessionId }),
+  performPreviewAction: async (projectId, sessionId, action) =>
+    await invoke<PreviewSessionProjection>("preview:performAction", { projectId, sessionId, action }),
+  getPreviewArtifact: async (projectId, sessionId, artifactId) =>
+    await invoke<{ metadata: PreviewArtifactMetadata; bytes: Uint8Array }>("preview:getArtifact", {
+      projectId,
+      sessionId,
+      artifactId
+    }),
+  openPreviewExternal: async (projectId, sessionId) =>
+    await invoke<void>("preview:openExternal", { projectId, sessionId }),
   setAutopilotPolicy: async (projectId, policy) => await invoke<ProjectWorkflowState>("workflow:setAutopilotPolicy", { projectId, policy }),
   advanceWorkflowStage: async (projectId) => await invoke<string>("workflow:advanceStage", { projectId }),
   recoverWorkflow: async (projectId) => await invoke<string>("workflow:recover", { projectId }),
@@ -415,11 +627,11 @@ const api: WorkbenchApi = {
     await invoke<unknown>("agent:create", { projectId, category, name, prompt, model, reasoningMode, reasoningEffort }),
   approve: async (projectId, agentId, approvalId, decision) =>
     await invoke<void>("agent:approve", { projectId, agentId, approvalId, decision }),
-  runIntegrity: async (projectId) => await invoke<void>("agent:runIntegrity", projectId),
-  runMerge: async (projectId) => await invoke<void>("agent:runMerge", projectId),
+  runIntegrity: async (projectId) => await invoke<void>("agent:runIntegrity", { projectId }),
+  runMerge: async (projectId) => await invoke<void>("agent:runMerge", { projectId }),
   runRecommendation: async (projectId, customFocus) => await invoke<void>("agent:runRecommendation", { projectId, customFocus }),
   refreshOverview: async (projectId) => await invoke<void>("project:refreshOverview", { projectId }),
-  revalidate: async (projectId) => await invoke<string>("project:revalidate", projectId)
+  revalidate: async (projectId) => await invoke<string>("project:revalidate", { projectId })
 };
 
 contextBridge.exposeInMainWorld("workbench", api);

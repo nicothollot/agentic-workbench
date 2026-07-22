@@ -6,21 +6,29 @@
   "type": "module",
   "author": "Codex",
   "license": "MIT",
+  "packageManager": "npm@11.12.0",
+  "engines": {
+    "node": ">=22.12.0 <25",
+    "npm": ">=10"
+  },
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "dev": "node scripts/dev.mjs",
-    "mock": "cross-env AWB_MOCK_MODE=1 node scripts/dev.mjs",
-    "start": "electron .",
+    "mock": "node scripts/dev.mjs --mock",
+    "start": "node scripts/start.mjs",
+    "start:compiled": "electron .",
     "generate:icons": "node scripts/generate-icons.mjs",
     "build": "npm run build:app",
     "build:app": "npm run clean && npm run generate:icons && npm run build:renderer && npm run build:electron",
     "build:renderer": "vite build",
     "build:electron": "vite build -c vite.main.config.ts && vite build -c vite.preload.config.ts",
     "check:repo-hygiene": "node scripts/check-repo-hygiene.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json && tsc --noEmit -p tsconfig.e2e.json",
     "lint": "eslint .",
     "test": "npm run check:repo-hygiene && vitest run --fileParallelism=false",
     "test:watch": "vitest",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:compiled": "playwright test",
     "repair:state": "node scripts/repair-state.mjs",
     "package:win": "node scripts/package-app.mjs --win",
     "package:win:portable": "node scripts/package-app.mjs --win-portable",
@@ -38,6 +46,7 @@
     "fast-xml-parser": "^5.2.5",
     "ignore": "^7.0.5",
     "nanoid": "^5.1.5",
+    "playwright-core": "1.55.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "smol-toml": "^1.4.1",
@@ -45,6 +54,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
+    "@playwright/test": "1.55.0",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
@@ -52,7 +62,6 @@
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^5.0.0",
-    "cross-env": "^10.0.0",
     "electron": "^37.2.6",
     "electron-builder": "^26.0.12",
     "eslint": "^9.33.0",
@@ -82,6 +91,14 @@
       {
         "from": "assets/branding/app.ico",
         "to": "app.ico"
+      },
+      {
+        "from": "scripts/preview-broker",
+        "to": "preview-broker"
+      },
+      {
+        "from": "node_modules/playwright-core",
+        "to": "preview-broker/node_modules/playwright-core"
       }
     ],
     "directories": {

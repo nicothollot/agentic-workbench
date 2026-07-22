@@ -24,7 +24,7 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        project: ["./tsconfig.json", "./tsconfig.electron.json"]
+        project: ["./tsconfig.json", "./tsconfig.electron.json", "./tsconfig.e2e.json"]
       },
       globals: {
         ...globals.browser,

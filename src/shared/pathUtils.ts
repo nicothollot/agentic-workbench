@@ -1,7 +1,7 @@
 import type { AppSettings, ProjectPathKind, ResolvedProjectPath } from "./types";
 
 const WINDOWS_DRIVE_PATH = /^[a-zA-Z]:[\\/]/;
-const WSL_UNC_PATH = /^\\\\wsl\$\\([^\\]+)\\(.*)$/i;
+const WSL_UNC_PATH = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)(?:\\(.*))?$/i;
 const WSL_MNT_DRIVE_PATH = /^\/mnt\/([a-zA-Z])(\/.*)?$/;
 const WINDOWS_PREFIX = /^[a-zA-Z]:/;
 
@@ -37,6 +37,24 @@ const normalizePosixPath = (inputPath: string): string => {
   return `${absolute ? "/" : ""}${normalized.join("/")}`;
 };
 
+const normalizePotentialWslUncPath = (inputPath: string): string =>
+  /^[/\\]{2}wsl(?:\$|\.localhost)[/\\]/i.test(inputPath)
+    ? inputPath.replace(/\//g, "\\")
+    : inputPath;
+
+const parseWslUncPath = (inputPath: string): { distroName: string; linuxPath: string } | undefined => {
+  const match = normalizePotentialWslUncPath(inputPath).match(WSL_UNC_PATH);
+  if (!match) {
+    return undefined;
+  }
+
+  const linuxTail = (match[2] ?? "").replace(/\\/g, "/");
+  return {
+    distroName: match[1],
+    linuxPath: normalizePosixPath(linuxTail ? `/${linuxTail}` : "/")
+  };
+};
+
 const splitComparablePath = (inputPath: string): { prefix: string; segments: string[]; isWindows: boolean } => {
   const normalized = inputPath.replace(/\\/g, "/");
   if (WINDOWS_PREFIX.test(normalized)) {
@@ -51,8 +69,11 @@ const splitComparablePath = (inputPath: string): { prefix: string; segments: str
 
   const uncMatch = normalized.match(/^\/\/([^/]+)\/([^/]+)(\/.*)?$/);
   if (uncMatch) {
+    const serverName = /^(?:wsl\$|wsl\.localhost)$/i.test(uncMatch[1])
+      ? "wsl"
+      : uncMatch[1].toLowerCase();
     return {
-      prefix: `//${uncMatch[1].toLowerCase()}/${uncMatch[2].toLowerCase()}`,
+      prefix: `//${serverName}/${uncMatch[2].toLowerCase()}`,
       segments: (uncMatch[3] ?? "").split("/").filter(Boolean),
       isWindows: true
     };
@@ -96,17 +117,26 @@ export const detectProjectPathKind = (inputPath: string): ProjectPathKind => {
     return "windows";
   }
 
-  if (WSL_UNC_PATH.test(inputPath)) {
+  if (parseWslUncPath(inputPath)) {
     return "wsl-unc";
   }
 
   return "linux";
 };
 
-export const normalizeWindowsPath = (inputPath: string): string => inputPath.replace(/\//g, "\\").replace(/\\+$/, "");
+export const normalizeWindowsPath = (inputPath: string): string => {
+  const normalized = inputPath.replace(/\//g, "\\");
+  if (/^[a-zA-Z]:\\+$/.test(normalized)) {
+    return `${normalized.slice(0, 2)}\\`;
+  }
+  return normalized.replace(/\\+$/, "");
+};
 
 export const windowsPathToWslPath = (inputPath: string): string => {
   const normalized = normalizeWindowsPath(inputPath);
+  if (!WINDOWS_DRIVE_PATH.test(normalized)) {
+    throw new Error(`Not a Windows drive path: ${inputPath}`);
+  }
   const drive = normalized.slice(0, 1).toLowerCase();
   const tail = normalized.slice(2).replace(/\\/g, "/");
   return `/mnt/${drive}${tail.startsWith("/") ? tail : `/${tail}`}`;
@@ -124,17 +154,11 @@ export const wslPathToWindowsPath = (inputPath: string): string | null => {
 };
 
 export const uncWslToLinuxPath = (inputPath: string): { distroName: string; linuxPath: string } => {
-  const match = inputPath.match(WSL_UNC_PATH);
-  if (!match) {
+  const parsed = parseWslUncPath(inputPath);
+  if (!parsed) {
     throw new Error(`Not a WSL UNC path: ${inputPath}`);
   }
-
-  const distroName = match[1];
-  const linuxTail = match[2].replace(/\\/g, "/");
-  return {
-    distroName,
-    linuxPath: linuxTail.startsWith("/") ? linuxTail : `/${linuxTail}`
-  };
+  return parsed;
 };
 
 export const linuxPathToUncWslPath = (linuxPath: string, distroName: string): string => {
@@ -189,12 +213,13 @@ export const resolveProjectPath = (
 
   if (kind === "wsl-unc") {
     const { distroName, linuxPath } = uncWslToLinuxPath(inputPath);
+    const normalizedHostPath = normalizeWindowsPath(normalizePotentialWslUncPath(inputPath));
     return {
       kind,
       inputPath,
-      displayPath: inputPath.replace(/\\+$/, ""),
-      hostPath: inputPath.replace(/\\+$/, ""),
-      wslPath: usesWslExecution ? linuxPath : inputPath.replace(/\\+$/, ""),
+      displayPath: normalizedHostPath,
+      hostPath: normalizedHostPath,
+      wslPath: usesWslExecution ? linuxPath : normalizedHostPath,
       distroName: usesWslExecution ? distroName : undefined,
       mountWarning: usesWslExecution && linuxPath.startsWith("/mnt/")
     };

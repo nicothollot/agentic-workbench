@@ -21,7 +21,7 @@ export const recommendationRiskLevelSchema = z.enum(["low", "medium", "high"]);
 export const ultimateGoalProgressSourceSchema = z.enum(["recommendation", "deterministic"]);
 export const workflowObjectiveSchema = z.enum(["deliver", "optimize"]);
 export const workflowModeSchema = z.enum(["normal", "fast"]);
-export const workflowPreviewStatusSchema = z.enum(["none", "queued", "active", "ready", "completed", "cancelled"]);
+export const workflowPreviewStatusSchema = z.enum(["none", "queued", "active", "ready", "completed", "cancelled", "failed"]);
 export const autopilotProfileSchema = z.enum(["balanced", "conservative", "aggressive", "custom"]);
 export const autopilotIntegrityFailurePolicySchema = z.enum(["repair", "pause", "policy"]);
 export const autopilotPresetIdSchema = z.enum([
@@ -1136,9 +1136,10 @@ export const userInputRequestSchema = z.object({
   attachmentInboxPath: z.string().min(1),
   attachmentInboxRelativePath: z.string().min(1),
   attachments: z.array(userInputRequestAttachmentSchema).default([]),
-  status: z.enum(["pending", "submitted"]).default("pending"),
+  status: z.enum(["pending", "submitted", "cancelled"]).default("pending"),
   createdAt: isoDatetime(),
-  submittedAt: isoDatetime().optional()
+  submittedAt: isoDatetime().optional(),
+  cancelledAt: isoDatetime().optional()
 });
 
 export const credentialRequestRecordSchema = z.object({
@@ -1543,6 +1544,14 @@ export const worktreeAssignmentSchema = z.object({
   targetBranch: z.string().optional()
 });
 
+// Project and agent identifiers become filesystem path segments in local
+// storage. Keep their persisted form portable and traversal-proof even when a
+// record originated in a repository-controlled portable interface.
+export const storageEntityIdSchema = z.string()
+  .min(1)
+  .max(200)
+  .regex(/^[A-Za-z0-9_-]+$/, "Storage identifiers may contain only letters, numbers, underscores, and hyphens.");
+
 export const approvalRequestSchema = z.object({
   id: z.string().min(1),
   agentId: z.string().min(1),
@@ -1622,7 +1631,7 @@ export const recommendationReportSchema = z.object({
 });
 
 export const agentStateSchema = z.object({
-  id: z.string().min(1),
+  id: storageEntityIdSchema,
   category: agentCategorySchema,
   name: z.string().min(1),
   taskPrompt: z.string().min(1),
@@ -1689,6 +1698,86 @@ export const agentStateSchema = z.object({
   }).optional()
 });
 
+const portableAgentStateSchema = agentStateSchema.omit({ worktree: true }).transform((agent) => {
+  const wasLive = agent.status === "starting" || agent.status === "running" || agent.status === "waiting_approval";
+  return {
+    ...agent,
+    status: wasLive ? "idle" as const : agent.status,
+    currentPhase: wasLive ? "Portable history; live execution was not transferred" : agent.currentPhase,
+    currentSubtask: wasLive ? undefined : agent.currentSubtask,
+    threadId: undefined,
+    approvals: agent.approvals
+      .filter((approval) => approval.status !== "pending")
+      .map((approval) => ({
+        ...approval,
+        threadId: undefined,
+        turnId: undefined,
+        itemId: undefined,
+        serverRequestId: undefined,
+        command: undefined,
+        cwd: undefined,
+        availableDecisions: []
+      })),
+    commandLog: agent.commandLog.map((command) => ({
+      ...command,
+      cwd: undefined,
+      output: ""
+    })),
+    events: agent.events.map((event) => ({ ...event, raw: undefined })),
+    outputReference: undefined
+  };
+});
+
+const portableWorkflowStateSchema = z.preprocess(
+  (value) => value ?? defaultProjectWorkflowState(),
+  projectWorkflowStateSchema
+).transform((workflow) => ({
+  ...workflow,
+  execution: {
+    ...workflow.execution,
+    activeRunId: undefined,
+    effectKey: undefined
+  },
+  autopilotStatus: undefined,
+  autopilotPolicy: {
+    ...workflow.autopilotPolicy,
+    enabled: false
+  },
+  previewRequest: {
+    ...workflow.previewRequest,
+    status: workflow.previewRequest.status === "active" || workflow.previewRequest.status === "ready"
+      ? "cancelled" as const
+      : workflow.previewRequest.status,
+    previewSessionId: undefined,
+    previewGateReportId: undefined,
+    evidenceKind: undefined
+  },
+  incidents: workflow.incidents.map((incident) =>
+    incident.kind === "approval" && (incident.status === "open" || incident.status === "resolving")
+      ? {
+          ...incident,
+          status: "superseded" as const,
+          userActionRequired: undefined,
+          primaryAction: undefined,
+          secondaryActions: [],
+          automaticActions: [
+            ...incident.automaticActions,
+            "Live approval state was excluded from the imported portable interface."
+          ],
+          updatedAt: workflow.execution.updatedAt,
+          resolvedAt: workflow.execution.updatedAt
+        }
+      : incident
+  )
+}));
+
+const portableLocalProjectStateSchema = localProjectStateSchema.transform((localState) => ({
+  ...localState,
+  activeAgentId: undefined,
+  autopilotEnabled: false,
+  workflowPauseRequested: true
+}));
+
 export const portableInterfaceSchema = z.object({
   schemaVersion: z.union([z.literal(1), z.literal(PORTABLE_INTERFACE_VERSION)]).default(PORTABLE_INTERFACE_VERSION),
   appMinVersion: z.string().default(APP_VERSION),
@@ -1697,17 +1786,21 @@ export const portableInterfaceSchema = z.object({
   identity: projectIdentitySchema,
   validation: validationSnapshotSchema,
   layout: layoutConfigSchema,
-  localStateDefaults: localProjectStateSchema,
-  workflow: z.preprocess((value) => value ?? defaultProjectWorkflowState(), projectWorkflowStateSchema),
+  // Portable files can carry presentation defaults, but never a local grant to
+  // start autonomous work merely because the file was selected.
+  localStateDefaults: portableLocalProjectStateSchema,
+  workflow: portableWorkflowStateSchema,
   overview: projectOverviewSchema.optional(),
   stats: projectStatsSchema.optional(),
   dependencies: z.array(dependencyRecordSchema),
   summaryCache: z.array(fileSummarySchema),
-  agents: z.array(agentStateSchema)
+  // Managed worktrees and live transport state are machine-local authority.
+  // Older portable files may contain those keys, but parsing removes them.
+  agents: z.array(portableAgentStateSchema)
 });
 
 export const localProjectRecordSchema = z.object({
-  id: z.string().min(1),
+  id: storageEntityIdSchema,
   displayPath: z.string().min(1),
   wslPath: z.string().min(1),
   projectRoot: z.string().min(1),

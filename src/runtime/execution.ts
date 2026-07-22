@@ -5,6 +5,10 @@ import type { AppSettings, ExecutionMode } from "@shared/types";
 
 const execFileAsync = promisify(execFile);
 
+export const DEFAULT_STRUCTURED_COMMAND_TIMEOUT_MS = 120_000;
+export const DEFAULT_SHELL_COMMAND_TIMEOUT_MS = 10 * 60_000;
+export const DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
+
 export interface CommandResult {
   stdout: string;
   stderr: string;
@@ -18,6 +22,8 @@ export interface StructuredCommandSpec {
   env?: Record<string, string | undefined>;
   runtimePathDirs?: string[];
   timeoutMs?: number;
+  maxOutputBytes?: number;
+  signal?: AbortSignal;
 }
 
 export interface ShellCommandSpec {
@@ -26,6 +32,8 @@ export interface ShellCommandSpec {
   env?: Record<string, string | undefined>;
   runtimePathDirs?: string[];
   timeoutMs?: number;
+  maxOutputBytes?: number;
+  signal?: AbortSignal;
 }
 
 export interface ExecutionPlan {
@@ -52,6 +60,13 @@ export interface WslResolvedCodexRuntime {
   requestedCodexCommand: string;
   resolvedCodexCommand?: string;
   resolvedNodeCommand?: string;
+  runtimePathDirs: string[];
+  user?: string;
+}
+
+export interface WslResolvedNodeRuntime {
+  requestedNodeCommand: string;
+  resolvedNodeCommand: string;
   runtimePathDirs: string[];
   user?: string;
 }
@@ -139,6 +154,7 @@ export const buildWslLoginShellExecutionPlan = (
       ...(spec.args ?? [])
     ],
     options: {
+      signal: spec.signal,
       env: process.env
     }
   };
@@ -373,6 +389,7 @@ export const buildStructuredExecutionPlan = (
       args: spec.args ?? [],
       options: {
         cwd: spec.cwd,
+        signal: spec.signal,
         env: {
           ...process.env,
           ...cleanEnvironment(spec.env)
@@ -381,12 +398,21 @@ export const buildStructuredExecutionPlan = (
     };
   }
 
+  // Resolved npm/codex launchers under nvm commonly use `#!/usr/bin/env node`.
+  // Keep the executable and every argument as positional argv while using a
+  // login shell solely to prepend the already-resolved runtime directories.
+  // Both structured spawn and exec paths consume this shared plan builder.
+  if (dedupeStrings(spec.runtimePathDirs ?? []).length > 0) {
+    return buildWslLoginShellExecutionPlan(settings, spec, platform);
+  }
+
   const args = [...buildWslBaseArgs(settings, spec.cwd, spec.env), spec.command, ...(spec.args ?? [])];
 
   return {
     file: "wsl.exe",
     args,
     options: {
+      signal: spec.signal,
       env: process.env
     }
   };
@@ -417,6 +443,7 @@ export const buildShellExecutionPlan = (
       file: "wsl.exe",
       args,
       options: {
+        signal: spec.signal,
         env: process.env
       }
     };
@@ -428,6 +455,7 @@ export const buildShellExecutionPlan = (
       args: ["/d", "/s", "/c", spec.command],
       options: {
         cwd: spec.cwd,
+        signal: spec.signal,
         env: {
           ...process.env,
           ...cleanEnvironment(spec.env)
@@ -441,6 +469,7 @@ export const buildShellExecutionPlan = (
     args: ["-lc", spec.command],
     options: {
       cwd: spec.cwd,
+      signal: spec.signal,
       env: {
         ...process.env,
         ...cleanEnvironment(spec.env)
@@ -731,7 +760,9 @@ export class RuntimeCommandExecutor {
         {
           ...(plan.options as ExecFileOptionsWithStringEncoding),
           encoding: "utf8",
-          timeout: spec.timeoutMs
+          timeout: spec.timeoutMs ?? DEFAULT_STRUCTURED_COMMAND_TIMEOUT_MS,
+          maxBuffer: spec.maxOutputBytes ?? DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES,
+          signal: spec.signal
         }
       );
       return {
@@ -740,9 +771,9 @@ export class RuntimeCommandExecutor {
         exitCode: 0
       };
     } catch (error) {
-      const typedError = error as { stdout?: string; stderr?: string; code?: number | string; message?: string };
+      const typedError = error as { stdout?: string; stderr?: string; code?: number | string; message?: string; name?: string };
       const failure = new Error(describeExecutionFailure(this.settings, spec, typedError, this.platform)) as ExecutionFailure;
-      failure.name = "ExecutionError";
+      failure.name = typedError.name === "AbortError" ? "AbortError" : "ExecutionError";
       failure.stdout = typedError.stdout ?? "";
       failure.stderr = typedError.stderr ?? "";
       failure.code = typedError.code;
@@ -934,6 +965,43 @@ export class RuntimeCommandExecutor {
     }
   }
 
+  async resolveWslNodeRuntime(
+    spec: Pick<StructuredCommandSpec, "cwd" | "timeoutMs"> & { command?: string } = {}
+  ): Promise<WslResolvedNodeRuntime> {
+    const requestedNodeCommand = spec.command ?? "node";
+    const mode = resolveExecutionMode(this.settings, this.platform);
+    if (mode !== "wsl") {
+      return {
+        requestedNodeCommand,
+        resolvedNodeCommand: requestedNodeCommand,
+        runtimePathDirs: requestedNodeCommand.includes("/")
+          ? [pathPosix.dirname(requestedNodeCommand)]
+          : [],
+        user: process.env.USER ?? process.env.USERNAME
+      };
+    }
+
+    // The Codex runtime probe is also the hardened Node-backed command probe:
+    // it checks direct paths, command -v, NVM's current alias, and every NVM
+    // version bin before returning the adjacent Node executable and PATH dirs.
+    const runtime = await this.resolveWslCodexRuntime({
+      command: requestedNodeCommand,
+      cwd: spec.cwd,
+      timeoutMs: spec.timeoutMs
+    });
+    if (!runtime.resolvedNodeCommand) {
+      throw new Error(
+        `Node.js could not be resolved inside WSL distro "${this.settings.distroName}" for command "${requestedNodeCommand}".`
+      );
+    }
+    return {
+      requestedNodeCommand,
+      resolvedNodeCommand: runtime.resolvedNodeCommand,
+      runtimePathDirs: runtime.runtimePathDirs,
+      user: runtime.user
+    };
+  }
+
   async runShellCommand(spec: ShellCommandSpec): Promise<CommandResult> {
     const plan = buildShellExecutionPlan(this.settings, spec, this.platform);
     try {
@@ -943,7 +1011,9 @@ export class RuntimeCommandExecutor {
         {
           ...(plan.options as ExecFileOptionsWithStringEncoding),
           encoding: "utf8",
-          timeout: spec.timeoutMs
+          timeout: spec.timeoutMs ?? DEFAULT_SHELL_COMMAND_TIMEOUT_MS,
+          maxBuffer: spec.maxOutputBytes ?? DEFAULT_COMMAND_OUTPUT_LIMIT_BYTES,
+          signal: spec.signal
         }
       );
       return {
@@ -953,9 +1023,12 @@ export class RuntimeCommandExecutor {
       };
     } catch (error) {
       const typedError = error as { stdout?: string; stderr?: string; code?: number | string; message?: string };
+      const stderr = typedError.stderr?.trim()
+        ? typedError.stderr
+        : describeExecutionFailure(this.settings, { command: spec.command, cwd: spec.cwd }, typedError, this.platform);
       return {
         stdout: typedError.stdout ?? "",
-        stderr: typedError.stderr ?? describeExecutionFailure(this.settings, { command: spec.command, cwd: spec.cwd }, typedError, this.platform),
+        stderr,
         exitCode: typeof typedError.code === "number" ? typedError.code : 1
       };
     }

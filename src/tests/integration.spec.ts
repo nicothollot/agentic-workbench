@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppService } from "@runtime/appService";
 import { MockCodexTransport } from "@runtime/mockCodexTransport";
-import { WorkbenchStorage } from "@runtime/storage";
+import { AGENT_TRANSCRIPT_ENTRY_MAX_BYTES, WorkbenchStorage, type SecretStorageCodec } from "@runtime/storage";
 import {
   buildValidationCommandResult,
   createValidationLedger,
@@ -19,16 +19,21 @@ import type { GoalCheckUpdateInput } from "@runtime/workflowRecommendations";
 import { createAgentSkeleton, createLocalProjectRecord } from "@shared/defaults";
 import { projectReviewLogBundleSchema } from "@shared/schemas";
 import { upsertWorkflowIncident } from "@shared/workflowExecution";
-import type { AgentState, ProjectWorkflowState, UltimateGoal } from "@shared/types";
+import type { AgentState, AgentTranscriptEntry, ProjectWorkflowState, UltimateGoal } from "@shared/types";
 import { nowIso } from "@shared/utils";
 import { createTempDir, initGitRepo, commitAll, writeMockSettings } from "./helpers";
 
 const execFileAsync = promisify(execFile);
 const createdServices = new Set<AppService>();
+const integrationSecretCodec: SecretStorageCodec = {
+  isEncryptionAvailable: () => true,
+  encryptString: (value) => Buffer.from(value, "utf8"),
+  decryptString: (encrypted) => encrypted.toString("utf8")
+};
 
 const createService = async (appDataDir: string): Promise<AppService> => {
   await writeMockSettings(appDataDir);
-  const service = new AppService(appDataDir);
+  const service = new AppService(appDataDir, integrationSecretCodec);
   trackService(service);
   await service.initialize();
   return service;
@@ -176,6 +181,50 @@ class CapturingPromptTransport extends MockCodexTransport {
 }
 
 describe("integration flows", () => {
+  it("bounds live command transcript memory and retains head/tail evidence on interruption", async () => {
+    const root = await createSampleRepo("bounded-live-command-output");
+    const appData = await createTempDir("appdata-bounded-live-command-output");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const runtime = service as any;
+    const project = runtime.projects.get(selected.record.id);
+    const agent = createAgentSkeleton("coding", "Verbose command agent", "Run a noisy command.", "gpt-5.4");
+    agent.status = "running";
+    project.record.agents.push(agent);
+
+    runtime.rememberCommandTranscriptStart(project, agent, "noisy-command", "npm test", root);
+    runtime.appendCommandTranscriptDelta(
+      project,
+      agent,
+      "noisy-command",
+      `begin\n${"x".repeat(AGENT_TRANSCRIPT_ENTRY_MAX_BYTES + 32_000)}`
+    );
+    runtime.appendCommandTranscriptDelta(project, agent, "noisy-command", "\nend-of-command\n");
+
+    const retained = [...runtime.commandOutputBuffers.values()][0] as {
+      outputHead: string;
+      outputTail: string;
+      totalOutputBytes: number;
+      truncated: boolean;
+    };
+    const retainedBytes = Buffer.byteLength(retained.outputHead) + Buffer.byteLength(retained.outputTail);
+    expect(retained.truncated).toBe(true);
+    expect(retainedBytes).toBeLessThanOrEqual(AGENT_TRANSCRIPT_ENTRY_MAX_BYTES);
+    expect(retained.totalOutputBytes).toBeGreaterThan(AGENT_TRANSCRIPT_ENTRY_MAX_BYTES);
+
+    runtime.flushCommandTranscriptsForAgent(project, agent, "agent_interrupted");
+    expect(runtime.commandOutputBuffers.size).toBe(0);
+    await vi.waitFor(async () => {
+      const transcript = await runtime.storage.readAgentTranscript(project.record.id, agent.id);
+      const command = transcript?.find((entry: AgentTranscriptEntry) => entry.itemId === "noisy-command");
+      expect(command?.text).toContain("begin");
+      expect(command?.text).toContain("command-output bytes omitted");
+      expect(command?.text).toContain("end-of-command");
+      expect(command?.metadata).toMatchObject({ truncated: true, status: "agent_interrupted" });
+    });
+  });
+
   it("does not report an existing interface on a true first open", async () => {
     const root = await createSampleRepo("first-open");
     const appData = await createTempDir("appdata-first-open");
@@ -196,7 +245,7 @@ describe("integration flows", () => {
     await expect(access(path.join(root, loadResult.validation.projectAccess?.probeFileName ?? "missing"))).rejects.toThrow();
   });
 
-  it("rejects non-GitHub repositories in open mode", async () => {
+  it("opens non-GitHub repositories for local agent work without requiring account linkage", async () => {
     const root = await createTempDir("non-github-open");
     await mkdir(path.join(root, "src"), { recursive: true });
     await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "non-github-open" }, null, 2));
@@ -207,7 +256,9 @@ describe("integration flows", () => {
     const appData = await createTempDir("appdata-non-github-open");
     const service = await createService(appData);
 
-    await expect(service.loadProject(root)).rejects.toThrow("GitHub-backed repositories");
+    const loaded = await service.loadProject(root);
+    expect(loaded.validation.projectKind).toBe("git");
+    expect(loaded.identity.normalizedRemotes).toEqual([]);
   });
 
   it("initializes a new workspace folder as a GitHub SSH repository in create mode", async () => {
@@ -294,7 +345,7 @@ describe("integration flows", () => {
     const selected = await serviceA.selectPendingInterface("fresh");
     await new Promise((resolve) => setTimeout(resolve, 80));
 
-    const serviceB = trackService(new AppService(appData));
+    const serviceB = trackService(new AppService(appData, integrationSecretCodec));
     await serviceB.initialize({ deferStartupWork: true });
 
     expect(serviceB.getState().projects.some((project) => project.record.id === selected.record.id)).toBe(false);
@@ -367,7 +418,9 @@ describe("integration flows", () => {
     const state = service.getState();
     const activeProject = state.projects.find((project) => project.record.id === reopened.record.id);
 
-    expect(activeProjectIdDuringOpen).toBe(created.record.id);
+    // Opening is transactional: progress events do not switch the active
+    // workspace until validation, scanning, and persistence all succeed.
+    expect(activeProjectIdDuringOpen).toBeUndefined();
     expect(state.activeProjectId).toBe(created.record.id);
     expect(reopened.tree.length).toBeGreaterThan(0);
     expect(activeProject?.record.localState.lastOpenedAt).toBeTruthy();
@@ -470,7 +523,10 @@ describe("integration flows", () => {
     await service.loadProject(root, "create");
     const selected = await service.selectPendingInterface("fresh");
 
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await waitFor(() => {
+      const record = getProjectRecord(service, selected.record.id);
+      return record?.interfaceCreation?.status === "completed" ? record : undefined;
+    });
 
     const project = service.getState().projects.find((entry) => entry.record.id === selected.record.id);
     const bootstrap = project?.record.agents.find((agent) => agent.category === "bootstrap");
@@ -874,6 +930,7 @@ describe("integration flows", () => {
     const root = await createSampleRepo("approvals");
     const appData = await createTempDir("appdata-approvals");
     const service = await createService(appData);
+    (service as any).settings.autoApproveCommands = false;
     await service.loadProject(root, "create");
     const selected = await service.selectPendingInterface("fresh");
     const projectId = selected.record.id;
@@ -935,6 +992,67 @@ describe("integration flows", () => {
     expect(developerInstructions).toContain("request the credential through the user-input/Credentials flow");
     expect(turnText).toContain(taskPrompt);
     expect(turnText).not.toContain("Make the largest coherent, reviewable change");
+  });
+
+  it("exposes typed browser tools to autonomous agents when the managed preview broker is packaged", async () => {
+    const root = await createSampleFolder("browser-dynamic-tools");
+    const appData = await createTempDir("appdata-browser-dynamic-tools");
+    await writeMockSettings(appData);
+    const service = trackService(new AppService(appData, integrationSecretCodec, {
+      previewWorkerPath: path.resolve(process.cwd(), "scripts", "preview-broker", "worker.cjs")
+    }));
+    await service.initialize();
+    await service.loadProject(root, "create", "use_folder_as_is");
+    const selected = await service.selectPendingInterface("fresh");
+    const transport = new CapturingPromptTransport();
+    (service as unknown as { transport: MockCodexTransport }).transport = transport;
+
+    await service.createAgent(selected.record.id, "manual", "Browser QA", "Inspect the running interface.", "gpt-5.4");
+
+    const tools = transport.threadStarts.at(-1)?.dynamicTools;
+    expect(tools).toHaveLength(1);
+    expect(tools?.[0]).toMatchObject({ type: "namespace", name: "browser" });
+    if (tools?.[0]?.type === "namespace") {
+      expect(tools[0].tools.map((tool) => tool.name)).toEqual([
+        "start",
+        "snapshot",
+        "navigate",
+        "click",
+        "fill",
+        "select",
+        "press",
+        "scroll",
+        "wait",
+        "screenshot"
+      ]);
+      const selectTool = tools[0].tools.find((tool) => tool.name === "select");
+      const waitTool = tools[0].tools.find((tool) => tool.name === "wait");
+      expect(selectTool?.type).toBe("function");
+      expect(waitTool?.type).toBe("function");
+      if (selectTool?.type === "function" && waitTool?.type === "function") {
+        expect(selectTool.inputSchema).toEqual({
+          type: "object",
+          properties: {
+            ref: { type: "string", minLength: 1, maxLength: 200 },
+            values: {
+              type: "array",
+              items: { type: "string", maxLength: 1_000 },
+              maxItems: 100
+            }
+          },
+          required: ["ref", "values"],
+          additionalProperties: false
+        });
+        expect(waitTool.inputSchema).toEqual({
+          type: "object",
+          properties: {
+            milliseconds: { type: "integer", minimum: 0, maximum: 30_000 }
+          },
+          required: ["milliseconds"],
+          additionalProperties: false
+        });
+      }
+    }
   });
 
   it("starts read-only agents with the current sandbox policy shape", async () => {
@@ -1812,7 +1930,9 @@ describe("integration flows", () => {
 
     const integrityAgent = getProjectRecord(service, selected.record.id)?.agents.find((agent) => agent.category === "integrity");
     expect(integrityAgent?.threadId).toBeUndefined();
-    expect(integrityAgent?.worktree?.worktreePath).toContain(".agent-workbench/worktrees");
+    expect(integrityAgent?.worktree?.baseDir).toBe(path.join(appData, "worktrees"));
+    expect(integrityAgent?.worktree?.worktreePath.startsWith(path.join(appData, "worktrees"))).toBe(true);
+    expect(integrityAgent?.worktree?.worktreePath.startsWith(root)).toBe(false);
     expect(integrityAgent?.integrityReport?.checks).toHaveLength(1);
     expect(integrityAgent?.integrityReport?.checks[0]).toMatchObject({
       name: "typecheck",
@@ -1820,6 +1940,61 @@ describe("integration flows", () => {
       status: "passed"
     });
     expect(integrityAgent?.status).toBe("completed");
+  });
+
+  it("does not execute repository-defined validation code until its content-bound command approval is accepted", async () => {
+    const markerDirectory = await createTempDir("integrity-command-approval-marker");
+    const markerPath = path.join(markerDirectory, "executed.txt");
+    const root = await createSampleProject("integrity-command-approval", "git", {
+      test: `node -e "require('fs').writeFileSync('${markerPath}', 'executed')"`
+    });
+    const appData = await createTempDir("appdata-integrity-command-approval");
+    const service = await createService(appData);
+    (service as any).settings.autoApproveCommands = false;
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const project = (service as any).projects.get(selected.record.id);
+    const workflow = project.record.workflow;
+    workflow.ultimateGoal = {
+      ...workflow.ultimateGoal,
+      summary: "Validate repository commands only after explicit review.",
+      confirmedAt: "2026-07-21T00:00:00.000Z"
+    };
+    workflow.scopedGoal = {
+      id: "scoped-command-approval",
+      sourceRecommendationId: "rec-command-approval",
+      summary: "Exercise the validation command approval boundary.",
+      executionBrief: "Require an exact approval before executing project code.",
+      acceptanceCriteria: [],
+      constraints: [],
+      testStrategy: [],
+      createdAt: "2026-07-21T00:00:00.000Z"
+    };
+
+    await service.runIntegrity(selected.record.id);
+
+    await expect(access(markerPath)).rejects.toThrow();
+    const waitingAgent = getProjectRecord(service, selected.record.id)?.agents.find(
+      (entry) => entry.category === "integrity" && entry.status === "waiting_approval"
+    );
+    const approval = waitingAgent?.approvals.find((entry) => entry.status === "pending");
+    expect(approval).toMatchObject({
+      kind: "command",
+      command: "npm test",
+      status: "pending"
+    });
+    expect(waitingAgent?.currentPhase).toBe("Waiting for validation command approval");
+
+    await service.approve(selected.record.id, waitingAgent!.id, approval!.id, "accept");
+
+    await expect(access(markerPath)).resolves.toBeUndefined();
+    const completedAgent = getProjectRecord(service, selected.record.id)?.agents.find(
+      (entry) => entry.category === "integrity" && entry.id !== waitingAgent?.id
+    );
+    expect(completedAgent?.integrityReport?.checks[0]).toMatchObject({
+      command: "npm test",
+      status: "passed"
+    });
   });
 
   it("runs generic Git sanity validation for fresh repositories without project commands", async () => {
@@ -1961,8 +2136,19 @@ describe("integration flows", () => {
     const selected = await service.selectPendingInterface("fresh");
     await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
 
-    const staleWorktreePath = path.join(root, ".agent-workbench", "worktrees", "prune-stale-worktree", "stale-pass", "stale");
+    const managedBaseDir = path.join(appData, "worktrees");
+    const staleWorktreePath = path.join(managedBaseDir, "prune-stale-worktree", "stale-pass", "stale");
     await execFileAsync("git", ["worktree", "add", "-b", "awb/prune-stale/manual", staleWorktreePath, "main"], { cwd: root });
+    const staleAgent = createAgentSkeleton("coding", "Completed stale pass", "Old worktree", "gpt-5.4");
+    staleAgent.status = "completed";
+    staleAgent.completedAt = nowIso();
+    staleAgent.worktree = {
+      baseDir: managedBaseDir,
+      worktreePath: staleWorktreePath,
+      branch: "awb/prune-stale/manual",
+      targetBranch: "main"
+    };
+    (service as any).projects.get(selected.record.id).record.agents.push(staleAgent);
     await expect(access(staleWorktreePath)).resolves.toBeUndefined();
 
     await service.openProject(selected.record.id);
@@ -2118,7 +2304,7 @@ describe("integration flows", () => {
     expect(project.record.agents.find((agent: any) => agent.id === activeAgent.id)?.status).toBe("running");
   });
 
-  it("queues Generate Preview safely, reaches preview ready, and resumes autopilot afterward", async () => {
+  it("never labels legacy cycle notes as browser-ready when the Playwright broker is unavailable", async () => {
     const root = await createSampleRepo("workflow-preview-cycle");
     const appData = await createTempDir("appdata-workflow-preview-cycle");
     const service = await createService(appData);
@@ -2167,15 +2353,17 @@ describe("integration flows", () => {
     (service as any).finalizeWorkflowCycle(liveProject);
     await (service as any).persistProjectUpdate(liveProject);
 
-    const ready = getProjectRecord(service, selected.record.id)?.workflow;
-    expect(ready?.previewRequest?.status).toBe("ready");
-    expect(ready?.previewRequest?.evidence?.[0]).toContain("deterministic validation and integration");
-    expect(ready?.ultimateGoalCompletion?.state).toBe("needs_more_work");
-    expect(getProjectRecord(service, selected.record.id)?.localState.workflowPauseRequested).toBe(true);
+    const unverified = getProjectRecord(service, selected.record.id)?.workflow;
+    expect(unverified?.previewRequest?.status).toBe("failed");
+    expect(unverified?.previewRequest?.evidenceKind).toBe("legacy");
+    expect(unverified?.previewRequest?.evidence?.[0]).toContain("deterministic validation and integration");
+    expect(unverified?.previewRequest?.reason).toContain("Playwright preview broker");
+    expect(unverified?.ultimateGoalCompletion?.state).toBe("needs_more_work");
+    expect(getProjectRecord(service, selected.record.id)?.localState.workflowPauseRequested).toBe(false);
     expect(getProjectRecord(service, selected.record.id)?.workflow.autopilotPolicy.enabled).toBe(true);
 
     const completed = await service.completeWorkflowPreview(selected.record.id);
-    expect(completed.previewRequest?.status).toBe("completed");
+    expect(completed.previewRequest?.status).toBe("failed");
     expect(getProjectRecord(service, selected.record.id)?.localState.workflowPauseRequested).toBe(false);
     expect(getProjectRecord(service, selected.record.id)?.workflow.autopilotPolicy.enabled).toBe(true);
   });
@@ -2415,6 +2603,61 @@ describe("integration flows", () => {
     expect(
       getProjectRecord(service, selected.record.id)?.workflow.humanInterventions.find((entry) => entry.linkedUserInputRequestId === userInputRequest.id)?.status
     ).toBe("resolved");
+  });
+
+  it("refuses stale user-input responses and cancels pending requests when their agent thread is interrupted", async () => {
+    const root = await createSampleRepo("stale-user-input-request");
+    const appData = await createTempDir("appdata-stale-user-input-request");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const runtime = service as any;
+    const loadedProject = runtime.projects.get(selected.record.id);
+    const agent = createAgentSkeleton("coding", "Interrupted input agent", "Wait for an answer", "gpt-test");
+    agent.status = "running";
+    agent.threadId = "thread-stale-input";
+    loadedProject.record.agents.unshift(agent);
+    runtime.threadToAgent.set(agent.threadId, { projectId: selected.record.id, agentId: agent.id });
+    const respond = vi.fn(async () => undefined);
+    runtime.transport = { respond };
+
+    await runtime.processTransportRequest({
+      method: "item/tool/requestUserInput",
+      id: "stale-server-request-id",
+      params: {
+        threadId: agent.threadId,
+        turnId: "turn-stale-input",
+        itemId: "item-stale-input",
+        questions: [{
+          id: "answer",
+          header: "Answer",
+          question: "Provide the requested detail.",
+          isOther: true,
+          isSecret: false,
+          options: null
+        }]
+      }
+    });
+
+    const request = await waitFor(() => getProjectRecord(service, selected.record.id)?.userInputRequests[0]);
+    agent.threadId = "replacement-thread";
+    runtime.threadToAgent.delete("thread-stale-input");
+    runtime.threadToAgent.set("replacement-thread", { projectId: selected.record.id, agentId: agent.id });
+
+    await expect(service.submitUserInputRequest(selected.record.id, request.id, ["Do not send this."]))
+      .rejects.toThrow(/stale.*live Codex thread/i);
+    expect(respond).not.toHaveBeenCalled();
+    expect(request.status).toBe("pending");
+
+    runtime.markAgentDisconnected(loadedProject, agent, "The Codex transport disconnected.");
+
+    expect(request.status).toBe("cancelled");
+    expect(request.cancelledAt).toBeTruthy();
+    expect(
+      loadedProject.record.workflow.humanInterventions.find(
+        (entry: { linkedUserInputRequestId?: string }) => entry.linkedUserInputRequestId === request.id
+      )?.status
+    ).toBe("dismissed");
   });
 
   it("routes mid-run credential requests to Credentials and sends stored secrets only after explicit approval", async () => {
@@ -3749,6 +3992,51 @@ describe("integration flows", () => {
     expect(status).toBe("");
   }, 12_000);
 
+  it("browser-gates a visual external repair before checkpointing or publishing it", async () => {
+    const root = await createSampleRepo("visual-external-repair-gate");
+    await writeFile(path.join(root, "src/app.css"), "body { color: navy; }\n");
+    await commitAll(root, "add visual surface");
+    const appData = await createTempDir("appdata-visual-external-repair-gate");
+    const service = await createService(appData);
+    await service.loadProject(root, "create");
+    const selected = await service.selectPendingInterface("fresh");
+    const runtime = service as any;
+    const project = runtime.projects.get(selected.record.id);
+    await writeFile(path.join(root, "src/app.css"), "body { color: rebeccapurple; }\n");
+
+    vi.spyOn(runtime, "scanWorkflowRepoHygiene").mockResolvedValue({
+      status: "passed",
+      mergeBlockingFindings: [],
+      forbiddenFiles: [],
+      cleanedFiles: [],
+      summaryForHumans: "Repository hygiene passed.",
+      scannedRef: "visual-external-repair"
+    });
+    vi.spyOn(runtime, "mergeGateBlockedReasons").mockReturnValue([]);
+    const evaluateGate = vi.spyOn(runtime, "evaluateInPlaceBrowserGate").mockResolvedValue({
+      allowed: false,
+      message: "Browser evidence is required for this repaired visual surface."
+    });
+
+    await runtime.finalizeExternalRepairCheckout(selected.record.id);
+
+    expect(evaluateGate).toHaveBeenCalledWith(project, true);
+    const record = getProjectRecord(service, selected.record.id);
+    const mergeAgent = record?.agents.find((agent) => agent.category === "merge" && agent.name === "External Repair Merge");
+    const browserIncident = record?.workflow.incidents.find((incident) => incident.title === "Browser verification blocked integration");
+    expect(mergeAgent).toMatchObject({
+      status: "failed",
+      currentPhase: "Waiting for browser verification"
+    });
+    expect(record?.workflow.manualHandoff).toMatchObject({
+      reason: "repair_exhausted",
+      title: "Browser verification required before finalization"
+    });
+    expect(browserIncident?.secondaryActions).toContainEqual({ kind: "revalidate", label: "Revalidate checkout" });
+    expect((await execFileAsync("git", ["status", "--short"], { cwd: root })).stdout).toContain("src/app.css");
+    expect((await execFileAsync("git", ["log", "-1", "--format=%s"], { cwd: root })).stdout.trim()).toBe("add visual surface");
+  });
+
   it("resets the current workflow cycle back to its start checkpoint", async () => {
     const root = await createSampleRepo("workflow-cycle-reset");
     const appData = await createTempDir("appdata-workflow-cycle-reset");
@@ -3977,7 +4265,7 @@ describe("integration flows", () => {
     }, 8_000);
     await service.updateUiState(selected.record.id, {});
 
-    const reopenedService = new AppService(appData);
+    const reopenedService = new AppService(appData, integrationSecretCodec);
     createdServices.add(reopenedService);
     await reopenedService.initialize();
     await reopenedService.updateSettings({
@@ -4109,7 +4397,7 @@ describe("integration flows", () => {
     const approval = await waitFor(() => getProjectRecord(service, selected.record.id)?.agents.find((entry) => entry.id === agent.id)?.approvals[0]);
     expect(approval.status).toBe("rejected");
     expect(approval.summary).toBe("Blocked by project boundary");
-    expect(approval.reason).toContain("escape the active project folder");
+    expect(approval.reason).toContain("active project folder");
   });
 
   it("auto-rejects approval requests whose command references paths outside the active project folder", async () => {
@@ -4145,6 +4433,7 @@ describe("integration flows", () => {
     const root = await createSampleFolder("approval-root-reference");
     const appData = await createTempDir("appdata-approval-root-reference");
     const service = await createService(appData);
+    (service as any).settings.autoApproveCommands = false;
     await service.loadProject(root, "create");
     const selected = await service.selectPendingInterface("fresh");
     await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
@@ -4173,6 +4462,7 @@ describe("integration flows", () => {
     const root = await createSampleFolder("approval-shell-wrapper");
     const appData = await createTempDir("appdata-approval-shell-wrapper");
     const service = await createService(appData);
+    (service as any).settings.autoApproveCommands = false;
     await service.loadProject(root, "create");
     const selected = await service.selectPendingInterface("fresh");
     await waitFor(() => getProjectRecord(service, selected.record.id)?.interfaceCreation?.status === "completed");
@@ -4557,7 +4847,9 @@ describe("integration flows", () => {
     const stored = getProjectRecord(service, selected.record.id)?.agents.find((entry) => entry.id === agent.id);
 
     expect(stored?.category).toBe("manual");
-    expect(stored?.worktree?.worktreePath).toContain(".agent-workbench/worktrees");
+    expect(stored?.worktree?.baseDir).toBe(path.join(appData, "worktrees"));
+    expect(stored?.worktree?.worktreePath.startsWith(path.join(appData, "worktrees"))).toBe(true);
+    expect(stored?.worktree?.worktreePath.startsWith(root)).toBe(false);
     expect(getProjectRecord(service, selected.record.id)?.workflow.stepProgress.coding.runCount).toBe(before);
   });
 

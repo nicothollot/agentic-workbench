@@ -8,6 +8,24 @@ import type {
 } from "@shared/types";
 import { unique } from "@shared/utils";
 
+export const TARGET_COMMAND_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024;
+
+export interface TargetProjectCommandStep {
+  executable: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+export interface TargetProjectCommandExecutionDescriptor {
+  source: "package_script" | "python_test" | "git_builtin" | "project_evidence";
+  requiresProjectTrust: boolean;
+  networkAccess: "none" | "possible" | "required";
+  timeoutMs: number;
+  maxOutputBytes: number;
+  usesShell: boolean;
+  steps: TargetProjectCommandStep[];
+}
+
 export interface TargetProjectResolvedCommand {
   name: string;
   command: string;
@@ -18,6 +36,7 @@ export interface TargetProjectResolvedCommand {
   skipReason?: string;
   mapsToCheckIds: string[];
   relatedFiles: string[];
+  execution: TargetProjectCommandExecutionDescriptor;
 }
 
 export interface TargetProjectCommandResolution {
@@ -149,6 +168,28 @@ const evidenceCommandApprovalReason = (command: ProjectEvidenceCommand): string 
   return undefined;
 };
 
+const projectCommandMayUseNetwork = (command: string): boolean =>
+  /\b(?:curl|wget|fetch|http|https|playwright|browser|deploy|publish|upload|download)\b/i.test(command);
+
+const executionDescriptor = (
+  source: TargetProjectCommandExecutionDescriptor["source"],
+  options: {
+    timeoutMs: number;
+    requiresProjectTrust?: boolean;
+    networkAccess?: TargetProjectCommandExecutionDescriptor["networkAccess"];
+    usesShell?: boolean;
+    steps?: TargetProjectCommandStep[];
+  }
+): TargetProjectCommandExecutionDescriptor => ({
+  source,
+  requiresProjectTrust: options.requiresProjectTrust ?? source !== "git_builtin",
+  networkAccess: options.networkAccess ?? "none",
+  timeoutMs: options.timeoutMs,
+  maxOutputBytes: TARGET_COMMAND_OUTPUT_LIMIT_BYTES,
+  usesShell: options.usesShell ?? false,
+  steps: options.steps ?? []
+});
+
 export const resolveEvidenceCommandsForExecution = async (
   projectRoot: string,
   evidenceCommands: ProjectEvidenceCommand[] = []
@@ -168,7 +209,12 @@ export const resolveEvidenceCommandsForExecution = async (
       approvalRequired: Boolean(skipReason),
       skipReason,
       mapsToCheckIds: command.mapsToCheckIds,
-      relatedFiles: []
+      relatedFiles: [],
+      execution: executionDescriptor("project_evidence", {
+        timeoutMs: 5 * 60_000,
+        networkAccess: command.requiresNetwork || projectCommandMayUseNetwork(command.command) ? "required" : "possible",
+        usesShell: true
+      })
     };
   });
   return {
@@ -192,7 +238,15 @@ export const resolveTargetProjectCommands = async (
         kind: "test",
         approvalRequired: false,
         mapsToCheckIds: [],
-        relatedFiles: ["package.json"]
+        relatedFiles: ["package.json"],
+        execution: executionDescriptor("package_script", {
+          timeoutMs: name === "build" ? 15 * 60_000 : name === "test" ? 10 * 60_000 : 5 * 60_000,
+          networkAccess: projectCommandMayUseNetwork(scripts[name]) ? "possible" : "none",
+          steps: [{
+            executable: "npm",
+            args: name === "test" ? ["test"] : ["run", name]
+          }]
+        })
       });
     }
   }
@@ -217,7 +271,18 @@ export const resolveTargetProjectCommands = async (
         kind: "test",
         approvalRequired: false,
         mapsToCheckIds: [],
-        relatedFiles: ["pyproject.toml", "requirements.txt", "tests/"]
+        relatedFiles: ["pyproject.toml", "requirements.txt", "tests/"],
+        execution: executionDescriptor("python_test", {
+          timeoutMs: 10 * 60_000,
+          steps: [{
+            executable: pythonExecutable,
+            args: ["-m", "pytest"],
+            env: {
+              PYTHONDONTWRITEBYTECODE: "1",
+              ...(srcLayout ? { PYTHONPATH: "src" } : {})
+            }
+          }]
+        })
       });
     } else if (testFiles.length > 0) {
       testCommands.push({
@@ -227,7 +292,18 @@ export const resolveTargetProjectCommands = async (
         kind: "test",
         approvalRequired: false,
         mapsToCheckIds: [],
-        relatedFiles: ["tests/"]
+        relatedFiles: ["tests/"],
+        execution: executionDescriptor("python_test", {
+          timeoutMs: 10 * 60_000,
+          steps: [{
+            executable: pythonExecutable,
+            args: ["-m", "unittest", "discover", "-s", "tests", "-q"],
+            env: {
+              PYTHONDONTWRITEBYTECODE: "1",
+              ...(srcLayout ? { PYTHONPATH: "src" } : {})
+            }
+          }]
+        })
       });
     }
   }
@@ -240,7 +316,14 @@ export const resolveTargetProjectCommands = async (
       kind: "test",
       approvalRequired: false,
       mapsToCheckIds: [],
-      relatedFiles: []
+      relatedFiles: [],
+      execution: executionDescriptor("git_builtin", {
+        timeoutMs: 30_000,
+        steps: [
+          { executable: "git", args: ["diff", "--check"] },
+          { executable: "git", args: ["status", "--short", "--untracked-files=all"] }
+        ]
+      })
     });
   }
 

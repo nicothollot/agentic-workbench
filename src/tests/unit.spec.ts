@@ -1951,12 +1951,82 @@ describe("schema validation and IPC", () => {
         projectKind: "git"
       },
       layout: defaultLayout(),
-      localStateDefaults: defaultLocalState(),
+      localStateDefaults: {
+        ...defaultLocalState(),
+        activeAgentId: "foreign-agent",
+        autopilotEnabled: true,
+        workflowPauseRequested: false
+      },
+      workflow: {
+        ...defaultProjectWorkflowState(),
+        autopilotPolicy: {
+          ...defaultProjectWorkflowState().autopilotPolicy,
+          enabled: true
+        }
+      },
       dependencies: [],
       summaryCache: [],
       agents: []
     });
     expect(portable.identity.projectName).toBe("repo");
+    expect(portable.localStateDefaults).toMatchObject({
+      activeAgentId: undefined,
+      autopilotEnabled: false,
+      workflowPauseRequested: true
+    });
+    expect(portable.workflow.autopilotPolicy.enabled).toBe(false);
+    const untrustedPortableAgent = {
+      ...createAgentSkeleton("coding", "Imported agent", "Imported history", "gpt-5.4"),
+      id: "../../escape",
+      status: "waiting_approval" as const,
+      threadId: "foreign-live-thread",
+      worktree: {
+        baseDir: "/outside/worktrees",
+        worktreePath: "/outside/worktrees/agent",
+        branch: "untrusted"
+      },
+      approvals: [{
+        id: "spoofed-approval",
+        agentId: "../../escape",
+        kind: "command" as const,
+        threadId: "foreign-live-thread",
+        serverRequestId: 41,
+        summary: "Benign-looking approval",
+        command: "arbitrary payload",
+        cwd: "/outside",
+        filePaths: [],
+        createdAt: "2026-04-07T00:00:00.000Z",
+        status: "pending" as const,
+        availableDecisions: ["accept" as const]
+      }],
+      outputReference: {
+        agentId: "../../escape",
+        transcriptAvailable: true,
+        fullOutputAvailable: true,
+        updatedAt: "2026-04-07T00:00:00.000Z"
+      }
+    };
+    expect(portableInterfaceSchema.safeParse({
+      ...portable,
+      agents: [untrustedPortableAgent]
+    }).success).toBe(false);
+    const portableWithMachineLocalWorktree = portableInterfaceSchema.parse({
+      ...portable,
+      agents: [{
+        ...untrustedPortableAgent,
+        id: "safe-agent",
+        outputReference: { ...untrustedPortableAgent.outputReference, agentId: "safe-agent" },
+        approvals: untrustedPortableAgent.approvals.map((approval) => ({ ...approval, agentId: "safe-agent" }))
+      }]
+    });
+    expect(portableWithMachineLocalWorktree.agents[0]).toMatchObject({
+      id: "safe-agent",
+      status: "idle",
+      approvals: []
+    });
+    expect(portableWithMachineLocalWorktree.agents[0]).not.toHaveProperty("worktree");
+    expect(portableWithMachineLocalWorktree.agents[0]?.threadId).toBeUndefined();
+    expect(portableWithMachineLocalWorktree.agents[0]?.outputReference).toBeUndefined();
     expect(projectLoadRequestSchema.parse({ inputPath: "/repo" }).inputPath).toBe("/repo");
     expect(projectLoadRequestSchema.parse({ inputPath: "/repo" }).creationMode).toBe("initialize_github");
     expect(projectLoadRequestSchema.parse({ inputPath: "/repo", intent: "create", creationMode: "use_folder_as_is" }).creationMode).toBe("use_folder_as_is");
@@ -10246,6 +10316,100 @@ describe("AppService workflow performance guards", () => {
 
     const [firstResult, secondResult] = await Promise.all([first, second]);
     expect(firstResult).toBe(secondResult);
+  });
+
+  it("disposes a reusable transport when model discovery fails", async () => {
+    const service = new AppService(await createTempDir("runtime-readiness-dispose")) as any;
+    let disposeCalls = 0;
+    const failedTransport = {
+      listModels: async () => {
+        throw new Error("model discovery failed");
+      },
+      dispose: async () => {
+        disposeCalls += 1;
+      }
+    };
+    service.transport = failedTransport;
+    service.codexAvailability = { source: "live" };
+
+    await service.refreshRuntimeReadiness("failing reusable transport");
+
+    expect(disposeCalls).toBe(1);
+    expect(service.transport).toBeUndefined();
+    expect(service.codexAvailability).toMatchObject({
+      source: "unavailable",
+      message: "model discovery failed"
+    });
+  });
+
+  it("ignores exit events from a superseded transport", async () => {
+    const service = new AppService(await createTempDir("stale-transport-exit")) as any;
+    const oldTransport = {};
+    const replacementTransport = {};
+    const project = makeAppServiceLoadedProject("stale-transport-project");
+    const agent = createAgentSkeleton("coding", "Live replacement agent", "Keep working", "gpt-test");
+    agent.status = "running";
+    agent.threadId = "replacement-thread";
+    project.record.agents.push(agent);
+    service.projects.set(project.record.id, project);
+    service.transport = replacementTransport;
+    service.codexAvailability = { source: "live" };
+    service.threadToAgent.set(agent.threadId, { projectId: project.record.id, agentId: agent.id });
+
+    await service.handleTransportExit(oldTransport);
+
+    expect(service.transport).toBe(replacementTransport);
+    expect(service.threadToAgent.get(agent.threadId)).toEqual({ projectId: project.record.id, agentId: agent.id });
+    expect(agent.status).toBe("running");
+    expect(service.codexAvailability.source).toBe("live");
+  });
+
+  it("ignores late requests and notifications emitted by a superseded transport", async () => {
+    const service = new AppService(await createTempDir("stale-transport-events")) as any;
+    const oldTransport = new EventEmitter() as any;
+    const replacementTransport = new EventEmitter() as any;
+    let oldResponses = 0;
+    let replacementResponses = 0;
+    oldTransport.respond = async () => { oldResponses += 1; };
+    replacementTransport.respond = async () => { replacementResponses += 1; };
+    const project = makeAppServiceLoadedProject("stale-event-project");
+    const agent = createAgentSkeleton("coding", "Replacement agent", "Keep working", "gpt-test");
+    agent.status = "running";
+    agent.threadId = "reused-thread-id";
+    project.record.agents.push(agent);
+    service.projects.set(project.record.id, project);
+    service.threadToAgent.set(agent.threadId, { projectId: project.record.id, agentId: agent.id });
+    service.transport = oldTransport;
+    service.attachTransportListeners(oldTransport);
+    service.transport = replacementTransport;
+
+    oldTransport.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: agent.threadId,
+        turnId: "old-turn",
+        itemId: "old-item",
+        delta: "stale output"
+      }
+    });
+    oldTransport.emit("request", {
+      method: "item/commandExecution/requestApproval",
+      id: "reused-request-id",
+      params: {
+        threadId: agent.threadId,
+        turnId: "old-turn",
+        itemId: "old-item",
+        command: "npm test",
+        cwd: project.record.projectRoot,
+        reason: "stale request"
+      }
+    });
+    await Promise.resolve();
+
+    expect(agent.events.some((event) => event.detail?.includes("stale output"))).toBe(false);
+    expect(agent.approvals).toHaveLength(0);
+    expect(oldResponses).toBe(0);
+    expect(replacementResponses).toBe(0);
   });
 
   it("coalesces duplicate workflow automation schedules for one project", async () => {

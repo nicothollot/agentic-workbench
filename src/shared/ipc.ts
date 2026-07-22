@@ -14,11 +14,13 @@ import {
   interfaceReasoningEffortSchema,
   localProjectRecordSchema,
   portableInterfaceSchema,
+  repoTreeNodeSchema,
   repositoryScanSettingsSchema,
   ultimateGoalSchema,
   validationStatusSchema,
   workflowModeSchema
 } from "./schemas";
+import { previewActionSchema, previewCheckpointKindSchema, previewStateProjectionSchema } from "./previewSchemas";
 
 export const credentialEntrySaveRequestSchema = z.object({
   projectId: z.string().min(1),
@@ -410,6 +412,28 @@ export const workflowPreviewCheckpointRequestSchema = z.object({
   projectId: z.string().min(1)
 });
 
+export const previewProjectRequestSchema = z.object({
+  projectId: z.string().min(1)
+});
+
+export const previewStartRequestSchema = previewProjectRequestSchema.extend({
+  checkpointKind: previewCheckpointKindSchema.default("explicit")
+});
+
+export const previewActionRequestSchema = previewProjectRequestSchema.extend({
+  sessionId: z.string().min(1),
+  action: previewActionSchema
+});
+
+export const previewArtifactRequestSchema = previewProjectRequestSchema.extend({
+  sessionId: z.string().min(1),
+  artifactId: z.string().min(1)
+});
+
+export const previewSessionRequestSchema = previewProjectRequestSchema.extend({
+  sessionId: z.string().min(1)
+});
+
 export const setAutopilotPolicyRequestSchema = z.object({
   projectId: z.string().min(1),
   policy: autopilotPolicySchema.partial()
@@ -455,12 +479,66 @@ export const manageUserInputRequestAttachmentsSchema = z.object({
 
 export const validationBadgeSchema = validationStatusSchema;
 
-export const projectSnapshotSchema = localProjectRecordSchema.extend({
-  portable: portableInterfaceSchema.optional()
+const interfacePreviewSchema = z.object({
+  projectName: z.string().min(1),
+  summarySnippet: z.string(),
+  agentPanelCount: z.number().int().nonnegative(),
+  repoTreeReady: z.boolean(),
+  overviewReady: z.boolean(),
+  versionSummary: z.string(),
+  lastOpenedAt: z.string().datetime({ offset: true }).optional(),
+  validationStatus: validationStatusSchema,
+  subsystemCount: z.number().int().nonnegative(),
+  pathSummaryCount: z.number().int().nonnegative(),
+  dependencyCount: z.number().int().nonnegative(),
+  contentSource: z.enum(["deterministic", "codex", "hybrid", "mock"])
 });
+
+const interfaceCandidateSchema = z.object({
+  source: z.enum(["portable", "local"]),
+  label: z.string().min(1),
+  path: z.string().min(1),
+  preview: interfacePreviewSchema,
+  validationStatus: validationStatusSchema,
+  data: z.union([portableInterfaceSchema, localProjectRecordSchema])
+});
+
+/**
+ * The bounded project projection sent to a renderer. This deliberately mirrors
+ * LoadedProjectView rather than the older portable-project shape. Keeping the
+ * runtime schema accurate is important because it is also used by the v2 state
+ * stream at the main/preload trust boundary.
+ */
+export const projectSnapshotSchema = z.object({
+  record: localProjectRecordSchema,
+  tree: z.array(repoTreeNodeSchema),
+  validationStatus: validationStatusSchema,
+  candidates: z.array(interfaceCandidateSchema)
+});
+
+export const settingsUpdateRequestSchema = z.union([
+  z.object({
+    patch: appSettingsSchema.partial(),
+    baseRevision: z.number().int().nonnegative().optional()
+  }).strict(),
+  appSettingsSchema.partial().strict().transform((patch) => ({ patch }))
+]);
 
 export const rendererStateSchema = z.object({
   settings: appSettingsSchema,
+  settingsRevision: z.number().int().nonnegative().default(0),
+  operations: z.array(z.object({
+    id: z.string().min(1),
+    kind: z.enum(["settings-update", "project-open", "repository-scan", "runtime-restart", "preview-session"]),
+    status: z.enum(["running", "completed", "failed", "cancelled"]),
+    phase: z.string().min(1),
+    message: z.string(),
+    startedAt: z.string().datetime({ offset: true }),
+    updatedAt: z.string().datetime({ offset: true }),
+    completedAt: z.string().datetime({ offset: true }).optional(),
+    error: z.string().optional()
+  })).default([]),
+  preview: previewStateProjectionSchema.optional(),
   github: gitHubStatusSchema,
   projects: z.array(projectSnapshotSchema),
   activeProjectId: z.string().optional(),
@@ -608,6 +686,14 @@ export type IpcChannel =
   | "workflow:requestPreview"
   | "workflow:cancelPreview"
   | "workflow:completePreview"
+  | "preview:getReadiness"
+  | "preview:grantTrust"
+  | "preview:start"
+  | "preview:stop"
+  | "preview:performAction"
+  | "preview:getArtifact"
+  | "preview:openExternal"
+  | "preview:installBrowser"
   | "workflow:advanceStage"
   | "workflow:recover"
   | "workflow:clearStaleLock"

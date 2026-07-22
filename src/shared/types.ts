@@ -36,7 +36,7 @@ export type RecommendationRiskLevel = "low" | "medium" | "high";
 export type UltimateGoalProgressSource = "recommendation" | "deterministic";
 export type WorkflowObjective = "deliver" | "optimize";
 export type WorkflowMode = "normal" | "fast";
-export type WorkflowPreviewStatus = "none" | "queued" | "active" | "ready" | "completed" | "cancelled";
+export type WorkflowPreviewStatus = "none" | "queued" | "active" | "ready" | "completed" | "cancelled" | "failed";
 export type AutopilotProfile = "balanced" | "conservative" | "aggressive" | "custom";
 export type AutopilotIntegrityFailurePolicy = "repair" | "pause" | "policy";
 export type AutopilotPresetId =
@@ -705,7 +705,7 @@ export type HumanInterventionKind =
 export type HumanInterventionSeverity = "low" | "medium" | "high" | "critical";
 export type HumanInterventionStatus = "pending" | "resolved" | "dismissed";
 export type WorkflowDecisionKind = "ultimate_goal" | "recommendation" | "scoped_goal" | "human_intervention" | "merge";
-export type UserInputRequestStatus = "pending" | "submitted";
+export type UserInputRequestStatus = "pending" | "submitted" | "cancelled";
 export type CredentialEntryStatus = "active" | "needs_attention" | "disabled";
 export type CredentialRequestStatus = "pending" | "fulfilled" | "dismissed";
 export type WorkspaceCenterTab =
@@ -1061,6 +1061,156 @@ export interface WorkflowPreviewRequest {
   autopilotWasEnabled?: boolean;
   reason?: string;
   evidence?: string[];
+  previewSessionId?: string;
+  previewGateReportId?: string;
+  evidenceKind?: "legacy" | "browser";
+}
+
+export type PreviewAdapter = "vite" | "next" | "cra" | "astro" | "static" | "custom";
+export type PreviewSessionStatus =
+  | "trust_required"
+  | "starting"
+  | "running"
+  | "capturing"
+  | "ready"
+  | "failed"
+  | "stopped";
+export type PreviewGateVerdict = "pass" | "needs_review" | "fail" | "not_applicable";
+export type PreviewCheckpointKind = "explicit" | "pre_merge";
+
+export interface PreviewRecipe {
+  id: string;
+  adapter: PreviewAdapter;
+  source: "explicit" | "detected";
+  command: string;
+  args: string[];
+  cwd: string;
+  urlPath: string;
+  fingerprint: string;
+  manifestPath?: string;
+}
+
+export interface ProjectTrustRecord {
+  projectId: string;
+  projectFingerprint: string;
+  recipeFingerprint: string;
+  grantedAt: string;
+  lastUsedAt: string;
+}
+
+export interface PreviewViewport {
+  id: "desktop" | "tablet" | "mobile" | "custom";
+  width: number;
+  height: number;
+  deviceScaleFactor?: number;
+}
+
+export interface PreviewArtifactMetadata {
+  id: string;
+  kind: "screenshot" | "accessibility" | "console" | "network" | "trace";
+  mimeType: string;
+  sizeBytes: number;
+  createdAt: string;
+  viewport?: PreviewViewport;
+  label: string;
+}
+
+export interface PreviewConsoleEntry {
+  id: string;
+  level: "log" | "info" | "warning" | "error";
+  text: string;
+  timestamp: string;
+}
+
+export interface PreviewNetworkEntry {
+  id: string;
+  url: string;
+  method: string;
+  status?: number;
+  outcome: "ok" | "failed" | "blocked";
+  detail?: string;
+  timestamp: string;
+}
+
+export interface PreviewElementReference {
+  ref: string;
+  role?: string;
+  name?: string;
+  tag: string;
+  inputType?: string;
+}
+
+export interface PreviewSnapshot {
+  url: string;
+  title: string;
+  ariaSnapshot: string;
+  elements: PreviewElementReference[];
+  capturedAt: string;
+}
+
+export type PreviewAction =
+  | { type: "navigate"; url: string }
+  | { type: "click"; ref: string }
+  | { type: "fill"; ref: string; value: string }
+  | { type: "select"; ref: string; values: string[] }
+  | { type: "press"; key: string; ref?: string }
+  | { type: "scroll"; deltaX?: number; deltaY: number }
+  | { type: "wait"; milliseconds: number }
+  | { type: "screenshot"; viewport?: PreviewViewport; label?: string }
+  | { type: "snapshot" };
+
+export interface PreviewSessionProjection {
+  id: string;
+  projectId: string;
+  projectFingerprint: string;
+  sourceRevision: string;
+  checkpointKind: PreviewCheckpointKind;
+  status: PreviewSessionStatus;
+  recipe: PreviewRecipe;
+  createdAt: string;
+  updatedAt: string;
+  readyAt?: string;
+  stoppedAt?: string;
+  validatedUrl?: string;
+  message: string;
+  artifacts: PreviewArtifactMetadata[];
+  console: PreviewConsoleEntry[];
+  network: PreviewNetworkEntry[];
+  latestSnapshot?: PreviewSnapshot;
+  blockedOrigins: string[];
+  error?: string;
+}
+
+export interface PreviewReadiness {
+  projectId: string;
+  status: "ready" | "recipe_required" | "browser_required" | "unavailable";
+  message: string;
+  recipe?: PreviewRecipe;
+  browserInstallCommand?: string;
+  checkedAt: string;
+}
+
+export interface PreviewGateReport {
+  id: string;
+  projectId: string;
+  cycleNumber: number;
+  checkpointKind: PreviewCheckpointKind;
+  sourceRevision: string;
+  recipeFingerprint: string;
+  verdict: PreviewGateVerdict;
+  deterministicResults: string[];
+  agentSummary?: string;
+  artifactIds: string[];
+  blockingFindings: string[];
+  createdAt: string;
+  reviewedAt?: string;
+  approvedAt?: string;
+}
+
+export interface PreviewStateProjection {
+  readiness?: PreviewReadiness;
+  activeSession?: PreviewSessionProjection;
+  latestReport?: PreviewGateReport;
 }
 
 export interface WorkflowBudgets {
@@ -1130,6 +1280,7 @@ export interface UserInputRequestRecord {
   status: UserInputRequestStatus;
   createdAt: string;
   submittedAt?: string;
+  cancelledAt?: string;
 }
 
 export interface CredentialRequestRecord {
@@ -2381,6 +2532,9 @@ export interface UltimateGoalImportPreview {
 
 export interface WorkbenchState {
   settings: AppSettings;
+  settingsRevision?: number;
+  operations?: WorkbenchOperationDescriptor[];
+  preview?: PreviewStateProjection;
   github: GitHubStatus;
   projects: LoadedProjectView[];
   activeProjectId?: string;
@@ -2391,6 +2545,27 @@ export interface WorkbenchState {
   runtimeReadiness: RuntimeReadinessReport;
   diagnostics: string[];
   rendererPayload?: RendererPayloadInfo;
+}
+
+export type WorkbenchOperationKind =
+  | "settings-update"
+  | "project-open"
+  | "repository-scan"
+  | "runtime-restart"
+  | "preview-session";
+
+export type WorkbenchOperationStatus = "running" | "completed" | "failed" | "cancelled";
+
+export interface WorkbenchOperationDescriptor {
+  id: string;
+  kind: WorkbenchOperationKind;
+  status: WorkbenchOperationStatus;
+  phase: string;
+  message: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  error?: string;
 }
 
 export interface RendererPayloadInfo {

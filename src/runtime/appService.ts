@@ -4,7 +4,12 @@ import path from "node:path";
 import { nanoid } from "nanoid";
 import type { ServerNotification, ServerRequest } from "@generated/app-server";
 import type { JsonValue } from "@generated/app-server/serde_json/JsonValue";
-import type { SandboxPolicy, ToolRequestUserInputQuestion } from "@generated/app-server/v2";
+import type {
+  DynamicToolCallResponse,
+  DynamicToolSpec,
+  SandboxPolicy,
+  ToolRequestUserInputQuestion
+} from "@generated/app-server/v2";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, PORTABLE_INTERFACE_VERSION, USER_INPUT_REQUESTS_PATH } from "@shared/constants";
 import { createAgentSkeleton, createLocalProjectRecord, defaultLocalState, defaultProjectCredentialsState, defaultProjectWorkflowState, defaultSettings, defaultWorkflowAppealState } from "@shared/defaults";
 import { createDefaultGoalCharter, listAutopilotPresets as buildAutopilotPresets } from "@shared/goalCharter";
@@ -15,7 +20,8 @@ import {
   resolveAgentReasoningEffort,
   resolveInterfaceCreationReasoningEffort
 } from "@shared/modelConfig";
-import { executionPathToHostPath, resolveProjectPath } from "@shared/pathUtils";
+import { executionPathToHostPath, resolveProjectPath, toProjectRelativePath } from "@shared/pathUtils";
+import { previewActionSchema } from "@shared/previewSchemas";
 import {
   appSettingsSchema,
   fileSummarySchema,
@@ -91,6 +97,10 @@ import type {
   ProjectLoadIntent,
   ProjectLoadResult,
   PlannerDecision,
+  PreviewAction,
+  PreviewCheckpointKind,
+  PreviewReadiness,
+  PreviewSessionProjection,
   RepoHygieneReport,
   RepositoryChildrenResponse,
   RepositorySearchResponse,
@@ -114,12 +124,14 @@ import type {
   WorkflowCycleStatus,
   WorkflowCycleSummaryView,
   WorkflowIncident,
+  WorkflowIncidentAction,
   WorkflowStepId,
   StructuredRecommendationFailureCategory,
   WorkPackage,
+  WorkbenchOperationDescriptor,
   WorkbenchState
 } from "@shared/types";
-import { nowIso, unique } from "@shared/utils";
+import { nowIso, stableStringify, unique } from "@shared/utils";
 import { calculateValidationStatus } from "@shared/validation";
 import {
   createScopedGoalFromWorkPackage,
@@ -177,7 +189,6 @@ import {
   checkpointWorktreeChanges,
   createWorktreeAssignment,
   determineDefaultBranch,
-  getManagedWorktreeBaseDir,
   listBranchesMissingFromHead,
   listUnmergedWorktreeFiles,
   pruneManagedWorktrees,
@@ -217,6 +228,7 @@ import { buildDiscoveredModels, getRecommendedInterfaceCreationModel } from "./m
 import { MockCodexTransport } from "./mockCodexTransport";
 import { createProjectIdentity } from "./projectIdentity";
 import {
+  assertExecutionPathWithinApprovedRoots,
   assertExecutionPathWithinProjectRoot,
   assertHostPathWithinProjectRoot,
   assertProjectRelativeHostPath,
@@ -224,11 +236,13 @@ import {
 } from "./projectBoundary";
 import { DEFAULT_REPOSITORY_SCAN_LIMITS, hasMeaningfulRepositoryContent, scanRepository, type GitMetadata, type RepoScanResult, type RepositoryScanLimits, type ScannedFile } from "./repoScanner";
 import { compactRuntimeEventRecord, reduceAgentRuntimeEvent } from "./runtimeEvents";
-import { WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
+import { AGENT_TRANSCRIPT_ENTRY_MAX_BYTES, WorkbenchStorage, type CredentialSecretInput, type SecretStorageCodec } from "./storage";
 import { sanitizeWorkflowState } from "./stateSanitizer";
 import { readUltimateGoalTextImport } from "./ultimateGoalImport";
 import { buildProjectShellHandoffPrompt, buildWorkflowRepairAgentPrompt, openProjectShellWindow } from "./projectShell";
 import { scanAndCleanRepoHygiene } from "./repoHygiene";
+import { PreviewBroker, type PreviewArtifactPayload, type PreviewProjectContext } from "./previewBroker";
+import { resolveContentBoundPreviewRevision } from "./previewRevision";
 import { resolveTargetProjectCommands, type TargetProjectResolvedCommand } from "./targetProjectCommands";
 import {
   createAgentContextDescriptor,
@@ -287,6 +301,16 @@ type AppServiceInitializeOptions = {
   deferStartupWork?: boolean;
   safeMode?: boolean;
 };
+
+export interface AppServiceResources {
+  previewWorkerPath?: string;
+}
+
+interface AgentBrowserSessionOwnership {
+  projectId: string;
+  sessionId: string;
+}
+
 type CodexUpdateRunOptions = {
   approvedCommand?: string;
   commandRunner?: CodexUpdateCommandRunner;
@@ -318,6 +342,13 @@ type StructuredOutputGuard = {
   kind: StructuredOutputKind;
   contentHash: string;
   source?: string;
+};
+type ValidationCommandApprovalContext = {
+  projectId: string;
+  agentId: string;
+  fingerprint: string;
+  automate: boolean;
+  continueAfterPass?: boolean;
 };
 
 const writeEnabledAgentCategories = new Set<AgentCategory>(["coding", "manual"]);
@@ -359,6 +390,124 @@ const WORKFLOW_AUTOMATION_NO_PROGRESS_LIMIT = 2;
 const WORKFLOW_AUTOMATION_HARD_ACTION_LIMIT = 20;
 const STRUCTURED_OUTPUT_HISTORY_LIMIT = 24;
 const WSL_WINDOWS_MOUNT_PATH = /^\/mnt\/[a-z](?:\/|$)/i;
+const VALIDATION_COMMAND_APPROVAL_REASON =
+  "This repository-defined validation command can execute project code. Its approval is bound to the exact command and current checkout contents.";
+
+const browserDynamicTools: DynamicToolSpec[] = [{
+  type: "namespace",
+  name: "browser",
+  description: "Inspect and interact with the trusted loopback preview created for the active project. Start the preview first, then use opaque element references returned by snapshots.",
+  tools: [
+    {
+      type: "function",
+      name: "start",
+      description: "Start or refresh the trusted project preview and return its accessibility snapshot.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      type: "function",
+      name: "snapshot",
+      description: "Return the current URL, accessibility tree, interactive element references, console errors, and failed requests.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false }
+    },
+    {
+      type: "function",
+      name: "navigate",
+      description: "Navigate within the current loopback preview origin.",
+      inputSchema: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "click",
+      description: "Click an element using an opaque ref returned by the latest snapshot.",
+      inputSchema: {
+        type: "object",
+        properties: { ref: { type: "string" } },
+        required: ["ref"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "fill",
+      description: "Fill an input using an opaque ref returned by the latest snapshot.",
+      inputSchema: {
+        type: "object",
+        properties: { ref: { type: "string" }, value: { type: "string" } },
+        required: ["ref", "value"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "select",
+      description: "Select one or more native option values using an opaque ref returned by the latest snapshot.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ref: { type: "string", minLength: 1, maxLength: 200 },
+          values: {
+            type: "array",
+            items: { type: "string", maxLength: 1_000 },
+            maxItems: 100
+          }
+        },
+        required: ["ref", "values"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "press",
+      description: "Press a keyboard key, optionally focused on an opaque element ref.",
+      inputSchema: {
+        type: "object",
+        properties: { key: { type: "string" }, ref: { type: "string" } },
+        required: ["key"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "scroll",
+      description: "Scroll the page by a bounded number of CSS pixels.",
+      inputSchema: {
+        type: "object",
+        properties: { deltaX: { type: "number" }, deltaY: { type: "number" } },
+        required: ["deltaY"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "wait",
+      description: "Wait up to 30 seconds for bounded asynchronous UI work, then return a fresh snapshot.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          milliseconds: { type: "integer", minimum: 0, maximum: 30_000 }
+        },
+        required: ["milliseconds"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "screenshot",
+      description: "Capture and return a screenshot of the current preview.",
+      inputSchema: {
+        type: "object",
+        properties: { label: { type: "string" } },
+        additionalProperties: false
+      }
+    }
+  ]
+}];
 
 const positiveAutonomyLimit = (value: number | undefined): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
@@ -404,6 +553,21 @@ const compactText = (value: string, maxLength: number): string => {
   return normalized.length <= maxLength
     ? normalized
     : `${normalized.slice(0, Math.max(0, maxLength - 24)).trimEnd()}...[truncated]`;
+};
+
+const COMMAND_TRANSCRIPT_HEAD_BYTES = 128_000;
+const COMMAND_TRANSCRIPT_TAIL_BYTES = AGENT_TRANSCRIPT_ENTRY_MAX_BYTES - COMMAND_TRANSCRIPT_HEAD_BYTES - 1_024;
+
+const utf8Head = (value: string, maxBytes: number): string => {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  return bytes.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD+$/, "");
+};
+
+const utf8Tail = (value: string, maxBytes: number): string => {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  return bytes.subarray(bytes.byteLength - maxBytes).toString("utf8").replace(/^\uFFFD+/, "");
 };
 
 const toTime = (value?: string): number => {
@@ -649,6 +813,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private codexReadinessInFlight?: Promise<CodexReadinessReport>;
   private codexUpdateCheckInFlight?: Promise<CodexUpdateCheckResult>;
   private readonly diagnostics: string[] = [];
+  private settingsRevision = 0;
+  private settingsUpdateQueue: Promise<void> = Promise.resolve();
+  private readonly operations = new Map<string, WorkbenchOperationDescriptor>();
   private readonly interfaceCreationRepairAttempts = new Map<string, number>();
   private readonly workflowAutomationInFlight = new Set<string>();
   private readonly workflowAutomationQueued = new Set<string>();
@@ -673,10 +840,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     message: string;
   };
   private readonly commandOutputBuffers = new Map<string, {
+    projectId: string;
+    agentId: string;
+    itemId: string;
     command?: string;
     cwd?: string;
     startedAt?: string;
-    output: string;
+    outputHead: string;
+    outputTail: string;
+    totalOutputBytes: number;
+    truncated: boolean;
   }>();
   private suppressTransportExitHandling = false;
   private transportInitialization?: Promise<void>;
@@ -689,13 +862,23 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private readonly repositoryIndexLoadOperations = new Map<string, Promise<void>>();
   private readonly debugWorkflowPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
   private readonly workflowPerfCounters = new Map<string, { count: number; startedAt: number; lastLoggedAt: number }>();
+  private readonly previewBroker?: PreviewBroker;
+  private readonly agentBrowserSessions = new Map<string, AgentBrowserSessionOwnership>();
+  private readonly previewOwnershipQueues = new Map<string, Promise<void>>();
+  private readonly validationCommandApprovalContexts = new Map<string, ValidationCommandApprovalContext>();
+  private readonly approvedValidationCommandFingerprints = new Map<string, "once" | "session">();
 
   constructor(
     private readonly appDataDir: string,
-    secretCodec?: SecretStorageCodec
+    secretCodec?: SecretStorageCodec,
+    resources: AppServiceResources = {}
   ) {
     super();
     this.storage = new WorkbenchStorage(appDataDir, secretCodec);
+    if (resources.previewWorkerPath) {
+      this.previewBroker = new PreviewBroker(appDataDir, resources.previewWorkerPath, () => this.settings);
+      this.previewBroker.on("changed", () => this.emitState());
+    }
   }
 
   private logWorkflowPerf(message: string): void {
@@ -1007,9 +1190,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     addCheck({
       id: "github",
       label: "GitHub account",
-      status: this.isGitHubLinked() ? "passed" : "failed",
-      message: this.githubStatus.message,
-      fixInApp: "Open Settings and refresh GitHub status after completing the GitHub link command.",
+      status: this.isGitHubLinked() ? "passed" : "warning",
+      message: this.isGitHubLinked()
+        ? this.githubStatus.message
+        : `${this.githubStatus.message} Local repository and agent work remains available; publishing and other GitHub actions will ask you to connect first.`,
+      fixInApp: "Open Access and refresh GitHub status before a GitHub-dependent action.",
       manualCommand: "gh auth login --hostname github.com --git-protocol ssh --web"
     });
 
@@ -1086,7 +1271,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       status,
       checkedAt: this.runtimeReadinessLastCheckedAt,
       summary: status === "ready"
-        ? "Runtime checks passed. Agent-backed workflow actions are available."
+        ? checks.some((check) => check.status === "warning")
+          ? "Core runtime checks passed. Optional capabilities that are not configured will be requested only when needed."
+          : "Runtime checks passed. Agent-backed workflow actions are available."
         : status === "checking"
           ? "Runtime checks are running. Agent-backed workflow actions are blocked until model discovery passes."
           : `Agent-backed workflow actions are blocked: ${failedLabels.join(", ")}.`,
@@ -1151,6 +1338,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       if (hasReusableTransport && reusableTransport && this.transport === reusableTransport) {
         this.availableModels = buildDiscoveredModels((await reusableTransport.listModels()).data);
         if (this.availableModels.length === 0) {
+          this.transport = undefined;
+          this.suppressTransportExitHandling = true;
+          try {
+            await reusableTransport.dispose();
+          } catch {
+            // The empty model list remains the actionable readiness failure.
+          } finally {
+            this.suppressTransportExitHandling = false;
+          }
           this.codexAvailability = {
             source: "unavailable",
             message: "Codex app-server started, but model discovery returned no available models."
@@ -1166,7 +1362,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         }
       }
     } catch (error) {
-      this.transport = undefined;
+      if (reusableTransport && this.transport === reusableTransport) {
+        this.transport = undefined;
+        this.suppressTransportExitHandling = true;
+        try {
+          await reusableTransport.dispose();
+        } catch {
+          // Preserve the model-discovery failure as the actionable readiness error.
+        } finally {
+          this.suppressTransportExitHandling = false;
+        }
+      }
       this.availableModels = [];
       this.codexAvailability = {
         source: "unavailable",
@@ -1638,12 +1844,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     );
 
     try {
-      await pruneManagedWorktrees(
-        project.record.projectRoot,
-        getManagedWorktreeBaseDir(project.record.projectRoot),
-        activeWorktreePaths,
-        this.getRuntimeSettings(project.record.distroName)
-      );
+      const recordedBaseDirs = [...new Set(
+        project.record.agents
+          .map((agent) => agent.worktree?.baseDir)
+          .filter((baseDir): baseDir is string => Boolean(baseDir))
+      )];
+      for (const baseDir of recordedBaseDirs) {
+        await pruneManagedWorktrees(
+          project.record.projectRoot,
+          baseDir,
+          activeWorktreePaths,
+          this.getRuntimeSettings(project.record.distroName)
+        );
+      }
     } catch (error) {
       this.diagnostics.unshift(
         `Failed to clean completed agent worktrees for ${project.record.identity.projectName}. ${error instanceof Error ? error.message : String(error)}`
@@ -3729,7 +3942,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       selectedTaskSource: workflow.cycleContract?.selectedTaskSource ?? workflow.recommendationHealth.selectedTaskSource,
       previousChecklist: checklistBeforeEvidence
     });
-    this.markWorkflowPreviewReady(project, completedAt);
+    const shouldCaptureBrowserPreview = this.markWorkflowPreviewReady(project, completedAt);
     const retrospective = buildCycleRetrospective({
       workflow,
       cycleNumber: workflow.workflowCycle.cycleNumber,
@@ -3770,6 +3983,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       stepId: "merge"
     });
     this.syncWorkflowState(project);
+    if (shouldCaptureBrowserPreview) {
+      if (!this.previewBroker) {
+        workflow.previewRequest = normalizeWorkflowPreviewRequest({
+          ...getWorkflowPreviewRequest(workflow),
+          status: "failed",
+          completedAt: nowIso(),
+          reason: "The managed Playwright preview broker is not available in this build."
+        });
+        this.syncWorkflowState(project);
+      } else {
+        const timer = setTimeout(() => {
+          if (this.disposed) {
+            return;
+          }
+          void this.startProjectPreview(project.record.id, "explicit").catch((error) => {
+            this.recordDiagnostic(
+              `Browser preview could not be captured for ${project.record.identity.projectName}. ${error instanceof Error ? error.message : String(error)}`
+            );
+          });
+        }, 0);
+        timer.unref?.();
+      }
+    }
   }
 
   private async persistProjectUpdate(project: LoadedProject, options?: boolean | PersistProjectUpdateOptions): Promise<void> {
@@ -4693,7 +4929,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return undefined;
   }
 
-  private textReferencesOutsideProject(project: LoadedProject, value?: string, cwd?: string): string | undefined {
+  private isExecutionPathWithinApprovedRoot(candidatePath: string, approvedRoot: string): boolean {
+    const relative = toProjectRelativePath(approvedRoot, candidatePath).replace(/\\/g, "/");
+    return relative === "" || (
+      relative !== ".." &&
+      !relative.startsWith("../") &&
+      !path.posix.isAbsolute(relative) &&
+      !path.win32.isAbsolute(relative)
+    );
+  }
+
+  private textReferencesOutsideProject(
+    project: LoadedProject,
+    value?: string,
+    cwd?: string,
+    approvedExternalRoots: string[] = []
+  ): string | undefined {
     if (!value?.trim()) {
       return undefined;
     }
@@ -4713,15 +4964,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         return candidate;
       }
 
+      const candidateExecutionPath = this.getExecutionPath(project, executionCwd, candidate);
       try {
         resolveExecutionPathWithinProjectRoot(
           project.record.projectRoot,
-          this.getExecutionPath(project, executionCwd, candidate),
+          candidateExecutionPath,
           project.record.hostPath,
           "Project boundary"
         );
       } catch {
-        return candidate;
+        if (!approvedExternalRoots.some((approvedRoot) => this.isExecutionPathWithinApprovedRoot(candidateExecutionPath, approvedRoot))) {
+          return candidate;
+        }
       }
     }
 
@@ -4733,7 +4987,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     return pathModule.isAbsolute(candidate) ? pathModule.normalize(candidate) : pathModule.normalize(pathModule.join(cwd, candidate));
   }
 
-  private sanitizeTextToProjectBoundary(project: LoadedProject, value?: string, cwd?: string): string | undefined {
+  private sanitizeTextToProjectBoundary(
+    project: LoadedProject,
+    value?: string,
+    cwd?: string,
+    approvedExternalRoots: string[] = []
+  ): string | undefined {
     if (!value?.trim()) {
       return value;
     }
@@ -4751,7 +5010,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           return token;
         }
 
-        return this.textReferencesOutsideProject(project, candidate, executionCwd)
+        return this.textReferencesOutsideProject(project, candidate, executionCwd, approvedExternalRoots)
           ? "[outside-project path blocked]"
           : token;
       })
@@ -5110,6 +5369,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   getRendererState(): WorkbenchState {
     const state: WorkbenchState = {
       settings: this.settings,
+      settingsRevision: this.settingsRevision,
+      operations: [...this.operations.values()].slice(-12),
+      preview: this.activeProjectId ? this.previewBroker?.getProjection(this.activeProjectId) : undefined,
       github: this.githubStatus,
       projects: [...this.projects.values()].map((project) => this.toRendererLoadedProjectView(project)),
       activeProjectId: this.activeProjectId,
@@ -5126,6 +5388,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   getState(): WorkbenchState {
     return {
       settings: this.settings,
+      settingsRevision: this.settingsRevision,
+      operations: [...this.operations.values()],
+      preview: this.activeProjectId ? this.previewBroker?.getProjection(this.activeProjectId) : undefined,
       github: this.githubStatus,
       projects: [...this.projects.values()].map<LoadedProjectView>((project) => ({
         record: project.record,
@@ -5143,6 +5408,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
   }
 
+  /**
+   * Records sanitized host/main-process diagnostics in the same bounded feed
+   * exposed by the runtime. Callers must not include credentials or portable
+   * machine secrets.
+   */
+  recordDiagnostic(message: string): void {
+    const normalized = compactText(message.trim(), 1_000);
+    if (!normalized || this.diagnostics[0] === normalized) {
+      return;
+    }
+    this.diagnostics.unshift(normalized);
+    this.diagnostics.splice(200);
+    this.emitState();
+  }
+
   async initialize(options: AppServiceInitializeOptions = {}): Promise<void> {
     const existingService = AppService.activeServicesByAppDataDir.get(this.appDataDir);
     if (existingService && existingService !== this) {
@@ -5157,6 +5437,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         ...this.settings,
         ...persistedSettings
       };
+    }
+    const mockModeOverride = process.env.AWB_MOCK_MODE?.trim().toLowerCase();
+    if (mockModeOverride === "1" || mockModeOverride === "true") {
+      this.settings = { ...this.settings, mockMode: true };
+    } else if (mockModeOverride === "0" || mockModeOverride === "false") {
+      this.settings = { ...this.settings, mockMode: false };
     }
     this.codexReadiness = {
       ...this.codexReadiness,
@@ -5331,7 +5617,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (AppService.activeServicesByAppDataDir.get(this.appDataDir) === this) {
       AppService.activeServicesByAppDataDir.delete(this.appDataDir);
     }
+    for (const project of this.projects.values()) {
+      for (const agent of project.record.agents) {
+        this.flushCommandTranscriptsForAgent(project, agent, "service_disposed");
+      }
+    }
+    this.commandOutputBuffers.clear();
     this.threadToAgent.clear();
+    this.agentBrowserSessions.clear();
+    this.validationCommandApprovalContexts.clear();
+    this.approvedValidationCommandFingerprints.clear();
     this.interfaceCreationRepairAttempts.clear();
     this.workflowRecoveryInFlight.clear();
     this.workflowAutomationQueued.clear();
@@ -5357,6 +5652,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         await this.saveProject(project, { force: true });
       }
     }
+    await this.previewBroker?.dispose();
     if (!this.transport) {
       return;
     }
@@ -5417,6 +5713,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
 
+    let candidateTransport: CodexTransport | undefined;
     try {
       const installedCodexVersion = await readInstalledCodexCliVersion(this.settings);
       const compatibility = assessCodexProtocolCompatibility(installedCodexVersion);
@@ -5434,10 +5731,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
 
       const launchPlan = await CodexAppServerTransport.resolveLaunchPlan(this.settings);
-      this.transport = new CodexAppServerTransport(this.settings, launchPlan);
-      this.attachTransportListeners(this.transport);
-      await this.transport.initialize();
-      this.availableModels = buildDiscoveredModels((await this.transport.listModels()).data);
+      candidateTransport = new CodexAppServerTransport(this.settings, launchPlan);
+      this.transport = candidateTransport;
+      this.attachTransportListeners(candidateTransport);
+      await candidateTransport.initialize();
+      this.availableModels = buildDiscoveredModels((await candidateTransport.listModels()).data);
       if (this.availableModels.length === 0) {
         const transport = this.transport;
         this.transport = undefined;
@@ -5465,7 +5763,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         protocolCompatibility: compatibility.status
       };
     } catch (error) {
-      this.transport = undefined;
+      if (this.transport === candidateTransport) {
+        this.transport = undefined;
+      }
+      if (candidateTransport) {
+        this.suppressTransportExitHandling = true;
+        try {
+          await candidateTransport.dispose();
+        } catch {
+          // The original startup failure remains the actionable readiness error.
+        } finally {
+          this.suppressTransportExitHandling = false;
+        }
+      }
       this.availableModels = [];
       this.codexAvailability = {
         source: "unavailable",
@@ -5478,8 +5788,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private attachTransportListeners(transport: CodexTransport): void {
-    transport.on("notification", (notification) => this.handleTransportNotification(notification));
-    transport.on("request", (request) => this.handleTransportRequest(request));
+    transport.on("notification", (notification) => {
+      if (this.transport === transport) {
+        this.handleTransportNotification(notification);
+      }
+    });
+    transport.on("request", (request) => this.handleTransportRequest(request, transport));
     transport.on("exit", () => {
       void this.handleTransportExit(transport);
     });
@@ -5490,9 +5804,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
 
-    if (this.transport === transport) {
-      this.transport = undefined;
+    // Exit events from a disposed or superseded app-server must not tear down
+    // the ownership maps and active agents belonging to its replacement.
+    if (this.transport !== transport) {
+      return;
     }
+    this.transport = undefined;
+    for (const project of this.projects.values()) {
+      for (const agent of project.record.agents) {
+        this.flushCommandTranscriptsForAgent(project, agent, "transport_disconnected");
+      }
+    }
+    this.commandOutputBuffers.clear();
     this.threadToAgent.clear();
     this.diagnostics.unshift("Codex app-server disconnected.");
     this.codexAvailability = {
@@ -5511,14 +5834,64 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     this.emitState();
   }
 
-  async updateSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
+  async updateSettings(partial: Partial<AppSettings>, baseRevision?: number): Promise<AppSettings> {
+    const task = this.settingsUpdateQueue.then(async () => await this.applySettingsUpdate(partial, baseRevision));
+    this.settingsUpdateQueue = task.then(() => undefined, () => undefined);
+    return await task;
+  }
+
+  private async applySettingsUpdate(partial: Partial<AppSettings>, baseRevision?: number): Promise<AppSettings> {
+    if (baseRevision !== undefined && baseRevision !== this.settingsRevision) {
+      throw new Error(`Settings changed in another view. Expected revision ${baseRevision}, current revision ${this.settingsRevision}.`);
+    }
+
+    const operationId = `settings-${nanoid()}`;
+    const startedAt = nowIso();
+    const operation: WorkbenchOperationDescriptor = {
+      id: operationId,
+      kind: "settings-update",
+      status: "running",
+      phase: "validating",
+      message: "Validating settings",
+      startedAt,
+      updatedAt: startedAt
+    };
+    this.operations.set(operationId, operation);
+    while (this.operations.size > 12) {
+      const oldest = this.operations.keys().next().value;
+      if (!oldest) {
+        break;
+      }
+      this.operations.delete(oldest);
+    }
+    const setOperationPhase = (
+      phase: string,
+      message: string,
+      status: WorkbenchOperationDescriptor["status"] = "running",
+      error?: string
+    ): void => {
+      const timestamp = nowIso();
+      Object.assign(operation, {
+        phase,
+        message,
+        status,
+        error,
+        updatedAt: timestamp,
+        completedAt: status === "running" ? undefined : timestamp
+      });
+      this.emitStateNow(`settings ${phase}`);
+    };
+    this.emitStateNow("settings validation started");
+
     const previousSettings = this.settings;
+    const previousGithubStatus = structuredClone(this.githubStatus);
+    const projectRecordSnapshots = new Map<string, LocalProjectRecord>();
     const agentReasoningEfforts = {
       ...DEFAULT_AGENT_REASONING_EFFORTS,
       ...(this.settings.agentReasoningEfforts ?? {}),
       ...(partial.agentReasoningEfforts ?? {})
     };
-    const nextSettings = {
+    const nextSettings = appSettingsSchema.parse({
       ...this.settings,
       ...partial,
       agentReasoningMode: partial.agentReasoningMode ?? this.settings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE,
@@ -5530,51 +5903,99 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         partial.agentReasoningEfforts !== undefined
           ? partial.interfaceCreationConfiguredAt ?? this.settings.interfaceCreationConfiguredAt ?? nowIso()
           : this.settings.interfaceCreationConfiguredAt
-    };
-    this.settings = nextSettings;
-    await this.storage.saveSettings(appSettingsSchema.parse(this.settings) as unknown as Record<string, unknown>);
-    if (
-      previousSettings.executionMode !== nextSettings.executionMode ||
-      previousSettings.distroName !== nextSettings.distroName ||
-      previousSettings.mockMode !== nextSettings.mockMode
-    ) {
-      await this.refreshGitHubStatus(false);
-    }
-    await this.restartTransportIfNeeded(previousSettings, nextSettings);
-    const repairLimitChanged = previousSettings.maxRepairCycles !== nextSettings.maxRepairCycles;
-    const reasoningChanged = previousSettings.interfaceCreationReasoningEffort !== nextSettings.interfaceCreationReasoningEffort;
-    const agentReasoningChanged =
-      (previousSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) !== (nextSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) ||
-      JSON.stringify(previousSettings.agentReasoningEfforts ?? {}) !== JSON.stringify(nextSettings.agentReasoningEfforts ?? {});
-    const modelChanged = previousSettings.interfaceCreationModel !== nextSettings.interfaceCreationModel;
-    if (repairLimitChanged || reasoningChanged || agentReasoningChanged || modelChanged) {
-      const interfaceConfig = this.resolveInterfaceCreationConfig();
-      for (const project of this.projects.values()) {
-        if (project.record.id !== this.activeProjectId) {
-          continue;
-        }
-        const workflow = this.ensureWorkflowState(project.record);
-        this.syncWorkflowSettings(workflow);
-        if (project.record.interfaceCreation && project.record.interfaceCreation.status !== "running") {
-          project.record.interfaceCreation.model = interfaceConfig.model;
-          project.record.interfaceCreation.reasoningEffort = interfaceConfig.reasoningEffort;
-          project.record.interfaceCreation.selectedModelSource = interfaceConfig.source;
-        }
-        const bootstrapAgent = project.record.agents.find((agent) => agent.category === "bootstrap" && !agent.threadId);
-        if (bootstrapAgent) {
-          bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
-          bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
-          bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
-        }
-        if (repairLimitChanged && this.resumeRepairIfLimitExpanded(project, previousSettings.maxRepairCycles)) {
-          await this.persistProjectUpdate(project, true);
-          continue;
-        }
-        await this.saveProject(project);
+    }) as AppSettings;
+
+    try {
+      setOperationPhase("saving", "Saving settings");
+      await this.storage.saveSettings(nextSettings as unknown as Record<string, unknown>);
+      this.settings = nextSettings;
+
+      const runtimeSettingsChanged =
+        previousSettings.executionMode !== nextSettings.executionMode ||
+        previousSettings.distroName !== nextSettings.distroName ||
+        previousSettings.mockMode !== nextSettings.mockMode ||
+        previousSettings.codexBinaryPath !== nextSettings.codexBinaryPath ||
+        previousSettings.codexHome !== nextSettings.codexHome;
+      if (runtimeSettingsChanged) {
+        setOperationPhase("restarting", "Restarting the Codex runtime");
       }
+      if (
+        previousSettings.executionMode !== nextSettings.executionMode ||
+        previousSettings.distroName !== nextSettings.distroName ||
+        previousSettings.mockMode !== nextSettings.mockMode
+      ) {
+        await this.refreshGitHubStatus(false);
+      }
+      await this.restartTransportIfNeeded(previousSettings, nextSettings);
+
+      setOperationPhase("reconciling", "Reconciling active project settings");
+      const repairLimitChanged = previousSettings.maxRepairCycles !== nextSettings.maxRepairCycles;
+      const reasoningChanged = previousSettings.interfaceCreationReasoningEffort !== nextSettings.interfaceCreationReasoningEffort;
+      const agentReasoningChanged =
+        (previousSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) !== (nextSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) ||
+        JSON.stringify(previousSettings.agentReasoningEfforts ?? {}) !== JSON.stringify(nextSettings.agentReasoningEfforts ?? {});
+      const modelChanged = previousSettings.interfaceCreationModel !== nextSettings.interfaceCreationModel;
+      if (repairLimitChanged || reasoningChanged || agentReasoningChanged || modelChanged) {
+        const interfaceConfig = this.resolveInterfaceCreationConfig();
+        for (const project of this.projects.values()) {
+          if (project.record.id !== this.activeProjectId) {
+            continue;
+          }
+          projectRecordSnapshots.set(project.record.id, structuredClone(project.record));
+          const workflow = this.ensureWorkflowState(project.record);
+          this.syncWorkflowSettings(workflow);
+          if (project.record.interfaceCreation && project.record.interfaceCreation.status !== "running") {
+            project.record.interfaceCreation.model = interfaceConfig.model;
+            project.record.interfaceCreation.reasoningEffort = interfaceConfig.reasoningEffort;
+            project.record.interfaceCreation.selectedModelSource = interfaceConfig.source;
+          }
+          const bootstrapAgent = project.record.agents.find((agent) => agent.category === "bootstrap" && !agent.threadId);
+          if (bootstrapAgent) {
+            bootstrapAgent.model = interfaceConfig.model ?? bootstrapAgent.model;
+            bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+            bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
+          }
+          if (repairLimitChanged && this.resumeRepairIfLimitExpanded(project, previousSettings.maxRepairCycles)) {
+            await this.persistProjectUpdate(project, true);
+            continue;
+          }
+          await this.saveProject(project);
+        }
+      }
+      this.settingsRevision += 1;
+      setOperationPhase("ready", "Settings applied", "completed");
+      return this.settings;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.settings = previousSettings;
+      this.githubStatus = previousGithubStatus;
+      for (const [projectId, snapshot] of projectRecordSnapshots) {
+        const project = this.projects.get(projectId);
+        if (!project) {
+          continue;
+        }
+        project.record = snapshot;
+        try {
+          await this.saveProject(project, { force: true });
+        } catch (rollbackError) {
+          this.diagnostics.unshift(
+            `Project settings rollback persistence failed. ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+          );
+        }
+      }
+      try {
+        await this.storage.saveSettings(previousSettings as unknown as Record<string, unknown>);
+      } catch (rollbackError) {
+        this.diagnostics.unshift(`Settings rollback persistence failed. ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+      }
+      try {
+        await this.restartTransportIfNeeded(nextSettings, previousSettings);
+      } catch (rollbackError) {
+        this.diagnostics.unshift(`Settings runtime rollback failed. ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+      }
+      setOperationPhase("failed", "Settings were restored after an update failure", "failed", message);
+      throw error;
     }
-    this.emitState();
-    return this.settings;
   }
 
   private isGitHubLinked(): boolean {
@@ -7141,7 +7562,6 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     const hasGitHubRemote = gitMetadata.normalizedRemotes.some(isGitHubRemote);
     const shouldInitializeGitHub = intent === "create" && creationMode === "initialize_github";
-    const shouldUseFolderAsIs = intent === "create" && creationMode === "use_folder_as_is";
     if (!hasGitHubRemote && shouldInitializeGitHub) {
       const linkedAccount = this.assertGitHubLinked(true);
       await ensureGitHubRepositoryForCreation(
@@ -7156,11 +7576,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       if (!gitMetadata.normalizedRemotes.some(isGitHubRemote)) {
         throw new Error("The selected folder could not be prepared as a GitHub-backed repository.");
       }
-    } else if (!hasGitHubRemote && !shouldUseFolderAsIs) {
-      this.assertGitHubLinked();
-      throw new Error("This platform only opens GitHub-backed repositories. Use Create New Workspace to initialize a folder as a GitHub SSH repository.");
-    } else if (intent === "open" || creationMode === "initialize_github") {
-      this.assertGitHubLinked();
+    } else if (intent === "open" && hasGitHubRemote && !this.isGitHubLinked()) {
+      this.recordDiagnostic("Opened a GitHub-backed repository without a linked GitHub session. Local work remains available; remote actions will request access when needed.");
     }
 
     const projectRoot = gitMetadata.gitRoot ?? resolvedPath.wslPath;
@@ -7227,89 +7644,126 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   async openProject(projectId: string): Promise<LoadedProjectView> {
     const existing = this.findProject(projectId);
     const savedAsGitHubBacked = existing.record.identity.normalizedRemotes.some(isGitHubRemote);
-    if (savedAsGitHubBacked) {
-      this.assertGitHubLinked();
-    }
-    this.activeProjectId = projectId;
-    existing.record.localState.lastOpenedAt = nowIso();
-    this.emitState();
-    this.assertResolvedPathCompatible(existing.record.distroName);
-    const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
-    const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
-    if (savedAsGitHubBacked && !gitMetadata.normalizedRemotes.some(isGitHubRemote)) {
-      throw new Error("This saved workspace no longer points at a GitHub-backed repository.");
-    }
-    const projectRoot = gitMetadata.gitRoot ?? existing.record.projectRoot;
-    const projectHostPath = gitMetadata.gitRoot
-      ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
-      : existing.record.hostPath;
-    const scan = this.annotateRepositoryScan(await scanRepository(projectHostPath, gitMetadata, projectRoot), "normal");
-    const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
-    const identity = createProjectIdentity({
-      kind: scan.kind,
-      projectRoot,
-      projectName: path.basename(projectRoot),
-      repositoryName: path.basename(gitMetadata.gitRoot ?? projectRoot),
-      gitRoot: gitMetadata.gitRoot,
-      normalizedRemotes: gitMetadata.normalizedRemotes,
-      rootCommit: gitMetadata.rootCommit,
-      manifestSignature: scan.manifestHash,
-      treeSignature: scan.treeHash
-    });
-    const validation = this.buildValidationSnapshot(scan, gitMetadata, projectAccess);
-    const updatedRecord: LocalProjectRecord = {
-      ...existing.record,
-      projectRoot,
-      hostPath: projectHostPath,
-      identity,
-      validation,
-      stats: scan.stats,
-      dependencies: scan.dependencies,
-      layout: {
-        ...existing.record.layout,
-        activeCenterTab: "overview"
-      },
-      localState: {
-        ...existing.record.localState,
-        lastOpenedAt: nowIso()
+    const operationId = `project-open-${nanoid()}`;
+    const startedAt = nowIso();
+    const operation: WorkbenchOperationDescriptor = {
+      id: operationId,
+      kind: "project-open",
+      status: "running",
+      phase: "validating",
+      message: `Validating ${existing.record.identity.projectName}`,
+      startedAt,
+      updatedAt: startedAt
+    };
+    this.operations.set(operationId, operation);
+    const setPhase = (
+      phase: string,
+      message: string,
+      status: WorkbenchOperationDescriptor["status"] = "running",
+      error?: string
+    ): void => {
+      const timestamp = nowIso();
+      Object.assign(operation, {
+        phase,
+        message,
+        status,
+        error,
+        updatedAt: timestamp,
+        completedAt: status === "running" ? undefined : timestamp
+      });
+      this.emitStateNow(`project open ${phase}`);
+    };
+    this.emitStateNow("project open validating");
+
+    try {
+      this.assertResolvedPathCompatible(existing.record.distroName);
+      const runtimeSettings = this.getRuntimeSettings(existing.record.distroName);
+      const gitMetadata = await readGitMetadata(existing.record.projectRoot, runtimeSettings);
+      if (savedAsGitHubBacked && !gitMetadata.normalizedRemotes.some(isGitHubRemote)) {
+        throw new Error("This saved workspace no longer points at its expected GitHub-backed repository.");
       }
-    };
-    const project: LoadedProject = {
-      record: updatedRecord,
-      tree: scan.tree,
-      scan,
-      gitMetadata,
-      summaryCache: new SummaryCache(updatedRecord.summaryCache),
-      candidates: await this.findInterfaceCandidates(projectRoot, projectHostPath, identity, validation)
-    };
+      setPhase("scanning", "Scanning repository and checking write access");
+      const projectRoot = gitMetadata.gitRoot ?? existing.record.projectRoot;
+      const projectHostPath = gitMetadata.gitRoot
+        ? executionPathToHostPath(gitMetadata.gitRoot, runtimeSettings, existing.record.distroName)
+        : existing.record.hostPath;
+      const scan = this.annotateRepositoryScan(await scanRepository(projectHostPath, gitMetadata, projectRoot), "normal");
+      const projectAccess = await this.verifyProjectWriteAccess(projectRoot, projectHostPath, runtimeSettings);
+      const identity = createProjectIdentity({
+        kind: scan.kind,
+        projectRoot,
+        projectName: path.basename(projectRoot),
+        repositoryName: path.basename(gitMetadata.gitRoot ?? projectRoot),
+        gitRoot: gitMetadata.gitRoot,
+        normalizedRemotes: gitMetadata.normalizedRemotes,
+        rootCommit: gitMetadata.rootCommit,
+        manifestSignature: scan.manifestHash,
+        treeSignature: scan.treeHash
+      });
+      const validation = this.buildValidationSnapshot(scan, gitMetadata, projectAccess);
+      const priorRecord = structuredClone(existing.record);
+      const updatedRecord: LocalProjectRecord = {
+        ...priorRecord,
+        projectRoot,
+        hostPath: projectHostPath,
+        identity,
+        validation,
+        stats: scan.stats,
+        dependencies: scan.dependencies,
+        localState: {
+          ...priorRecord.localState,
+          lastOpenedAt: nowIso()
+        }
+      };
+      const candidates = await this.findInterfaceCandidates(projectRoot, projectHostPath, identity, validation);
+      const project: LoadedProject = {
+        record: updatedRecord,
+        tree: scan.tree,
+        scan,
+        gitMetadata,
+        summaryCache: new SummaryCache(updatedRecord.summaryCache),
+        candidates
+      };
 
-    const interfaceConfig = this.resolveInterfaceCreationConfig();
-    if (this.isProjectMeaningfullyEmpty(project)) {
-      this.prepareSkippedInterfaceCreation(project, interfaceConfig.model, interfaceConfig.reasoningEffort, interfaceConfig.source);
-    }
-    if (!this.isProjectMeaningfullyEmpty(project) && !project.record.agents.some((agent) => agent.category === "bootstrap")) {
-      const bootstrapAgent = createAgentSkeleton(
-        "bootstrap",
-        "Interface Creation Agent",
-        "Analyze the repository in read-only mode and generate the initial project interface.",
-        interfaceConfig.model ?? "unavailable"
-      );
-      bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
-      bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
-      project.record.agents.unshift(bootstrapAgent);
-    }
+      setPhase("preparing", "Preparing saved workflow and repository index");
+      const interfaceConfig = this.resolveInterfaceCreationConfig();
+      if (this.isProjectMeaningfullyEmpty(project)) {
+        this.prepareSkippedInterfaceCreation(project, interfaceConfig.model, interfaceConfig.reasoningEffort, interfaceConfig.source);
+      }
+      if (!this.isProjectMeaningfullyEmpty(project) && !project.record.agents.some((agent) => agent.category === "bootstrap")) {
+        const bootstrapAgent = createAgentSkeleton(
+          "bootstrap",
+          "Interface Creation Agent",
+          "Analyze the repository in read-only mode and generate the initial project interface.",
+          interfaceConfig.model ?? "unavailable"
+        );
+        bootstrapAgent.reasoningEffort = interfaceConfig.reasoningEffort;
+        bootstrapAgent.reasoningEffortSource = interfaceConfig.reasoningMode;
+        project.record.agents.unshift(bootstrapAgent);
+      }
 
-    this.reconcileWorkflowResumeState(project);
-    this.syncWorkflowState(project);
-    this.projects.set(projectId, project);
-    await this.cleanupCompletedManagedWorktrees(project);
-    await this.saveRepositoryIndex(project);
-    await this.saveProject(project);
-    this.activeProjectId = projectId;
-    await this.resumeSavedAgents(project);
-    this.emitState();
-    this.startRuntimeReadinessCheck("project reopened");
-    return this.toRendererLoadedProjectView(project);
+      this.reconcileWorkflowResumeState(project);
+      this.syncWorkflowState(project);
+      await this.cleanupCompletedManagedWorktrees(project);
+      await this.saveRepositoryIndex(project);
+      await this.saveProject(project);
+
+      // Commit the fully validated project atomically from the renderer's point of view.
+      this.projects.set(projectId, project);
+      this.activeProjectId = projectId;
+      setPhase("ready", `${project.record.identity.projectName} is ready`, "completed");
+      try {
+        await this.resumeSavedAgents(project);
+      } catch (error) {
+        this.recordDiagnostic(`Saved agents could not be resumed automatically. ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.startRuntimeReadinessCheck("project reopened");
+      return this.toRendererLoadedProjectView(project);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setPhase("failed", "The previous workspace remains open", "failed", message);
+      throw error;
+    }
   }
 
   private hasMeaningfulInterfaceContent(record: Pick<LocalProjectRecord, "overview" | "summaryCache" | "workflow">): boolean {
@@ -7615,9 +8069,19 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         record.layout = portable.layout;
         record.localState = {
           ...portable.localStateDefaults,
+          activeAgentId: undefined,
+          autopilotEnabled: false,
+          workflowPauseRequested: true,
           lastOpenedAt: nowIso()
         };
-        record.workflow = portable.workflow;
+        record.workflow = {
+          ...portable.workflow,
+          autopilotPolicy: {
+            ...portable.workflow.autopilotPolicy,
+            enabled: false
+          },
+          autopilotStatus: undefined
+        };
         record.summaryCache = portable.summaryCache;
         record.agents = portable.agents;
         record.overview = portable.overview;
@@ -7804,7 +8268,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     if (serializedRecord) {
       const fingerprint = sha256(serializedRecord);
-      if (this.projectSaveFingerprints.get(project.record.id) === fingerprint) {
+      if (!options?.force && this.projectSaveFingerprints.get(project.record.id) === fingerprint) {
         this.recordWorkflowPerfCounter("project save skips", `${payloadSize} bytes`);
         this.logWorkflowPerf(`save skipped ${project.record.identity.projectName}: unchanged ${payloadSize} bytes`);
         return;
@@ -8454,11 +8918,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     });
   }
 
-  private markWorkflowPreviewReady(project: LoadedProject, completedAt = nowIso()): void {
+  private markWorkflowPreviewReady(project: LoadedProject, completedAt = nowIso()): boolean {
     const workflow = this.ensureWorkflowState(project.record);
     const previewRequest = getWorkflowPreviewRequest(workflow);
     if (previewRequest.status !== "active") {
-      return;
+      return false;
     }
 
     const evidence = [
@@ -8470,22 +8934,632 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     ].filter((entry): entry is string => Boolean(entry));
     workflow.previewRequest = {
       ...previewRequest,
-      status: "ready",
+      status: "active",
       completedAt,
       remainingCycles: 0,
-      evidence
+      evidence,
+      evidenceKind: "legacy"
     };
-    const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
-    if (autopilotPolicy.enabled && autopilotPolicy.pauseOnPreviewReady) {
-      project.record.localState.workflowPauseRequested = true;
-    }
     this.recordWorkflowActivity(workflow, {
       source: "workflow",
-      status: "waiting",
-      title: "Preview is ready for inspection",
-      detail: evidence.join(" "),
+      status: "running",
+      title: "Browser verification is starting",
+      detail: `${evidence.join(" ")} Playwright must capture the running interface before this checkpoint can be approved.`,
       stepId: "merge"
     });
+    return true;
+  }
+
+  private requirePreviewBroker(): PreviewBroker {
+    if (!this.previewBroker) {
+      throw new Error("The managed Playwright preview broker is not available in this build.");
+    }
+    return this.previewBroker;
+  }
+
+  private async serializePreviewOwnershipOperation<T>(
+    projectId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const previous = this.previewOwnershipQueues.get(projectId) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(operation);
+    const tail = run.then(() => undefined, () => undefined);
+    this.previewOwnershipQueues.set(projectId, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.previewOwnershipQueues.get(projectId) === tail) {
+        this.previewOwnershipQueues.delete(projectId);
+      }
+    }
+  }
+
+  private clearAgentBrowserSessionOwnership(projectId: string, sessionId?: string): void {
+    for (const [agentId, ownership] of this.agentBrowserSessions) {
+      if (ownership.projectId === projectId && (!sessionId || ownership.sessionId === sessionId)) {
+        this.agentBrowserSessions.delete(agentId);
+      }
+    }
+  }
+
+  private claimAgentBrowserSession(agentId: string, projectId: string, sessionId: string): void {
+    this.clearAgentBrowserSessionOwnership(projectId, sessionId);
+    this.agentBrowserSessions.set(agentId, { projectId, sessionId });
+  }
+
+  private pruneAgentBrowserSessionOwnership(
+    projectId: string,
+    activeSession?: PreviewSessionProjection
+  ): void {
+    for (const [agentId, ownership] of this.agentBrowserSessions) {
+      if (
+        ownership.projectId === projectId &&
+        (
+          !activeSession ||
+          ownership.sessionId !== activeSession.id ||
+          !this.isLivePreviewSession(activeSession)
+        )
+      ) {
+        this.agentBrowserSessions.delete(agentId);
+      }
+    }
+  }
+
+  private agentBrowserSessionOwner(projectId: string, sessionId: string): string | undefined {
+    for (const [agentId, ownership] of this.agentBrowserSessions) {
+      if (ownership.projectId === projectId && ownership.sessionId === sessionId) {
+        return agentId;
+      }
+    }
+    return undefined;
+  }
+
+  private isLivePreviewSession(session: PreviewSessionProjection): boolean {
+    return session.status !== "failed" && session.status !== "stopped";
+  }
+
+  private async previewProjectContext(project: LoadedProject, agent?: AgentState): Promise<PreviewProjectContext> {
+    const workflow = this.ensureWorkflowState(project.record);
+    const projectRoot = agent?.worktree?.worktreePath ?? project.record.projectRoot;
+    const projectHostPath = agent?.worktree?.worktreePath
+      ? executionPathToHostPath(
+          agent.worktree.worktreePath,
+          this.getRuntimeSettings(project.record.distroName),
+          project.record.distroName
+        )
+      : project.record.hostPath;
+    const baseRevision = await resolveContentBoundPreviewRevision({
+      projectRoot,
+      projectHostPath,
+      runtimeSettings: this.getRuntimeSettings(project.record.distroName)
+    });
+    return {
+      projectId: project.record.id,
+      projectFingerprint: project.record.identity.fingerprint,
+      projectRoot,
+      projectHostPath,
+      sourceRevision: agent
+        ? `${baseRevision}:agent:${agent.id}`
+        : baseRevision,
+      cycleNumber: workflow.workflowCycle.cycleNumber
+    };
+  }
+
+  async getPreviewReadiness(projectId: string): Promise<PreviewReadiness> {
+    const project = this.findProject(projectId);
+    return await this.requirePreviewBroker().getReadiness(await this.previewProjectContext(project));
+  }
+
+  async grantPreviewTrust(projectId: string, sessionId: string): Promise<PreviewSessionProjection> {
+    const project = this.findProject(projectId);
+    const broker = this.requirePreviewBroker();
+    const workflow = this.ensureWorkflowState(project.record);
+    const startedAt = nowIso();
+    try {
+      const session = await this.serializePreviewOwnershipOperation(projectId, async () => {
+        const activeSession = broker.getProjection(projectId).activeSession;
+        const ownerAgentId = this.agentBrowserSessionOwner(projectId, sessionId);
+        if (
+          !activeSession ||
+          activeSession.id !== sessionId ||
+          activeSession.status !== "trust_required"
+        ) {
+          if (ownerAgentId) {
+            this.agentBrowserSessions.delete(ownerAgentId);
+          }
+          throw new Error(
+            "The preview trust request is stale; only the currently active trust-required session can be granted."
+          );
+        }
+        if (ownerAgentId && !project.record.agents.some((agent) => agent.id === ownerAgentId)) {
+          this.agentBrowserSessions.delete(ownerAgentId);
+          throw new Error("The agent-owned preview trust request is stale because its agent no longer exists.");
+        }
+
+        try {
+          const startedSession = await broker.trustAndStartPreview(projectId, sessionId);
+          this.clearAgentBrowserSessionOwnership(projectId);
+          if (ownerAgentId && this.isLivePreviewSession(startedSession)) {
+            this.claimAgentBrowserSession(ownerAgentId, projectId, startedSession.id);
+          }
+          return startedSession;
+        } catch (error) {
+          const currentSession = broker.getProjection(projectId).activeSession;
+          if (ownerAgentId && currentSession?.id !== sessionId) {
+            this.agentBrowserSessions.delete(ownerAgentId);
+          }
+          throw error;
+        }
+      });
+      const projection = broker.getProjection(projectId);
+      const report = projection.latestReport;
+      const isReady = session.status === "ready";
+      const isFailed = session.status === "failed";
+      const preMergePassed = session.checkpointKind === "pre_merge" && report?.verdict === "pass";
+      const externalRepairNeedsRevalidation = preMergePassed && Boolean(
+        workflow.manualHandoff &&
+        project.record.agents.some((agent) =>
+          agent.category === "merge" &&
+          agent.name === "External Repair Merge" &&
+          agent.currentPhase === "Waiting for browser verification" &&
+          agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
+        )
+      );
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: preMergePassed ? "completed" : isReady ? "ready" : isFailed ? "failed" : "active",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? startedAt,
+        startedAt,
+        completedAt: isReady || isFailed ? nowIso() : undefined,
+        remainingCycles: 0,
+        reason: preMergePassed
+          ? externalRepairNeedsRevalidation
+            ? "The repaired checkout passed its browser gate. Revalidate it to finish checkpointing and publication."
+            : "The exact integration revision passed its browser gate. Retry merge to apply it."
+          : session.message,
+        evidence: isReady
+          ? [
+              `${session.artifacts.filter((artifact) => artifact.kind === "screenshot").length} browser viewport captures are ready.`,
+              session.latestSnapshot ? `Accessibility snapshot: ${session.latestSnapshot.title || "untitled page"}.` : undefined,
+              report?.blockingFindings.length
+                ? `${report.blockingFindings.length} browser finding(s) require review.`
+                : "No blocking browser findings were detected."
+            ].filter((entry): entry is string => Boolean(entry))
+          : [session.message],
+        previewSessionId: session.id,
+        previewGateReportId: report?.id,
+        evidenceKind: isReady ? "browser" : undefined
+      });
+      if (isReady && !preMergePassed) {
+        project.record.localState.workflowPauseRequested = true;
+      }
+      this.recordWorkflowActivity(workflow, {
+        source: "workflow",
+        status: preMergePassed ? "completed" : isReady ? "waiting" : isFailed ? "failed" : "running",
+        title: preMergePassed
+          ? externalRepairNeedsRevalidation
+            ? "External repair browser gate passed"
+            : "Integration browser gate passed"
+          : isReady
+            ? "Browser preview is ready for inspection"
+            : "Preview trust granted",
+        detail: workflow.previewRequest.reason ?? session.message,
+        stepId: session.checkpointKind === "pre_merge" ? "merge" : getWorkflowActiveStepId(workflow)
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, { save: "immediate", automate: false });
+      return session;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: "failed",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? startedAt,
+        completedAt: nowIso(),
+        remainingCycles: 0,
+        reason: message,
+        evidence: [message]
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, { save: "immediate", automate: false }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async installPreviewBrowser(projectId: string): Promise<PreviewReadiness> {
+    const project = this.findProject(projectId);
+    return await this.requirePreviewBroker().installBrowser(await this.previewProjectContext(project));
+  }
+
+  async startProjectPreview(
+    projectId: string,
+    checkpointKind: PreviewCheckpointKind = "explicit"
+  ): Promise<PreviewSessionProjection> {
+    const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const broker = this.requirePreviewBroker();
+    const operationId = `preview-${nanoid()}`;
+    const startedAt = nowIso();
+    const operation: WorkbenchOperationDescriptor = {
+      id: operationId,
+      kind: "preview-session",
+      status: "running",
+      phase: "preparing",
+      message: "Preparing the managed browser preview",
+      startedAt,
+      updatedAt: startedAt
+    };
+    this.operations.set(operationId, operation);
+    while (this.operations.size > 12) {
+      const oldest = this.operations.keys().next().value;
+      if (!oldest) {
+        break;
+      }
+      this.operations.delete(oldest);
+    }
+    const setPhase = (
+      phase: string,
+      message: string,
+      status: WorkbenchOperationDescriptor["status"] = "running",
+      error?: string
+    ): void => {
+      const timestamp = nowIso();
+      Object.assign(operation, {
+        phase,
+        message,
+        status,
+        error,
+        updatedAt: timestamp,
+        completedAt: status === "running" ? undefined : timestamp
+      });
+      this.emitStateNow(`preview ${phase}`);
+    };
+
+    try {
+      setPhase("checking-readiness", "Checking the preview recipe and managed Chromium");
+      const context = await this.previewProjectContext(project);
+      const readiness = await broker.getReadiness(context);
+      if (readiness.status !== "ready") {
+        throw new Error(readiness.message);
+      }
+      setPhase("launching", "Starting the project and capturing browser evidence");
+      const session = await this.serializePreviewOwnershipOperation(projectId, async () => {
+        const activeSession = broker.getProjection(projectId).activeSession;
+        if (
+          activeSession &&
+          this.isLivePreviewSession(activeSession) &&
+          activeSession.checkpointKind !== checkpointKind
+        ) {
+          throw new Error(
+            checkpointKind === "explicit"
+              ? "An active pre-merge browser gate cannot be replaced by an explicit preview. Stop or finish the gate first."
+              : "The pre-merge browser gate cannot replace an active explicit preview. Stop it from Preview first."
+          );
+        }
+        try {
+          const startedSession = await broker.startPreview(context, checkpointKind);
+          this.clearAgentBrowserSessionOwnership(projectId);
+          return startedSession;
+        } finally {
+          this.pruneAgentBrowserSessionOwnership(projectId, broker.getProjection(projectId).activeSession);
+        }
+      });
+      const projection = broker.getProjection(projectId);
+      const isReady = session.status === "ready";
+      const isFailed = session.status === "failed";
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: isReady ? "ready" : isFailed ? "failed" : "active",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? startedAt,
+        startedAt,
+        completedAt: isReady || isFailed ? nowIso() : undefined,
+        remainingCycles: 0,
+        reason: session.message,
+        evidence: isReady
+          ? [
+              `${session.artifacts.filter((artifact) => artifact.kind === "screenshot").length} browser viewport captures are ready.`,
+              session.latestSnapshot ? `Accessibility snapshot: ${session.latestSnapshot.title || "untitled page"}.` : undefined,
+              projection.latestReport?.blockingFindings.length
+                ? `${projection.latestReport.blockingFindings.length} browser finding(s) require review.`
+                : "No blocking browser findings were detected."
+            ].filter((entry): entry is string => Boolean(entry))
+          : [session.message],
+        previewSessionId: session.id,
+        previewGateReportId: projection.latestReport?.id,
+        evidenceKind: isReady ? "browser" : undefined
+      });
+      if (isReady) {
+        const autopilotPolicy = resolveEffectiveAutopilotPolicy(workflow, project.record.localState.autopilotEnabled);
+        if (autopilotPolicy.enabled && autopilotPolicy.pauseOnPreviewReady) {
+          project.record.localState.workflowPauseRequested = true;
+        }
+        this.recordWorkflowActivity(workflow, {
+          source: "workflow",
+          status: "waiting",
+          title: "Browser preview is ready for inspection",
+          detail: workflow.previewRequest.evidence?.join(" ") ?? session.message,
+          stepId: "merge"
+        });
+      } else if (session.status === "trust_required") {
+        this.recordWorkflowActivity(workflow, {
+          source: "workflow",
+          status: "waiting",
+          title: "Preview trust is required",
+          detail: session.message,
+          stepId: getWorkflowActiveStepId(workflow)
+        });
+      }
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, { save: "immediate", emit: false, automate: false });
+      setPhase(
+        isReady ? "ready" : session.status,
+        session.message,
+        isFailed ? "failed" : isReady ? "completed" : "running",
+        session.error
+      );
+      return session;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: "failed",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? startedAt,
+        startedAt,
+        completedAt: nowIso(),
+        remainingCycles: 0,
+        reason: message,
+        evidence: [message]
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, { save: "immediate", emit: false, automate: false }).catch(() => undefined);
+      setPhase("failed", message, "failed", message);
+      throw error;
+    }
+  }
+
+  async stopProjectPreview(projectId: string, sessionId: string): Promise<void> {
+    const project = this.findProject(projectId);
+    await this.serializePreviewOwnershipOperation(projectId, async () => {
+      await this.requirePreviewBroker().stopPreview(projectId, sessionId);
+      this.clearAgentBrowserSessionOwnership(projectId, sessionId);
+    });
+    const workflow = this.ensureWorkflowState(project.record);
+    const request = getWorkflowPreviewRequest(workflow);
+    if (request.previewSessionId === sessionId && request.status !== "completed") {
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...request,
+        status: "cancelled",
+        completedAt: nowIso(),
+        reason: "The browser preview session was stopped by the operator."
+      });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, { save: "immediate", automate: false });
+    }
+  }
+
+  async performPreviewAction(
+    projectId: string,
+    sessionId: string,
+    action: PreviewAction
+  ): Promise<PreviewSessionProjection> {
+    this.findProject(projectId);
+    return await this.requirePreviewBroker().performAction(projectId, sessionId, action);
+  }
+
+  async getPreviewArtifact(
+    projectId: string,
+    sessionId: string,
+    artifactId: string
+  ): Promise<PreviewArtifactPayload> {
+    this.findProject(projectId);
+    return await this.requirePreviewBroker().getArtifact(projectId, sessionId, artifactId);
+  }
+
+  getPreviewValidatedUrl(projectId: string, sessionId: string): string {
+    this.findProject(projectId);
+    return this.requirePreviewBroker().validatedUrl(projectId, sessionId);
+  }
+
+  private projectCycleRequiresBrowserGate(project: LoadedProject): boolean {
+    const cycleNumber = this.ensureWorkflowState(project.record).workflowCycle.cycleNumber;
+    const changedFiles = project.record.agents
+      .filter((agent) => agent.workflowCycleNumber === cycleNumber && agent.category === "coding")
+      .flatMap((agent) => agent.changedFiles)
+      .map((filePath) => filePath.replace(/\\/g, "/").toLowerCase());
+    return changedFiles.some((filePath) =>
+      /(?:^|\/)(?:src\/renderer|renderer|ui|web|app|pages|components|public|static|assets)(?:\/|$)/.test(filePath) ||
+      /\.(?:html?|css|scss|sass|less|styl|tsx|jsx|vue|svelte|astro)$/.test(filePath)
+    );
+  }
+
+  private async evaluatePreMergeBrowserGate(
+    project: LoadedProject,
+    integrationWorktree: NonNullable<AgentState["worktree"]>
+  ): Promise<{ allowed: boolean; message: string }> {
+    if (!this.projectCycleRequiresBrowserGate(project)) {
+      return { allowed: true, message: "No user-interface files changed in this cycle." };
+    }
+    const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
+    const integrationMetadata = await readGitMetadata(integrationWorktree.worktreePath, runtimeSettings);
+    const sourceRevision = integrationMetadata.head;
+    if (!sourceRevision) {
+      return { allowed: false, message: "The integration revision could not be identified for browser verification." };
+    }
+    const context: PreviewProjectContext = {
+      projectId: project.record.id,
+      projectFingerprint: project.record.identity.fingerprint,
+      projectRoot: integrationWorktree.worktreePath,
+      projectHostPath: executionPathToHostPath(
+        integrationWorktree.worktreePath,
+        runtimeSettings,
+        project.record.distroName
+      ),
+      sourceRevision,
+      cycleNumber: this.ensureWorkflowState(project.record).workflowCycle.cycleNumber
+    };
+    return await this.evaluateBrowserGateForContext(project, context);
+  }
+
+  private async evaluateInPlaceBrowserGate(
+    project: LoadedProject,
+    forceForVisualProject = false
+  ): Promise<{ allowed: boolean; message: string }> {
+    if (!forceForVisualProject && !this.projectCycleRequiresBrowserGate(project)) {
+      return { allowed: true, message: "No user-interface files changed in this cycle." };
+    }
+    try {
+      return await this.evaluateBrowserGateForContext(project, await this.previewProjectContext(project));
+    } catch (error) {
+      return { allowed: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  private async evaluateBrowserGateForContext(
+    project: LoadedProject,
+    context: PreviewProjectContext
+  ): Promise<{ allowed: boolean; message: string }> {
+    const broker = this.previewBroker;
+    if (!broker) {
+      return {
+        allowed: false,
+        message: "This build does not include the managed Playwright broker required for UI-changing merges."
+      };
+    }
+
+    const sourceRevision = context.sourceRevision;
+    const existing = broker.getProjection(project.record.id);
+    if (
+      existing.latestReport?.checkpointKind === "pre_merge" &&
+      existing.latestReport.sourceRevision === sourceRevision &&
+      (existing.latestReport.verdict === "pass" || Boolean(existing.latestReport.approvedAt))
+    ) {
+      if (
+        existing.activeSession?.checkpointKind === "pre_merge" &&
+        existing.activeSession.sourceRevision === sourceRevision
+      ) {
+        const sessionId = existing.activeSession.id;
+        await this.serializePreviewOwnershipOperation(project.record.id, async () => {
+          await broker.stopPreview(project.record.id, sessionId);
+          this.clearAgentBrowserSessionOwnership(project.record.id, sessionId);
+        });
+      }
+      return {
+        allowed: true,
+        message: existing.latestReport.approvedAt
+          ? "The operator approved the exact integration revision's browser report."
+          : "The exact integration revision passed deterministic browser verification."
+      };
+    }
+
+    const readiness = await broker.getReadiness(context, true);
+    if (readiness.status !== "ready") {
+      const workflow = this.ensureWorkflowState(project.record);
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: "failed",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? nowIso(),
+        completedAt: nowIso(),
+        remainingCycles: 0,
+        reason: readiness.message,
+        evidence: [readiness.message]
+      });
+      return { allowed: false, message: readiness.message };
+    }
+
+    try {
+      const session = await this.serializePreviewOwnershipOperation(project.record.id, async () => {
+        const activeSession = broker.getProjection(project.record.id).activeSession;
+        if (activeSession && this.isLivePreviewSession(activeSession)) {
+          if (activeSession.checkpointKind === "explicit") {
+            throw new Error(
+              "The pre-merge browser gate cannot replace an active explicit preview. Stop it from Preview first."
+            );
+          }
+          if (activeSession.sourceRevision !== sourceRevision) {
+            throw new Error(
+              "A pre-merge browser gate for another revision is already active. Finish or stop it before verifying this revision."
+            );
+          }
+          return activeSession;
+        }
+        try {
+          const startedSession = await broker.startPreview(context, "pre_merge");
+          this.clearAgentBrowserSessionOwnership(project.record.id);
+          return startedSession;
+        } finally {
+          this.pruneAgentBrowserSessionOwnership(
+            project.record.id,
+            broker.getProjection(project.record.id).activeSession
+          );
+        }
+      });
+      const projection = broker.getProjection(project.record.id);
+      const report = projection.latestReport;
+      const workflow = this.ensureWorkflowState(project.record);
+      if (session.status === "trust_required") {
+        workflow.previewRequest = normalizeWorkflowPreviewRequest({
+          ...getWorkflowPreviewRequest(workflow),
+          status: "active",
+          requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? nowIso(),
+          startedAt: nowIso(),
+          remainingCycles: 0,
+          reason: session.message,
+          evidence: [session.message],
+          previewSessionId: session.id
+        });
+        return { allowed: false, message: session.message };
+      }
+      if (session.status !== "ready" || !report) {
+        return { allowed: false, message: session.error ?? session.message };
+      }
+
+      const evidence = [
+        `${session.artifacts.filter((artifact) => artifact.kind === "screenshot").length} browser viewport captures were recorded for ${sourceRevision.slice(0, 12)}.`,
+        ...report.deterministicResults,
+        ...report.blockingFindings.slice(0, 5)
+      ];
+      const requiresReview = report.verdict !== "pass" && !report.approvedAt;
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: requiresReview ? "ready" : "completed",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? nowIso(),
+        startedAt: session.createdAt,
+        completedAt: nowIso(),
+        remainingCycles: 0,
+        reason: requiresReview
+          ? "The integration preview has browser findings that require operator review."
+          : "The integration revision passed its browser gate.",
+        evidence,
+        previewSessionId: session.id,
+        previewGateReportId: report.id,
+        evidenceKind: "browser"
+      });
+      if (requiresReview) {
+        project.record.localState.workflowPauseRequested = true;
+        return {
+          allowed: false,
+          message: `Browser verification found ${report.blockingFindings.length} item(s) requiring operator review.`
+        };
+      }
+      await this.serializePreviewOwnershipOperation(project.record.id, async () => {
+        await broker.stopPreview(project.record.id, session.id);
+        this.clearAgentBrowserSessionOwnership(project.record.id, session.id);
+      });
+      return { allowed: true, message: "The exact integration revision passed its browser gate." };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const workflow = this.ensureWorkflowState(project.record);
+      workflow.previewRequest = normalizeWorkflowPreviewRequest({
+        ...getWorkflowPreviewRequest(workflow),
+        status: "failed",
+        requestedAt: getWorkflowPreviewRequest(workflow).requestedAt ?? nowIso(),
+        completedAt: nowIso(),
+        remainingCycles: 0,
+        reason: message,
+        evidence: [message]
+      });
+      return { allowed: false, message };
+    }
   }
 
   private completeWorkflowPreviewCheckpoint(project: LoadedProject, detail = "Preview checkpoint dismissed."): boolean {
@@ -8583,6 +9657,46 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   async completeWorkflowPreview(projectId: string): Promise<ProjectWorkflowState> {
     const project = this.findProject(projectId);
+    const workflow = this.ensureWorkflowState(project.record);
+    const request = getWorkflowPreviewRequest(workflow);
+    if (request.status === "ready" && request.evidenceKind === "browser") {
+      if (!request.previewSessionId || !request.previewGateReportId) {
+        throw new Error("The browser preview report is incomplete and cannot be approved.");
+      }
+      const projection = this.requirePreviewBroker().getProjection(projectId);
+      const report = projection.latestReport;
+      let expectedSourceRevision = (await this.previewProjectContext(project)).sourceRevision;
+      if (report?.checkpointKind === "pre_merge" && project.scan.kind === "git") {
+        const waitingMergeAgent = project.record.agents.find((agent) =>
+          agent.category === "merge" &&
+          agent.currentPhase === "Waiting for browser verification" &&
+          agent.workflowCycleNumber === workflow.workflowCycle.cycleNumber
+        );
+        const preservedIntegrationWorktree = waitingMergeAgent?.worktree;
+        if (preservedIntegrationWorktree) {
+          const metadata = await readGitMetadata(
+            preservedIntegrationWorktree.worktreePath,
+            this.getRuntimeSettings(project.record.distroName)
+          );
+          expectedSourceRevision = metadata.head ?? "";
+        } else if (
+          waitingMergeAgent?.name !== "External Repair Merge" ||
+          !workflow.manualHandoff
+        ) {
+          throw new Error("The integration worktree for this browser report is no longer available.");
+        }
+      }
+      if (
+        !report ||
+        report.id !== request.previewGateReportId ||
+        report.sourceRevision !== expectedSourceRevision
+      ) {
+        throw new Error("The browser preview is stale. Capture the current project revision before approving it.");
+      }
+      this.requirePreviewBroker().approveReport(projectId, request.previewSessionId);
+    } else if (request.status === "ready") {
+      throw new Error("This checkpoint has no verified browser evidence. Run the Playwright preview before approving it.");
+    }
     const completed = this.completeWorkflowPreviewCheckpoint(project, "The operator dismissed the preview checkpoint and resumed normal workflow progression.");
     if (!completed) {
       return project.record.workflow;
@@ -12275,6 +13389,37 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       return;
     }
 
+    const externalRepairNeedsBrowserGate =
+      this.projectCycleRequiresBrowserGate(project) ||
+      isVisualProject(this.buildWorkflowRecommendationContext(project));
+    if (externalRepairNeedsBrowserGate) {
+      const browserGate = await this.evaluateInPlaceBrowserGate(project, true);
+      if (!browserGate.allowed) {
+        await this.blockMergeForBrowserVerification(
+          project,
+          mergeAgent,
+          browserGate,
+          "The external repair passed deterministic validation and hygiene, but browser verification blocked finalization.",
+          "Kept the content-bound repaired checkout unchanged for a safe retry.",
+          "The repaired checkout was not checkpointed or published.",
+          {
+            preserveExternalRepairForRevalidation: true,
+            followUpAction: { kind: "revalidate", label: "Revalidate checkout" }
+          }
+        );
+        return;
+      }
+      this.recordWorkflowActivity(workflow, {
+        source: "validation",
+        status: "completed",
+        title: "External repair browser gate passed",
+        detail: browserGate.message,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+    }
+
     let changedFiles: string[] = [];
     let checkpointCreated = false;
     if (project.scan.kind === "git") {
@@ -12748,6 +13893,18 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (request.status !== "pending") {
       throw new Error("This request was already submitted.");
     }
+    const agent = project.record.agents.find((entry) => entry.id === request.agentId);
+    const liveMapping = this.threadToAgent.get(request.threadId);
+    const transport = this.transport;
+    if (
+      !transport ||
+      !agent ||
+      agent.threadId !== request.threadId ||
+      liveMapping?.projectId !== project.record.id ||
+      liveMapping.agentId !== agent.id
+    ) {
+      throw new Error("This user-input request is stale and is not attached to the agent's live Codex thread. Recover the workflow to request fresh input.");
+    }
 
     const normalizedAnswers = request.questions.map((question, index) => {
       const answer = answers[index]?.trim() ?? "";
@@ -12771,26 +13928,21 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       normalizedAnswers[answerIndex] = `${normalizedAnswers[answerIndex]}${attachmentNote}`;
     }
 
-    if (this.transport) {
-      await this.transport.respond(request.serverRequestId, { answers: normalizedAnswers });
-    }
+    await transport.respond(request.serverRequestId, { answers: normalizedAnswers });
 
     request.status = "submitted";
     request.submittedAt = nowIso();
 
-    const agent = project.record.agents.find((entry) => entry.id === request.agentId);
-    if (agent) {
-      reduceAgentRuntimeEvent(agent, {
-        kind: "raw",
-        title: "User input submitted",
-        detail: request.title,
-        raw: {
-          answerCount: normalizedAnswers.length,
-          attachments: request.attachments.map((attachment) => attachment.relativePath)
-        }
-      });
-      this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-    }
+    reduceAgentRuntimeEvent(agent, {
+      kind: "raw",
+      title: "User input submitted",
+      detail: request.title,
+      raw: {
+        answerCount: normalizedAnswers.length,
+        attachments: request.attachments.map((attachment) => attachment.relativePath)
+      }
+    });
+    this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
 
     if (request.humanInterventionId) {
       const notes = request.attachments.length
@@ -13297,10 +14449,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         targetBranch,
         runtimeSettings
       );
-      await assertExecutionPathWithinProjectRoot(
+      await assertExecutionPathWithinApprovedRoots(
         project.record.projectRoot,
         agent.worktree.worktreePath,
         project.record.hostPath,
+        [agent.worktree.baseDir],
         runtimeSettings,
         project.record.distroName,
         `${agentRoles[category].name} worktree creation`
@@ -13409,10 +14562,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       ? `${roleInstructions}\nWhen an output schema is supplied, return only valid JSON matching that schema exactly. Keep string fields concise. Do not add greetings, commentary, markdown fences, or filler.`
       : roleInstructions;
     const cwd = agent.worktree?.worktreePath ?? project.record.projectRoot;
-    await assertExecutionPathWithinProjectRoot(
+    await assertExecutionPathWithinApprovedRoots(
       project.record.projectRoot,
       cwd,
       project.record.hostPath,
+      agent.worktree?.baseDir ? [agent.worktree.baseDir] : [],
       this.getRuntimeSettings(project.record.distroName),
       project.record.distroName,
       "Agent execution"
@@ -13442,6 +14596,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       baseInstructions,
       developerInstructions: this.buildProjectBoundaryDeveloperInstructions(project, cwd, sandbox),
       personality: "pragmatic",
+      dynamicTools: this.previewBroker ? browserDynamicTools : null,
       experimentalRawEvents: false
     });
     this.logWorkflowPerf(`app-server thread started for ${agent.name}: ${Math.round(performance.now() - threadStartedAt)}ms`);
@@ -13480,6 +14635,13 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     if (!approval) {
       throw new Error(`Unknown approval: ${approvalId}`);
     }
+    const validationCommandContext = this.validationCommandApprovalContexts.get(approvalId);
+    if (
+      validationCommandContext &&
+      (validationCommandContext.projectId !== project.record.id || validationCommandContext.agentId !== agent.id)
+    ) {
+      throw new Error("This validation command approval is stale or belongs to a different project agent.");
+    }
     if (approval.status !== "pending") {
       throw new Error(`Approval ${approvalId} has already been ${approval.status}.`);
     }
@@ -13488,6 +14650,15 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     try {
       if (this.transport && approval.serverRequestId !== undefined) {
+        const liveMapping = approval.threadId ? this.threadToAgent.get(approval.threadId) : undefined;
+        if (
+          !approval.threadId ||
+          agent.threadId !== approval.threadId ||
+          liveMapping?.projectId !== project.record.id ||
+          liveMapping.agentId !== agent.id
+        ) {
+          throw new Error("This approval is stale and is not attached to the agent's live Codex thread.");
+        }
         let result: unknown = { decision };
         if (approval.kind === "permissions") {
           result = {
@@ -13522,6 +14693,103 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       });
     }
     this.mirrorLatestAgentEventToWorkflow(workflow, agent);
+
+    if (validationCommandContext) {
+      const rejected = decision === "decline" || decision === "cancel";
+      const group = [...this.validationCommandApprovalContexts.entries()].filter(
+        ([, context]) => context.projectId === project.record.id && context.agentId === agent.id
+      );
+      if (rejected) {
+        const cancelledIds: string[] = [];
+        for (const [pendingApprovalId, context] of group) {
+          this.validationCommandApprovalContexts.delete(pendingApprovalId);
+          this.approvedValidationCommandFingerprints.delete(context.fingerprint);
+          const pendingApproval = agent.approvals.find((entry) => entry.id === pendingApprovalId);
+          if (pendingApproval?.status === "pending") {
+            pendingApproval.status = "cancelled";
+            cancelledIds.push(pendingApprovalId);
+          }
+        }
+        if (cancelledIds.length > 0) {
+          const cancelled = new Set(cancelledIds);
+          resolveWorkflowIncidents(
+            workflow,
+            (incident) => incident.evidenceRefs.some((reference) =>
+              reference.startsWith("approval:") && cancelled.has(reference.slice("approval:".length))
+            ),
+            "superseded"
+          );
+        }
+        agent.status = "failed";
+        agent.completedAt = nowIso();
+        agent.currentPhase = "Validation command approval declined";
+        agent.currentSubtask = undefined;
+        agent.lastMessageSnippet = "Repository-defined validation commands were not executed.";
+        project.record.localState.workflowPauseRequested = true;
+        this.updateWorkflowStepProgress(workflow, "integrity", {
+          requiresUserInput: true,
+          currentActivity: "Validation command declined",
+          currentSubstep: undefined,
+          latestProgressNote: "No repository-defined validation code was executed.",
+          message: "The workflow is paused. Revalidate when you are ready to review the command again.",
+          warning: "Validation cannot continue without command approval."
+        }, { status: "failed" });
+        this.syncWorkflowState(project);
+        await this.persistProjectUpdate(project, {
+          save: "immediate",
+          emit: "coalesced",
+          automate: false,
+          reason: "validation command approval declined"
+        });
+        return;
+      }
+
+      this.approvedValidationCommandFingerprints.set(
+        validationCommandContext.fingerprint,
+        decision === "acceptForSession" ? "session" : "once"
+      );
+      const pendingValidationApprovals = group.some(([pendingApprovalId]) =>
+        agent.approvals.some((entry) => entry.id === pendingApprovalId && entry.status === "pending")
+      );
+      if (pendingValidationApprovals) {
+        agent.status = "waiting_approval";
+        agent.currentPhase = "Waiting for validation command approval";
+        await this.persistProjectUpdate(project, {
+          save: "immediate",
+          emit: "coalesced",
+          automate: false,
+          reason: "validation command approval partially resolved"
+        });
+        return;
+      }
+
+      for (const [resolvedApprovalId] of group) {
+        this.validationCommandApprovalContexts.delete(resolvedApprovalId);
+      }
+      agent.status = "completed";
+      agent.completedAt = nowIso();
+      agent.currentPhase = "Validation commands approved";
+      agent.currentSubtask = undefined;
+      this.updateWorkflowStepProgress(workflow, "integrity", {
+        requiresUserInput: false,
+        currentActivity: "Starting approved validation commands",
+        currentSubstep: undefined,
+        latestProgressNote: "All exact command requests were approved.",
+        message: "Rebinding the current checkout before execution."
+      }, { status: "waiting" });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, {
+        save: "immediate",
+        emit: "coalesced",
+        automate: false,
+        reason: "validation commands approved"
+      });
+      await this.runIntegrity(project.record.id, validationCommandContext.automate, {
+        continueAfterPass: validationCommandContext.continueAfterPass
+      });
+      return;
+    }
+
     await this.persistProjectUpdate(project, true);
   }
 
@@ -14005,10 +15273,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       reviewBaseBranch,
       runtimeSettings
     );
-    await assertExecutionPathWithinProjectRoot(
+    await assertExecutionPathWithinApprovedRoots(
       project.record.projectRoot,
       agent.worktree.worktreePath,
       project.record.hostPath,
+      [agent.worktree.baseDir],
       runtimeSettings,
       project.record.distroName,
       "Integrity review worktree"
@@ -14097,6 +15366,104 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
+  private validationCommandFingerprint(
+    project: LoadedProject,
+    revision: string,
+    command: TargetProjectResolvedCommand
+  ): string {
+    return sha256(stableStringify({
+      version: 1,
+      projectIdentity: project.record.identity.fingerprint,
+      revision,
+      command: command.command,
+      phase: command.phase,
+      kind: command.kind,
+      execution: command.execution
+    }));
+  }
+
+  private queueValidationCommandApprovals(
+    project: LoadedProject,
+    agent: AgentState,
+    cwd: string,
+    commands: Array<{ command: TargetProjectResolvedCommand; fingerprint: string }>,
+    automate: boolean,
+    continueAfterPass?: boolean
+  ): void {
+    const workflow = this.ensureWorkflowState(project.record);
+    for (const entry of commands) {
+      const approval: ApprovalRequestRecord = {
+        id: nanoid(),
+        agentId: agent.id,
+        kind: "command",
+        summary: `Run project validation: ${entry.command.command}`,
+        reason: VALIDATION_COMMAND_APPROVAL_REASON,
+        command: entry.command.command,
+        cwd,
+        filePaths: entry.command.relatedFiles,
+        createdAt: nowIso(),
+        status: "pending",
+        availableDecisions: ["accept", "acceptForSession", "decline", "cancel"]
+      };
+      this.validationCommandApprovalContexts.set(approval.id, {
+        projectId: project.record.id,
+        agentId: agent.id,
+        fingerprint: entry.fingerprint,
+        automate,
+        continueAfterPass
+      });
+      reduceAgentRuntimeEvent(agent, { kind: "approval-request", approval });
+      const incident = upsertWorkflowIncident(workflow, {
+        kind: "approval",
+        severity: "warning",
+        sourceStep: "integrity",
+        title: "Project validation command needs approval",
+        summary: approval.summary,
+        rootCause: VALIDATION_COMMAND_APPROVAL_REASON,
+        evidenceRefs: [`approval:${approval.id}`],
+        involvedPaths: entry.command.relatedFiles,
+        automaticActions: ["Bound the request to the current checkout contents and exact command."],
+        userActionRequired: "Review the repository-defined command before allowing it to execute.",
+        primaryAction: { kind: "approve", label: "Review command", targetId: approval.id },
+        secondaryActions: [{ kind: "view_details", label: "View command details" }],
+        status: "open"
+      });
+      appendWorkflowJournalEvent(workflow, {
+        kind: "approval",
+        status: "waiting",
+        stepId: "integrity",
+        title: incident.title,
+        summary: approval.summary,
+        agentId: agent.id,
+        incidentId: incident.id,
+        evidenceRefs: incident.evidenceRefs
+      });
+    }
+
+    agent.status = "waiting_approval";
+    agent.currentPhase = "Waiting for validation command approval";
+    agent.currentSubtask = `${commands.length} repository-defined command${commands.length === 1 ? "" : "s"} waiting`;
+    agent.lastActivityAt = nowIso();
+    agent.lastMessageSnippet = "Repository-defined validation commands remain paused until their exact requests are approved.";
+    this.updateWorkflowStepProgress(workflow, "integrity", {
+      requiresUserInput: true,
+      currentActivity: "Waiting for command approval",
+      currentSubstep: commands.length === 1 ? commands[0].command.command : `${commands.length} commands need review`,
+      latestProgressNote: "No repository-defined validation code has run.",
+      message: "Review the exact validation command requests to continue safely."
+    }, { status: "waiting" });
+    this.recordWorkflowActivity(workflow, {
+      source: "validation",
+      status: "waiting",
+      title: "Validation paused for explicit command approval",
+      detail: `${commands.length} repository-defined command${commands.length === 1 ? " is" : "s are"} waiting.`,
+      stepId: "integrity",
+      agentId: agent.id,
+      agentCategory: "integrity"
+    });
+    this.syncWorkflowState(project);
+  }
+
   async runIntegrity(
     projectId: string,
     automate = false,
@@ -14151,10 +15518,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     );
     const cwd = await this.prepareIntegrityReviewWorkspace(project, agent);
     await this.persistProjectUpdate(project);
-    await assertExecutionPathWithinProjectRoot(
+    await assertExecutionPathWithinApprovedRoots(
       project.record.projectRoot,
       cwd,
       project.record.hostPath,
+      agent.worktree?.baseDir ? [agent.worktree.baseDir] : [],
       this.getRuntimeSettings(project.record.distroName),
       project.record.distroName,
       "Integrity validation"
@@ -14168,6 +15536,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       evidenceCommands: workflow.evidenceCommands,
       previousCommandResults
     });
+    const commands: TargetProjectResolvedCommand[] = [...commandResolution.evidenceCommands, ...commandResolution.testCommands];
     const validationRuntimePathDirs = await this.resolveValidationRuntimePathDirs(project);
     let ledger = createValidationLedger({
       cycleNumber: workflow.workflowCycle.cycleNumber,
@@ -14194,13 +15563,106 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         relatedFiles: command.relatedFiles
       }));
     }
+
+    const trustBoundCommands = commands.filter((command) => command.execution.requiresProjectTrust);
+    if (trustBoundCommands.length > 0 && this.settings.autoApproveCommands) {
+      this.recordWorkflowActivity(workflow, {
+        source: "validation",
+        status: "completed",
+        title: "Repository validation commands allowed by settings",
+        detail: `Automatic command approval is enabled for ${trustBoundCommands.length} repository-defined command${trustBoundCommands.length === 1 ? "" : "s"}.`,
+        stepId: "integrity",
+        agentId: agent.id,
+        agentCategory: "integrity"
+      });
+    } else if (trustBoundCommands.length > 0) {
+      let revision: string;
+      try {
+        revision = await resolveContentBoundPreviewRevision({
+          projectRoot: cwd,
+          projectHostPath: agent.worktree ? cwd : project.record.hostPath ?? project.record.projectRoot,
+          runtimeSettings: this.getRuntimeSettings(project.record.distroName)
+        });
+      } catch (error) {
+        const detail = `Workbench could not bind repository-defined commands to the current checkout, so no project code was executed. ${error instanceof Error ? error.message : String(error)}`;
+        agent.status = "failed";
+        agent.completedAt = nowIso();
+        agent.currentPhase = "Validation command authorization blocked";
+        agent.lastMessageSnippet = detail.slice(0, 240);
+        agent.validationLedger = ledger;
+        agent.integrityReport = {
+          summary: detail,
+          checks: [],
+          risks: [detail],
+          generatedAt: nowIso()
+        };
+        project.record.localState.workflowPauseRequested = true;
+        this.updateWorkflowStepProgress(workflow, "integrity", {
+          requiresUserInput: true,
+          currentActivity: "Validation authorization blocked",
+          currentSubstep: undefined,
+          latestProgressNote: detail,
+          message: detail,
+          warning: "No repository-defined validation code was executed."
+        }, { status: "failed" });
+        upsertWorkflowIncident(workflow, {
+          kind: "validation",
+          severity: "high",
+          sourceStep: "integrity",
+          title: "Could not safely authorize validation commands",
+          summary: detail,
+          rootCause: detail,
+          involvedPaths: unique(trustBoundCommands.flatMap((command) => command.relatedFiles)),
+          evidenceRefs: [`agent:${agent.id}`],
+          automaticActions: ["Refused to execute repository-defined commands without a content-bound approval."],
+          userActionRequired: "Reduce the checkout to a safely fingerprintable size, then revalidate.",
+          primaryAction: { kind: "revalidate", label: "Revalidate" },
+          secondaryActions: [{ kind: "view_details", label: "View details" }],
+          status: "open"
+        });
+        this.syncWorkflowState(project);
+        await this.persistProjectUpdate(project, { save: "immediate", emit: "coalesced", automate: false, reason: "validation authorization blocked" });
+        return;
+      }
+
+      const authorizationEntries = trustBoundCommands.map((command) => ({
+        command,
+        fingerprint: this.validationCommandFingerprint(project, revision, command)
+      }));
+      const waitingForApproval = authorizationEntries.filter(
+        (entry) => !this.approvedValidationCommandFingerprints.has(entry.fingerprint)
+      );
+      if (waitingForApproval.length > 0) {
+        agent.validationLedger = ledger;
+        this.queueValidationCommandApprovals(
+          project,
+          agent,
+          cwd,
+          waitingForApproval,
+          automate,
+          options.continueAfterPass
+        );
+        await this.persistProjectUpdate(project, {
+          save: "immediate",
+          emit: "coalesced",
+          automate: false,
+          reason: "validation command approval requested"
+        });
+        return;
+      }
+      for (const entry of authorizationEntries) {
+        if (this.approvedValidationCommandFingerprints.get(entry.fingerprint) === "once") {
+          this.approvedValidationCommandFingerprints.delete(entry.fingerprint);
+        }
+      }
+    }
+
     const checks: Array<{
       name: string;
       command: string;
       status: "passed" | "failed" | "skipped";
       outputSnippet: string;
     }> = [];
-    const commands: TargetProjectResolvedCommand[] = [...commandResolution.evidenceCommands, ...commandResolution.testCommands];
     for (const command of commands) {
       this.recordWorkflowActivity(workflow, {
         source: "validation",
@@ -14219,11 +15681,53 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }, { status: "running" });
       await this.persistProjectUpdate(project);
       const startedAt = nowIso();
-      const result = await runner.runShellCommand({
-        command: command.command,
-        cwd,
-        runtimePathDirs: validationRuntimePathDirs
-      });
+      let result: { stdout: string; stderr: string; exitCode: number };
+      if (!command.execution.usesShell && command.execution.steps.length > 0) {
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        let exitCode = 0;
+        for (const step of command.execution.steps) {
+          try {
+            const stepResult = await runner.execStructuredCommand({
+              command: step.executable,
+              args: step.args,
+              cwd,
+              env: step.env,
+              runtimePathDirs: validationRuntimePathDirs,
+              timeoutMs: command.execution.timeoutMs,
+              maxOutputBytes: command.execution.maxOutputBytes
+            });
+            stdout.push(stepResult.stdout);
+            stderr.push(stepResult.stderr);
+            exitCode = stepResult.exitCode;
+          } catch (error) {
+            const failure = error as Error & {
+              stdout?: string;
+              stderr?: string;
+              code?: number | string;
+            };
+            stdout.push(failure.stdout ?? "");
+            stderr.push(failure.stderr?.trim() ? failure.stderr : failure.message);
+            exitCode = typeof failure.code === "number" ? failure.code : 1;
+          }
+          if (exitCode !== 0) {
+            break;
+          }
+        }
+        result = {
+          stdout: stdout.filter(Boolean).join("\n"),
+          stderr: stderr.filter(Boolean).join("\n"),
+          exitCode
+        };
+      } else {
+        result = await runner.runShellCommand({
+          command: command.command,
+          cwd,
+          runtimePathDirs: validationRuntimePathDirs,
+          timeoutMs: command.execution.timeoutMs,
+          maxOutputBytes: command.execution.maxOutputBytes
+        });
+      }
       const endedAt = nowIso();
       let status: "passed" | "failed" = result.exitCode === 0 ? "passed" : "failed";
       let stderr = result.stderr;
@@ -14724,10 +16228,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const runtimeSettings = this.getRuntimeSettings(project.record.distroName);
-    await assertExecutionPathWithinProjectRoot(
+    await assertExecutionPathWithinApprovedRoots(
       project.record.projectRoot,
       mergeAgent.worktree.worktreePath,
       project.record.hostPath,
+      [mergeAgent.worktree.baseDir],
       runtimeSettings,
       project.record.distroName,
       "Resolved merge-conflict worktree"
@@ -14788,6 +16293,41 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }, { status: "failed" });
       this.syncWorkflowState(project);
       await this.persistProjectUpdate(project, false);
+      return true;
+    }
+
+    const browserGate = await this.evaluatePreMergeBrowserGate(project, mergeAgent.worktree);
+    if (!browserGate.allowed) {
+      mergeAgent.mergeReport = {
+        summary: `Resolved merge-conflict worktree is preserved, but browser verification blocked finalization. ${browserGate.message}`,
+        targetBranch,
+        mergedBranches: codingBranches,
+        conflicts: [],
+        conflictCycleCount: mergeAgent.mergeReport?.conflictCycleCount ?? 1,
+        generatedAt: nowIso()
+      };
+      mergeAgent.status = "failed";
+      mergeAgent.completedAt = nowIso();
+      mergeAgent.currentPhase = "Waiting for browser verification";
+      project.record.localState.workflowPauseRequested = true;
+      this.recordWorkflowOpenIssue(workflow, "Browser verification blocked resolved merge", browserGate.message, "merge");
+      this.recordWorkflowActivity(workflow, {
+        source: "validation",
+        status: "waiting",
+        title: "Browser verification blocked resolved merge",
+        detail: browserGate.message,
+        stepId: "merge",
+        agentId: mergeAgent.id,
+        agentCategory: "merge"
+      });
+      this.updateWorkflowStepProgress(workflow, "merge", {
+        currentActivity: "Waiting for browser verification",
+        latestProgressNote: browserGate.message,
+        message: mergeAgent.mergeReport.summary,
+        warning: "The opened checkout and remote were not updated."
+      }, { status: "failed" });
+      this.syncWorkflowState(project);
+      await this.persistProjectUpdate(project, { save: "immediate", emit: "coalesced", automate: false });
       return true;
     }
 
@@ -14863,6 +16403,108 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       reason: "resolved merge-conflict worktree applied"
     });
     return true;
+  }
+
+  private async blockMergeForBrowserVerification(
+    project: LoadedProject,
+    mergeAgent: AgentState,
+    browserGate: { allowed: boolean; message: string },
+    summaryPrefix: string,
+    preservedStateMessage: string,
+    mergeWarning: string,
+    options?: {
+      followUpAction?: WorkflowIncidentAction;
+      preserveExternalRepairForRevalidation?: boolean;
+    }
+  ): Promise<void> {
+    const workflow = this.ensureWorkflowState(project.record);
+    const previewRequest = getWorkflowPreviewRequest(workflow);
+    mergeAgent.mergeReport = {
+      ...(mergeAgent.mergeReport ?? {
+        mergedBranches: [],
+        conflicts: [],
+        conflictCycleCount: 0,
+        generatedAt: nowIso()
+      }),
+      summary: `${summaryPrefix} ${browserGate.message}`
+    };
+    mergeAgent.status = "failed";
+    mergeAgent.completedAt = nowIso();
+    mergeAgent.currentPhase = "Waiting for browser verification";
+    mergeAgent.lastMessageSnippet = mergeAgent.mergeReport.summary.slice(0, 240);
+    project.record.localState.workflowPauseRequested = true;
+    if (options?.preserveExternalRepairForRevalidation) {
+      this.updateWorkflowRepairState(workflow, {
+        status: "exhausted",
+        latestIssueSummary: mergeAgent.mergeReport.summary,
+        latestFailureReason: browserGate.message
+      });
+      workflow.manualHandoff = {
+        ...this.buildRepairManualHandoff(
+          project,
+          mergeAgent.mergeReport.summary,
+          browserGate.message,
+          "repair_exhausted"
+        ),
+        title: "Browser verification required before finalization",
+        whatSystemWasTryingToDo: "Finalize the validated external repair without losing or publishing unverified changes"
+      };
+    }
+    const followUpAction = options?.followUpAction ?? { kind: "retry", label: "Retry merge" };
+    const incident = upsertWorkflowIncident(workflow, {
+      kind: previewRequest.status === "ready" || previewRequest.status === "active" ? "approval" : "validation",
+      severity: previewRequest.status === "ready" ? "warning" : "high",
+      sourceStep: "merge",
+      title: previewRequest.status === "ready"
+        ? "Browser evidence needs operator review"
+        : "Browser verification blocked integration",
+      summary: mergeAgent.mergeReport.summary,
+      rootCause: browserGate.message,
+      evidenceRefs: [
+        ...(previewRequest.previewSessionId ? [`preview-session:${previewRequest.previewSessionId}`] : []),
+        ...(previewRequest.previewGateReportId ? [`preview-report:${previewRequest.previewGateReportId}`] : [])
+      ],
+      automaticActions: [preservedStateMessage],
+      userActionRequired: previewRequest.status === "ready"
+        ? options?.preserveExternalRepairForRevalidation
+          ? "Review and approve the Preview evidence, then revalidate the preserved checkout."
+          : "Review the Preview evidence and approve it before retrying merge."
+        : options?.preserveExternalRepairForRevalidation
+          ? "Resolve the Preview readiness or trust requirement, then revalidate the preserved checkout."
+          : "Resolve the Preview readiness or trust requirement, then retry merge.",
+      primaryAction: previewRequest.status === "ready"
+        ? { kind: "approve", label: "Review preview" }
+        : { kind: "view_details", label: "Open Preview" },
+      secondaryActions: [followUpAction],
+      status: "open"
+    });
+    appendWorkflowJournalEvent(workflow, {
+      kind: "incident",
+      status: "waiting",
+      stepId: "merge",
+      title: incident.title,
+      summary: browserGate.message,
+      agentId: mergeAgent.id,
+      incidentId: incident.id,
+      evidenceRefs: incident.evidenceRefs
+    });
+    this.recordWorkflowActivity(workflow, {
+      source: "workflow",
+      status: "waiting",
+      title: incident.title,
+      detail: browserGate.message,
+      stepId: "merge",
+      agentId: mergeAgent.id,
+      agentCategory: "merge"
+    });
+    this.updateWorkflowStepProgress(workflow, "merge", {
+      currentActivity: "Waiting for browser verification",
+      latestProgressNote: browserGate.message,
+      message: mergeAgent.mergeReport.summary,
+      warning: mergeWarning
+    }, { status: "failed" });
+    this.syncWorkflowState(project);
+    await this.persistProjectUpdate(project, { save: "immediate", emit: "coalesced", automate: false });
   }
 
   async runMerge(projectId: string, automate = false): Promise<void> {
@@ -15115,6 +16757,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         conflictCycleCount: 0,
         generatedAt: nowIso()
       };
+      const browserGate = await this.evaluateInPlaceBrowserGate(project);
+      if (!browserGate.allowed) {
+        await this.blockMergeForBrowserVerification(
+          project,
+          mergeAgent,
+          browserGate,
+          "Validated changes remain in place, but browser verification blocked finalization.",
+          "Kept the content-bound folder state unchanged for a safe retry.",
+          "The in-place workflow was not marked complete."
+        );
+        return;
+      }
+      if (this.projectCycleRequiresBrowserGate(project)) {
+        this.recordWorkflowActivity(workflow, {
+          source: "validation",
+          status: "completed",
+          title: "Browser gate passed",
+          detail: browserGate.message,
+          stepId: "merge",
+          agentId: mergeAgent.id,
+          agentCategory: "merge"
+        });
+      }
       mergeAgent.status = "completed";
       mergeAgent.completedAt = nowIso();
       workflow.workflowCycle.status = "merged";
@@ -15146,7 +16811,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const codingBranches = this.getMergeCandidateCodingBranches(project);
-    const integrationWorktree = mergeAgent.worktree ?? (await createWorktreeAssignment(
+    const preservedBrowserGateWorktree = project.record.agents.find((candidate) =>
+      candidate.id !== mergeAgent.id &&
+      candidate.category === "merge" &&
+      candidate.currentPhase === "Waiting for browser verification" &&
+      candidate.workflowCycleNumber === workflow.workflowCycle.cycleNumber &&
+      candidate.worktree?.worktreePath
+    )?.worktree;
+    const integrationWorktree = mergeAgent.worktree ?? preservedBrowserGateWorktree ?? (await createWorktreeAssignment(
       project.record.projectRoot,
       this.settings.worktreeBaseDir,
       project.record.identity.projectName,
@@ -15155,10 +16827,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       runtimeSettings
     ));
     mergeAgent.worktree = integrationWorktree;
-    await assertExecutionPathWithinProjectRoot(
+    await assertExecutionPathWithinApprovedRoots(
       project.record.projectRoot,
       integrationWorktree.worktreePath,
       project.record.hostPath,
+      [integrationWorktree.baseDir],
       runtimeSettings,
       project.record.distroName,
       "Merge integration worktree"
@@ -15330,6 +17003,29 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           }
           : false);
         return;
+      }
+      const browserGate = await this.evaluatePreMergeBrowserGate(project, integrationWorktree);
+      if (!browserGate.allowed) {
+        await this.blockMergeForBrowserVerification(
+          project,
+          mergeAgent,
+          browserGate,
+          "Merged cleanly in the integration worktree, but browser verification blocked finalization.",
+          "Preserved the exact integration worktree for a safe retry.",
+          "The opened checkout and remote were not updated."
+        );
+        return;
+      }
+      if (this.projectCycleRequiresBrowserGate(project)) {
+        this.recordWorkflowActivity(workflow, {
+          source: "validation",
+          status: "completed",
+          title: "Browser gate passed",
+          detail: browserGate.message,
+          stepId: "merge",
+          agentId: mergeAgent.id,
+          agentCategory: "merge"
+        });
       }
       try {
         appliedCheckoutBranch = integrationBranch
@@ -16374,9 +18070,60 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       if (approval.status === "pending") {
         approval.status = "cancelled";
         cancelledApprovalIds.push(approval.id);
+        const validationContext = this.validationCommandApprovalContexts.get(approval.id);
+        if (validationContext) {
+          this.approvedValidationCommandFingerprints.delete(validationContext.fingerprint);
+          this.validationCommandApprovalContexts.delete(approval.id);
+        }
       }
     }
     return cancelledApprovalIds;
+  }
+
+  private cancelPendingUserInputRequestsForInterruptedAgent(
+    project: LoadedProject,
+    agent: AgentState,
+    reason: string
+  ): string[] {
+    const timestamp = nowIso();
+    const cancelledRequestIds: string[] = [];
+    for (const request of project.record.userInputRequests) {
+      if (request.agentId !== agent.id || request.status !== "pending") {
+        continue;
+      }
+      request.status = "cancelled";
+      request.cancelledAt = timestamp;
+      cancelledRequestIds.push(request.id);
+    }
+    if (cancelledRequestIds.length === 0) {
+      return cancelledRequestIds;
+    }
+
+    const cancelled = new Set(cancelledRequestIds);
+    const workflow = this.ensureWorkflowState(project.record);
+    for (const intervention of workflow.humanInterventions) {
+      if (
+        intervention.status === "pending" &&
+        intervention.linkedUserInputRequestId &&
+        cancelled.has(intervention.linkedUserInputRequestId)
+      ) {
+        intervention.status = "dismissed";
+        intervention.resolvedAt = timestamp;
+        intervention.resolutionNotes = reason;
+      }
+    }
+    for (const credentialRequest of project.record.credentials.requests) {
+      if (
+        credentialRequest.status === "pending" &&
+        credentialRequest.userInputRequestId &&
+        cancelled.has(credentialRequest.userInputRequestId)
+      ) {
+        credentialRequest.status = "dismissed";
+        credentialRequest.resolvedAt = timestamp;
+        credentialRequest.notes = reason;
+      }
+    }
+    return cancelledRequestIds;
   }
 
   private markAgentDisconnected(project: LoadedProject, agent: AgentState, reason: string): void {
@@ -16386,6 +18133,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const cancelledApprovalIds = this.cancelPendingApprovalsForInterruptedAgent(agent);
+    const cancelledUserInputRequestIds = this.cancelPendingUserInputRequestsForInterruptedAgent(project, agent, reason);
     agent.status = "disconnected";
     agent.completedAt = nowIso();
     agent.currentPhase = "Interrupted; recovery available";
@@ -16420,12 +18168,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         });
       }
     }
+    if (cancelledUserInputRequestIds.length > 0) {
+      this.recordWorkflowActivity(workflow, {
+        source: "system",
+        status: "completed",
+        title: "Stale user-input request cancelled",
+        detail: `${cancelledUserInputRequestIds.length} request${cancelledUserInputRequestIds.length === 1 ? " was" : "s were"} detached from the interrupted Codex thread.`,
+        stepId: this.getWorkflowStepIdForAgent(agent),
+        agentId: agent.id,
+        agentCategory: agent.category
+      });
+    }
     this.mirrorLatestAgentEventToWorkflow(workflow, agent);
   }
 
   private markActiveAgentsDisconnected(project: LoadedProject, reason: string): AgentState[] {
     const interruptedAgents = project.record.agents.filter((agent) => agent.category !== "manual" && isAgentActive(agent));
     for (const agent of interruptedAgents) {
+      this.flushCommandTranscriptsForAgent(project, agent, "agent_interrupted");
       this.markAgentDisconnected(project, agent, reason);
     }
     return interruptedAgents;
@@ -16561,21 +18321,78 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   private rememberCommandTranscriptStart(project: LoadedProject, agent: AgentState, itemId: string, command: string, cwd?: string): void {
     this.commandOutputBuffers.set(this.transcriptBufferKey(project.record.id, agent.id, itemId), {
+      projectId: project.record.id,
+      agentId: agent.id,
+      itemId,
       command,
       cwd,
       startedAt: nowIso(),
-      output: ""
+      outputHead: "",
+      outputTail: "",
+      totalOutputBytes: 0,
+      truncated: false
     });
   }
 
   private appendCommandTranscriptDelta(project: LoadedProject, agent: AgentState, itemId: string, delta: string): void {
     const key = this.transcriptBufferKey(project.record.id, agent.id, itemId);
     const existing = this.commandOutputBuffers.get(key) ?? {
+      projectId: project.record.id,
+      agentId: agent.id,
+      itemId,
       startedAt: nowIso(),
-      output: ""
+      outputHead: "",
+      outputTail: "",
+      totalOutputBytes: 0,
+      truncated: false
     };
-    existing.output += delta;
+    const deltaBytes = Buffer.byteLength(delta, "utf8");
+    existing.totalOutputBytes += deltaBytes;
+    if (!existing.truncated && existing.totalOutputBytes <= AGENT_TRANSCRIPT_ENTRY_MAX_BYTES) {
+      existing.outputHead += delta;
+    } else if (!existing.truncated) {
+      const combined = `${existing.outputHead}${delta}`;
+      existing.outputHead = utf8Head(combined, COMMAND_TRANSCRIPT_HEAD_BYTES);
+      existing.outputTail = utf8Tail(combined, COMMAND_TRANSCRIPT_TAIL_BYTES);
+      existing.truncated = true;
+    } else {
+      existing.outputTail = utf8Tail(`${existing.outputTail}${delta}`, COMMAND_TRANSCRIPT_TAIL_BYTES);
+    }
     this.commandOutputBuffers.set(key, existing);
+  }
+
+  private bufferedCommandOutput(existing: (typeof this.commandOutputBuffers extends Map<string, infer TValue> ? TValue : never)): string {
+    if (!existing.truncated) {
+      return existing.outputHead;
+    }
+    const retainedBytes = Buffer.byteLength(existing.outputHead, "utf8") + Buffer.byteLength(existing.outputTail, "utf8");
+    const omittedBytes = Math.max(0, existing.totalOutputBytes - retainedBytes);
+    return `${existing.outputHead}\n[... ${omittedBytes} command-output bytes omitted by Agent Workbench streaming limits ...]\n${existing.outputTail}`;
+  }
+
+  private flushCommandTranscriptsForAgent(project: LoadedProject, agent: AgentState, status: string): void {
+    for (const [key, existing] of this.commandOutputBuffers) {
+      if (existing.projectId !== project.record.id || existing.agentId !== agent.id) {
+        continue;
+      }
+      this.commandOutputBuffers.delete(key);
+      this.appendAgentTranscriptEntry(project, agent, {
+        id: `${agent.id}:command:${existing.itemId}:${Date.now()}`,
+        timestamp: nowIso(),
+        kind: "command",
+        itemId: existing.itemId,
+        title: existing.command ?? "Command output",
+        text: this.bufferedCommandOutput(existing),
+        metadata: {
+          status,
+          exitCode: null,
+          cwd: existing.cwd ?? null,
+          startedAt: existing.startedAt ?? null,
+          truncated: existing.truncated,
+          totalOutputBytes: existing.totalOutputBytes
+        }
+      });
+    }
   }
 
   private flushCommandTranscript(project: LoadedProject, agent: AgentState, itemId: string, status: string, exitCode?: number | null): void {
@@ -16591,12 +18408,14 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       kind: "command",
       itemId,
       title: existing.command ?? "Command output",
-      text: existing.output,
+      text: this.bufferedCommandOutput(existing),
       metadata: {
         status,
         exitCode: exitCode ?? null,
         cwd: existing.cwd ?? null,
-        startedAt: existing.startedAt ?? null
+        startedAt: existing.startedAt ?? null,
+        truncated: existing.truncated,
+        totalOutputBytes: existing.totalOutputBytes
       }
     });
   }
@@ -16713,6 +18532,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           turnId: notification.params.turn.id,
           status: notification.params.turn.status
         });
+        this.flushCommandTranscriptsForAgent(project, agent, `turn_${notification.params.turn.status}`);
         if (writeAgentFinalizationAlreadyStarted) {
           restoreWriteAgentLifecycle();
           break;
@@ -16958,6 +18778,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           ]
             .filter((part) => part.length > 0)
             .join(" ");
+        this.flushCommandTranscriptsForAgent(project, agent, "transport_error");
         reduceAgentRuntimeEvent(agent, {
           kind: "raw",
           title: "Transport error",
@@ -17062,11 +18883,314 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
   }
 
-  private handleTransportRequest(request: ServerRequest): void {
-    void this.processTransportRequest(request);
+  private previewToolResultText(session: PreviewSessionProjection): string {
+    const consoleFindings = session.console
+      .filter((entry) => entry.level === "warning" || entry.level === "error")
+      .slice(-50);
+    const networkFindings = session.network
+      .filter((entry) => entry.outcome !== "ok")
+      .slice(-50);
+    return JSON.stringify({
+      sessionId: session.id,
+      status: session.status,
+      message: session.message,
+      url: session.validatedUrl,
+      snapshot: session.latestSnapshot,
+      consoleFindings,
+      networkFindings,
+      blockedOrigins: session.blockedOrigins,
+      artifacts: session.artifacts.slice(0, 20)
+    }, null, 2).slice(0, 240_000);
   }
 
-  private async processTransportRequest(request: ServerRequest): Promise<void> {
+  private browserPreviewAction(tool: string, args: Record<string, JsonValue>): PreviewAction {
+    switch (tool) {
+      case "snapshot":
+        return { type: "snapshot" };
+      case "navigate":
+        return { type: "navigate", url: typeof args.url === "string" ? args.url : "" };
+      case "click":
+        return { type: "click", ref: typeof args.ref === "string" ? args.ref : "" };
+      case "fill":
+        return {
+          type: "fill",
+          ref: typeof args.ref === "string" ? args.ref : "",
+          value: typeof args.value === "string" ? args.value : ""
+        };
+      case "select":
+        return previewActionSchema.parse({
+          type: "select",
+          ref: args.ref,
+          values: args.values
+        }) as PreviewAction;
+      case "press":
+        return {
+          type: "press",
+          key: typeof args.key === "string" ? args.key : "",
+          ref: typeof args.ref === "string" ? args.ref : undefined
+        };
+      case "scroll":
+        return {
+          type: "scroll",
+          deltaX: typeof args.deltaX === "number" ? args.deltaX : undefined,
+          deltaY: typeof args.deltaY === "number" ? args.deltaY : 0
+        };
+      case "wait":
+        return previewActionSchema.parse({
+          type: "wait",
+          milliseconds: args.milliseconds
+        }) as PreviewAction;
+      case "screenshot":
+        return {
+          type: "screenshot",
+          label: typeof args.label === "string" ? args.label : "Agent browser capture"
+        };
+      default:
+        throw new Error(`Unknown browser tool: ${tool}`);
+    }
+  }
+
+  private async startAgentBrowserPreview(
+    project: LoadedProject,
+    agent: AgentState,
+    broker: PreviewBroker
+  ): Promise<PreviewSessionProjection> {
+    return await this.serializePreviewOwnershipOperation(project.record.id, async () => {
+      let activeSession = broker.getProjection(project.record.id).activeSession;
+      const storedOwnership = this.agentBrowserSessions.get(agent.id);
+      if (
+        storedOwnership &&
+        (
+          storedOwnership.projectId !== project.record.id ||
+          !activeSession ||
+          storedOwnership.sessionId !== activeSession.id
+        )
+      ) {
+        this.agentBrowserSessions.delete(agent.id);
+      }
+
+      if (activeSession && this.isLivePreviewSession(activeSession)) {
+        let ownerAgentId = this.agentBrowserSessionOwner(project.record.id, activeSession.id);
+        if (
+          ownerAgentId &&
+          ownerAgentId !== agent.id &&
+          !project.record.agents.some((candidate) => candidate.id === ownerAgentId)
+        ) {
+          this.agentBrowserSessions.delete(ownerAgentId);
+          ownerAgentId = undefined;
+        }
+        const requesterOwnership = this.agentBrowserSessions.get(agent.id);
+        const requesterOwnsSession =
+          requesterOwnership?.projectId === project.record.id &&
+          requesterOwnership.sessionId === activeSession.id &&
+          ownerAgentId === agent.id;
+
+        if (activeSession.checkpointKind === "pre_merge") {
+          if (requesterOwnsSession) {
+            this.agentBrowserSessions.delete(agent.id);
+          }
+          throw new Error(
+            "browser.start cannot replace the active pre-merge browser gate. Wait for it to finish or stop it from Preview."
+          );
+        }
+        if (!requesterOwnsSession) {
+          throw new Error(
+            ownerAgentId
+              ? "browser.start cannot replace another agent's active browser session."
+              : "browser.start cannot replace the operator's active browser preview. Stop it from Preview first."
+          );
+        }
+        if (activeSession.status === "trust_required") {
+          throw new Error(
+            `${activeSession.message}. The operator must grant this exact project trust request in Preview before the agent can continue.`
+          );
+        }
+        if (activeSession.status !== "ready") {
+          throw new Error(`This agent's browser preview is still ${activeSession.status}. Wait for it to become ready.`);
+        }
+
+        const currentContext = await this.previewProjectContext(project, agent);
+        if (activeSession.sourceRevision === currentContext.sourceRevision) {
+          return activeSession;
+        }
+        const readiness = await broker.getReadiness(currentContext);
+        if (readiness.status !== "ready") {
+          throw new Error(readiness.message);
+        }
+        try {
+          const restartedSession = await broker.startPreview(currentContext, "explicit");
+          this.pruneAgentBrowserSessionOwnership(project.record.id, restartedSession);
+          if (this.isLivePreviewSession(restartedSession)) {
+            this.claimAgentBrowserSession(agent.id, project.record.id, restartedSession.id);
+          }
+          return restartedSession;
+        } catch (error) {
+          activeSession = broker.getProjection(project.record.id).activeSession;
+          this.pruneAgentBrowserSessionOwnership(project.record.id, activeSession);
+          throw error;
+        }
+      }
+
+      if (activeSession) {
+        this.clearAgentBrowserSessionOwnership(project.record.id, activeSession.id);
+      }
+      const context = await this.previewProjectContext(project, agent);
+      const readiness = await broker.getReadiness(context);
+      if (readiness.status !== "ready") {
+        throw new Error(readiness.message);
+      }
+      try {
+        const session = await broker.startPreview(context, "explicit");
+        this.pruneAgentBrowserSessionOwnership(project.record.id, session);
+        if (this.isLivePreviewSession(session)) {
+          this.claimAgentBrowserSession(agent.id, project.record.id, session.id);
+        }
+        return session;
+      } catch (error) {
+        activeSession = broker.getProjection(project.record.id).activeSession;
+        this.pruneAgentBrowserSessionOwnership(project.record.id, activeSession);
+        throw error;
+      }
+    });
+  }
+
+  private async performAgentBrowserAction(
+    project: LoadedProject,
+    agent: AgentState,
+    broker: PreviewBroker,
+    action: PreviewAction
+  ): Promise<PreviewSessionProjection> {
+    return await this.serializePreviewOwnershipOperation(project.record.id, async () => {
+      const ownership = this.agentBrowserSessions.get(agent.id);
+      if (!ownership || ownership.projectId !== project.record.id) {
+        if (ownership) {
+          this.agentBrowserSessions.delete(agent.id);
+        }
+        throw new Error("This agent does not own a ready browser preview. Call browser.start first.");
+      }
+
+      const activeSession = broker.getProjection(project.record.id).activeSession;
+      if (
+        !activeSession ||
+        activeSession.id !== ownership.sessionId ||
+        this.agentBrowserSessionOwner(project.record.id, ownership.sessionId) !== agent.id
+      ) {
+        this.agentBrowserSessions.delete(agent.id);
+        throw new Error("This agent's browser session is stale and can no longer be used. Call browser.start again.");
+      }
+      if (activeSession.checkpointKind !== "explicit" || activeSession.status !== "ready") {
+        if (!this.isLivePreviewSession(activeSession) || activeSession.checkpointKind !== "explicit") {
+          this.agentBrowserSessions.delete(agent.id);
+        }
+        throw new Error("This agent's browser session is not ready. Call browser.start again when Preview is available.");
+      }
+
+      try {
+        const session = await broker.performAction(project.record.id, ownership.sessionId, action);
+        if (
+          session.id !== ownership.sessionId ||
+          session.projectId !== project.record.id ||
+          session.status !== "ready"
+        ) {
+          this.agentBrowserSessions.delete(agent.id);
+          throw new Error("The browser action did not return this agent's active session.");
+        }
+        return session;
+      } catch (error) {
+        this.pruneAgentBrowserSessionOwnership(
+          project.record.id,
+          broker.getProjection(project.record.id).activeSession
+        );
+        throw error;
+      }
+    });
+  }
+
+  private async processBrowserToolRequest(
+    request: Extract<ServerRequest, { method: "item/tool/call" }>,
+    project: LoadedProject,
+    agent: AgentState,
+    sourceTransport: CodexTransport | undefined = this.transport
+  ): Promise<void> {
+    if (!sourceTransport || this.transport !== sourceTransport) {
+      return;
+    }
+    const response: DynamicToolCallResponse = { contentItems: [], success: false };
+    try {
+      if (request.params.namespace !== "browser") {
+        throw new Error(`Unsupported dynamic tool namespace: ${request.params.namespace ?? "none"}`);
+      }
+      const broker = this.requirePreviewBroker();
+      const rawArguments = request.params.arguments;
+      const args = rawArguments && typeof rawArguments === "object" && !Array.isArray(rawArguments)
+        ? rawArguments as Record<string, JsonValue>
+        : {};
+      let session: PreviewSessionProjection;
+      if (request.params.tool === "start") {
+        session = await this.startAgentBrowserPreview(project, agent, broker);
+        if (session.status === "trust_required") {
+          throw new Error(
+            `${session.message}. The operator must grant this exact project trust request in Preview before the agent can run it.`
+          );
+        }
+      } else {
+        session = await this.performAgentBrowserAction(
+          project,
+          agent,
+          broker,
+          this.browserPreviewAction(request.params.tool, args)
+        );
+      }
+
+      response.contentItems.push({ type: "inputText", text: this.previewToolResultText(session) });
+      if (request.params.tool === "screenshot") {
+        const screenshot = session.artifacts.find((artifact) => artifact.kind === "screenshot");
+        if (screenshot && screenshot.sizeBytes <= 3 * 1024 * 1024) {
+          const artifact = await broker.getArtifact(project.record.id, session.id, screenshot.id);
+          response.contentItems.push({
+            type: "inputImage",
+            imageUrl: `data:${artifact.metadata.mimeType};base64,${Buffer.from(artifact.bytes).toString("base64")}`
+          });
+        }
+      }
+      response.success = true;
+      reduceAgentRuntimeEvent(agent, {
+        kind: "raw",
+        title: `Browser ${request.params.tool}`,
+        detail: session.message
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      response.contentItems = [{ type: "inputText", text: message.slice(0, 4_000) }];
+      reduceAgentRuntimeEvent(agent, {
+        kind: "raw",
+        title: `Browser ${request.params.tool} failed`,
+        detail: message
+      });
+    }
+    if (this.transport !== sourceTransport) {
+      return;
+    }
+    agent.lastActivityAt = nowIso();
+    this.scheduleProjectSave(project, { syncWorkflow: false });
+    this.emitState();
+    await sourceTransport.respond(request.id, response);
+  }
+
+  private handleTransportRequest(request: ServerRequest, sourceTransport: CodexTransport | undefined = this.transport): void {
+    if (!sourceTransport || this.transport !== sourceTransport) {
+      return;
+    }
+    void this.processTransportRequest(request, sourceTransport);
+  }
+
+  private async processTransportRequest(
+    request: ServerRequest,
+    sourceTransport: CodexTransport | undefined = this.transport
+  ): Promise<void> {
+    if (!sourceTransport || this.transport !== sourceTransport || this.disposed) {
+      return;
+    }
     const threadId =
       "params" in request && request.params && "threadId" in request.params ? String((request.params as { threadId?: string }).threadId) : undefined;
     if (!threadId) {
@@ -17079,7 +19203,12 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     const project = this.projects.get(mapping.projectId);
     const agent = project?.record.agents.find((entry) => entry.id === mapping.agentId);
-    if (!project || !agent) {
+    if (!project || !agent || agent.threadId !== threadId) {
+      return;
+    }
+
+    if (request.method === "item/tool/call") {
+      await this.processBrowserToolRequest(request, project, agent, sourceTransport);
       return;
     }
 
@@ -17099,8 +19228,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
           "Paid API services are disabled in Codex Agent Workbench settings.",
           "Use a free/no-card provider, no-key/open-data source, demo/mock mode, or request only a free-tier credential."
         ].join(" ");
-        if (this.transport) {
-          await this.transport.respond(request.id, { answers: normalizedQuestions.map(() => answer) });
+        if (this.transport === sourceTransport) {
+          await sourceTransport.respond(request.id, { answers: normalizedQuestions.map(() => answer) });
+        }
+        if (this.transport !== sourceTransport) {
+          return;
         }
         agent.currentPhase = "Rejected paid credential request";
         agent.lastActivityAt = nowIso();
@@ -17143,6 +19275,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         createdAt: nowIso()
       };
       await mkdir(this.resolveUserInputRequestInboxHostPath(project, requestId), { recursive: true });
+      if (this.transport !== sourceTransport) {
+        return;
+      }
 
       const intervention = await this.createHumanInterventionRecord(project, {
         kind: isCredentialRequest ? "credentials" : "external_setup",
@@ -17158,6 +19293,16 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         blocking: true,
         linkedUserInputRequestId: requestId
       }, { persist: false });
+      if (this.transport !== sourceTransport) {
+        await this.resolveHumanInterventionRecord(
+          project,
+          intervention.id,
+          "dismissed",
+          "The originating Codex transport was replaced before this request could be registered.",
+          { persist: false }
+        );
+        return;
+      }
       userInputRequest.humanInterventionId = intervention.id;
       this.addCredentialRequestForUserInput(project, agent, userInputRequest, intervention);
       project.record.userInputRequests.unshift(userInputRequest);
@@ -17237,6 +19382,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const approvalForChecks = approval;
+    const approvedWorktreeRoots = agent.worktree?.baseDir ? [agent.worktree.baseDir] : [];
 
     let unsafeReason: string | undefined;
     try {
@@ -17245,10 +19391,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       }
 
       if (!unsafeReason && approvalForChecks.cwd) {
-        await assertExecutionPathWithinProjectRoot(
+        await assertExecutionPathWithinApprovedRoots(
           project.record.projectRoot,
           approvalForChecks.cwd,
           project.record.hostPath,
+          approvedWorktreeRoots,
           this.getRuntimeSettings(project.record.distroName),
           project.record.distroName,
           "Command approval"
@@ -17259,7 +19406,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         const referencedOutsidePath = this.textReferencesOutsideProject(
           project,
           approvalForChecks.command,
-          approvalForChecks.cwd ?? project.record.projectRoot
+          approvalForChecks.cwd ?? project.record.projectRoot,
+          approvedWorktreeRoots
         );
         if (referencedOutsidePath) {
           unsafeReason = `Command approval was rejected because it referenced a path outside the active project folder: ${referencedOutsidePath}`;
@@ -17268,10 +19416,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
       if (!unsafeReason) {
         for (const filePath of approvalForChecks.filePaths) {
-          await assertExecutionPathWithinProjectRoot(
+          await assertExecutionPathWithinApprovedRoots(
             project.record.projectRoot,
             filePath,
             project.record.hostPath,
+            approvedWorktreeRoots,
             this.getRuntimeSettings(project.record.distroName),
             project.record.distroName,
             "File change approval"
@@ -17282,18 +19431,22 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       unsafeReason = error instanceof Error ? error.message : String(error);
     }
 
+    if (this.transport !== sourceTransport) {
+      return;
+    }
+
     approval = {
       ...approval,
-      summary: this.sanitizeTextToProjectBoundary(project, approval.summary, approvalForChecks.cwd ?? project.record.projectRoot) ?? approval.summary,
-      reason: this.sanitizeTextToProjectBoundary(project, approval.reason, approvalForChecks.cwd ?? project.record.projectRoot),
-      command: this.sanitizeTextToProjectBoundary(project, approval.command, approvalForChecks.cwd ?? project.record.projectRoot),
-      cwd: this.sanitizeTextToProjectBoundary(project, approval.cwd, approvalForChecks.cwd ?? project.record.projectRoot),
-      filePaths: approval.filePaths.map((filePath) => this.sanitizeTextToProjectBoundary(project, filePath, approvalForChecks.cwd ?? project.record.projectRoot) ?? filePath)
+      summary: this.sanitizeTextToProjectBoundary(project, approval.summary, approvalForChecks.cwd ?? project.record.projectRoot, approvedWorktreeRoots) ?? approval.summary,
+      reason: this.sanitizeTextToProjectBoundary(project, approval.reason, approvalForChecks.cwd ?? project.record.projectRoot, approvedWorktreeRoots),
+      command: this.sanitizeTextToProjectBoundary(project, approval.command, approvalForChecks.cwd ?? project.record.projectRoot, approvedWorktreeRoots),
+      cwd: this.sanitizeTextToProjectBoundary(project, approval.cwd, approvalForChecks.cwd ?? project.record.projectRoot, approvedWorktreeRoots),
+      filePaths: approval.filePaths.map((filePath) => this.sanitizeTextToProjectBoundary(project, filePath, approvalForChecks.cwd ?? project.record.projectRoot, approvedWorktreeRoots) ?? filePath)
     };
 
     if (unsafeReason) {
       approval.status = "rejected";
-      approval.reason = this.sanitizeTextToProjectBoundary(project, unsafeReason, approval.cwd ?? project.record.projectRoot) ?? unsafeReason;
+      approval.reason = this.sanitizeTextToProjectBoundary(project, unsafeReason, approval.cwd ?? project.record.projectRoot, approvedWorktreeRoots) ?? unsafeReason;
       approval.summary = "Blocked by project boundary";
       agent.approvals.unshift(approval);
       reduceAgentRuntimeEvent(agent, {
@@ -17303,9 +19456,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         raw: request
       });
       this.mirrorLatestAgentEventToWorkflow(this.ensureWorkflowState(project.record), agent);
-      if (this.transport) {
-        await this.transport.respond(request.id, { decision: "decline" });
-      }
+      await sourceTransport.respond(request.id, { decision: "decline" });
       await this.persistProjectUpdate(project);
       return;
     }
@@ -17315,9 +19466,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         kind: "approval-request",
         approval
       });
-      if (this.transport) {
-        await this.transport.respond(request.id, { decision: "accept" });
-      }
+      await sourceTransport.respond(request.id, { decision: "accept" });
       reduceAgentRuntimeEvent(agent, {
         kind: "approval-resolved",
         approvalId: approval.id,

@@ -20,7 +20,7 @@ The desktop UI is intended to run on Windows. Codex, Git, worktrees, and determi
 ## Prerequisites
 
 - Windows 11 with WSL2 and Ubuntu.
-- Node.js 24+ and npm 11+.
+- Node.js 22.12+ (the repository pins 22.22.0 in `.nvmrc`) and npm 10+.
 - `git` available in WSL.
 - `codex` installed in WSL and authenticated if you want live Codex transport.
 - For Windows packaging: outbound access to Electron release artifacts from `github.com`.
@@ -75,11 +75,10 @@ npm run mock
 Run the compiled local workspace without generating a new Windows executable:
 
 ```bash
-npm run build:app
 npm start
 ```
 
-This is also the primary local Windows workflow. From PowerShell in the repository, run `npm run build` and then `npm start`; the Electron app runs on Windows while Git, Codex, and managed worktrees continue to use WSL as execution truth.
+`npm start` checks whether the renderer, main-process, and preload bundles are current and rebuilds them when needed. This is also the primary local Windows workflow: from PowerShell in the repository, run `npm start`; the Electron app runs on Windows while Git, Codex, managed previews, and worktrees continue to use WSL as execution truth.
 
 ## Build And Test
 
@@ -89,6 +88,7 @@ npm run typecheck
 npm run lint
 npm test
 npm run build:app
+npm run test:e2e
 ```
 
 Distributable packaging:
@@ -145,9 +145,9 @@ The portable file is versioned and schema-validated. Version 2 checksums are ver
 - Machine-specific paths and settings stay local.
 - The runtime blocks target-project artifacts from being written into the Agentic Workbench source repository.
 
-## Mission Control And Advanced Views
+## Workspace And Advanced Views
 
-The Overview tab starts with Mission Control, a high-level operator view:
+The workspace opens on Mission, a calm high-level operator view:
 
 - Live execution map: goal, recommendation, plan, coding, integrity, and merge stages with repair-loop routing.
 - Causal timeline: selectable events with attached status, source, and evidence.
@@ -161,6 +161,8 @@ Advanced tabs remain available for detailed operation:
 - History: cycle summaries and agent cards. Every retained agent has a visible "View full output" action.
 - Repository: indexed file tree, scan status, truncation/partial-index warnings, summaries, and excluded paths.
 - Settings: runtime readiness, Codex update checks, credentials, model defaults, safe mode state, and Goal Charter settings.
+
+Preview runs through a managed Playwright broker in WSL. Repository preview commands require project trust, browser sessions are scoped to their operator or agent owner, and visual projects must produce content-bound browser evidence before merge. Browser binaries or Linux dependencies are installed only through an explicit operator action.
 
 The full-output viewer supports copy, search, line wrapping, preformatted/plain text modes, and collapsed technical details. Preview text may be truncated, but retained sidecar output is loaded on demand.
 

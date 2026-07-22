@@ -42,7 +42,7 @@ export {
 } from "./autopilotPolicy";
 
 const activeAgentStatuses = new Set(["starting", "running", "waiting_approval"]);
-const workflowPreviewStatuses = new Set(["none", "queued", "active", "ready", "completed", "cancelled"]);
+const workflowPreviewStatuses = new Set(["none", "queued", "active", "ready", "completed", "cancelled", "failed"]);
 
 const isAgentActive = (agent: AgentState): boolean => activeAgentStatuses.has(agent.status);
 
@@ -80,7 +80,10 @@ export const normalizeWorkflowPreviewRequest = (
     modeBeforePreview: previewRequest?.modeBeforePreview === "fast" ? "fast" : previewRequest?.modeBeforePreview === "normal" ? "normal" : undefined,
     autopilotWasEnabled: previewRequest?.autopilotWasEnabled,
     reason: previewRequest?.reason,
-    evidence: previewRequest?.evidence?.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).slice(0, 8)
+    evidence: previewRequest?.evidence?.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).slice(0, 8),
+    previewSessionId: previewRequest?.previewSessionId,
+    previewGateReportId: previewRequest?.previewGateReportId,
+    evidenceKind: previewRequest?.evidenceKind === "browser" ? "browser" : previewRequest?.evidenceKind === "legacy" ? "legacy" : undefined
   };
 };
 

@@ -1,8 +1,9 @@
-import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { z } from "zod";
 import { APP_VERSION, PORTABLE_INTERFACE_PATH, REVIEW_LOG_BUNDLE_VERSION } from "@shared/constants";
 import { createPortableInterface } from "@shared/defaults";
-import { localProjectRecordSchema, portableInterfaceSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema } from "@shared/schemas";
+import { appSettingsSchema, localProjectRecordSchema, portableInterfaceSchema, projectReviewLogBundleSchema, projectWorkflowStateSchema, storageEntityIdSchema } from "@shared/schemas";
 import type {
   AgentCategory,
   AgentLifecycleStatus,
@@ -46,19 +47,76 @@ export interface CredentialSecretInput {
   secretKey?: string;
 }
 
-type StoredSecretValue = {
-  encoding: "safeStorage" | "plain";
-  value: string;
-};
+export type CredentialStorageErrorCode =
+  | "credential_storage_unavailable"
+  | "credential_storage_locked"
+  | "credential_store_corrupt";
 
-type CredentialSecretStore = {
-  version: 1;
-  entries: Record<string, {
-    apiKey: StoredSecretValue;
-    secretKey?: StoredSecretValue;
-    updatedAt: string;
-  }>;
-};
+/**
+ * A recoverable credential failure that callers should surface to the user.
+ * `credential_storage_unavailable` means a new secret cannot be encrypted on
+ * this machine. `credential_storage_locked` means encrypted data exists but
+ * cannot currently be decrypted. `credential_store_corrupt` means the store
+ * failed strict integrity validation and was deliberately left untouched.
+ */
+export class CredentialStorageError extends Error {
+  readonly name = "CredentialStorageError";
+
+  constructor(
+    readonly code: CredentialStorageErrorCode,
+    message: string,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+  }
+}
+
+export class StorageReadLimitError extends Error {
+  readonly name = "StorageReadLimitError";
+
+  constructor(
+    readonly filePath: string,
+    readonly maxBytes: number
+  ) {
+    super(`Refused to load ${path.basename(filePath)} because it exceeds the ${maxBytes} byte storage limit.`);
+  }
+}
+
+export interface VersionedStorageBackup {
+  backupPath: string;
+  created: boolean;
+  sourceVersion: string;
+}
+
+const safeStorageSecretValueSchema = z.object({
+  encoding: z.literal("safeStorage"),
+  value: z.string().min(1).regex(
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
+    "Encrypted credential value must be valid base64."
+  )
+}).strict();
+
+const legacyPlainSecretValueSchema = z.object({
+  encoding: z.literal("plain"),
+  value: z.string()
+}).strict();
+
+const storedSecretValueSchema = z.discriminatedUnion("encoding", [
+  safeStorageSecretValueSchema,
+  legacyPlainSecretValueSchema
+]);
+
+const credentialSecretStoreSchema = z.object({
+  version: z.literal(1),
+  entries: z.record(z.string().min(1), z.object({
+    apiKey: storedSecretValueSchema,
+    secretKey: storedSecretValueSchema.optional(),
+    updatedAt: z.string().datetime({ offset: true })
+  }).strict())
+}).strict();
+
+type StoredSecretValue = z.infer<typeof storedSecretValueSchema>;
+type CredentialSecretStore = z.infer<typeof credentialSecretStoreSchema>;
 
 type ProjectStateParseResult =
   | { ok: true; value: unknown }
@@ -126,6 +184,18 @@ export type RepositoryIndexStore = {
 export const PROJECT_STATE_WARNING_BYTES = 750_000;
 export const PROJECT_STATE_COMPACT_BYTES = 1_500_000;
 export const PROJECT_STATE_HARD_LOAD_BYTES = 24_000_000;
+
+export const SETTINGS_MAX_LOAD_BYTES = 1_000_000;
+export const REGISTRY_MAX_LOAD_BYTES = 4_000_000;
+export const REPOSITORY_INDEX_MAX_LOAD_BYTES = 64_000_000;
+export const PORTABLE_INTERFACE_MAX_LOAD_BYTES = 24_000_000;
+export const CREDENTIAL_STORE_MAX_LOAD_BYTES = 4_000_000;
+export const AGENT_TRANSCRIPT_MAX_ENTRIES = 2_000;
+export const AGENT_TRANSCRIPT_MAX_BYTES = 8_000_000;
+export const AGENT_TRANSCRIPT_ENTRY_MAX_BYTES = 512_000;
+export const AGENT_FULL_OUTPUT_MAX_BYTES = 8_000_000;
+
+const STORAGE_TRUNCATION_MARKER = "[... truncated by Agent Workbench storage limits ...]";
 
 const SIDE_CAR_PRESERVE_TEXT_BYTES = 12_000;
 const SIDE_CAR_PRESERVE_EVENT_BYTES = 8_000;
@@ -603,7 +673,7 @@ const buildRedactionNotes = (record: LocalProjectRecord): string[] => {
 };
 
 export class WorkbenchStorage {
-  private readonly writeQueues = new Map<string, Promise<void>>();
+  private readonly fileQueues = new Map<string, Promise<void>>();
   private readonly loadIssues: StateLoadIssue[] = [];
   private readonly debugState = process.env.AWB_DEBUG_STATE === "1";
   private readonly debugPerf = process.env.WORKBENCH_PERF === "1" || process.env.AWB_DEBUG_WORKFLOW_PERF === "1";
@@ -672,7 +742,13 @@ export class WorkbenchStorage {
   }
 
   private projectDir(projectId: string): string {
-    return path.join(this.appDataDir, "projects", projectId);
+    const projectsRoot = path.resolve(this.appDataDir, "projects");
+    const safeProjectId = storageEntityIdSchema.parse(projectId);
+    const projectDirectory = path.resolve(projectsRoot, safeProjectId);
+    if (path.dirname(projectDirectory) !== projectsRoot) {
+      throw new Error("Project storage path escaped the managed projects directory.");
+    }
+    return projectDirectory;
   }
 
   private projectStatePath(projectId: string): string {
@@ -692,7 +768,13 @@ export class WorkbenchStorage {
   }
 
   private projectAgentTranscriptPath(projectId: string, agentId: string): string {
-    return path.join(this.projectAgentTranscriptDir(projectId), `${agentId}.json`);
+    const transcriptDirectory = path.resolve(this.projectAgentTranscriptDir(projectId));
+    const safeAgentId = storageEntityIdSchema.parse(agentId);
+    const transcriptPath = path.resolve(transcriptDirectory, `${safeAgentId}.json`);
+    if (path.dirname(transcriptPath) !== transcriptDirectory) {
+      throw new Error("Agent transcript path escaped its managed project directory.");
+    }
+    return transcriptPath;
   }
 
   private projectAgentOutputDir(projectId: string): string {
@@ -700,7 +782,13 @@ export class WorkbenchStorage {
   }
 
   private projectAgentOutputPath(projectId: string, agentId: string): string {
-    return path.join(this.projectAgentOutputDir(projectId), `${agentId}.json`);
+    const outputDirectory = path.resolve(this.projectAgentOutputDir(projectId));
+    const safeAgentId = storageEntityIdSchema.parse(agentId);
+    const outputPath = path.resolve(outputDirectory, `${safeAgentId}.json`);
+    if (path.dirname(outputPath) !== outputDirectory) {
+      throw new Error("Agent output path escaped its managed project directory.");
+    }
+    return outputPath;
   }
 
   private registryPath(): string {
@@ -725,6 +813,53 @@ export class WorkbenchStorage {
     this.loadIssues.push(issue);
     const detail = issue.quarantinePath ? ` -> ${issue.quarantinePath}` : "";
     console.warn(`[storage] ${issue.action} ${issue.statePath}${detail}: ${issue.message}`);
+  }
+
+  private async readTextFileBounded(filePath: string, maxBytes: number): Promise<string> {
+    const handle = await open(filePath, "r");
+    try {
+      const fileStats = await handle.stat();
+      if (fileStats.size > maxBytes) {
+        throw new StorageReadLimitError(filePath, maxBytes);
+      }
+
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let position = 0;
+      while (totalBytes <= maxBytes) {
+        const remaining = maxBytes + 1 - totalBytes;
+        const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining));
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+        if (bytesRead === 0) {
+          break;
+        }
+        chunks.push(chunk.subarray(0, bytesRead));
+        totalBytes += bytesRead;
+        position += bytesRead;
+        if (totalBytes > maxBytes) {
+          throw new StorageReadLimitError(filePath, maxBytes);
+        }
+      }
+      return Buffer.concat(chunks, totalBytes).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async runFileOperation<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+    const previousOperation = this.fileQueues.get(filePath) ?? Promise.resolve();
+    const result = previousOperation
+      .catch(() => undefined)
+      .then(operation);
+    const queueTail = result.then(() => undefined, () => undefined);
+    this.fileQueues.set(filePath, queueTail);
+    try {
+      return await result;
+    } finally {
+      if (this.fileQueues.get(filePath) === queueTail) {
+        this.fileQueues.delete(filePath);
+      }
+    }
   }
 
   private isRetryableAtomicWriteError(error: unknown): boolean {
@@ -780,24 +915,60 @@ export class WorkbenchStorage {
   }
 
   private async writeJsonAtomically(filePath: string, value: unknown): Promise<void> {
-    const previousWrite = this.writeQueues.get(filePath) ?? Promise.resolve();
-    const nextWrite = previousWrite
-      .catch(() => undefined)
-      .then(async () => await this.writeJsonAtomicallyNow(filePath, value));
-    this.writeQueues.set(filePath, nextWrite);
-    try {
-      await nextWrite;
-    } finally {
-      if (this.writeQueues.get(filePath) === nextWrite) {
-        this.writeQueues.delete(filePath);
-      }
+    await this.runFileOperation(filePath, async () => await this.writeJsonAtomicallyNow(filePath, value));
+  }
+
+  /**
+   * Public atomic replacement primitive for versioned migrations. All writes
+   * to the same path are serialized within this storage instance.
+   */
+  async replaceJsonAtomically(filePath: string, value: unknown): Promise<void> {
+    await this.writeJsonAtomically(filePath, value);
+  }
+
+  /**
+   * Creates one immutable, timestamped backup for a source schema version.
+   * Repeated migration attempts return the existing backup instead of
+   * producing an unbounded series of identical pre-migration copies.
+   */
+  async createVersionedBackupOnce(filePath: string, sourceVersion: string | number): Promise<VersionedStorageBackup> {
+    const normalizedVersion = String(sourceVersion)
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    if (!normalizedVersion) {
+      throw new Error("A source version is required before creating a migration backup.");
     }
+
+    const queueKey = `${filePath}\0backup\0${normalizedVersion}`;
+    return await this.runFileOperation(queueKey, async () => {
+      const directory = path.dirname(filePath);
+      const backupPrefix = `${path.basename(filePath)}.backup.source-v${normalizedVersion}.`;
+      const existing = (await readdir(directory).catch(() => []))
+        .filter((entry) => entry.startsWith(backupPrefix))
+        .sort()[0];
+      if (existing) {
+        return {
+          backupPath: path.join(directory, existing),
+          created: false,
+          sourceVersion: normalizedVersion
+        };
+      }
+
+      const timestamp = nowIso().replace(/[:.]/g, "-");
+      const backupPath = path.join(directory, `${backupPrefix}${timestamp}.json`);
+      await copyFile(filePath, backupPath);
+      return { backupPath, created: true, sourceVersion: normalizedVersion };
+    });
   }
 
   async loadRegistry(): Promise<string[]> {
     try {
-      const raw = await readFile(this.registryPath(), "utf8");
-      return JSON.parse(raw) as string[];
+      const raw = await this.readTextFileBounded(this.registryPath(), REGISTRY_MAX_LOAD_BYTES);
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed)
+        ? parsed.filter((entry): entry is string => storageEntityIdSchema.safeParse(entry).success)
+        : [];
     } catch {
       return [];
     }
@@ -805,12 +976,13 @@ export class WorkbenchStorage {
 
   async saveRegistry(projectIds: string[]): Promise<void> {
     await this.ensureBaseDirs();
-    await this.writeJsonAtomically(this.registryPath(), projectIds);
+    await this.writeJsonAtomically(this.registryPath(), z.array(storageEntityIdSchema).parse(projectIds));
   }
 
-  async loadSettings(): Promise<Record<string, unknown> | null> {
+  async loadSettings(): Promise<AppSettings | null> {
     try {
-      return JSON.parse(await readFile(this.settingsPath(), "utf8")) as Record<string, unknown>;
+      const raw = await this.readTextFileBounded(this.settingsPath(), SETTINGS_MAX_LOAD_BYTES);
+      return appSettingsSchema.parse(JSON.parse(raw));
     } catch {
       return null;
     }
@@ -818,7 +990,7 @@ export class WorkbenchStorage {
 
   async saveSettings(settings: Record<string, unknown>): Promise<void> {
     await this.ensureBaseDirs();
-    await this.writeJsonAtomically(this.settingsPath(), settings);
+    await this.writeJsonAtomically(this.settingsPath(), appSettingsSchema.parse(settings));
   }
 
   async saveProject(record: LocalProjectRecord): Promise<void> {
@@ -853,7 +1025,10 @@ export class WorkbenchStorage {
 
   async loadRepositoryIndex(projectId: string): Promise<RepositoryIndexStore | null> {
     try {
-      const raw = await readFile(this.projectRepositoryIndexPath(projectId), "utf8");
+      const raw = await this.readTextFileBounded(
+        this.projectRepositoryIndexPath(projectId),
+        REPOSITORY_INDEX_MAX_LOAD_BYTES
+      );
       const parsed = JSON.parse(raw) as Partial<RepositoryIndexStore>;
       if (parsed.version !== 1 || parsed.projectId !== projectId || typeof parsed.projectRoot !== "string" || !Array.isArray(parsed.files)) {
         return null;
@@ -974,7 +1149,7 @@ export class WorkbenchStorage {
       };
     }
 
-    const raw = await readFile(statePath, "utf8");
+    const raw = await this.readTextFileBounded(statePath, PROJECT_STATE_HARD_LOAD_BYTES);
     const parsed = this.parseProjectStateText(raw);
     if (!parsed.ok) {
       return {
@@ -1016,85 +1191,155 @@ export class WorkbenchStorage {
   }
 
   private encodeSecretValue(value: string): StoredSecretValue {
-    if (this.secretCodec?.isEncryptionAvailable()) {
+    let encryptionAvailable = false;
+    try {
+      encryptionAvailable = this.secretCodec?.isEncryptionAvailable() === true;
+    } catch {
+      encryptionAvailable = false;
+    }
+    if (!encryptionAvailable || !this.secretCodec) {
+      throw new CredentialStorageError(
+        "credential_storage_unavailable",
+        "Secure credential storage is unavailable. The secret was not saved."
+      );
+    }
+
+    try {
       return {
         encoding: "safeStorage",
         value: this.secretCodec.encryptString(value).toString("base64")
       };
+    } catch (error) {
+      throw new CredentialStorageError(
+        "credential_storage_unavailable",
+        "Secure credential storage could not encrypt the secret. The secret was not saved.",
+        { cause: error }
+      );
     }
-
-    return {
-      encoding: "plain",
-      value
-    };
   }
 
   private decodeSecretValue(value: StoredSecretValue): string {
-    if (value.encoding === "safeStorage" && this.secretCodec?.isEncryptionAvailable()) {
-      return this.secretCodec.decryptString(Buffer.from(value.value, "base64"));
+    if (value.encoding === "plain") {
+      // Legacy plaintext remains readable so the caller can migrate it once
+      // secure storage becomes available. New plaintext writes are forbidden.
+      return value.value;
     }
 
-    return value.value;
+    let encryptionAvailable = false;
+    try {
+      encryptionAvailable = this.secretCodec?.isEncryptionAvailable() === true;
+    } catch {
+      encryptionAvailable = false;
+    }
+    if (!encryptionAvailable || !this.secretCodec) {
+      throw new CredentialStorageError(
+        "credential_storage_locked",
+        "This credential is encrypted and cannot be unlocked because secure credential storage is unavailable."
+      );
+    }
+
+    try {
+      return this.secretCodec.decryptString(Buffer.from(value.value, "base64"));
+    } catch (error) {
+      throw new CredentialStorageError(
+        "credential_storage_locked",
+        "This credential is encrypted but could not be unlocked on this machine.",
+        { cause: error }
+      );
+    }
   }
 
   private async loadCredentialSecretStore(projectId: string): Promise<CredentialSecretStore> {
+    const credentialPath = this.projectCredentialSecretPath(projectId);
+    let raw: string;
     try {
-      const raw = await readFile(this.projectCredentialSecretPath(projectId), "utf8");
-      const parsed = JSON.parse(raw) as CredentialSecretStore;
-      return {
-        version: 1,
-        entries: parsed.entries ?? {}
-      };
-    } catch {
-      return {
-        version: 1,
-        entries: {}
-      };
+      raw = await this.readTextFileBounded(credentialPath, CREDENTIAL_STORE_MAX_LOAD_BYTES);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return { version: 1, entries: {} };
+      }
+      if (error instanceof StorageReadLimitError) {
+        throw new CredentialStorageError(
+          "credential_store_corrupt",
+          `The credential store exceeds its ${CREDENTIAL_STORE_MAX_LOAD_BYTES} byte integrity limit and was not modified.`,
+          { cause: error }
+        );
+      }
+      throw new CredentialStorageError(
+        "credential_storage_unavailable",
+        "The credential store could not be read. Existing credentials were not modified.",
+        { cause: error }
+      );
+    }
+
+    try {
+      return credentialSecretStoreSchema.parse(JSON.parse(raw));
+    } catch (error) {
+      throw new CredentialStorageError(
+        "credential_store_corrupt",
+        "The credential store failed integrity validation and was not modified.",
+        { cause: error }
+      );
     }
   }
 
-  private async saveCredentialSecretStore(projectId: string, store: CredentialSecretStore): Promise<void> {
-    await this.ensureBaseDirs();
-    await mkdir(this.projectDir(projectId), { recursive: true });
-    await this.writeJsonAtomically(this.projectCredentialSecretPath(projectId), store);
+  private async saveCredentialSecretStoreNow(projectId: string, store: CredentialSecretStore): Promise<void> {
+    const validated = credentialSecretStoreSchema.parse(store);
+    await this.writeJsonAtomicallyNow(this.projectCredentialSecretPath(projectId), validated);
   }
 
   async saveCredentialSecret(projectId: string, entryId: string, secrets: CredentialSecretInput): Promise<void> {
-    const store = await this.loadCredentialSecretStore(projectId);
-    store.entries[entryId] = {
-      apiKey: this.encodeSecretValue(secrets.apiKey),
-      secretKey: secrets.secretKey?.trim() ? this.encodeSecretValue(secrets.secretKey.trim()) : undefined,
-      updatedAt: nowIso()
-    };
-    await this.saveCredentialSecretStore(projectId, store);
+    await this.ensureBaseDirs();
+    await mkdir(this.projectDir(projectId), { recursive: true });
+    const credentialPath = this.projectCredentialSecretPath(projectId);
+    await this.runFileOperation(credentialPath, async () => {
+      const store = await this.loadCredentialSecretStore(projectId);
+      store.entries[entryId] = {
+        apiKey: this.encodeSecretValue(secrets.apiKey),
+        secretKey: secrets.secretKey?.trim() ? this.encodeSecretValue(secrets.secretKey.trim()) : undefined,
+        updatedAt: nowIso()
+      };
+      await this.saveCredentialSecretStoreNow(projectId, store);
+    });
   }
 
   async deleteCredentialSecret(projectId: string, entryId: string): Promise<void> {
-    const store = await this.loadCredentialSecretStore(projectId);
-    delete store.entries[entryId];
-    await this.saveCredentialSecretStore(projectId, store);
+    await this.ensureBaseDirs();
+    await mkdir(this.projectDir(projectId), { recursive: true });
+    const credentialPath = this.projectCredentialSecretPath(projectId);
+    await this.runFileOperation(credentialPath, async () => {
+      const store = await this.loadCredentialSecretStore(projectId);
+      delete store.entries[entryId];
+      await this.saveCredentialSecretStoreNow(projectId, store);
+    });
   }
 
   async hasCredentialSecret(projectId: string, entryId: string): Promise<{ hasApiKey: boolean; hasSecretKey: boolean }> {
-    const store = await this.loadCredentialSecretStore(projectId);
-    const entry = store.entries[entryId];
-    return {
-      hasApiKey: Boolean(entry?.apiKey),
-      hasSecretKey: Boolean(entry?.secretKey)
-    };
+    const credentialPath = this.projectCredentialSecretPath(projectId);
+    return await this.runFileOperation(credentialPath, async () => {
+      const store = await this.loadCredentialSecretStore(projectId);
+      const entry = store.entries[entryId];
+      return {
+        hasApiKey: Boolean(entry?.apiKey),
+        hasSecretKey: Boolean(entry?.secretKey)
+      };
+    });
   }
 
   async readCredentialSecret(projectId: string, entryId: string): Promise<CredentialSecretInput | null> {
-    const store = await this.loadCredentialSecretStore(projectId);
-    const entry = store.entries[entryId];
-    if (!entry) {
-      return null;
-    }
+    const credentialPath = this.projectCredentialSecretPath(projectId);
+    return await this.runFileOperation(credentialPath, async () => {
+      const store = await this.loadCredentialSecretStore(projectId);
+      const entry = store.entries[entryId];
+      if (!entry) {
+        return null;
+      }
 
-    return {
-      apiKey: this.decodeSecretValue(entry.apiKey),
-      secretKey: entry.secretKey ? this.decodeSecretValue(entry.secretKey) : undefined
-    };
+      return {
+        apiKey: this.decodeSecretValue(entry.apiKey),
+        secretKey: entry.secretKey ? this.decodeSecretValue(entry.secretKey) : undefined
+      };
+    });
   }
 
   private transcriptEntriesFromAgent(projectId: string, agent: LocalProjectRecord["agents"][number]): AgentTranscriptEntry[] {
@@ -1191,6 +1436,113 @@ export class WorkbenchStorage {
         updatedAt: nowIso()
       };
     }
+  }
+
+  private utf8Prefix(value: string, maxBytes: number): string {
+    const encoded = Buffer.from(value);
+    if (encoded.length <= maxBytes) {
+      return value;
+    }
+    return encoded.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/u, "");
+  }
+
+  private utf8Suffix(value: string, maxBytes: number): string {
+    const encoded = Buffer.from(value);
+    if (encoded.length <= maxBytes) {
+      return value;
+    }
+    return encoded.subarray(encoded.length - maxBytes).toString("utf8").replace(/^\uFFFD/u, "");
+  }
+
+  private truncateTextForStorage(value: string, maxBytes: number, label: string): string {
+    const originalBytes = Buffer.byteLength(value);
+    if (originalBytes <= maxBytes) {
+      return value;
+    }
+    const marker = `\n\n${STORAGE_TRUNCATION_MARKER}\n${label} was ${originalBytes} bytes; the storage cap is ${maxBytes} bytes.\n\n`;
+    const contentBudget = Math.max(0, maxBytes - Buffer.byteLength(marker));
+    const prefixBudget = Math.floor(contentBudget * 0.4);
+    const suffixBudget = contentBudget - prefixBudget;
+    return `${this.utf8Prefix(value, prefixBudget)}${marker}${this.utf8Suffix(value, suffixBudget)}`;
+  }
+
+  private truncateTranscriptEntry(entry: AgentTranscriptEntry): AgentTranscriptEntry {
+    const next: AgentTranscriptEntry = {
+      ...entry,
+      id: this.truncateTextForStorage(entry.id, 8_192, "Transcript entry id"),
+      title: this.truncateTextForStorage(entry.title, 32_000, "Transcript entry title"),
+      itemId: entry.itemId
+        ? this.truncateTextForStorage(entry.itemId, 8_192, "Transcript item id")
+        : undefined,
+      text: entry.text
+        ? this.truncateTextForStorage(entry.text, AGENT_TRANSCRIPT_ENTRY_MAX_BYTES, "Transcript entry text")
+        : undefined,
+      metadata: entry.metadata
+        ? Object.fromEntries(Object.entries(entry.metadata).map(([key, value]) => [
+          this.truncateTextForStorage(key, 2_048, "Transcript metadata key"),
+          typeof value === "string"
+            ? this.truncateTextForStorage(value, 32_000, "Transcript metadata value")
+            : value
+        ]))
+        : undefined
+    };
+
+    if (entry.raw !== undefined && this.serializedByteLength(entry.raw) > AGENT_TRANSCRIPT_ENTRY_MAX_BYTES) {
+      let serialized: string;
+      try {
+        serialized = JSON.stringify(entry.raw);
+      } catch {
+        serialized = entry.raw instanceof Error
+          ? entry.raw.message
+          : "[Unserializable raw transcript payload]";
+      }
+      next.raw = this.truncateTextForStorage(
+        serialized,
+        AGENT_TRANSCRIPT_ENTRY_MAX_BYTES,
+        "Raw transcript payload"
+      );
+    }
+    return next;
+  }
+
+  private capTranscriptEntries(agentId: string, transcript: AgentTranscriptEntry[]): AgentTranscriptEntry[] {
+    const normalized = transcript.map((entry) => this.truncateTranscriptEntry(entry));
+    const maximumCandidateCount = normalized.length > AGENT_TRANSCRIPT_MAX_ENTRIES
+      ? AGENT_TRANSCRIPT_MAX_ENTRIES - 1
+      : AGENT_TRANSCRIPT_MAX_ENTRIES;
+    const firstCandidate = Math.max(0, normalized.length - maximumCandidateCount);
+    const selected: AgentTranscriptEntry[] = [];
+    let selectedBytes = 0;
+    // Reserve enough room for the store envelope and an omission marker.
+    const entryBudget = AGENT_TRANSCRIPT_MAX_BYTES - 4_096;
+    for (let index = normalized.length - 1; index >= firstCandidate; index -= 1) {
+      const entry = normalized[index];
+      const entryBytes = this.serializedByteLength(entry) + 1;
+      if (selectedBytes + entryBytes > entryBudget) {
+        break;
+      }
+      selected.unshift(entry);
+      selectedBytes += entryBytes;
+    }
+
+    const omittedEntries = normalized.length - selected.length;
+    if (omittedEntries === 0) {
+      return selected;
+    }
+    const markerTimestamp = selected[0]?.timestamp ?? normalized.at(-1)?.timestamp ?? nowIso();
+    return [{
+      id: `${agentId}:storage-truncation`,
+      timestamp: markerTimestamp,
+      kind: "event",
+      title: "Earlier transcript entries truncated",
+      text: `${STORAGE_TRUNCATION_MARKER} ${omittedEntries} earlier transcript entr${omittedEntries === 1 ? "y was" : "ies were"} removed to stay within storage limits.`,
+      metadata: {
+        truncated: true,
+        omittedEntries,
+        maxEntries: AGENT_TRANSCRIPT_MAX_ENTRIES,
+        maxBytes: AGENT_TRANSCRIPT_MAX_BYTES
+      }
+    }, ...selected];
   }
 
   async loadProject(projectId: string): Promise<LocalProjectRecord | null> {
@@ -1298,7 +1650,7 @@ export class WorkbenchStorage {
       agentId: agent.id,
       agentName: agent.name,
       updatedAt: nowIso(),
-      entries: transcript
+      entries: this.capTranscriptEntries(agent.id, transcript)
     };
     await this.writeJsonAtomically(this.projectAgentTranscriptPath(projectId, agent.id), store);
   }
@@ -1311,26 +1663,39 @@ export class WorkbenchStorage {
     await this.ensureBaseDirs();
     await mkdir(this.projectAgentTranscriptDir(projectId), { recursive: true });
     const transcriptPath = this.projectAgentTranscriptPath(projectId, agent.id);
-    let entries: AgentTranscriptEntry[] = [];
-    try {
-      const existing = JSON.parse(await readFile(transcriptPath, "utf8")) as AgentTranscriptStore;
-      entries = Array.isArray(existing.entries) ? existing.entries : [];
-    } catch {
-      // Missing or malformed transcript sidecars should not affect the primary project state.
-    }
+    await this.runFileOperation(transcriptPath, async () => {
+      let entries: AgentTranscriptEntry[] = [];
+      try {
+        const existing = JSON.parse(
+          await this.readTextFileBounded(transcriptPath, AGENT_TRANSCRIPT_MAX_BYTES)
+        ) as AgentTranscriptStore;
+        entries = Array.isArray(existing.entries) ? existing.entries : [];
+      } catch {
+        // Missing, malformed, or legacy-oversized transcript sidecars do not
+        // affect primary project state. The new entry starts a bounded store.
+      }
 
-    entries.push(entry);
-    if (entries.length > 2_000) {
-      entries = entries.slice(-2_000);
-    }
-    await this.saveAgentTranscript(projectId, agent, entries);
+      const store: AgentTranscriptStore = {
+        version: 1,
+        projectId,
+        agentId: agent.id,
+        agentName: agent.name,
+        updatedAt: nowIso(),
+        entries: this.capTranscriptEntries(agent.id, [...entries, entry])
+      };
+      await this.writeJsonAtomicallyNow(transcriptPath, store);
+    });
   }
 
   async getAgentTranscript(projectId: string, agentId: string): Promise<AgentTranscriptEntry[] | null> {
+    const transcriptPath = this.projectAgentTranscriptPath(projectId, agentId);
     try {
-      const transcriptPath = this.projectAgentTranscriptPath(projectId, agentId);
-      const store = JSON.parse(await readFile(transcriptPath, "utf8")) as AgentTranscriptStore;
-      return Array.isArray(store.entries) ? store.entries : [];
+      return await this.runFileOperation(transcriptPath, async () => {
+        const store = JSON.parse(
+          await this.readTextFileBounded(transcriptPath, AGENT_TRANSCRIPT_MAX_BYTES)
+        ) as AgentTranscriptStore;
+        return Array.isArray(store.entries) ? this.capTranscriptEntries(agentId, store.entries) : [];
+      });
     } catch {
       return null;
     }
@@ -1347,22 +1712,38 @@ export class WorkbenchStorage {
   ): Promise<void> {
     await this.ensureBaseDirs();
     await mkdir(this.projectAgentOutputDir(projectId), { recursive: true });
-    const store: AgentFullOutputStore = {
-      version: 1,
+    const baseStore = {
+      version: 1 as const,
       projectId,
       agentId: agent.id,
       agentName: agent.name,
       workflowCycleNumber: agent.workflowCycleNumber,
-      updatedAt: nowIso(),
-      output
+      updatedAt: nowIso()
     };
+    let outputBudget = AGENT_FULL_OUTPUT_MAX_BYTES - 4_096;
+    let store: AgentFullOutputStore = {
+      ...baseStore,
+      output: this.truncateTextForStorage(output, outputBudget, "Agent full output")
+    };
+    while (this.serializedByteLength(store) > AGENT_FULL_OUTPUT_MAX_BYTES && outputBudget > 1_024) {
+      const overflow = this.serializedByteLength(store) - AGENT_FULL_OUTPUT_MAX_BYTES;
+      outputBudget = Math.max(1_024, outputBudget - overflow - 1_024);
+      store = {
+        ...baseStore,
+        output: this.truncateTextForStorage(output, outputBudget, "Agent full output")
+      };
+    }
     await this.writeJsonAtomically(this.projectAgentOutputPath(projectId, agent.id), store);
   }
 
   async getAgentFullOutput(projectId: string, agentId: string): Promise<string | null> {
     try {
       const outputPath = this.projectAgentOutputPath(projectId, agentId);
-      const store = JSON.parse(await readFile(outputPath, "utf8")) as AgentFullOutputStore;
+      const store = JSON.parse(
+        // Allow bounded envelope headroom when reading sidecars written by an
+        // older build whose output alone was close to the new cap.
+        await this.readTextFileBounded(outputPath, AGENT_FULL_OUTPUT_MAX_BYTES + 64_000)
+      ) as AgentFullOutputStore;
       return typeof store.output === "string" ? store.output : "";
     } catch {
       return null;
@@ -1405,7 +1786,7 @@ export class WorkbenchStorage {
 
   async readPortableInterface(interfacePath: string): Promise<PortableProjectInterface | null> {
     try {
-      const raw = await readFile(interfacePath, "utf8");
+      const raw = await this.readTextFileBounded(interfacePath, PORTABLE_INTERFACE_MAX_LOAD_BYTES);
       const value = JSON.parse(raw) as unknown;
       if (!value || typeof value !== "object" || Array.isArray(value)) {
         return null;

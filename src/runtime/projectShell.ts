@@ -81,6 +81,16 @@ const quoteForBashSingle = (value: string): string => `'${value.replace(/'/g, `'
 
 const quoteForCmd = (value: string): string => `"${value}"`;
 
+// Values written into a .cmd artifact are parsed once more when the user opens
+// that artifact. Percent expansion is active even inside quotes, so escape it
+// at generation time and keep delayed expansion disabled in the script.
+const quoteForCmdFile = (value: string): string => {
+  if (/["\r\n\0]/.test(value)) {
+    throw new Error("A Windows handoff argument contains characters that cannot be represented safely in a command file.");
+  }
+  return `"${value.replace(/\^/g, "^^").replace(/%/g, "%%")}"`;
+};
+
 const resolveWindowsCommandInterpreter = (): string =>
   process.env.ComSpec ?? (process.env.SystemRoot ? path.win32.join(process.env.SystemRoot, "System32", "cmd.exe") : "cmd.exe");
 
@@ -105,7 +115,7 @@ const buildProjectShellWindowTitle = (projectName: string): string => `Codex Han
 const formatLauncherFailure = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-const WSL_UNC_PREFIX = /^\\\\wsl(?:\.localhost)?\\([^\\]+)(?:\\|$)/i;
+const WSL_UNC_PREFIX = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)(?:\\|$)/i;
 
 const normalizeWslDistroName = (value?: string): string | undefined => {
   const trimmed = value?.trim().replace(/^['"]+|['"]+$/g, "");
@@ -137,7 +147,7 @@ const findMatchingWslDistro = (availableDistros: string[], candidate?: string): 
 const listWindowsWslDistros = async (
   execFileProcess: ExecFileProcess
 ): Promise<string[]> => await new Promise((resolve, reject) => {
-  execFileProcess("wsl.exe", ["--list", "--quiet"], { encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
+  execFileProcess(resolveWindowsWslExecutable(), ["--list", "--quiet"], { encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
     if (error) {
       const failure = Object.assign(new Error(error.message), { stdout, stderr, code: "code" in error ? error.code : undefined });
       reject(failure);
@@ -404,46 +414,61 @@ const buildCodexHandoffShellScript = (
 };
 
 const buildWindowsProjectShellLauncherScript = (
-  projectName: string,
   projectRoot: string,
   shellScriptExecutionPath: string,
   launcherWorkingDirectoryHostPath: string,
-  promptHostPath: string,
-  shellScriptHostPath: string,
-  launchLogHostPath: string,
   settings: { distroName?: string }
 ): string => [
   "@echo off",
-  "setlocal",
-  `title ${buildProjectShellWindowTitle(projectName)}`,
-  `cd /d ${quoteForCmd(launcherWorkingDirectoryHostPath)}`,
+  "setlocal DisableDelayedExpansion",
+  `cd /d ${quoteForCmdFile(launcherWorkingDirectoryHostPath)}`,
   "echo Starting Codex Agent Workbench handoff...",
   "echo.",
   settings.distroName
     ? [
-        `${quoteForCmd(resolveWindowsWslExecutable())} -d ${quoteForCmd(settings.distroName)} --cd ${quoteForCmd(projectRoot)} bash ${quoteForCmd(shellScriptExecutionPath)}`,
+        `${quoteForCmdFile(resolveWindowsWslExecutable())} -d ${quoteForCmdFile(settings.distroName)} --cd ${quoteForCmdFile(projectRoot)} --exec bash ${quoteForCmdFile(shellScriptExecutionPath)}`,
         "set \"status=%ERRORLEVEL%\"",
         "if \"%status%\"==\"-1\" (",
         "  echo.",
-        `  echo Explicit WSL distro ${quoteForCmd(settings.distroName)} failed with status %status%. Retrying with the default WSL distro...`,
-        `  ${quoteForCmd(resolveWindowsWslExecutable())} --cd ${quoteForCmd(projectRoot)} bash ${quoteForCmd(shellScriptExecutionPath)}`,
+        "  echo The configured WSL distro could not be launched. Retrying with the default WSL distro...",
+        `  ${quoteForCmdFile(resolveWindowsWslExecutable())} --cd ${quoteForCmdFile(projectRoot)} --exec bash ${quoteForCmdFile(shellScriptExecutionPath)}`,
         "  set \"status=%ERRORLEVEL%\"",
         ")"
       ].join("\r\n")
     : [
-        `${quoteForCmd(resolveWindowsWslExecutable())} --cd ${quoteForCmd(projectRoot)} bash ${quoteForCmd(shellScriptExecutionPath)}`,
+        `${quoteForCmdFile(resolveWindowsWslExecutable())} --cd ${quoteForCmdFile(projectRoot)} --exec bash ${quoteForCmdFile(shellScriptExecutionPath)}`,
         "set \"status=%ERRORLEVEL%\""
       ].join("\r\n"),
   "echo.",
   "echo Codex handoff process exited with status %status%.",
-  `echo Launcher working directory: ${launcherWorkingDirectoryHostPath}`,
-  `echo Prompt file: ${promptHostPath}`,
-  `echo Shell script: ${shellScriptHostPath}`,
-  `echo Debug log: ${launchLogHostPath}`,
+  "echo Handoff files and diagnostics are in the .agent-workbench manual-handoff folder.",
   "echo.",
   "echo If Codex did not start correctly, copy the error text above and send it back.",
   "endlocal"
 ].join("\r\n");
+
+export const buildWindowsWslProjectShellLaunchPlan = (
+  projectRoot: string,
+  shellScriptExecutionPath: string,
+  projectName: string,
+  distroName?: string
+): ProjectShellLaunchPlan => {
+  const executable = resolveWindowsWslExecutable();
+  const args = [
+    ...(distroName ? ["-d", distroName] : []),
+    "--cd",
+    projectRoot,
+    "--exec",
+    "bash",
+    shellScriptExecutionPath
+  ];
+  return {
+    executable,
+    args,
+    commandPreview: `${buildProjectShellWindowTitle(projectName)} :: ${JSON.stringify([executable, ...args])}`,
+    windowsHide: false
+  };
+};
 
 const buildPowerShellFallbackLaunchPlan = (
   launcherHostPath: string
@@ -455,7 +480,7 @@ const buildPowerShellFallbackLaunchPlan = (
     `-FilePath ${quoteForPowerShell(commandInterpreter)}`,
     `-ArgumentList @('/d', '/k', ${quoteForPowerShell(launcherHostPath)})`,
     `-WorkingDirectory ${quoteForPowerShell(launcherWorkingDirectory)}`,
-    `-WindowStyle Normal`
+    "-WindowStyle Normal"
   ].join(" ");
 
   return {
@@ -589,17 +614,17 @@ export const openProjectShellWindow = async (
     );
     await writeFile(shellScriptHostPath, shellScript, "utf8");
     const launcherScript = buildWindowsProjectShellLauncherScript(
-      request.projectName,
       request.projectRoot,
       shellScriptExecutionPath,
       launcherWorkingDirectoryHostPath,
-      promptHostPath,
-      shellScriptHostPath,
-      launchLogHostPath,
       { distroName: effectiveDistroName }
     );
     await writeFile(launcherHostPath, launcherScript, "utf8");
 
+    // cmd.exe is intentionally retained for the interactive handoff because a
+    // detached wsl.exe with ignored stdio cannot accept terminal input. The
+    // generated command file is constrained and escaped above; all other
+    // runtime execution paths use exact executable/argv spawning.
     const plan = buildWindowsProjectShellLaunchPlan(launcherHostPath, request.projectName);
     const fallbackPlan = buildPowerShellFallbackLaunchPlan(launcherHostPath);
     await writeFile(launchLogHostPath, buildLaunchLog({

@@ -385,7 +385,8 @@ describe("workflow v1 persistence migration", () => {
     expect(imported?.validation.projectAccess).toBeUndefined();
     expect(imported?.localStateDefaults).toMatchObject({
       treeFilter: "",
-      workflowPauseRequested: false
+      autopilotEnabled: false,
+      workflowPauseRequested: true
     });
     expect(imported?.localStateDefaults.selectedFile).toBeUndefined();
     expect(imported?.localStateDefaults.activeAgentId).toBeUndefined();
@@ -486,7 +487,18 @@ describe("workflow v1 persistence migration", () => {
     const exportPath = await serviceA.exportInterface(selected.record.id);
     const payload = JSON.parse(await readFile(exportPath, "utf8")) as Record<string, unknown>;
     payload.schemaVersion = 1;
-    payload.workflow = legacyWorkflowPayload();
+    const untrustedWorkflow = legacyWorkflowPayload();
+    untrustedWorkflow.autopilotPolicy = {
+      ...defaultProjectWorkflowState().autopilotPolicy,
+      enabled: true
+    };
+    payload.workflow = untrustedWorkflow;
+    payload.localStateDefaults = {
+      ...(payload.localStateDefaults as Record<string, unknown>),
+      autopilotEnabled: true,
+      workflowPauseRequested: false,
+      activeAgentId: "foreign-live-agent"
+    };
     const validation = payload.validation as Record<string, unknown>;
     validation.interfaceSchemaVersion = 1;
     updatePortableChecksum(payload);
@@ -497,6 +509,12 @@ describe("workflow v1 persistence migration", () => {
     const importedProject = serviceB.getState().projects.find((project) => project.record.id === imported.record.id);
 
     expect(importedProject?.record.workflow.schemaVersion).toBe(WORKFLOW_SCHEMA_VERSION);
+    expect(importedProject?.record.localState).toMatchObject({
+      activeAgentId: undefined,
+      autopilotEnabled: false,
+      workflowPauseRequested: true
+    });
+    expect(importedProject?.record.workflow.autopilotPolicy.enabled).toBe(false);
     expect(importedProject?.record.workflow.activityLog).toEqual(expect.arrayContaining(legacyActivity));
     expect(importedProject?.record.workflow.journal.map((event) => event.title)).toEqual(expect.arrayContaining([
       "Legacy integrity run failed",
