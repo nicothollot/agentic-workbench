@@ -36,6 +36,7 @@ export const defaultSettings = (): AppSettings => ({
   warnOnMntMount: true,
   mockMode: false,
   maxRepairCycles: 3,
+  agentModelMode: "auto",
   interfaceCreationReasoningEffort: "medium",
   agentReasoningMode: DEFAULT_AGENT_REASONING_MODE,
   agentReasoningEfforts: { ...DEFAULT_AGENT_REASONING_EFFORTS },

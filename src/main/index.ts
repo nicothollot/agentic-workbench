@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, screen, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, screen, shell, type IpcMainInvokeEvent } from "electron";
 import log from "electron-log/main";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -8,6 +8,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { APP_ID, APP_NAME } from "@shared/constants";
+import { requiresExplicitReasoningApproval } from "@shared/modelConfig";
 import { getPreloadEntryPath, getRendererEntryPath } from "@shared/electronAppPaths";
 import {
   RENDERER_DELTA_HARD_BYTES,
@@ -98,7 +99,7 @@ import {
   visualExportSessionRequestSchema,
   visualExportStartRequestSchema
 } from "@shared/ipc";
-import type { VisualExportCaptureTarget, VisualExportTab, WorkbenchState } from "@shared/types";
+import type { InterfaceReasoningEffort, VisualExportCaptureTarget, VisualExportTab, WorkbenchState } from "@shared/types";
 import { AppService } from "@runtime/appService";
 import { decideRendererNavigation } from "./navigationPolicy";
 import { MINIMUM_WINDOW_SIZE, WindowStateStore, clampWindowBounds, defaultWindowBounds } from "./windowState";
@@ -652,6 +653,31 @@ const createRepositoryPathWindow = async (projectId: string, relativePath: strin
   }
 };
 
+const approvePremiumReasoning = async (
+  event: IpcMainInvokeEvent,
+  effort: InterfaceReasoningEffort | undefined,
+  actionLabel: string
+): Promise<void> => {
+  if (!requiresExplicitReasoningApproval(effort)) {
+    return;
+  }
+  const owner = BrowserWindow.fromWebContents(event.sender) ?? mainWindow ?? undefined;
+  const options = {
+    type: "warning" as const,
+    title: "Approve premium reasoning",
+    message: `${effort === "ultra" ? "Ultra" : "Max"} reasoning is a premium, high-compute choice.`,
+    detail: `${actionLabel}\n\nAutomatic routing never chooses this effort. Continue only for a task that truly needs it.`,
+    buttons: ["Cancel", `Approve ${effort === "ultra" ? "Ultra" : "Max"} for this run`],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true
+  };
+  const result = owner ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options);
+  if (result.response !== 1) {
+    throw new Error("Premium reasoning was not approved.");
+  }
+};
+
 const registerIpc = (): void => {
   ipcMain.handle("state:subscribe", () => currentRendererSnapshot());
   ipcMain.handle("state:resync", () => currentRendererSnapshot());
@@ -873,15 +899,17 @@ const registerIpc = (): void => {
     const parsed = repositoryRescanRequestSchema.parse(payload);
     return await appService?.rescanRepository(parsed.projectId, parsed.options);
   });
-  ipcMain.handle("project:summarizeRepositoryPath", async (_event, payload) => {
+  ipcMain.handle("project:summarizeRepositoryPath", async (event, payload) => {
     const parsed = repositoryPathSummaryRequestSchema.parse(payload);
+    await approvePremiumReasoning(event, parsed.reasoningEffort, "Summarize this repository path");
     return await appService?.summarizeRepositoryPath(parsed.projectId, parsed.relativePath, parsed.model, {
       reasoningMode: parsed.reasoningMode,
       reasoningEffort: parsed.reasoningEffort
     });
   });
-  ipcMain.handle("project:askRepositoryPath", async (_event, payload) => {
+  ipcMain.handle("project:askRepositoryPath", async (event, payload) => {
     const parsed = repositoryPathQuestionRequestSchema.parse(payload);
+    await approvePremiumReasoning(event, parsed.reasoningEffort, "Answer this repository question");
     return await appService?.askRepositoryPath(parsed.projectId, parsed.relativePath, parsed.question, parsed.model, {
       reasoningMode: parsed.reasoningMode,
       reasoningEffort: parsed.reasoningEffort
@@ -992,8 +1020,9 @@ const registerIpc = (): void => {
     const parsed = updateGoalCharterRequestSchema.parse(payload);
     return await appService?.updateGoalCharter(parsed.projectId, parsed.patch);
   });
-  ipcMain.handle("workflow:polishGoalCharterField", async (_event, payload) => {
+  ipcMain.handle("workflow:polishGoalCharterField", async (event, payload) => {
     const parsed = polishGoalCharterFieldRequestSchema.parse(payload);
+    await approvePremiumReasoning(event, parsed.reasoningEffort, "Polish this Goal Charter field");
     return await appService?.polishGoalCharterField(parsed.projectId, {
       field: parsed.field,
       value: parsed.value,
@@ -1002,8 +1031,9 @@ const registerIpc = (): void => {
       reasoningEffort: parsed.reasoningEffort
     });
   });
-  ipcMain.handle("workflow:generateGoalCharterDraft", async (_event, payload) => {
+  ipcMain.handle("workflow:generateGoalCharterDraft", async (event, payload) => {
     const parsed = generateGoalCharterDraftRequestSchema.parse(payload);
+    await approvePremiumReasoning(event, parsed.reasoningEffort, "Generate a Goal Charter draft");
     return await appService?.generateGoalCharterDraft(parsed.projectId, {
       prompt: parsed.prompt,
       currentDraft: parsed.currentDraft,
@@ -1190,8 +1220,9 @@ const registerIpc = (): void => {
     const parsed = projectOpenRequestSchema.parse(payload);
     return await appService?.revalidateProject(parsed.projectId);
   });
-  ipcMain.handle("agent:create", async (_event, payload) => {
+  ipcMain.handle("agent:create", async (event, payload) => {
     const parsed = createAgentRequestSchema.parse(payload);
+    await approvePremiumReasoning(event, parsed.reasoningEffort, `Start ${parsed.name}`);
     return await appService?.createAgent(parsed.projectId, parsed.category, parsed.name, parsed.prompt, parsed.model, {
       reasoningMode: parsed.reasoningMode,
       effort: parsed.reasoningEffort

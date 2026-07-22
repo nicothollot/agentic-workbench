@@ -206,6 +206,7 @@ const buildReviewLogRuntimeContext = (settings: AppSettings): ReviewLogRuntimeCo
   mockMode: settings.mockMode,
   maxRepairCycles: settings.maxRepairCycles,
   interfaceCreationModel: settings.interfaceCreationModel,
+  agentModelMode: settings.agentModelMode,
   interfaceCreationReasoningEffort: settings.interfaceCreationReasoningEffort,
   agentReasoningMode: settings.agentReasoningMode,
   agentReasoningEfforts: settings.agentReasoningEfforts,

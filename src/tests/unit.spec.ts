@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   getAutomaticAgentReasoningEffort,
   getPreferredInterfaceCreationReasoningEffort,
+  requiresExplicitReasoningApproval,
   resolveAgentReasoningEffort,
   resolveInterfaceCreationReasoningEffort
 } from "@shared/modelConfig";
@@ -192,7 +193,7 @@ import {
   selectRelevantWorkflowContext
 } from "@runtime/contextSelector";
 import { REPOSITORY_ROOT_PARENT, buildRepositoryTreeRows } from "@renderer/repositoryTree";
-import { buildDiscoveredModels } from "@runtime/modelCatalog";
+import { buildDiscoveredModels, getRecommendedAgentModel } from "@runtime/modelCatalog";
 import type { Model } from "@generated/app-server/v2";
 
 type SpawnProcess = typeof import("node:child_process").spawn;
@@ -1555,8 +1556,8 @@ describe("reasoning defaults", () => {
       supportedReasoningEfforts: ["low", "medium", "high", "xhigh"]
     };
 
-    expect(getAutomaticAgentReasoningEffort("coding", "Implement a workflow IPC refactor.", model)).toBe("xhigh");
-    expect(getAutomaticAgentReasoningEffort("coding", "Fix a small label typo.", model)).toBe("high");
+    expect(getAutomaticAgentReasoningEffort("coding", "Implement a workflow IPC refactor.", model)).toBe("high");
+    expect(getAutomaticAgentReasoningEffort("coding", "Fix a small label typo.", model)).toBe("medium");
     expect(getAutomaticAgentReasoningEffort("merge", "Integrate validated work deterministically.", model)).toBe("low");
     expect(getAutomaticAgentReasoningEffort("merge", "Resolve merge conflicts across branches.", model)).toBe("medium");
     expect(getAutomaticAgentReasoningEffort("recommendation", "Recommend the next workflow checklist task group.", model)).toBe("medium");
@@ -1571,6 +1572,15 @@ describe("reasoning defaults", () => {
     expect(resolveAgentReasoningEffort(model, "coding", "Implement the scoped task.", "auto")).toBe("high");
     expect(resolveAgentReasoningEffort(model, "manual", "Explain the repository.", "manual", "xhigh")).toBe("high");
     expect(resolveAgentReasoningEffort(model, "manual", "Explain the repository.", "manual", "low")).toBe("low");
+
+    const premiumCapableModel: Pick<DiscoveredModel, "supportedReasoningEfforts"> = {
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+    };
+    expect(resolveAgentReasoningEffort(premiumCapableModel, "coding", "Implement a complex runtime fix.", "auto")).toBe("high");
+    expect(resolveAgentReasoningEffort(premiumCapableModel, "manual", "Implement a complex runtime fix.", "manual", "ultra")).toBe("ultra");
+    expect(requiresExplicitReasoningApproval("max")).toBe(true);
+    expect(requiresExplicitReasoningApproval("ultra")).toBe(true);
+    expect(requiresExplicitReasoningApproval("xhigh")).toBe(false);
   });
 
   it("surfaces hidden models from the newest discovered GPT generation", () => {
@@ -1585,6 +1595,21 @@ describe("reasoning defaults", () => {
     expect(discovered[0]?.model).toBe("gpt-5.5");
     expect(discovered[0]?.recommendedForInterfaceCreation).toBe(true);
     expect(discovered[0]?.labels).toContain("CLI listed");
+  });
+
+  it("routes autonomous roles to Terra and repeatable roles to Luna without selecting Sol", () => {
+    const discovered = buildDiscoveredModels([
+      makeModel({ model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", hidden: true }),
+      makeModel({ model: "gpt-5.6-terra", displayName: "GPT-5.6 Terra" }),
+      makeModel({ model: "gpt-5.6-luna", displayName: "GPT-5.6 Luna", isDefault: true })
+    ]);
+
+    expect(getRecommendedAgentModel(discovered, "coding")?.model).toBe("gpt-5.6-terra");
+    expect(getRecommendedAgentModel(discovered, "integrity")?.model).toBe("gpt-5.6-terra");
+    expect(getRecommendedAgentModel(discovered, "recommendation")?.model).toBe("gpt-5.6-luna");
+    expect(getRecommendedAgentModel(discovered, "merge")?.model).toBe("gpt-5.6-luna");
+    expect(getRecommendedAgentModel(discovered, "manual", "Explain and summarize this repository")?.model).toBe("gpt-5.6-luna");
+    expect(getRecommendedAgentModel(discovered, "manual", "Fix and test this component")?.model).toBe("gpt-5.6-terra");
   });
 });
 
@@ -3400,6 +3425,19 @@ describe("workflow state", () => {
         id: startingAgent.id
       }
     });
+
+    expect(getWorkflowRecoveryCandidate(
+      workflow,
+      [startingAgent],
+      new Date("2026-04-07T00:00:19.000Z").getTime(),
+      10 * 60 * 1000
+    )).toBeNull();
+    expect(getWorkflowRecoveryCandidate(
+      workflow,
+      [startingAgent],
+      new Date("2026-04-07T00:00:21.000Z").getTime(),
+      10 * 60 * 1000
+    )?.kind).toBe("startup_stalled");
   });
 
   it("derives one workflow runtime status for running, stale, paused, and approval states", () => {

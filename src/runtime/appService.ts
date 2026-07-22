@@ -224,7 +224,7 @@ import {
   defaultVisualExportPath,
   resolveArtifactDestination
 } from "./artifactPaths";
-import { buildDiscoveredModels, getRecommendedInterfaceCreationModel } from "./modelCatalog";
+import { buildDiscoveredModels, getRecommendedAgentModel, getRecommendedInterfaceCreationModel } from "./modelCatalog";
 import { MockCodexTransport } from "./mockCodexTransport";
 import { createProjectIdentity } from "./projectIdentity";
 import {
@@ -5097,7 +5097,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "goal",
       "Ultimate Goal Agent",
       "Inspect the repository and draft the persistent project charter using structured output.",
-      this.getDefaultAgentModel()
+      this.getDefaultAgentModel("goal", "Inspect the repository and draft the persistent project charter.")
     );
     const reasoningConfig = this.resolveAgentReasoningEffortForTask("goal", agent.model, `${agent.name}\n\n${agent.taskPrompt}`);
     agent.reasoningEffort = reasoningConfig.effort;
@@ -5898,6 +5898,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       agentReasoningEfforts,
       interfaceCreationConfiguredAt:
         partial.interfaceCreationModel !== undefined ||
+        partial.agentModelMode !== undefined ||
         partial.interfaceCreationReasoningEffort !== undefined ||
         partial.agentReasoningMode !== undefined ||
         partial.agentReasoningEfforts !== undefined
@@ -5934,7 +5935,9 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       const agentReasoningChanged =
         (previousSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) !== (nextSettings.agentReasoningMode ?? DEFAULT_AGENT_REASONING_MODE) ||
         JSON.stringify(previousSettings.agentReasoningEfforts ?? {}) !== JSON.stringify(nextSettings.agentReasoningEfforts ?? {});
-      const modelChanged = previousSettings.interfaceCreationModel !== nextSettings.interfaceCreationModel;
+      const modelChanged =
+        previousSettings.interfaceCreationModel !== nextSettings.interfaceCreationModel ||
+        previousSettings.agentModelMode !== nextSettings.agentModelMode;
       if (repairLimitChanged || reasoningChanged || agentReasoningChanged || modelChanged) {
         const interfaceConfig = this.resolveInterfaceCreationConfig();
         for (const project of this.projects.values()) {
@@ -7809,7 +7812,11 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   }
 
   private resolveInterfaceCreationModel(): { model?: string; source: "user" | "recommended" } {
-    if (this.settings.interfaceCreationModel && this.availableModels.some((entry) => entry.model === this.settings.interfaceCreationModel)) {
+    if (
+      this.settings.agentModelMode === "manual" &&
+      this.settings.interfaceCreationModel &&
+      this.availableModels.some((entry) => entry.model === this.settings.interfaceCreationModel)
+    ) {
       return {
         model: this.settings.interfaceCreationModel,
         source: "user"
@@ -7822,7 +7829,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
   }
 
-  private resolveReasoningEffortForModel(model?: string): "low" | "medium" | "high" | "xhigh" | undefined {
+  private resolveReasoningEffortForModel(model?: string): InterfaceReasoningEffort | undefined {
     const modelRecord = this.availableModels.find((entry) => entry.model === model);
     return resolveInterfaceCreationReasoningEffort(modelRecord, this.settings.interfaceCreationReasoningEffort);
   }
@@ -7869,14 +7876,24 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     };
   }
 
-  private getDefaultAgentModel(): string {
-    return this.resolveInterfaceCreationConfig().model ?? this.availableModels[0]?.model ?? "gpt-5.4-mini";
+  private getDefaultAgentModel(category: AgentCategory = "coding", taskPrompt = ""): string {
+    if (
+      this.settings.agentModelMode === "manual" &&
+      this.settings.interfaceCreationModel &&
+      this.availableModels.some((entry) => entry.model === this.settings.interfaceCreationModel)
+    ) {
+      return this.settings.interfaceCreationModel;
+    }
+    return getRecommendedAgentModel(this.availableModels, category, taskPrompt)?.model
+      ?? this.resolveInterfaceCreationConfig().model
+      ?? this.availableModels[0]?.model
+      ?? "gpt-5.4-mini";
   }
 
   private prepareSkippedInterfaceCreation(
     project: LoadedProject,
     model?: string,
-    reasoningEffort?: "low" | "medium" | "high" | "xhigh",
+    reasoningEffort?: InterfaceReasoningEffort,
     selectedModelSource: "user" | "recommended" = "recommended"
   ): void {
     project.record.overview = buildDeterministicOverview({
@@ -8778,7 +8795,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const target = await this.buildRepositoryPathSummaryTarget(project, relativePath);
     const evidence = await this.buildRepositoryPathEvidence(project, target);
     const agentName = `Summarize ${target.pathKind}: ${path.posix.basename(target.relativePath)}`;
-    return await this.createAgent(projectId, "manual", agentName, this.buildRepositoryPathSummaryPrompt(project, target, evidence), model || this.getDefaultAgentModel(), {
+    const prompt = this.buildRepositoryPathSummaryPrompt(project, target, evidence);
+    return await this.createAgent(projectId, "manual", agentName, prompt, model || this.getDefaultAgentModel("manual", prompt), {
       sandbox: "read-only",
       outputSchema: this.buildRepositoryPathSummaryOutputSchema(),
       reasoningMode: options?.reasoningMode,
@@ -8803,7 +8821,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     const target = await this.buildRepositoryPathSummaryTarget(project, relativePath);
     const evidence = await this.buildRepositoryPathEvidence(project, target);
     const agentName = `Ask ${target.pathKind}: ${path.posix.basename(target.relativePath)}`;
-    return await this.createAgent(projectId, "manual", agentName, this.buildRepositoryPathQuestionPrompt(target, evidence, question), model || this.getDefaultAgentModel(), {
+    const prompt = this.buildRepositoryPathQuestionPrompt(target, evidence, question);
+    return await this.createAgent(projectId, "manual", agentName, prompt, model || this.getDefaultAgentModel("manual", prompt), {
       sandbox: "read-only",
       reasoningMode: options?.reasoningMode,
       effort: options?.reasoningEffort,
@@ -12758,7 +12777,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
         "goal",
         "Goal Agent",
         this.buildScopedGoalPrompt(project, approvedRecommendation),
-        this.getDefaultAgentModel(),
+        this.getDefaultAgentModel("goal", this.buildScopedGoalPrompt(project, approvedRecommendation)),
         {
           sandbox: "read-only",
           outputSchema: this.buildScopedGoalOutputSchema(),
@@ -13292,7 +13311,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
   private async finalizeExternalRepairCheckout(projectId: string): Promise<void> {
     const project = this.findProject(projectId);
     const workflow = this.ensureWorkflowState(project.record);
-    const mergeModel = this.getDefaultAgentModel();
+    const mergeModel = this.getDefaultAgentModel("merge", "Finalize a repair completed in the opened checkout.");
     const mergeAgent = await this.createAgent(
       projectId,
       "merge",
@@ -14195,6 +14214,17 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
   async advanceWorkflowStage(projectId: string): Promise<ProjectWorkflowState["workflowStage"]> {
     const project = this.findProject(projectId);
+    const detachedAgents = this.markDetachedActiveAgentsDisconnected(project);
+    if (detachedAgents.length > 0) {
+      this.resetWorkflowAfterInterruptedAgents(project, detachedAgents, { markRecoveryHandled: true });
+      this.recordWorkflowActivity(this.ensureWorkflowState(project.record), {
+        source: "system",
+        status: "waiting",
+        title: "Detached agent state recovered",
+        detail: "The saved run had no live Codex thread in this app session. Its workflow step was safely requeued before continuing.",
+        stepId: getWorkflowActiveStepId(this.ensureWorkflowState(project.record))
+      });
+    }
     this.syncWorkflowState(project);
     await this.ensureAgentBackedRuntimeReady(project, "workflow advance runtime check");
     if (!this.hasActiveWorkflowAgent(project) && this.requeueStaleRunningWorkflowSteps(project)) {
@@ -14419,7 +14449,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
 
     const workflow = this.ensureWorkflowState(project.record);
-    const agent = createAgentSkeleton(category, name, prompt, model || this.getDefaultAgentModel());
+    const agent = createAgentSkeleton(category, name, prompt, model || this.getDefaultAgentModel(category, prompt));
     const reasoningConfig = this.resolveAgentReasoningEffortForTask(
       category,
       agent.model,
@@ -14587,41 +14617,53 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     }
     const sandbox = options?.sandbox ?? "read-only";
     const sandboxPolicy = this.buildRestrictedSandboxPolicy(project, sandbox);
-    const threadStartedAt = performance.now();
-    const threadResponse = await this.transport.startThread({
-      cwd,
-      model: agent.model,
-      approvalPolicy: "on-request",
-      sandbox,
-      baseInstructions,
-      developerInstructions: this.buildProjectBoundaryDeveloperInstructions(project, cwd, sandbox),
-      personality: "pragmatic",
-      dynamicTools: this.previewBroker ? browserDynamicTools : null,
-      experimentalRawEvents: false
-    });
-    this.logWorkflowPerf(`app-server thread started for ${agent.name}: ${Math.round(performance.now() - threadStartedAt)}ms`);
-    agent.threadId = threadResponse.thread.id;
-    agent.startedAt ??= nowIso();
-    this.threadToAgent.set(agent.threadId, { projectId: project.record.id, agentId: agent.id });
-    const turnStartedAt = performance.now();
-    await this.transport.startTurn({
-      threadId: threadResponse.thread.id,
-      input: [
-        {
-          type: "text",
-          text: turnPrompt,
-          text_elements: []
-        }
-      ],
-      cwd,
-      sandboxPolicy,
-      model: agent.model,
-      effort: agent.reasoningEffort ?? null,
-      outputSchema: options?.outputSchema ?? null
-    });
-    this.logWorkflowPerf(`app-server turn started for ${agent.name}: ${Math.round(performance.now() - turnStartedAt)}ms`);
-    await this.saveProject(project);
-    this.emitState();
+    try {
+      const threadStartedAt = performance.now();
+      const threadResponse = await this.transport.startThread({
+        cwd,
+        model: agent.model,
+        approvalPolicy: "on-request",
+        sandbox,
+        baseInstructions,
+        developerInstructions: this.buildProjectBoundaryDeveloperInstructions(project, cwd, sandbox),
+        personality: "pragmatic",
+        dynamicTools: this.previewBroker ? browserDynamicTools : null,
+        experimentalRawEvents: false
+      });
+      this.logWorkflowPerf(`app-server thread started for ${agent.name}: ${Math.round(performance.now() - threadStartedAt)}ms`);
+      agent.threadId = threadResponse.thread.id;
+      agent.startedAt ??= nowIso();
+      this.threadToAgent.set(agent.threadId, { projectId: project.record.id, agentId: agent.id });
+      const turnStartedAt = performance.now();
+      await this.transport.startTurn({
+        threadId: threadResponse.thread.id,
+        input: [
+          {
+            type: "text",
+            text: turnPrompt,
+            text_elements: []
+          }
+        ],
+        cwd,
+        sandboxPolicy,
+        model: agent.model,
+        effort: agent.reasoningEffort ?? null,
+        outputSchema: options?.outputSchema ?? null
+      });
+      this.logWorkflowPerf(`app-server turn started for ${agent.name}: ${Math.round(performance.now() - turnStartedAt)}ms`);
+      await this.saveProject(project);
+      this.emitState();
+    } catch (error) {
+      if (agent.threadId) {
+        this.threadToAgent.delete(agent.threadId);
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      this.markAgentDisconnected(project, agent, `Codex could not start this run. ${detail}`);
+      this.resetWorkflowAfterInterruptedAgents(project, [agent]);
+      await this.saveProject(project);
+      this.emitState();
+      throw error;
+    }
   }
 
   async approve(agentProjectId: string, agentId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
@@ -15245,7 +15287,8 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
 
     const passNumber = workflow.stepProgress.coding.runCount + 1;
     const agentName = repair ? `Repair Coding Pass ${passNumber}` : `Coding Pass ${passNumber}`;
-    await this.createAgent(projectId, "coding", agentName, this.buildWorkflowCodingPrompt(project, repair), this.getDefaultAgentModel(), {
+    const prompt = this.buildWorkflowCodingPrompt(project, repair);
+    await this.createAgent(projectId, "coding", agentName, prompt, this.getDefaultAgentModel("coding", prompt), {
       targetBranch: this.getLatestCompletedWorkflowCodingBranch(project)
     });
   }
@@ -15473,7 +15516,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
     await this.ensureAgentBackedRuntimeReady(project, "integrity runtime check");
     this.assertResolvedPathCompatible(project.record.distroName);
     const runner = new RuntimeCommandExecutor(this.getRuntimeSettings(project.record.distroName));
-    const integrityModel = this.getDefaultAgentModel();
+    const integrityModel = this.getDefaultAgentModel("integrity", "Validate the current workflow implementation and repair risks.");
     const workflow = this.ensureWorkflowState(project.record);
     const retryingAfterRepair = workflow.repair.status === "repairing" || workflow.repair.status === "retrying_validation";
     const retryingExternalEnvironmentValidation =
@@ -16569,7 +16612,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       reason: "merge started"
     });
 
-    const mergeModel = this.getDefaultAgentModel();
+    const mergeModel = this.getDefaultAgentModel("merge", "Integrate validated work deterministically.");
     const mergeAgent = await this.createAgent(
       projectId,
       "merge",
@@ -17291,7 +17334,7 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       "recommendation",
       "Recommendation Agent",
       this.buildRecommendationPrompt(project, normalizedCustomFocus),
-      this.getDefaultAgentModel(),
+      this.getDefaultAgentModel("recommendation", this.buildRecommendationPrompt(project, normalizedCustomFocus)),
       {
         sandbox: "read-only",
         outputSchema: this.buildRecommendationOutputSchema(),
@@ -18189,6 +18232,27 @@ export class AppService extends EventEmitter<{ stateChanged: [WorkbenchState] }>
       this.markAgentDisconnected(project, agent, reason);
     }
     return interruptedAgents;
+  }
+
+  private markDetachedActiveAgentsDisconnected(project: LoadedProject): AgentState[] {
+    const detachedAgents = project.record.agents.filter((agent) => {
+      if (agent.category === "manual" || !isAgentActive(agent)) {
+        return false;
+      }
+      if (!agent.threadId) {
+        return true;
+      }
+      const mapping = this.threadToAgent.get(agent.threadId);
+      return mapping?.projectId !== project.record.id || mapping.agentId !== agent.id;
+    });
+    for (const agent of detachedAgents) {
+      this.markAgentDisconnected(
+        project,
+        agent,
+        "This saved run has no live Codex thread in the current app session. Continue workflow to restart the interrupted step."
+      );
+    }
+    return detachedAgents;
   }
 
   private resetWorkflowAfterInterruptedAgents(

@@ -436,19 +436,21 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
     return {
       data: [
         {
-          id: "gpt-5.5",
-          model: "gpt-5.5",
+          id: "gpt-5.6-sol",
+          model: "gpt-5.6-sol",
           upgrade: null,
           upgradeInfo: null,
           availabilityNux: null,
-          displayName: "GPT-5.5",
-          description: "Mock newest GPT model",
+          displayName: "GPT-5.6 Sol",
+          description: "Mock premium model for the hardest open-ended work",
           hidden: true,
           supportedReasoningEfforts: [
             { reasoningEffort: "low", description: "Low reasoning" },
             { reasoningEffort: "medium", description: "Medium reasoning" },
             { reasoningEffort: "high", description: "High reasoning" },
-            { reasoningEffort: "xhigh", description: "Extra high reasoning" }
+            { reasoningEffort: "xhigh", description: "Extra high reasoning" },
+            { reasoningEffort: "max", description: "Maximum reasoning; approval required" },
+            { reasoningEffort: "ultra", description: "Ultra reasoning; approval required" }
           ],
           defaultReasoningEffort: "high",
           inputModalities: ["text"],
@@ -459,13 +461,13 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           isDefault: false
         },
         {
-          id: "gpt-5.4-mini",
-          model: "gpt-5.4-mini",
+          id: "gpt-5.6-luna",
+          model: "gpt-5.6-luna",
           upgrade: null,
           upgradeInfo: null,
           availabilityNux: null,
-          displayName: "GPT-5.4 Mini",
-          description: "Mock fast model",
+          displayName: "GPT-5.6 Luna",
+          description: "Mock fast model for clear, repeatable tasks",
           hidden: false,
           supportedReasoningEfforts: [
             { reasoningEffort: "low", description: "Low reasoning" },
@@ -481,13 +483,13 @@ export class MockCodexTransport extends EventEmitter<TransportEventMap> implemen
           isDefault: true
         },
         {
-          id: "gpt-5.4",
-          model: "gpt-5.4",
+          id: "gpt-5.6-terra",
+          model: "gpt-5.6-terra",
           upgrade: null,
           upgradeInfo: null,
           availabilityNux: null,
-          displayName: "GPT-5.4",
-          description: "Mock strong model",
+          displayName: "GPT-5.6 Terra",
+          description: "Mock everyday workhorse for autonomous building",
           hidden: false,
           supportedReasoningEfforts: [
             { reasoningEffort: "low", description: "Low reasoning" },

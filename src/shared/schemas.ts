@@ -10,7 +10,7 @@ export const projectPathKindSchema = z.enum(["windows", "wsl-unc", "linux"]);
 export const projectKindSchema = z.enum(["git", "folder"]);
 export const summarySourceSchema = z.enum(["deterministic", "codex", "hybrid", "mock"]);
 export const agentCategorySchema = z.enum(["bootstrap", "goal", "coding", "integrity", "merge", "recommendation", "manual"]);
-export const interfaceReasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh"]);
+export const interfaceReasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]);
 export const executionModeSchema = z.enum(["local", "wsl"]);
 export const appAppearanceThemeSchema = z.enum(["catc-dark", "catc-light", "space"]);
 export const appAppearanceDensitySchema = z.enum(["compact", "comfortable"]);
@@ -170,6 +170,7 @@ export const approvalDecisionSchema = z.enum(["accept", "acceptForSession", "dec
 export const credentialEntryStatusSchema = z.enum(["active", "needs_attention", "disabled"]);
 export const credentialRequestStatusSchema = z.enum(["pending", "fulfilled", "dismissed"]);
 export const agentReasoningModeSchema = z.enum(["auto", "manual"]);
+export const agentModelModeSchema = z.enum(["auto", "manual"]);
 export const goalCharterDraftTextFieldSchema = z.enum([
   "currentSummary",
   "currentDetailedIntent",
@@ -221,6 +222,7 @@ export const appSettingsSchema = z.object({
   mockMode: z.boolean(),
   maxRepairCycles: z.number().int().min(1).max(10).default(3),
   interfaceCreationModel: z.string().min(1).optional(),
+  agentModelMode: agentModelModeSchema.default("auto"),
   interfaceCreationReasoningEffort: interfaceReasoningEffortSchema.optional(),
   interfaceCreationConfiguredAt: isoDatetime().optional(),
   agentReasoningMode: agentReasoningModeSchema.default("auto"),
@@ -241,6 +243,7 @@ export const reviewLogRuntimeContextSchema = z.object({
   mockMode: z.boolean(),
   maxRepairCycles: z.number().int().min(1).max(10),
   interfaceCreationModel: z.string().min(1).optional(),
+  agentModelMode: agentModelModeSchema.optional(),
   interfaceCreationReasoningEffort: interfaceReasoningEffortSchema.optional(),
   agentReasoningMode: agentReasoningModeSchema.optional(),
   agentReasoningEfforts: agentReasoningEffortsSchema.optional(),

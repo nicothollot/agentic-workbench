@@ -1,20 +1,25 @@
 import type { AgentCategory, AgentReasoningMode, DiscoveredModel, InterfaceReasoningEffort } from "./types";
 
-export const INTERFACE_REASONING_EFFORTS: InterfaceReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+export const INTERFACE_REASONING_EFFORTS: InterfaceReasoningEffort[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+export const AUTOMATIC_REASONING_EFFORTS: InterfaceReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+export const requiresExplicitReasoningApproval = (effort?: InterfaceReasoningEffort): boolean =>
+  effort === "max" || effort === "ultra";
 
 const fastModelPattern = /(mini|small|fast|spark|economy)/i;
 const reasoningRank: Record<InterfaceReasoningEffort, number> = {
   low: 1,
   medium: 2,
   high: 3,
-  xhigh: 4
+  xhigh: 4,
+  max: 5,
+  ultra: 6
 };
 
 export const DEFAULT_AGENT_REASONING_MODE: AgentReasoningMode = "auto";
 export const DEFAULT_AGENT_REASONING_EFFORTS: Record<AgentCategory, InterfaceReasoningEffort> = {
   bootstrap: "medium",
   goal: "high",
-  coding: "xhigh",
+  coding: "high",
   integrity: "medium",
   merge: "low",
   recommendation: "medium",
@@ -102,7 +107,7 @@ const automaticReasoningPreferenceForTask = (
   switch (category) {
     case "coding":
       return {
-        preferred: deepCoding || !lightweightCoding ? ["xhigh", "high"] : ["high", "xhigh"],
+        preferred: deepCoding || !lightweightCoding ? ["high", "xhigh"] : ["medium", "high"],
         fallbackDirection: "highest"
       };
     case "merge":
@@ -117,7 +122,7 @@ const automaticReasoningPreferenceForTask = (
       };
     case "goal":
       return {
-        preferred: complexPlanning ? ["xhigh", "high"] : ["high", "medium"],
+        preferred: complexPlanning ? ["high", "xhigh"] : ["medium", "high"],
         fallbackDirection: "highest"
       };
     case "recommendation":
@@ -133,7 +138,7 @@ const automaticReasoningPreferenceForTask = (
     case "manual":
       if (manualChange) {
         return {
-          preferred: complexCoding ? ["xhigh", "high"] : ["high", "medium"],
+          preferred: complexCoding ? ["high", "xhigh"] : ["medium", "high"],
           fallbackDirection: "highest"
         };
       }
@@ -199,7 +204,7 @@ export const getAutomaticAgentReasoningEffort = (
   taskPrompt: string,
   model?: Pick<DiscoveredModel, "supportedReasoningEfforts">
 ): InterfaceReasoningEffort => {
-  const supported = supportedEffortsForModel(model);
+  const supported = supportedEffortsForModel(model).filter((effort) => AUTOMATIC_REASONING_EFFORTS.includes(effort));
   const preference = automaticReasoningPreferenceForTask(category, taskPrompt);
   return pickFirstSupportedReasoningEffort(supported, preference.preferred, preference.fallbackDirection);
 };

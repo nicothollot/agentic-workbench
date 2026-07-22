@@ -1,6 +1,6 @@
 import { isInterfaceReasoningEffort, normalizeSupportedReasoningEfforts } from "@shared/modelConfig";
 import type { Model } from "@generated/app-server/v2";
-import type { DiscoveredModel } from "@shared/types";
+import type { AgentCategory, DiscoveredModel } from "@shared/types";
 
 const lowerText = (model: Model): string =>
   `${model.model} ${model.displayName} ${model.description}`.toLowerCase();
@@ -50,6 +50,15 @@ const deriveLabels = (model: Model): string[] => {
   if (model.hidden) {
     labels.add("CLI listed");
   }
+  if (/\bterra\b/.test(text)) {
+    labels.add("everyday builder");
+  }
+  if (/\bluna\b/.test(text)) {
+    labels.add("repeatable tasks");
+  }
+  if (/\bsol\b/.test(text)) {
+    labels.add("premium");
+  }
 
   return [...labels];
 };
@@ -57,6 +66,14 @@ const deriveLabels = (model: Model): string[] => {
 const interfaceCreationScore = (model: Model): number => {
   const text = lowerText(model);
   let score = 0;
+
+  if (/\bterra\b/.test(text)) {
+    score += 10_000_000;
+  } else if (/\bluna\b/.test(text)) {
+    score += 8_000_000;
+  } else if (/\bsol\b/.test(text)) {
+    score -= 10_000_000;
+  }
 
   if (/(mini|small|fast|spark|economy)/.test(text)) {
     score += 50;
@@ -118,3 +135,31 @@ export const buildDiscoveredModels = (models: Model[]): DiscoveredModel[] => {
 
 export const getRecommendedInterfaceCreationModel = (models: DiscoveredModel[]): DiscoveredModel | undefined =>
   models.find((model) => model.recommendedForInterfaceCreation) ?? models[0];
+
+const discoveredModelText = (model: DiscoveredModel): string =>
+  `${model.model} ${model.displayName} ${model.description}`.toLowerCase();
+
+const modelTier = (model: DiscoveredModel): "terra" | "luna" | "sol" | "other" => {
+  const text = discoveredModelText(model);
+  if (/\bterra\b/.test(text)) return "terra";
+  if (/\bluna\b/.test(text)) return "luna";
+  if (/\bsol\b/.test(text)) return "sol";
+  return "other";
+};
+
+/** Automatic routing deliberately excludes Sol. Premium Sol runs remain an explicit user override. */
+export const getRecommendedAgentModel = (
+  models: DiscoveredModel[],
+  category: AgentCategory,
+  taskPrompt = ""
+): DiscoveredModel | undefined => {
+  const isReadOnlyManualTask = category === "manual" &&
+    /\b(explain|summari[sz]e|inspect|review|where|what|why|status|classif|extract|route)\b/i.test(taskPrompt) &&
+    !/\b(implement|change|edit|write|fix|debug|refactor|test|build|merge|resolve)\b/i.test(taskPrompt);
+  const preferredTier = category === "merge" || category === "recommendation" || isReadOnlyManualTask ? "luna" : "terra";
+  return models.find((model) => modelTier(model) === preferredTier)
+    ?? models.find((model) => modelTier(model) === "terra")
+    ?? models.find((model) => modelTier(model) === "luna")
+    ?? models.find((model) => modelTier(model) !== "sol")
+    ?? models[0];
+};

@@ -21,8 +21,9 @@ export type AgentLifecycleStatus =
   | "disconnected";
 export type ApprovalKind = "command" | "file-change" | "permissions" | "apply-patch";
 export type ApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
-export type InterfaceReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type InterfaceReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type AgentReasoningMode = "auto" | "manual";
+export type AgentModelMode = "auto" | "manual";
 export type AgentReasoningEfforts = Partial<Record<AgentCategory, InterfaceReasoningEffort>>;
 export type InterfaceCreationStatus = "idle" | "queued" | "running" | "completed" | "failed";
 export type ModelCatalogSource = "live" | "mock" | "unavailable";
@@ -754,6 +755,7 @@ export interface AppSettings {
   mockMode: boolean;
   maxRepairCycles: number;
   interfaceCreationModel?: string;
+  agentModelMode?: AgentModelMode;
   interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
   interfaceCreationConfiguredAt?: string;
   agentReasoningMode?: AgentReasoningMode;
@@ -774,6 +776,7 @@ export interface ReviewLogRuntimeContext {
   mockMode: boolean;
   maxRepairCycles: number;
   interfaceCreationModel?: string;
+  agentModelMode?: AgentModelMode;
   interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
   agentReasoningMode?: AgentReasoningMode;
   agentReasoningEfforts?: AgentReasoningEfforts;

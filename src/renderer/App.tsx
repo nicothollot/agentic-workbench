@@ -54,6 +54,7 @@ import type {
   AgentHistorySummary,
   AgentListResponse,
   AgentLifecycleStatus,
+  AgentModelMode,
   AgentReasoningEfforts,
   AgentReasoningMode,
   AgentState,
@@ -257,6 +258,7 @@ type SettingsDraftState = {
   warnOnMntMount: boolean;
   maxRepairCycles: number;
   interfaceCreationModel: string;
+  agentModelMode: AgentModelMode;
   interfaceCreationReasoningEffort: InterfaceReasoningEffort;
   agentReasoningMode: AgentReasoningMode;
   agentReasoningEfforts: Record<AgentCategory, InterfaceReasoningEffort>;
@@ -278,6 +280,7 @@ type SettingsDraftUpdate = {
   warnOnMntMount?: boolean;
   maxRepairCycles?: number;
   interfaceCreationModel?: string;
+  agentModelMode?: AgentModelMode;
   interfaceCreationReasoningEffort?: InterfaceReasoningEffort;
   agentReasoningMode?: AgentReasoningMode;
   agentReasoningEfforts?: AgentReasoningEfforts;
@@ -708,7 +711,9 @@ const reasoningEffortLabel = (value: InterfaceReasoningEffort): string =>
     low: "Low",
     medium: "Medium",
     high: "High",
-    xhigh: "Extra high"
+    xhigh: "Extra high",
+    max: "Max · approval required",
+    ultra: "Ultra · approval required"
   })[value];
 
 const reasoningEffortDescription = (value: InterfaceReasoningEffort): string =>
@@ -716,7 +721,9 @@ const reasoningEffortDescription = (value: InterfaceReasoningEffort): string =>
     low: "Fast coordination for simple deterministic work.",
     medium: "Balanced planning and repository review.",
     high: "Careful analysis for complex tasks and implementation.",
-    xhigh: "Deepest analysis for coding and high-risk changes."
+    xhigh: "Deep analysis for coding and high-risk changes.",
+    max: "Premium maximum reasoning; each run requires confirmation.",
+    ultra: "Premium ultra reasoning; each run requires confirmation."
   })[value];
 
 const configurableAgentCategories: AgentCategory[] = [
@@ -735,6 +742,23 @@ const normalizeAgentReasoningEfforts = (efforts?: AgentReasoningEfforts): Record
 });
 
 const normalizeReasoningMode = (mode?: AgentReasoningMode): AgentReasoningMode => mode ?? DEFAULT_AGENT_REASONING_MODE;
+
+const modelTierLabel = (model?: DiscoveredModel): "Terra" | "Luna" | "Sol" | "Other" => {
+  const text = `${model?.model ?? ""} ${model?.displayName ?? ""} ${model?.description ?? ""}`.toLowerCase();
+  if (/\bterra\b/.test(text)) return "Terra";
+  if (/\bluna\b/.test(text)) return "Luna";
+  if (/\bsol\b/.test(text)) return "Sol";
+  return "Other";
+};
+
+const recommendedModelForRole = (models: DiscoveredModel[], category: AgentCategory): DiscoveredModel | undefined => {
+  const preferredTier = category === "merge" || category === "recommendation" ? "Luna" : "Terra";
+  return models.find((model) => modelTierLabel(model) === preferredTier)
+    ?? models.find((model) => modelTierLabel(model) === "Terra")
+    ?? models.find((model) => modelTierLabel(model) === "Luna")
+    ?? models.find((model) => modelTierLabel(model) !== "Sol")
+    ?? models[0];
+};
 
 const exclusionRuleLabel = (rule: "default" | "gitignore"): string =>
   rule === "default" ? "Built-in default exclusion" : ".gitignore exclusion";
@@ -7415,6 +7439,7 @@ const SettingsDialog = ({
   const supportedReasoningEfforts = selectedModel?.supportedReasoningEfforts.length
     ? selectedModel.supportedReasoningEfforts
     : INTERFACE_REASONING_EFFORTS;
+  const standardReasoningEfforts = supportedReasoningEfforts.filter((effort) => effort !== "max" && effort !== "ultra");
   const agentReasoningEfforts = normalizeAgentReasoningEfforts(settingsDraft.agentReasoningEfforts);
   const setAgentReasoningEffort = (category: AgentCategory, effort: InterfaceReasoningEffort) => {
     onChange({
@@ -7644,11 +7669,35 @@ const SettingsDialog = ({
         </div>
         <div className="settings-section">
           <div className="settings-section__heading">
-            <strong>Model</strong>
-            <span className="badge">Model discovery</span>
+            <strong>Model routing</strong>
+            <span className="badge">{settingsDraft.agentModelMode === "auto" ? "Automatic by role" : "Manual override"}</span>
           </div>
           <p className="settings-card__copy">
-            The selected model is used directly for agent-backed repository analysis, goal drafting, coding, validation, and merge runs.
+            Automatic routing keeps routine autonomous work on Terra, uses Luna for repeatable recommendation and merge tasks, and never selects premium Sol on its own.
+          </p>
+          <label className="form-field settings-model-mode">
+            <span>Model selection</span>
+            <select className="input" value={settingsDraft.agentModelMode} onChange={(event) => onChange({ agentModelMode: event.target.value as AgentModelMode })}>
+              <option value="auto">Automatic by role (recommended)</option>
+              <option value="manual">One model for every role</option>
+            </select>
+          </label>
+          {settingsDraft.agentModelMode === "auto" ? (
+            <div className="model-routing-grid" aria-label="Automatic model routing">
+              {configurableAgentCategories.map((category) => {
+                const routedModel = recommendedModelForRole(state.availableModels, category);
+                return (
+                  <div key={category} className="model-routing-item">
+                    <span>{agentCategoryLabel(category)}</span>
+                    <strong>{routedModel?.displayName ?? "Discovered fallback"}</strong>
+                    <small>{modelTierLabel(routedModel)} route</small>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          <p className="settings-card__copy">
+            {settingsDraft.agentModelMode === "manual" ? "Choose the single model used by every agent role." : "Selecting a card below switches to a deliberate single-model override. Sol remains available for exceptional runs."}
           </p>
           <div className="loader-grid">
             {state.availableModels.length ? state.availableModels.map((model) => (
@@ -7656,7 +7705,7 @@ const SettingsDialog = ({
                 key={model.id}
                 model={model}
                 selected={settingsDraft.interfaceCreationModel === model.model}
-                onSelect={(selectedModelName) => onChange({ interfaceCreationModel: selectedModelName })}
+                onSelect={(selectedModelName) => onChange({ interfaceCreationModel: selectedModelName, agentModelMode: "manual" })}
               />
             )) : (
               <div className="overview-card">
@@ -7709,7 +7758,7 @@ const SettingsDialog = ({
                       onChange={(event) => setAgentReasoningEffort(category, event.target.value as InterfaceReasoningEffort)}
                       disabled={!state.availableModels.length || settingsDraft.agentReasoningMode === "auto"}
                     >
-                      {supportedReasoningEfforts.map((effort) => (
+                      {standardReasoningEfforts.map((effort) => (
                         <option key={effort} value={effort}>
                           {reasoningEffortLabel(effort)}: {reasoningEffortDescription(effort)}
                         </option>
@@ -7724,7 +7773,8 @@ const SettingsDialog = ({
             </div>
             <div className="tag-row">
               {selectedModel?.defaultReasoningEffort ? <span className="tag">Model default: {selectedModel.defaultReasoningEffort}</span> : null}
-              <span className="tag">Supported: {supportedReasoningEfforts.map(reasoningEffortLabel).join(", ")}</span>
+              <span className="tag">Standard automatic range: {standardReasoningEfforts.map(reasoningEffortLabel).join(", ")}</span>
+              {supportedReasoningEfforts.some((effort) => effort === "max" || effort === "ultra") ? <span className="tag">Max / Ultra: explicit run approval only</span> : null}
               <span className="tag">Coding auto: {reasoningEffortLabel(resolveAgentReasoningEffort(selectedModel, "coding", "Implement the scoped coding task.", "auto"))}</span>
               <span className="tag">Merge auto: {reasoningEffortLabel(resolveAgentReasoningEffort(selectedModel, "merge", "Integrate validated work deterministically.", "auto"))}</span>
             </div>
@@ -8873,6 +8923,7 @@ const WorkbenchApp = () => {
     warnOnMntMount: true,
     maxRepairCycles: 3,
     interfaceCreationModel: "",
+    agentModelMode: "auto" as AgentModelMode,
     interfaceCreationReasoningEffort: "medium" as InterfaceReasoningEffort,
     agentReasoningMode: DEFAULT_AGENT_REASONING_MODE,
     agentReasoningEfforts: normalizeAgentReasoningEfforts(),
@@ -9042,6 +9093,7 @@ const WorkbenchApp = () => {
   const availableModels = useMemo(() => state?.availableModels ?? [], [state?.availableModels]);
   const interfaceCreationConfiguredAt = state?.settings.interfaceCreationConfiguredAt;
   const settingsModel = state?.settings.interfaceCreationModel;
+  const settingsAgentModelMode = state?.settings.agentModelMode ?? "auto";
   const settingsReasoning = state?.settings.interfaceCreationReasoningEffort;
   const settingsAgentReasoningMode = normalizeReasoningMode(state?.settings.agentReasoningMode);
   const settingsAgentReasoningEfforts = useMemo(
@@ -9700,6 +9752,7 @@ const WorkbenchApp = () => {
       current.warnOnMntMount === settingsWarnOnMntMount &&
       current.maxRepairCycles === settingsMaxRepairCycles &&
       current.interfaceCreationModel === nextModel &&
+      current.agentModelMode === settingsAgentModelMode &&
       current.interfaceCreationReasoningEffort === nextReasoning &&
       current.agentReasoningMode === settingsAgentReasoningMode &&
       JSON.stringify(current.agentReasoningEfforts) === JSON.stringify(settingsAgentReasoningEfforts) &&
@@ -9720,6 +9773,7 @@ const WorkbenchApp = () => {
           warnOnMntMount: settingsWarnOnMntMount,
           maxRepairCycles: settingsMaxRepairCycles,
           interfaceCreationModel: nextModel,
+          agentModelMode: settingsAgentModelMode,
           interfaceCreationReasoningEffort: nextReasoning,
           agentReasoningMode: settingsAgentReasoningMode,
           agentReasoningEfforts: settingsAgentReasoningEfforts,
@@ -9739,6 +9793,7 @@ const WorkbenchApp = () => {
     settingsAutoApproveGitCommits,
     settingsAutoApproveGitPushes,
     settingsAgentReasoningEfforts,
+    settingsAgentModelMode,
     settingsAgentReasoningMode,
     settingsConsiderPaidServices,
     settingsAppearanceDensity,
@@ -12176,6 +12231,7 @@ const WorkbenchApp = () => {
         warnOnMntMount: settingsDraft.warnOnMntMount,
         maxRepairCycles: settingsDraft.maxRepairCycles,
         interfaceCreationModel: settingsDraft.interfaceCreationModel || undefined,
+        agentModelMode: settingsDraft.agentModelMode,
         interfaceCreationReasoningEffort: settingsDraft.agentReasoningEfforts.bootstrap ?? settingsDraft.interfaceCreationReasoningEffort,
         agentReasoningMode: settingsDraft.agentReasoningMode,
         agentReasoningEfforts: settingsDraft.agentReasoningEfforts,
@@ -12304,6 +12360,7 @@ const WorkbenchApp = () => {
       warnOnMntMount: next.warnOnMntMount ?? current.warnOnMntMount,
       maxRepairCycles: next.maxRepairCycles ?? current.maxRepairCycles,
       interfaceCreationModel: nextModel,
+      agentModelMode: next.agentModelMode ?? current.agentModelMode,
       interfaceCreationReasoningEffort: nextAgentReasoningEfforts.bootstrap ?? nextReasoning,
       agentReasoningMode: next.agentReasoningMode ?? current.agentReasoningMode,
       agentReasoningEfforts: nextAgentReasoningEfforts,

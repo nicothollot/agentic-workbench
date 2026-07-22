@@ -186,7 +186,10 @@ export const getWorkflowRecoveryCandidate = (
   const activeAgent = currentCycleAgents.find(isAgentActive);
   if (activeAgent) {
     const lastActivity = toTime(activeAgent.lastActivityAt ?? activeAgent.startedAt ?? activeAgent.createdAt);
-    return lastActivity > 0 && nowMs - lastActivity > staleMs
+    const recoveryAfterMs = activeAgent.status === "starting" && !activeAgent.threadId
+      ? Math.min(staleMs, 20_000)
+      : staleMs;
+    return lastActivity > 0 && nowMs - lastActivity > recoveryAfterMs
       ? {
         kind: activeAgent.status === "starting" && !activeAgent.threadId ? "startup_stalled" : "stale",
         agent: activeAgent

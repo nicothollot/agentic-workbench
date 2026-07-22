@@ -642,10 +642,180 @@ textarea { font: inherit; }
   box-shadow: var(--ui-shadow-sm);
 }
 
+/* Keep every legacy workspace surface on the active theme palette. The base
+   feature stylesheet intentionally remains portable, so this final shell layer
+   owns contrast for dark, light, and space modes. */
+.shell--workspace .recent-project,
+.shell--workspace .candidate-card,
+.shell--workspace .model-option,
+.shell--workspace .runs-page-header,
+.shell--workspace .runs-list-card,
+.shell--workspace .runs-detail-card,
+.shell--workspace .runs-manual-panel,
+.shell--workspace .workflow-plan-card,
+.shell--workspace .workflow-attention-panel,
+.shell--workspace .workflow-checklist-card,
+.shell--workspace .workflow-autopilot-compact,
+.shell--workspace .workflow-context-panel,
+.shell--workspace .workflow-activity-mini,
+.shell--workspace .logs-feed-panel,
+.shell--workspace .logs-command-panel,
+.shell--workspace .repository-access-card,
+.shell--workspace .goal-charter-card,
+.shell--workspace .history-agent-card,
+.shell--workspace .agent-output-panel,
+.shell--workspace .agent-transcript-panel,
+.shell--workspace .runtime-readiness-panel,
+.shell--workspace .codex-readiness-panel,
+.shell--workspace .credentials-security-note {
+  border-color: var(--ui-border);
+  background: var(--ui-surface);
+  color: var(--ui-text);
+  box-shadow: var(--ui-shadow-sm);
+}
+
+.shell--workspace .model-option--selected {
+  border-color: color-mix(in srgb, var(--ui-accent) 60%, var(--ui-border));
+  background: color-mix(in srgb, var(--ui-accent) 10%, var(--ui-surface));
+}
+
+.shell--workspace .workflow-operator-header__facts > div,
+.shell--workspace .workflow-now-card__grid > div,
+.shell--workspace .workflow-checklist-card__stats > div,
+.shell--workspace .workflow-autopilot-compact__grid > div,
+.shell--workspace .workflow-autopilot-compact__grid > label,
+.shell--workspace .workflow-plan-card__grid > div,
+.shell--workspace .workflow-checklist-card__groups > div,
+.shell--workspace .workflow-manual-handoff__section,
+.shell--workspace .operator-score-grid__item--negative,
+.shell--workspace .operator-command--failed,
+.shell--workspace .workflow-agent-message-row,
+.shell--workspace .workflow-context-card,
+.shell--workspace .overview-current-work-card__facts > div,
+.shell--workspace .runs-page-header__stats > div,
+.shell--workspace .runs-detail-grid > div,
+.shell--workspace .run-row,
+.shell--workspace .run-detail-disclosure,
+.shell--workspace .run-evidence-summary,
+.shell--workspace .run-evidence-group,
+.shell--workspace .repository-fact-card,
+.shell--workspace .repository-coverage-grid > div,
+.shell--workspace .goal-charter-card__strategy > div,
+.shell--workspace .goal-charter-card__lists > div,
+.shell--workspace .goal-charter-original,
+.shell--workspace .history-page-header__stats > div,
+.shell--workspace .history-cycle-card__facts > div,
+.shell--workspace .history-agent-card__grid > div,
+.shell--workspace .logs-header__stats > div,
+.shell--workspace .history-cycle-card__details,
+.shell--workspace .history-cycle-card__next,
+.shell--workspace .model-routing-item {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-raised);
+  color: var(--ui-text);
+}
+
+.shell--workspace .runs-filter-tab,
+.shell--workspace .filter-chip,
+.shell--workspace .segmented-control button {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-subtle);
+  color: var(--ui-text-muted);
+}
+
+.shell--workspace .runs-filter-tab.is-active,
+.shell--workspace .filter-chip.is-active,
+.shell--workspace .segmented-control button.is-active,
+.shell--workspace .segmented-control button[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--ui-accent) 55%, var(--ui-border));
+  background: color-mix(in srgb, var(--ui-accent) 18%, var(--ui-surface-raised));
+  color: var(--ui-text);
+}
+
+.shell--workspace button:disabled,
+.shell--workspace select:disabled,
+.shell--workspace input:disabled,
+.shell--workspace textarea:disabled {
+  opacity: 0.62;
+}
+
+.shell--workspace .workflow-blocker-details {
+  grid-column: 1 / -1;
+  max-height: min(70dvh, 720px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .workflow-operator-grid--top > :not(.workflow-blocker-details) {
+  max-height: min(58dvh, 560px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .workflow-operator-grid--plan {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.shell--workspace .workflow-operator-grid--plan > * {
+  max-height: min(74dvh, 760px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .logs-feed-panel,
+.shell--workspace .logs-command-panel {
+  max-height: min(76dvh, 800px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .history-cycle-card--expanded .history-cycle-card__details {
+  max-height: min(70dvh, 720px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .history-cycle-card {
+  max-height: min(82dvh, 840px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .runs-list-card {
+  max-height: min(78dvh, 820px);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell--workspace .repository-summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.model-routing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.model-routing-item {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid;
+  border-radius: var(--ui-radius-sm);
+}
+
+.model-routing-item span,
+.model-routing-item small { color: var(--ui-text-muted); }
+
 .shell--workspace .panel::before,
 .shell--workspace .overview-card::before,
 .shell--workspace .agent-card::before,
 .shell--workspace .settings-card::before,
+.shell--workspace .candidate-card::before,
+.shell--workspace .model-option::before,
 .shell--workspace .workflow-option::before,
 .shell--workspace .card-surface::before { display: none; }
 
